@@ -953,6 +953,7 @@
 			buildPhases = (
 				706E1033C199ECF8C156C2AB /* Sources */,
 				05014A794D7ADC41D2C38AF5 /* Resources */,
+				36AA4795BA6A04289EEF98BE /* ShellScript */,
 			);
 			buildRules = (
 			);
@@ -1005,6 +1006,23 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		36AA4795BA6A04289EEF98BE /* ShellScript */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "rm -rf \"${BUILT_PRODUCTS_DIR}/${PRODUCT_NAME}.app/baseq3\"\ncp -RL \"${SRCROOT}/baseq3\" \"${BUILT_PRODUCTS_DIR}/${PRODUCT_NAME}.app/baseq3\"\n";
+			showEnvVarsInLog = 0;
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		706E1033C199ECF8C156C2AB /* Sources */ = {

@@ -1,0 +1,12 @@
+# Game data (too large for git — must be provided locally)
+baseq3/
+*.pk3
+
+# Xcode
+*.xcuserstate
+xcuserdata/
+DerivedData/
+.DS_Store
+
+# Build
+build/
