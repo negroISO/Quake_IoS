@@ -1,0 +1,109 @@
+name: Quake3-iOS
+options:
+  bundleIdPrefix: com.quake3ios
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    CLANG_ENABLE_MODULES: YES
+
+targets:
+  Quake3-iOS:
+    type: application
+    platform: iOS
+    sources:
+      - path: Quake3-iOS
+        type: group
+        includes:
+          - "*.swift"
+      - path: Quake3-iOS/Quake3-iOS-Bridging-Header.h
+        buildPhase: none
+      - path: code/ios
+        type: group
+      - path: code/qcommon
+        type: group
+        excludes:
+          - "vm_x86.c"
+          - "vm_armv7l.c"
+          - "vm_powerpc*.c"
+          - "vm_sparc.c"
+      - path: code/client
+        type: group
+        excludes:
+          - "cl_curl.c"
+      - path: code/server
+        type: group
+        excludes:
+          - "sv_rankings.c"
+      - path: code/botlib
+        type: group
+      - path: code/renderercommon
+        type: group
+        excludes:
+          - "vulkan/**"
+      # renderervk excluded — stub Metal renderer provides GetRefAPI
+      - path: code/libjpeg
+        type: group
+      - path: code/libogg
+        type: group
+      - path: code/libvorbis
+        type: group
+
+    resources:
+      - path: Resources/baseq3
+        buildPhase: resources
+
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.quake3ios.app
+        INFOPLIST_GENERATION_MODE: GeneratedByXcode
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_OBJC_BRIDGING_HEADER: Quake3-iOS/Quake3-iOS-Bridging-Header.h
+        TARGETED_DEVICE_FAMILY: "1,2"
+        GCC_C_LANGUAGE_STANDARD: c11
+        CLANG_ENABLE_OBJC_ARC: YES
+        HEADER_SEARCH_PATHS:
+          - "$(SRCROOT)/code"
+          - "$(SRCROOT)/code/renderercommon"
+          - "$(SRCROOT)/code/renderervk"
+          - "$(SRCROOT)/code/qcommon"
+          - "$(SRCROOT)/code/client"
+          - "$(SRCROOT)/code/server"
+          - "$(SRCROOT)/code/botlib"
+          - "$(SRCROOT)/code/libjpeg"
+          - "$(SRCROOT)/code/libogg/include"
+          - "$(SRCROOT)/code/libvorbis/include"
+          - "$(SRCROOT)/code/libvorbis/lib"
+        GCC_PREPROCESSOR_DEFINITIONS:
+          - "$(inherited)"
+          - "BOTLIB"
+          - "USE_ICON"
+          - "USE_VULKAN"
+          - "USE_VBO"
+          - "USE_CODEC_VORBIS"
+          - "HAVE_VM_COMPILED"
+          - "IOS_BUILD=1"
+          - "MACOS_X=1"
+          - "USE_LOCAL_HEADERS=1"
+          - "ARCH_STRING=\\\"arm64\\\""
+          - "DLL_EXT=\\\".dylib\\\""
+        OTHER_CFLAGS:
+          - "-Wno-shorten-64-to-32"
+          - "-Wno-unused-variable"
+          - "-Wno-unused-function"
+          - "-Wno-implicit-function-declaration"
+          - "-Wno-sign-conversion"
+          - "-Wno-incompatible-pointer-types"
+          - "-Wno-deprecated-declarations"
+      configs:
+        Debug:
+          SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+          GCC_OPTIMIZATION_LEVEL: "0"
+        Release:
+          SWIFT_OPTIMIZATION_LEVEL: "-O"
+          GCC_OPTIMIZATION_LEVEL: "s"
