@@ -231,6 +231,7 @@ struct MetalView: UIViewRepresentable {
                   let commandQueue,
                   let uiSamplerState,
                   let worldSamplerState,
+                  let depthStencilState,
                   let commandBuffer = commandQueue.makeCommandBuffer()
             else { return }
 
