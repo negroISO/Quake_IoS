@@ -164,7 +164,11 @@ struct MetalView: UIViewRepresentable {
                 + drawUniforms.texCoordScroll * drawUniforms.timeSeconds;
             float4 texel = colorTexture.sample(textureSampler, texCoord);
             float4 lightmap = lightmapTexture.sample(textureSampler, in.lightmapTexCoord);
-            return texel * lightmap * in.color;
+            float4 result = texel * lightmap * in.color;
+            if (result.a < 0.01) {
+                discard_fragment();
+            }
+            return result;
         }
 
         vertex EntityVertexOut q3_entity_vertex(const device EntityVertexIn *vertices [[buffer(0)]],
@@ -481,7 +485,7 @@ struct MetalView: UIViewRepresentable {
 
             let depthDescriptor = MTLDepthStencilDescriptor()
             depthDescriptor.isDepthWriteEnabled = true
-            depthDescriptor.depthCompareFunction = .less
+            depthDescriptor.depthCompareFunction = .lessEqual
             depthStencilState = device.makeDepthStencilState(descriptor: depthDescriptor)
 
             let additiveDepthDescriptor = MTLDepthStencilDescriptor()
