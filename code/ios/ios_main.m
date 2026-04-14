@@ -396,6 +396,7 @@ void Quake3_Init(const char *basePath) {
 
     char cmdline[256] = "";
     Com_Init(cmdline);
+    Cbuf_AddText("map q3dm1\n");
     engine_initialized = qtrue;
 
     Com_Printf("=== Quake3 iOS Engine Initialized ===\n");
