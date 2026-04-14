@@ -707,8 +707,19 @@ static qboolean LoadMD3ModelData(const char *modName, void *buffer, int fileSize
     uint32_t bytesToEnd;
 
     *outModel = NULL;
+    if (buffer == NULL || fileSize <= 0) {
+        ri.Printf(PRINT_WARNING, "Metal model: '%s' rejected: no data (fileSize=%d)\n", modName, fileSize);
+        return qfalse;
+    }
+    if ((uint32_t)fileSize < sizeof(md3Header_t)) {
+        ri.Printf(PRINT_WARNING, "Metal model: '%s' rejected: file too small for MD3 header (fileSize=%d, need>=%u)\n",
+            modName, fileSize, (unsigned)sizeof(md3Header_t));
+        return qfalse;
+    }
+
     pinmodel = (md3Header_t *)buffer;
     version = LittleLong(pinmodel->version);
+    ri.Printf(PRINT_DEVELOPER, "Metal model: inspecting '%s' (fileSize=%d, version=%u)\n", modName, fileSize, version);
     if (version != MD3_VERSION) {
         ri.Printf(PRINT_WARNING, "Metal model: %s has wrong version (%u should be %u)\n", modName, version, MD3_VERSION);
         return qfalse;
@@ -716,7 +727,8 @@ static qboolean LoadMD3ModelData(const char *modName, void *buffer, int fileSize
 
     size = LittleLong(pinmodel->ofsEnd);
     if (size == 0 || size > (uint32_t)fileSize) {
-        ri.Printf(PRINT_WARNING, "Metal model: %s has corrupted header\n", modName);
+        ri.Printf(PRINT_WARNING, "Metal model: '%s' rejected: corrupted header (ofsEnd=%u, fileSize=%d)\n",
+            modName, size, fileSize);
         return qfalse;
     }
 
@@ -740,6 +752,10 @@ static qboolean LoadMD3ModelData(const char *modName, void *buffer, int fileSize
 
     if (hdr->numFrames < 1 || hdr->numSurfaces < 1 ||
         hdr->ofsFrames > size || hdr->ofsTags > size || hdr->ofsSurfaces > size) {
+        ri.Printf(PRINT_WARNING,
+            "Metal model: '%s' rejected: invalid header ranges (frames=%d tags=%d surfaces=%d ofsFrames=%d ofsTags=%d ofsSurfaces=%d size=%u)\n",
+            modName, hdr->numFrames, hdr->numTags, hdr->numSurfaces,
+            hdr->ofsFrames, hdr->ofsTags, hdr->ofsSurfaces, size);
         ri.Free(hdr);
         return qfalse;
     }
@@ -774,6 +790,9 @@ static qboolean LoadMD3ModelData(const char *modName, void *buffer, int fileSize
 
         bytesToEnd = size - (uint32_t)((byte *)surf - (byte *)hdr);
         if (bytesToEnd < sizeof(*surf)) {
+            ri.Printf(PRINT_WARNING,
+                "Metal model: '%s' rejected: surface %d truncated before header (bytesToEnd=%u need>=%u)\n",
+                modName, i, bytesToEnd, (unsigned)sizeof(*surf));
             ri.Free(hdr);
             return qfalse;
         }
@@ -792,6 +811,10 @@ static qboolean LoadMD3ModelData(const char *modName, void *buffer, int fileSize
 
         if (surf->ofsTriangles > bytesToEnd || surf->ofsShaders > bytesToEnd ||
             surf->ofsSt > bytesToEnd || surf->ofsXyzNormals > bytesToEnd || surf->ofsEnd > bytesToEnd) {
+            ri.Printf(PRINT_WARNING,
+                "Metal model: '%s' rejected: surface %d has invalid offsets (tri=%d shaders=%d st=%d xyz=%d end=%d bytesToEnd=%u)\n",
+                modName, i, surf->ofsTriangles, surf->ofsShaders, surf->ofsSt,
+                surf->ofsXyzNormals, surf->ofsEnd, bytesToEnd);
             ri.Free(hdr);
             return qfalse;
         }
@@ -839,6 +862,8 @@ static qboolean TryRegisterModelPath(const char *name, metalModel_t *modelSlot) 
 
     fileSize = ri.FS_ReadFile(name, &fileBuffer);
     if (fileSize <= 0 || fileBuffer == NULL) {
+        ri.Printf(PRINT_WARNING, "Metal model: '%s' rejected: FS_ReadFile returned fileSize=%d buffer=%p\n",
+            name, fileSize, fileBuffer);
         return qfalse;
     }
 
