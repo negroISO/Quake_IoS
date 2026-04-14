@@ -355,6 +355,19 @@ void IN_Init(void) {
     Com_Printf("IN_Init: iOS touch + controller input\n");
     Cbuf_AddText(
         "seta cl_freelook 1\n"
+        "seta in_joystick 1\n"
+        "seta j_yaw -0.022\n"
+        "seta j_pitch 0.022\n"
+        "seta j_forward -0.25\n"
+        "seta j_side 0.25\n"
+        "seta j_up 0.25\n"
+        "seta j_yaw_axis 2\n"
+        "seta j_pitch_axis 3\n"
+        "seta j_forward_axis 1\n"
+        "seta j_side_axis 0\n"
+        "seta j_up_axis 4\n"
+        "seta cl_pitchspeed 140\n"
+        "seta cl_yawspeed 140\n"
         "bind PAD0_RIGHTTRIGGER \"+attack\"\n"
         "bind PAD0_A \"+moveup\"\n"
         "bind PAD0_B \"+movedown\"\n"
@@ -366,15 +379,17 @@ void IN_Frame(void) {
     int leftForward;
     s_lastGamepadPollMsec = eventTime;
 
+    /* Left stick: X = strafe (side), Y = forward/back (push up = forward) */
     leftSide = GamepadAxisToQuake(ApplyDeadzone(s_gamepadState.leftX, 0.18f));
-    leftForward = GamepadAxisToQuake(-ApplyDeadzone(s_gamepadState.leftY, 0.18f));
+    leftForward = GamepadAxisToQuake(ApplyDeadzone(s_gamepadState.leftY, 0.18f));
     Sys_QueEvent(eventTime, SE_JOYSTICK_AXIS, AXIS_SIDE, leftSide, 0, NULL);
     Sys_QueEvent(eventTime, SE_JOYSTICK_AXIS, AXIS_FORWARD, leftForward, 0, NULL);
     Sys_QueEvent(eventTime, SE_JOYSTICK_AXIS, AXIS_UP, 0, 0, NULL);
+    /* Right stick: X = yaw (look left/right), Y = pitch (look up/down) */
     Sys_QueEvent(eventTime, SE_JOYSTICK_AXIS, AXIS_YAW,
                  GamepadAxisToQuake(ApplyDeadzone(s_gamepadState.rightX, 0.12f)), 0, NULL);
     Sys_QueEvent(eventTime, SE_JOYSTICK_AXIS, AXIS_PITCH,
-                 GamepadAxisToQuake(-ApplyDeadzone(s_gamepadState.rightY, 0.12f)), 0, NULL);
+                 GamepadAxisToQuake(ApplyDeadzone(s_gamepadState.rightY, 0.12f)), 0, NULL);
 
     QueueGamepadButtonEvent(K_PAD0_RIGHTTRIGGER, s_prevGamepadState.firePressed, s_gamepadState.firePressed, eventTime);
     QueueGamepadButtonEvent(K_PAD0_A, s_prevGamepadState.jumpPressed, s_gamepadState.jumpPressed, eventTime);
@@ -498,5 +513,6 @@ void Quake3_Init(const char *basePath) {
 
 void Quake3_Frame(void) {
     if (!engine_initialized) return;
+    IN_Frame();
     Com_Frame(qfalse);
 }
