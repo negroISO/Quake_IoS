@@ -41,6 +41,8 @@ static qhandle_t s_whiteTextureHandle;
 static qhandle_t s_skyTextureHandle;
 static qhandle_t s_timHellBaseTextureHandle;
 static qhandle_t s_timHellAddTextureHandle;
+static qhandle_t *s_worldLightmapHandles;
+static int s_worldLightmapCount;
 
 typedef struct {
     qboolean loaded;
@@ -125,6 +127,33 @@ static qhandle_t EnsureWhiteTexture(void) {
     return s_whiteTextureHandle;
 }
 
+static qhandle_t RegisterRawTexture(const char *name, byte *rgba, int width, int height) {
+    metalTexture_t *texture;
+
+    if (rgba == NULL || width <= 0 || height <= 0) {
+        return EnsureWhiteTexture();
+    }
+
+    texture = FindTextureByName(name);
+    if (texture == NULL) {
+        texture = AllocTextureSlot();
+        if (texture == NULL) {
+            ri.Free(rgba);
+            return EnsureWhiteTexture();
+        }
+        Q_strncpyz(texture->name, name, sizeof(texture->name));
+    } else if (texture->rgbaBytes != NULL) {
+        ri.Free(texture->rgbaBytes);
+        texture->rgbaBytes = NULL;
+        texture->generation += 1;
+    }
+
+    texture->width = width;
+    texture->height = height;
+    texture->rgbaBytes = rgba;
+    return texture->handle;
+}
+
 static qhandle_t EnsureSkyTexture(void) {
     metalTexture_t *texture;
     byte *rgba;
@@ -190,6 +219,7 @@ static void SetupWorldDraw(Q3MetalWorldDrawCmd *draw,
                            uint32_t firstIndex,
                            uint32_t indexCount,
                            qhandle_t textureHandle,
+                           qhandle_t lightmapTextureHandle,
                            uint32_t flags,
                            float scaleS,
                            float scaleT,
@@ -198,6 +228,7 @@ static void SetupWorldDraw(Q3MetalWorldDrawCmd *draw,
     draw->firstIndex = firstIndex;
     draw->indexCount = indexCount;
     draw->textureHandle = (uint32_t)textureHandle;
+    draw->lightmapTextureHandle = (uint32_t)lightmapTextureHandle;
     draw->flags = flags;
     draw->texCoordScale[0] = scaleS;
     draw->texCoordScale[1] = scaleT;
@@ -260,6 +291,7 @@ static qhandle_t RegisterTexture(const char *name) {
     texture = AllocTextureSlot();
     if (texture == NULL) {
         ri.Printf(PRINT_WARNING, "Metal stub: texture registry full, dropping '%s'\n", name);
+        ri.Free(rgba);
         return EnsureWhiteTexture();
     }
 
@@ -311,6 +343,11 @@ static void FreeWorldMapData(void) {
     if (s_world.draws != NULL) {
         ri.Free(s_world.draws);
     }
+    if (s_worldLightmapHandles != NULL) {
+        ri.Free(s_worldLightmapHandles);
+        s_worldLightmapHandles = NULL;
+    }
+    s_worldLightmapCount = 0;
     Com_Memset(&s_world, 0, sizeof(s_world));
 }
 
@@ -382,10 +419,58 @@ static void EmitWorldVertex(Q3MetalWorldVertex *dest, const drawVert_t *source) 
     dest->position[2] = LittleFloat(source->xyz[2]);
     dest->texCoord[0] = LittleFloat(source->st[0]);
     dest->texCoord[1] = LittleFloat(source->st[1]);
+    dest->lightmapTexCoord[0] = LittleFloat(source->lightmap[0]);
+    dest->lightmapTexCoord[1] = LittleFloat(source->lightmap[1]);
     dest->color[0] = ByteToVisibleColor(source->color.rgba[0]);
     dest->color[1] = ByteToVisibleColor(source->color.rgba[1]);
     dest->color[2] = ByteToVisibleColor(source->color.rgba[2]);
     dest->color[3] = 1.0f;
+}
+
+static void LoadWorldLightmaps(const dheader_t *header, const char *mapName) {
+    const byte *lightmapBytes;
+    int lumpLength;
+    int lightmapCount;
+    int i;
+
+    lumpLength = LittleLong(header->lumps[LUMP_LIGHTMAPS].filelen);
+    if (lumpLength <= 0) {
+        return;
+    }
+
+    lightmapCount = lumpLength / (LIGHTMAP_WIDTH * LIGHTMAP_HEIGHT * 3);
+    if (lightmapCount <= 0) {
+        return;
+    }
+
+    s_worldLightmapHandles = ri.Malloc(lightmapCount * sizeof(*s_worldLightmapHandles));
+    if (s_worldLightmapHandles == NULL) {
+        return;
+    }
+    Com_Memset(s_worldLightmapHandles, 0, lightmapCount * sizeof(*s_worldLightmapHandles));
+    s_worldLightmapCount = lightmapCount;
+    lightmapBytes = (const byte *)header + LittleLong(header->lumps[LUMP_LIGHTMAPS].fileofs);
+
+    for (i = 0; i < lightmapCount; ++i) {
+        byte *rgba = ri.Malloc(LIGHTMAP_WIDTH * LIGHTMAP_HEIGHT * 4);
+        const byte *source = lightmapBytes + i * LIGHTMAP_WIDTH * LIGHTMAP_HEIGHT * 3;
+        int pixel;
+        char lightmapName[MAX_QPATH];
+
+        if (rgba == NULL) {
+            break;
+        }
+
+        for (pixel = 0; pixel < LIGHTMAP_WIDTH * LIGHTMAP_HEIGHT; ++pixel) {
+            rgba[pixel * 4 + 0] = source[pixel * 3 + 0];
+            rgba[pixel * 4 + 1] = source[pixel * 3 + 1];
+            rgba[pixel * 4 + 2] = source[pixel * 3 + 2];
+            rgba[pixel * 4 + 3] = 255;
+        }
+
+        Com_sprintf(lightmapName, sizeof(lightmapName), "*lightmap:%s:%d", mapName, i);
+        s_worldLightmapHandles[i] = RegisterRawTexture(lightmapName, rgba, LIGHTMAP_WIDTH, LIGHTMAP_HEIGHT);
+    }
 }
 
 static qboolean IsSupportedWorldSurface(const dsurface_t *surface, int drawVertCount, int drawIndexCount) {
@@ -479,6 +564,8 @@ static qboolean LoadWorldMapData(const char *name) {
     uint32_t triSoupDraws = 0;
     uint32_t skippedNoDrawSurfaces = 0;
 
+    static const uint32_t defaultWorldFlags = Q3_METAL_WORLD_DRAWFLAG_NOCULL;
+
     if (ri.FS_ReadFile(name, &fileBuffer) <= 0 || fileBuffer == NULL) {
         ri.Printf(PRINT_WARNING, "Metal world: failed to read BSP '%s'\n", name);
         return qfalse;
@@ -559,6 +646,7 @@ static qboolean LoadWorldMapData(const char *name) {
     }
 
     FreeWorldMapData();
+    LoadWorldLightmaps(header, name);
 
     s_world.vertices = ri.Malloc(totalVertices * sizeof(*s_world.vertices));
     s_world.indices = ri.Malloc(totalIndices * sizeof(*s_world.indices));
@@ -582,6 +670,10 @@ static qboolean LoadWorldMapData(const char *name) {
         int shaderNum;
         uint32_t baseVertex;
         qhandle_t textureHandle;
+        qhandle_t lightmapHandle;
+        int lightmapNum;
+        qboolean hasLightmap;
+        uint32_t worldFlags;
         int j;
 
         if (!IsSupportedWorldSurface(surface, drawVertCount, drawIndexCount)) {
@@ -593,6 +685,8 @@ static qboolean LoadWorldMapData(const char *name) {
         firstIndex = LittleLong(surface->firstIndex);
         numIndexes = LittleLong(surface->numIndexes);
         shaderNum = LittleLong(surface->shaderNum);
+        lightmapNum = LittleLong(surface->lightmapNum);
+        hasLightmap = qfalse;
 
         if (shaderNum < 0 || shaderNum >= shaderCount) {
             continue;
@@ -606,6 +700,13 @@ static qboolean LoadWorldMapData(const char *name) {
             skyDraws += 1;
         } else {
             textureHandle = RegisterTexture(shaders[shaderNum].shader);
+        }
+        lightmapHandle = EnsureWhiteTexture();
+        worldFlags = defaultWorldFlags;
+        if (!IsSkyShaderName(shaders[shaderNum].shader) && lightmapNum >= 0 && lightmapNum < s_worldLightmapCount) {
+            lightmapHandle = s_worldLightmapHandles[lightmapNum];
+            hasLightmap = qtrue;
+            worldFlags |= Q3_METAL_WORLD_DRAWFLAG_LIGHTMAP_MULTIPLY;
         }
 
         if (surfaceType == MST_PATCH) {
@@ -675,6 +776,7 @@ static qboolean LoadWorldMapData(const char *name) {
                                        firstIndexForStage,
                                        indexCountForStage,
                                        EnsureTimHellBaseTexture(),
+                                       EnsureWhiteTexture(),
                                        Q3_METAL_WORLD_DRAWFLAG_NOCULL,
                                        2.0f, 2.0f,
                                        0.05f, 0.10f);
@@ -682,6 +784,7 @@ static qboolean LoadWorldMapData(const char *name) {
                                        firstIndexForStage,
                                        indexCountForStage,
                                        EnsureTimHellAddTexture(),
+                                       EnsureWhiteTexture(),
                                        Q3_METAL_WORLD_DRAWFLAG_ADDITIVE | Q3_METAL_WORLD_DRAWFLAG_NOCULL,
                                        3.0f, 3.0f,
                                        0.05f, 0.10f);
@@ -692,7 +795,8 @@ static qboolean LoadWorldMapData(const char *name) {
                                        firstIndexForDraw,
                                        indexCountForDraw,
                                        textureHandle,
-                                       Q3_METAL_WORLD_DRAWFLAG_NOCULL,
+                                       hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
+                                       worldFlags,
                                        1.0f, 1.0f,
                                        0.0f, 0.0f);
                     }
@@ -728,6 +832,7 @@ static qboolean LoadWorldMapData(const char *name) {
                            firstIndexForStage,
                            indexCountForStage,
                            EnsureTimHellBaseTexture(),
+                           EnsureWhiteTexture(),
                            Q3_METAL_WORLD_DRAWFLAG_NOCULL,
                            2.0f, 2.0f,
                            0.05f, 0.10f);
@@ -735,6 +840,7 @@ static qboolean LoadWorldMapData(const char *name) {
                            firstIndexForStage,
                            indexCountForStage,
                            EnsureTimHellAddTexture(),
+                           EnsureWhiteTexture(),
                            Q3_METAL_WORLD_DRAWFLAG_ADDITIVE | Q3_METAL_WORLD_DRAWFLAG_NOCULL,
                            3.0f, 3.0f,
                            0.05f, 0.10f);
@@ -745,7 +851,8 @@ static qboolean LoadWorldMapData(const char *name) {
                            firstIndexForDraw,
                            indexCountForDraw,
                            textureHandle,
-                           Q3_METAL_WORLD_DRAWFLAG_NOCULL,
+                           hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
+                           worldFlags,
                            1.0f, 1.0f,
                            0.0f, 0.0f);
         }

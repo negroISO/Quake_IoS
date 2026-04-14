@@ -1,5 +1,7 @@
 import SwiftUI
 import MetalKit
+import GameController
+import QuartzCore
 import simd
 
 struct MetalView: UIViewRepresentable {
@@ -36,6 +38,7 @@ struct MetalView: UIViewRepresentable {
         struct GPUWorldVertex {
             var position: SIMD3<Float>
             var texCoord: SIMD2<Float>
+            var lightmapTexCoord: SIMD2<Float>
             var color: SIMD4<Float>
         }
 
@@ -102,6 +105,7 @@ struct MetalView: UIViewRepresentable {
         struct WorldVertexOut {
             float4 position [[position]];
             float2 texCoord;
+            float2 lightmapTexCoord;
             float4 color;
         };
 
@@ -119,6 +123,7 @@ struct MetalView: UIViewRepresentable {
             WorldVertexIn inVertex = vertices[vertexID];
             out.position = uniforms.viewProjection * float4(inVertex.position, 1.0);
             out.texCoord = inVertex.texCoord;
+            out.lightmapTexCoord = inVertex.lightmapTexCoord;
             out.color = inVertex.color;
             return out;
         }
@@ -126,11 +131,13 @@ struct MetalView: UIViewRepresentable {
         fragment float4 q3_world_fragment(WorldVertexOut in [[stage_in]],
                                           constant WorldDrawUniforms &drawUniforms [[buffer(0)]],
                                           texture2d<float> colorTexture [[texture(0)]],
+                                          texture2d<float> lightmapTexture [[texture(1)]],
                                           sampler textureSampler [[sampler(0)]]) {
             float2 texCoord = in.texCoord * drawUniforms.texCoordScale
                 + drawUniforms.texCoordScroll * drawUniforms.timeSeconds;
             float4 texel = colorTexture.sample(textureSampler, texCoord);
-            return texel * in.color;
+            float4 lightmap = lightmapTexture.sample(textureSampler, in.lightmapTexCoord);
+            return texel * lightmap * in.color;
         }
         """
 
@@ -149,6 +156,46 @@ struct MetalView: UIViewRepresentable {
         private var worldIndexBuffer: MTLBuffer?
         private var cachedWorldGeneration: UInt32 = 0
         private var debugFrameCounter: UInt32 = 0
+        private var frameTimeOrigin = CACurrentMediaTime()
+        private weak var activeController: GCController?
+
+        override init() {
+            super.init()
+            GCController.shouldMonitorBackgroundEvents = true
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(controllerDidConnect(_:)),
+                name: .GCControllerDidConnect,
+                object: nil
+            )
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(controllerDidDisconnect(_:)),
+                name: .GCControllerDidDisconnect,
+                object: nil
+            )
+            activeController = GCController.controllers().first
+        }
+
+        deinit {
+            NotificationCenter.default.removeObserver(self)
+        }
+
+        @objc private func controllerDidConnect(_ notification: Notification) {
+            activeController = notification.object as? GCController
+            if let vendor = activeController?.vendorName {
+                print("[Metal] Controller connected: \(vendor)")
+            } else {
+                print("[Metal] Controller connected")
+            }
+        }
+
+        @objc private func controllerDidDisconnect(_ notification: Notification) {
+            if activeController === (notification.object as? GCController) {
+                activeController = GCController.controllers().first
+            }
+            print("[Metal] Controller disconnected")
+        }
 
         func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
             print("[Metal] Drawable size: \(size)")
@@ -161,6 +208,7 @@ struct MetalView: UIViewRepresentable {
             }
 
             Q3MetalRenderer_UpdateDrawableSize(Int32(view.drawableSize.width), Int32(view.drawableSize.height))
+            updateControllerState()
             Quake3_Frame()
 
             guard let snapshot = Q3MetalRenderer_GetFrameSnapshot()?.pointee else { return }
@@ -202,9 +250,12 @@ struct MetalView: UIViewRepresentable {
                    let indicesPointer = Q3MetalRenderer_GetWorldIndices() {
                     let _ = indicesPointer
                     let worldDraws = UnsafeBufferPointer(start: worldDrawsPointer, count: Int(snapshot.worldCommandCount))
-                    let timeSeconds = Float(Date().timeIntervalSinceReferenceDate)
+                    let timeSeconds = Float(CACurrentMediaTime() - frameTimeOrigin)
                     for draw in worldDraws where draw.indexCount > 0 {
-                        guard let texture = texture(for: draw.textureHandle, device: view.device) else {
+                        guard let baseTexture = texture(for: draw.textureHandle, device: view.device) else {
+                            continue
+                        }
+                        guard let lightmapTexture = texture(for: draw.lightmapTextureHandle, device: view.device) else {
                             continue
                         }
                         let additive = (draw.flags & UInt32(Q3_METAL_WORLD_DRAWFLAG_ADDITIVE)) != 0
@@ -221,7 +272,8 @@ struct MetalView: UIViewRepresentable {
                             timeSeconds: timeSeconds,
                             _padding: 0
                         )
-                        encoder.setFragmentTexture(texture, index: 0)
+                        encoder.setFragmentTexture(baseTexture, index: 0)
+                        encoder.setFragmentTexture(lightmapTexture, index: 1)
                         encoder.setFragmentBytes(&drawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 0)
                         encoder.drawIndexedPrimitives(
                             type: .triangle,
@@ -372,6 +424,26 @@ struct MetalView: UIViewRepresentable {
             additiveDepthStencilState = device.makeDepthStencilState(descriptor: additiveDepthDescriptor)
         }
 
+        private func updateControllerState() {
+            let controller = activeController ?? GCController.controllers().first
+            activeController = controller
+
+            guard let gamepad = controller?.extendedGamepad else {
+                Q3Gamepad_SetState(0, 0, 0, 0, 0, 0, 0)
+                return
+            }
+
+            let leftX = gamepad.leftThumbstick.xAxis.value
+            let leftY = gamepad.leftThumbstick.yAxis.value
+            let rightX = gamepad.rightThumbstick.xAxis.value
+            let rightY = gamepad.rightThumbstick.yAxis.value
+            let firePressed: Int32 = gamepad.rightTrigger.isPressed ? 1 : 0
+            let jumpPressed: Int32 = gamepad.buttonA.isPressed ? 1 : 0
+            let crouchPressed: Int32 = gamepad.buttonB.isPressed ? 1 : 0
+
+            Q3Gamepad_SetState(leftX, leftY, rightX, rightY, firePressed, jumpPressed, crouchPressed)
+        }
+
         private func uploadVertices(_ vertices: UnsafeBufferPointer<Q3MetalVertex>, device: MTLDevice?) -> MTLBuffer? {
             guard let device else { return nil }
 
@@ -421,14 +493,15 @@ struct MetalView: UIViewRepresentable {
             var gpuVertices = [GPUWorldVertex]()
             gpuVertices.reserveCapacity(vertexCount)
             for vertex in sourceVertices {
-                gpuVertices.append(
-                    GPUWorldVertex(
-                        position: SIMD3<Float>(vertex.position.0, vertex.position.1, vertex.position.2),
-                        texCoord: SIMD2<Float>(vertex.texCoord.0, vertex.texCoord.1),
-                        color: SIMD4<Float>(vertex.color.0, vertex.color.1, vertex.color.2, vertex.color.3)
+                    gpuVertices.append(
+                        GPUWorldVertex(
+                            position: SIMD3<Float>(vertex.position.0, vertex.position.1, vertex.position.2),
+                            texCoord: SIMD2<Float>(vertex.texCoord.0, vertex.texCoord.1),
+                            lightmapTexCoord: SIMD2<Float>(vertex.lightmapTexCoord.0, vertex.lightmapTexCoord.1),
+                            color: SIMD4<Float>(vertex.color.0, vertex.color.1, vertex.color.2, vertex.color.3)
+                        )
                     )
-                )
-            }
+                }
 
             let sourceIndices = UnsafeBufferPointer(start: indicesPointer, count: indexCount)
             guard let sourceIndexBase = sourceIndices.baseAddress else {

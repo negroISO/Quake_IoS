@@ -5,5 +5,7 @@
 
 void Quake3_Init(const char *basePath);
 void Quake3_Frame(void);
+void Q3Gamepad_SetState(float leftX, float leftY, float rightX, float rightY,
+                        int firePressed, int jumpPressed, int crouchPressed);
 
 #endif

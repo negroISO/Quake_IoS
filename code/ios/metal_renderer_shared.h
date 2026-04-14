@@ -16,6 +16,7 @@ typedef struct {
 typedef struct {
     float position[3];
     float texCoord[2];
+    float lightmapTexCoord[2];
     float color[4];
 } Q3MetalWorldVertex;
 
@@ -29,6 +30,7 @@ typedef struct {
     uint32_t firstIndex;
     uint32_t indexCount;
     uint32_t textureHandle;
+    uint32_t lightmapTextureHandle;
     uint32_t flags;
     float texCoordScale[2];
     float texCoordScroll[2];
@@ -36,7 +38,8 @@ typedef struct {
 
 enum {
     Q3_METAL_WORLD_DRAWFLAG_ADDITIVE = 1u << 0,
-    Q3_METAL_WORLD_DRAWFLAG_NOCULL = 1u << 1
+    Q3_METAL_WORLD_DRAWFLAG_NOCULL = 1u << 1,
+    Q3_METAL_WORLD_DRAWFLAG_LIGHTMAP_MULTIPLY = 1u << 2
 };
 
 typedef struct {

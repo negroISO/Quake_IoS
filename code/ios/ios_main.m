@@ -25,6 +25,7 @@
 
 #include "../qcommon/q_shared.h"
 #include "../qcommon/qcommon.h"
+#include "../client/keycodes.h"
 #include "ios_local.h"
 
 #ifndef DEDICATED
@@ -296,11 +297,117 @@ qboolean Sys_SetAffinityMask(const uint64_t mask) { return qfalse; }
 // Input stubs
 // =============================================================
 
-void IN_Init(void) {
-    Com_Printf("IN_Init: iOS touch input\n");
+typedef struct {
+    float leftX;
+    float leftY;
+    float rightX;
+    float rightY;
+    qboolean firePressed;
+    qboolean jumpPressed;
+    qboolean crouchPressed;
+} iosGamepadState_t;
+
+static iosGamepadState_t s_gamepadState;
+static iosGamepadState_t s_prevGamepadState;
+static int s_lastGamepadPollMsec;
+
+static float ClampUnitAxis(float value) {
+    if (value < -1.0f) {
+        return -1.0f;
+    }
+    if (value > 1.0f) {
+        return 1.0f;
+    }
+    return value;
 }
-void IN_Frame(void) {}
+
+static float ApplyDeadzone(float value, float deadzone) {
+    float magnitude = fabsf(value);
+
+    if (magnitude <= deadzone) {
+        return 0.0f;
+    }
+
+    magnitude = (magnitude - deadzone) / (1.0f - deadzone);
+    return copysignf(magnitude, value);
+}
+
+static int GamepadAxisToQuake(float value) {
+    float clamped = ClampUnitAxis(value);
+    int scaled = (int)lrintf(clamped * 127.0f);
+
+    if (scaled < -127) {
+        return -127;
+    }
+    if (scaled > 127) {
+        return 127;
+    }
+    return scaled;
+}
+
+static void QueueGamepadButtonEvent(int key, qboolean previous, qboolean current, int eventTime) {
+    if (previous != current) {
+        Sys_QueEvent(eventTime, SE_KEY, key, current, 0, NULL);
+    }
+}
+
+void IN_Init(void) {
+    Com_Printf("IN_Init: iOS touch + controller input\n");
+    Cbuf_AddText(
+        "seta cl_freelook 1\n"
+        "bind PAD0_RIGHTTRIGGER \"+attack\"\n"
+        "bind PAD0_A \"+moveup\"\n"
+        "bind PAD0_B \"+movedown\"\n"
+    );
+}
+void IN_Frame(void) {
+    int eventTime = Sys_Milliseconds();
+    int deltaMsec = eventTime - s_lastGamepadPollMsec;
+    int leftSide;
+    int leftForward;
+    float lookX;
+    float lookY;
+    int mouseDx;
+    int mouseDy;
+
+    if (deltaMsec < 1) {
+        deltaMsec = 1;
+    } else if (deltaMsec > 50) {
+        deltaMsec = 50;
+    }
+    s_lastGamepadPollMsec = eventTime;
+
+    leftSide = GamepadAxisToQuake(ApplyDeadzone(s_gamepadState.leftX, 0.18f));
+    leftForward = GamepadAxisToQuake(-ApplyDeadzone(s_gamepadState.leftY, 0.18f));
+    Sys_QueEvent(eventTime, SE_JOYSTICK_AXIS, AXIS_SIDE, leftSide, 0, NULL);
+    Sys_QueEvent(eventTime, SE_JOYSTICK_AXIS, AXIS_FORWARD, leftForward, 0, NULL);
+    Sys_QueEvent(eventTime, SE_JOYSTICK_AXIS, AXIS_UP, 0, 0, NULL);
+
+    lookX = ApplyDeadzone(s_gamepadState.rightX, 0.12f);
+    lookY = ApplyDeadzone(s_gamepadState.rightY, 0.12f);
+    mouseDx = (int)lrintf(lookX * 900.0f * ((float)deltaMsec / 1000.0f));
+    mouseDy = (int)lrintf(-lookY * 900.0f * ((float)deltaMsec / 1000.0f));
+    if (mouseDx != 0 || mouseDy != 0) {
+        Sys_QueEvent(eventTime, SE_MOUSE, mouseDx, mouseDy, 0, NULL);
+    }
+
+    QueueGamepadButtonEvent(K_PAD0_RIGHTTRIGGER, s_prevGamepadState.firePressed, s_gamepadState.firePressed, eventTime);
+    QueueGamepadButtonEvent(K_PAD0_A, s_prevGamepadState.jumpPressed, s_gamepadState.jumpPressed, eventTime);
+    QueueGamepadButtonEvent(K_PAD0_B, s_prevGamepadState.crouchPressed, s_gamepadState.crouchPressed, eventTime);
+    s_prevGamepadState = s_gamepadState;
+}
 void IN_Shutdown(void) {}
+
+void Q3Gamepad_SetState(float leftX, float leftY, float rightX, float rightY,
+                        int firePressed, int jumpPressed, int crouchPressed) {
+    s_gamepadState.leftX = ClampUnitAxis(leftX);
+    s_gamepadState.leftY = ClampUnitAxis(leftY);
+    s_gamepadState.rightX = ClampUnitAxis(rightX);
+    s_gamepadState.rightY = ClampUnitAxis(rightY);
+    s_gamepadState.firePressed = firePressed ? qtrue : qfalse;
+    s_gamepadState.jumpPressed = jumpPressed ? qtrue : qfalse;
+    s_gamepadState.crouchPressed = crouchPressed ? qtrue : qfalse;
+}
 
 // =============================================================
 // GLimp stubs (we use Metal, but engine expects these)
