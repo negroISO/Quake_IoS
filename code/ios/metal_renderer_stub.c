@@ -32,6 +32,7 @@ static Q3MetalVertex s_vertices[Q3_METAL_MAX_VERTICES];
 static Q3MetalDrawCmd s_draws[Q3_METAL_MAX_DRAWS];
 static uint32_t s_vertexCount;
 static uint32_t s_drawCount;
+static uint32_t s_sceneLogCounter;
 static float s_currentColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
 static metalTexture_t s_textures[Q3_METAL_MAX_TEXTURES];
 static qhandle_t s_nextTextureHandle = 1;
@@ -469,6 +470,24 @@ static void RE_RenderScene(const refdef_t *fd) {
     s_sceneView.viewAxis[6] = fd->viewaxis[2][0];
     s_sceneView.viewAxis[7] = fd->viewaxis[2][1];
     s_sceneView.viewAxis[8] = fd->viewaxis[2][2];
+
+    s_sceneLogCounter += 1;
+    if ((s_sceneLogCounter % 60) == 0) {
+        ri.Printf(
+            PRINT_ALL,
+            "Metal debug refdef[%u]: vieworg=(%.2f %.2f %.2f) axis0=(%.3f %.3f %.3f) "
+            "axis1=(%.3f %.3f %.3f) axis2=(%.3f %.3f %.3f) fov=(%.2f %.2f) rdflags=0x%x worldLoaded=%d draws=%u\n",
+            s_sceneLogCounter,
+            fd->vieworg[0], fd->vieworg[1], fd->vieworg[2],
+            fd->viewaxis[0][0], fd->viewaxis[0][1], fd->viewaxis[0][2],
+            fd->viewaxis[1][0], fd->viewaxis[1][1], fd->viewaxis[1][2],
+            fd->viewaxis[2][0], fd->viewaxis[2][1], fd->viewaxis[2][2],
+            fd->fov_x, fd->fov_y,
+            fd->rdflags,
+            s_world.loaded,
+            s_world.drawCount
+        );
+    }
 
     if (s_world.loaded && !(fd->rdflags & RDF_NOWORLDMODEL)) {
         s_frameSnapshot.worldVertexCount = s_world.vertexCount;

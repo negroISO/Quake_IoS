@@ -121,6 +121,7 @@ struct MetalView: UIViewRepresentable {
         private var worldVertexBuffer: MTLBuffer?
         private var worldIndexBuffer: MTLBuffer?
         private var cachedWorldGeneration: UInt32 = 0
+        private var debugFrameCounter: UInt32 = 0
 
         func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
             print("[Metal] Drawable size: \(size)")
@@ -159,7 +160,8 @@ struct MetalView: UIViewRepresentable {
                let sceneView = Q3MetalRenderer_GetSceneView()?.pointee,
                let worldVertexBuffer = uploadWorldBuffers(device: view.device, generation: snapshot.worldGeneration),
                let worldIndexBuffer {
-                var worldUniforms = WorldUniforms(viewProjection: makeWorldViewProjection(sceneView))
+                let viewProjection = makeWorldViewProjection(sceneView)
+                var worldUniforms = WorldUniforms(viewProjection: viewProjection)
                 encoder.setRenderPipelineState(worldPipelineState)
                 encoder.setDepthStencilState(depthStencilState)
                 encoder.setVertexBuffer(worldVertexBuffer, offset: 0, index: 0)
@@ -178,6 +180,23 @@ struct MetalView: UIViewRepresentable {
                             indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride
                         )
                     }
+                }
+
+                debugFrameCounter &+= 1
+                if debugFrameCounter % 60 == 0 {
+                    let axis0 = SIMD3<Float>(sceneView.viewAxis.0, sceneView.viewAxis.1, sceneView.viewAxis.2)
+                    let axis1 = SIMD3<Float>(sceneView.viewAxis.3, sceneView.viewAxis.4, sceneView.viewAxis.5)
+                    let axis2 = SIMD3<Float>(sceneView.viewAxis.6, sceneView.viewAxis.7, sceneView.viewAxis.8)
+                    let fovX = String(format: "%.2f", sceneView.fovX)
+                    let fovY = String(format: "%.2f", sceneView.fovY)
+                    print(
+                        "[Metal] world frame \(debugFrameCounter) " +
+                        "vieworg=(\(sceneView.viewOrigin.0), \(sceneView.viewOrigin.1), \(sceneView.viewOrigin.2)) " +
+                        "axis0=\(formatVector(axis0)) axis1=\(formatVector(axis1)) axis2=\(formatVector(axis2)) " +
+                        "fov=(\(fovX), \(fovY)) " +
+                        "draws=\(snapshot.worldCommandCount) verts=\(snapshot.worldVertexCount) indices=\(snapshot.worldIndexCount)"
+                    )
+                    print("[Metal] world MVP \(formatMatrix(viewProjection))")
                 }
             }
 
@@ -436,6 +455,24 @@ struct MetalView: UIViewRepresentable {
             ))
 
             return openGLToMetalClip * quakeProjection * flip * viewer
+        }
+
+        private func formatVector(_ vector: SIMD3<Float>) -> String {
+            String(format: "(%.3f, %.3f, %.3f)", vector.x, vector.y, vector.z)
+        }
+
+        private func formatMatrix(_ matrix: simd_float4x4) -> String {
+            let c0 = matrix.columns.0
+            let c1 = matrix.columns.1
+            let c2 = matrix.columns.2
+            let c3 = matrix.columns.3
+            return String(
+                format: "[[%.3f, %.3f, %.3f, %.3f], [%.3f, %.3f, %.3f, %.3f], [%.3f, %.3f, %.3f, %.3f], [%.3f, %.3f, %.3f, %.3f]]",
+                c0.x, c0.y, c0.z, c0.w,
+                c1.x, c1.y, c1.z, c1.w,
+                c2.x, c2.y, c2.z, c2.w,
+                c3.x, c3.y, c3.z, c3.w
+            )
         }
     }
 }
