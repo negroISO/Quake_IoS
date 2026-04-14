@@ -3,6 +3,7 @@
 
 #include "../qcommon/q_shared.h"
 #include "../qcommon/qfiles.h"
+#include "../client/client.h"
 #include "../renderercommon/tr_public.h"
 #include "../renderer/tr_common.h"
 #include "metal_renderer_shared.h"
@@ -219,6 +220,37 @@ static void FreeWorldMapData(void) {
 static float ByteToVisibleColor(byte value) {
     float normalized = (float)value / 255.0f;
     return 0.25f + normalized * 0.75f;
+}
+
+static qboolean BuildFallbackSceneView(vec3_t vieworg, vec3_t axis0, vec3_t axis1, vec3_t axis2, float *fovX, float *fovY) {
+    vec3_t viewAngles;
+    float aspect;
+
+    if (!s_world.loaded || !cl.snap.valid) {
+        return qfalse;
+    }
+
+    vieworg[0] = cl.snap.ps.origin[0];
+    vieworg[1] = cl.snap.ps.origin[1];
+    vieworg[2] = cl.snap.ps.origin[2] + cl.snap.ps.viewheight;
+
+    VectorCopy(cl.viewangles, viewAngles);
+    if (VectorCompare(viewAngles, vec3_origin)) {
+        VectorCopy(cl.snap.ps.viewangles, viewAngles);
+    }
+
+    {
+        vec3_t axes[3];
+        AnglesToAxis(viewAngles, axes);
+        VectorCopy(axes[0], axis0);
+        VectorCopy(axes[1], axis1);
+        VectorCopy(axes[2], axis2);
+    }
+
+    *fovX = 90.0f;
+    aspect = s_glConfig.vidHeight > 0 ? (float)s_glConfig.vidWidth / (float)s_glConfig.vidHeight : (2796.0f / 1290.0f);
+    *fovY = atanf(tanf((*fovX) * (float)M_PI / 360.0f) / aspect) * 360.0f / (float)M_PI;
+    return qtrue;
 }
 
 static qboolean LoadWorldMapData(const char *name) {
@@ -491,17 +523,17 @@ static void RE_RenderScene(const refdef_t *fd) {
     fovX = fd->fov_x;
     fovY = fd->fov_y;
 
-    /* HACK: always override camera when fov is suspiciously small (QVM ABI bug) */
     if (s_world.loaded && fovX < 45.0f) {
-        vieworg[0] = 504.0f;   /* q3dm1 spawn near atrium */
-        vieworg[1] = 296.0f;
-        vieworg[2] = 24.0f;
-        fovX = 90.0f;
-        fovY = 73.7f;
-        ri.Printf(
-            PRINT_WARNING,
-            "Metal hack: fov=%.1f too small, overriding camera to q3dm1 spawn\n", fd->fov_x
-        );
+        if (BuildFallbackSceneView(vieworg, axis0, axis1, axis2, &fovX, &fovY) && (s_sceneLogCounter % 60) == 0) {
+            ri.Printf(
+                PRINT_WARNING,
+                "Metal fallback camera[%u]: repaired invalid refdef using cl.snap.ps origin=(%.2f %.2f %.2f) angles=(%.2f %.2f %.2f) fov=(%.2f %.2f)\n",
+                s_sceneLogCounter + 1,
+                cl.snap.ps.origin[0], cl.snap.ps.origin[1], cl.snap.ps.origin[2],
+                cl.viewangles[0], cl.viewangles[1], cl.viewangles[2],
+                fovX, fovY
+            );
+        }
     }
 
     s_sceneView.fovX = fovX;
