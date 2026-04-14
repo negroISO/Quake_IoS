@@ -95,6 +95,7 @@ struct MetalView: UIViewRepresentable {
         struct WorldVertexIn {
             float3 position;
             float2 texCoord;
+            float2 lightmapTexCoord;
             float4 color;
         };
 
