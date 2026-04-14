@@ -686,6 +686,7 @@ final class GameControllerBridge {
     }
 
     private func pushState() {
+        // Feed the engine continuously from the latest controller sample.
         Q3Gamepad_SetState(
             state.leftX,
             state.leftY,

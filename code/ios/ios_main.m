@@ -362,19 +362,8 @@ void IN_Init(void) {
 }
 void IN_Frame(void) {
     int eventTime = Sys_Milliseconds();
-    int deltaMsec = eventTime - s_lastGamepadPollMsec;
     int leftSide;
     int leftForward;
-    float lookX;
-    float lookY;
-    int mouseDx;
-    int mouseDy;
-
-    if (deltaMsec < 1) {
-        deltaMsec = 1;
-    } else if (deltaMsec > 50) {
-        deltaMsec = 50;
-    }
     s_lastGamepadPollMsec = eventTime;
 
     leftSide = GamepadAxisToQuake(ApplyDeadzone(s_gamepadState.leftX, 0.18f));
@@ -382,14 +371,10 @@ void IN_Frame(void) {
     Sys_QueEvent(eventTime, SE_JOYSTICK_AXIS, AXIS_SIDE, leftSide, 0, NULL);
     Sys_QueEvent(eventTime, SE_JOYSTICK_AXIS, AXIS_FORWARD, leftForward, 0, NULL);
     Sys_QueEvent(eventTime, SE_JOYSTICK_AXIS, AXIS_UP, 0, 0, NULL);
-
-    lookX = ApplyDeadzone(s_gamepadState.rightX, 0.12f);
-    lookY = ApplyDeadzone(s_gamepadState.rightY, 0.12f);
-    mouseDx = (int)lrintf(lookX * 900.0f * ((float)deltaMsec / 1000.0f));
-    mouseDy = (int)lrintf(-lookY * 900.0f * ((float)deltaMsec / 1000.0f));
-    if (mouseDx != 0 || mouseDy != 0) {
-        Sys_QueEvent(eventTime, SE_MOUSE, mouseDx, mouseDy, 0, NULL);
-    }
+    Sys_QueEvent(eventTime, SE_JOYSTICK_AXIS, AXIS_YAW,
+                 GamepadAxisToQuake(ApplyDeadzone(s_gamepadState.rightX, 0.12f)), 0, NULL);
+    Sys_QueEvent(eventTime, SE_JOYSTICK_AXIS, AXIS_PITCH,
+                 GamepadAxisToQuake(-ApplyDeadzone(s_gamepadState.rightY, 0.12f)), 0, NULL);
 
     QueueGamepadButtonEvent(K_PAD0_RIGHTTRIGGER, s_prevGamepadState.firePressed, s_gamepadState.firePressed, eventTime);
     QueueGamepadButtonEvent(K_PAD0_A, s_prevGamepadState.jumpPressed, s_gamepadState.jumpPressed, eventTime);

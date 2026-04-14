@@ -18,7 +18,7 @@ private struct GameRootView: UIViewControllerRepresentable {
     @Binding var engineStarted: Bool
 
     func makeUIViewController(context: Context) -> GCEventViewController {
-        let viewController = GCEventViewController()
+        let viewController = GameViewController()
         viewController.controllerUserInteractionEnabled = false
         viewController.view.backgroundColor = .black
 
@@ -64,5 +64,16 @@ private struct GameRootView: UIViewControllerRepresentable {
             Quake3_Init(basePath)
             print("[Swift] Engine initialized")
         }
+    }
+}
+
+private final class GameViewController: GCEventViewController {
+    override var canBecomeFirstResponder: Bool {
+        true
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        becomeFirstResponder()
     }
 }

@@ -403,6 +403,10 @@ CL_JoystickMove
 static void CL_JoystickMove( usercmd_t *cmd ) {
 	//int		movespeed;
 	float	anglespeed;
+	int		side;
+	int		forward;
+	int		yaw;
+	int		pitch;
 
 	if ( in_speed.active ^ cl_run->integer ) {
 		//movespeed = 2;
@@ -417,17 +421,27 @@ static void CL_JoystickMove( usercmd_t *cmd ) {
 		anglespeed = 0.001 * cls.frametime;
 	}
 
-	if ( !in_strafe.active ) {
-		cl.viewangles[YAW] += anglespeed * cl_yawspeed->value * cl.joystickAxis[AXIS_SIDE];
-	} else {
-		cmd->rightmove = ClampCharMove( cmd->rightmove + cl.joystickAxis[AXIS_SIDE] );
+	side = cl.joystickAxis[AXIS_SIDE];
+	forward = cl.joystickAxis[AXIS_FORWARD];
+	yaw = cl.joystickAxis[AXIS_YAW];
+	pitch = cl.joystickAxis[AXIS_PITCH];
+
+	if ( yaw == 0 ) {
+		yaw = side;
+	}
+	if ( pitch == 0 ) {
+		pitch = forward;
 	}
 
-	if ( in_mlooking ) {
-		cl.viewangles[PITCH] += anglespeed * cl_pitchspeed->value * cl.joystickAxis[AXIS_FORWARD];
-	} else {
-		cmd->forwardmove = ClampCharMove( cmd->forwardmove + cl.joystickAxis[AXIS_FORWARD] );
+	if ( !in_strafe.active ) {
+		cl.viewangles[YAW] += anglespeed * cl_yawspeed->value * yaw;
 	}
+	cmd->rightmove = ClampCharMove( cmd->rightmove + side );
+
+	if ( in_mlooking ) {
+		cl.viewangles[PITCH] += anglespeed * cl_pitchspeed->value * pitch;
+	}
+	cmd->forwardmove = ClampCharMove( cmd->forwardmove + forward );
 
 	cmd->upmove = ClampCharMove( cmd->upmove + cl.joystickAxis[AXIS_UP] );
 }
