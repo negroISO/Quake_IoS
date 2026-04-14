@@ -1019,7 +1019,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "rm -rf \"${BUILT_PRODUCTS_DIR}/${PRODUCT_NAME}.app/baseq3\"\ncp -RL \"${SRCROOT}/baseq3\" \"${BUILT_PRODUCTS_DIR}/${PRODUCT_NAME}.app/baseq3\"\n";
+			shellScript = "set -e\nAPP_BASEQ3=\"${BUILT_PRODUCTS_DIR}/${PRODUCT_NAME}.app/baseq3\"\nSRC_BASEQ3=\"${SRCROOT}/baseq3\"\nFALLBACK_ONE=\"/Users/targus/Documents/github_sources/quake_ios/resources/baseq3\"\nFALLBACK_TWO=\"/Users/targus/Documents/github_sources/quake_ios/Quake3e-HD/baseq3\"\n\nrm -rf \"$APP_BASEQ3\"\n\nif [ -d \"$SRC_BASEQ3\" ] && [ \"$(find \"$SRC_BASEQ3\" -mindepth 1 -maxdepth 1 | head -n 1)\" ]; then\n  cp -RL \"$SRC_BASEQ3\" \"$APP_BASEQ3\"\nelif [ -d \"$FALLBACK_ONE\" ]; then\n  cp -RL \"$FALLBACK_ONE\" \"$APP_BASEQ3\"\nelif [ -d \"$FALLBACK_TWO\" ]; then\n  cp -RL \"$FALLBACK_TWO\" \"$APP_BASEQ3\"\nelse\n  echo \"error: no baseq3 data directory found\" >&2\n  exit 1\nfi\n";
 			showEnvVarsInLog = 0;
 		};
 /* End PBXShellScriptBuildPhase section */
