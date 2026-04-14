@@ -388,8 +388,8 @@ static void RE_Shutdown(refShutdownCode_t code) {
 static void RE_BeginRegistration(glconfig_t *config) {
     ri.Printf(PRINT_ALL, "RE_BeginRegistration: Metal stub\n");
     EnsureWhiteTexture();
-    s_glConfig.vidWidth = 1290;
-    s_glConfig.vidHeight = 2796;
+    s_glConfig.vidWidth = 2796;
+    s_glConfig.vidHeight = 1290;
     s_glConfig.windowAspect = (float)s_glConfig.vidWidth / (float)s_glConfig.vidHeight;
     s_glConfig.colorBits = 32;
     s_glConfig.depthBits = 24;
