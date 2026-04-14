@@ -158,44 +158,9 @@ struct MetalView: UIViewRepresentable {
         private var cachedWorldGeneration: UInt32 = 0
         private var debugFrameCounter: UInt32 = 0
         private var frameTimeOrigin = CACurrentMediaTime()
-        private weak var activeController: GCController?
 
         override init() {
             super.init()
-            GCController.shouldMonitorBackgroundEvents = true
-            NotificationCenter.default.addObserver(
-                self,
-                selector: #selector(controllerDidConnect(_:)),
-                name: .GCControllerDidConnect,
-                object: nil
-            )
-            NotificationCenter.default.addObserver(
-                self,
-                selector: #selector(controllerDidDisconnect(_:)),
-                name: .GCControllerDidDisconnect,
-                object: nil
-            )
-            activeController = GCController.controllers().first
-        }
-
-        deinit {
-            NotificationCenter.default.removeObserver(self)
-        }
-
-        @objc private func controllerDidConnect(_ notification: Notification) {
-            activeController = notification.object as? GCController
-            if let vendor = activeController?.vendorName {
-                print("[Metal] Controller connected: \(vendor)")
-            } else {
-                print("[Metal] Controller connected")
-            }
-        }
-
-        @objc private func controllerDidDisconnect(_ notification: Notification) {
-            if activeController === (notification.object as? GCController) {
-                activeController = GCController.controllers().first
-            }
-            print("[Metal] Controller disconnected")
         }
 
         func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
@@ -209,7 +174,6 @@ struct MetalView: UIViewRepresentable {
             }
 
             Q3MetalRenderer_UpdateDrawableSize(Int32(view.drawableSize.width), Int32(view.drawableSize.height))
-            updateControllerState()
             Quake3_Frame()
 
             guard let snapshot = Q3MetalRenderer_GetFrameSnapshot()?.pointee else { return }
@@ -425,26 +389,6 @@ struct MetalView: UIViewRepresentable {
             additiveDepthStencilState = device.makeDepthStencilState(descriptor: additiveDepthDescriptor)
         }
 
-        private func updateControllerState() {
-            let controller = activeController ?? GCController.controllers().first
-            activeController = controller
-
-            guard let gamepad = controller?.extendedGamepad else {
-                Q3Gamepad_SetState(0, 0, 0, 0, 0, 0, 0)
-                return
-            }
-
-            let leftX = gamepad.leftThumbstick.xAxis.value
-            let leftY = gamepad.leftThumbstick.yAxis.value
-            let rightX = gamepad.rightThumbstick.xAxis.value
-            let rightY = gamepad.rightThumbstick.yAxis.value
-            let firePressed: Int32 = gamepad.rightTrigger.isPressed ? 1 : 0
-            let jumpPressed: Int32 = gamepad.buttonA.isPressed ? 1 : 0
-            let crouchPressed: Int32 = gamepad.buttonB.isPressed ? 1 : 0
-
-            Q3Gamepad_SetState(leftX, leftY, rightX, rightY, firePressed, jumpPressed, crouchPressed)
-        }
-
         private func uploadVertices(_ vertices: UnsafeBufferPointer<Q3MetalVertex>, device: MTLDevice?) -> MTLBuffer? {
             guard let device else { return nil }
 
@@ -634,5 +578,122 @@ struct MetalView: UIViewRepresentable {
                 c3.x, c3.y, c3.z, c3.w
             )
         }
+    }
+}
+
+@MainActor
+final class GameControllerBridge {
+    static let shared = GameControllerBridge()
+
+    private struct State {
+        var leftX: Float = 0
+        var leftY: Float = 0
+        var rightX: Float = 0
+        var rightY: Float = 0
+        var firePressed: Int32 = 0
+        var jumpPressed: Int32 = 0
+        var crouchPressed: Int32 = 0
+    }
+
+    private var started = false
+    private var activeController: GCController?
+    private var state = State()
+
+    private init() {}
+
+    func start() {
+        guard !started else { return }
+        started = true
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(controllerDidConnect(_:)),
+            name: .GCControllerDidConnect,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(controllerDidDisconnect(_:)),
+            name: .GCControllerDidDisconnect,
+            object: nil
+        )
+
+        GCController.startWirelessControllerDiscovery { [weak self] in
+            print("[Metal] Controller discovery completed")
+            Task { @MainActor in
+                self?.pickActiveController()
+            }
+        }
+        pickActiveController()
+    }
+
+    @objc private func controllerDidConnect(_ notification: Notification) {
+        if let controller = notification.object as? GCController {
+            print("[Metal] Controller connected: \(controller.vendorName ?? "Unknown")")
+        } else {
+            print("[Metal] Controller connected")
+        }
+        pickActiveController(preferred: notification.object as? GCController)
+    }
+
+    @objc private func controllerDidDisconnect(_ notification: Notification) {
+        let disconnected = notification.object as? GCController
+        if activeController === disconnected {
+            activeController = nil
+            state = State()
+            pushState()
+        }
+        print("[Metal] Controller disconnected")
+        pickActiveController()
+    }
+
+    private func pickActiveController(preferred: GCController? = nil) {
+        let nextController = [preferred, activeController]
+            .compactMap { $0 }
+            .first { $0.extendedGamepad != nil }
+            ?? GCController.controllers().first { $0.extendedGamepad != nil }
+
+        guard activeController !== nextController else {
+            return
+        }
+
+        activeController?.extendedGamepad?.valueChangedHandler = nil
+        activeController = nextController
+        state = State()
+        pushState()
+
+        guard let controller = nextController, let gamepad = controller.extendedGamepad else {
+            return
+        }
+
+        controller.playerIndex = .index1
+        gamepad.valueChangedHandler = { [weak self] gamepad, _ in
+            self?.ingest(gamepad: gamepad)
+        }
+        ingest(gamepad: gamepad)
+        print("[Metal] Using controller: \(controller.vendorName ?? "Unknown")")
+    }
+
+    private func ingest(gamepad: GCExtendedGamepad) {
+        state.leftX = gamepad.leftThumbstick.xAxis.value
+        state.leftY = gamepad.leftThumbstick.yAxis.value
+        state.rightX = gamepad.rightThumbstick.xAxis.value
+        state.rightY = gamepad.rightThumbstick.yAxis.value
+        state.firePressed = gamepad.rightTrigger.isPressed ? 1 : 0
+        state.jumpPressed = gamepad.buttonA.isPressed ? 1 : 0
+        state.crouchPressed = gamepad.buttonB.isPressed ? 1 : 0
+        pushState()
+    }
+
+    private func pushState() {
+        Q3Gamepad_SetState(
+            state.leftX,
+            state.leftY,
+            state.rightX,
+            state.rightY,
+            state.firePressed,
+            state.jumpPressed,
+            state.crouchPressed
+        )
     }
 }
