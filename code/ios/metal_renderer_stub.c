@@ -750,7 +750,7 @@ static qboolean LoadMD3ModelData(const char *modName, void *buffer, int fileSize
     LL(hdr->ofsSurfaces);
     LL(hdr->ofsEnd);
 
-    if (hdr->numFrames < 1 || hdr->numSurfaces < 1 ||
+    if (hdr->numFrames < 1 || hdr->numSurfaces < 0 ||
         hdr->ofsFrames > size || hdr->ofsTags > size || hdr->ofsSurfaces > size) {
         ri.Printf(PRINT_WARNING,
             "Metal model: '%s' rejected: invalid header ranges (frames=%d tags=%d surfaces=%d ofsFrames=%d ofsTags=%d ofsSurfaces=%d size=%u)\n",
@@ -862,8 +862,8 @@ static qboolean TryRegisterModelPath(const char *name, metalModel_t *modelSlot) 
 
     fileSize = ri.FS_ReadFile(name, &fileBuffer);
     if (fileSize <= 0 || fileBuffer == NULL) {
-        ri.Printf(PRINT_WARNING, "Metal model: '%s' rejected: FS_ReadFile returned fileSize=%d buffer=%p\n",
-            name, fileSize, fileBuffer);
+        ri.Printf(PRINT_DEVELOPER, "Metal model: '%s' not present in pk3 (optional, fileSize=%d)\n",
+            name, fileSize);
         return qfalse;
     }
 
