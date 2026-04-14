@@ -265,6 +265,111 @@ static float ByteToVisibleColor(byte value) {
     return 0.25f + normalized * 0.75f;
 }
 
+#define Q3_METAL_PATCH_SUBDIVISIONS 5
+
+static void LerpDrawVert(const drawVert_t *a, const drawVert_t *b, drawVert_t *out) {
+    int i;
+
+    for (i = 0; i < 3; ++i) {
+        out->xyz[i] = 0.5f * (a->xyz[i] + b->xyz[i]);
+        out->normal[i] = 0.5f * (a->normal[i] + b->normal[i]);
+    }
+    for (i = 0; i < 2; ++i) {
+        out->st[i] = 0.5f * (a->st[i] + b->st[i]);
+        out->lightmap[i] = 0.5f * (a->lightmap[i] + b->lightmap[i]);
+    }
+    for (i = 0; i < 4; ++i) {
+        out->color.rgba[i] = (byte)(((int)a->color.rgba[i] + (int)b->color.rgba[i]) >> 1);
+    }
+}
+
+static void EvalQuadraticDrawVert(const drawVert_t *a, const drawVert_t *b, const drawVert_t *c, float t, drawVert_t *out) {
+    drawVert_t ab;
+    drawVert_t bc;
+    drawVert_t result;
+    float omt = 1.0f - t;
+    int i;
+
+    for (i = 0; i < 3; ++i) {
+        ab.xyz[i] = omt * a->xyz[i] + t * b->xyz[i];
+        bc.xyz[i] = omt * b->xyz[i] + t * c->xyz[i];
+        ab.normal[i] = omt * a->normal[i] + t * b->normal[i];
+        bc.normal[i] = omt * b->normal[i] + t * c->normal[i];
+    }
+    for (i = 0; i < 2; ++i) {
+        ab.st[i] = omt * a->st[i] + t * b->st[i];
+        bc.st[i] = omt * b->st[i] + t * c->st[i];
+        ab.lightmap[i] = omt * a->lightmap[i] + t * b->lightmap[i];
+        bc.lightmap[i] = omt * b->lightmap[i] + t * c->lightmap[i];
+    }
+    for (i = 0; i < 4; ++i) {
+        ab.color.rgba[i] = (byte)(omt * a->color.rgba[i] + t * b->color.rgba[i]);
+        bc.color.rgba[i] = (byte)(omt * b->color.rgba[i] + t * c->color.rgba[i]);
+    }
+
+    LerpDrawVert(&ab, &bc, &result);
+
+    for (i = 0; i < 3; ++i) {
+        out->xyz[i] = omt * ab.xyz[i] + t * bc.xyz[i];
+        out->normal[i] = omt * ab.normal[i] + t * bc.normal[i];
+    }
+    for (i = 0; i < 2; ++i) {
+        out->st[i] = omt * ab.st[i] + t * bc.st[i];
+        out->lightmap[i] = omt * ab.lightmap[i] + t * bc.lightmap[i];
+    }
+    for (i = 0; i < 4; ++i) {
+        out->color.rgba[i] = (byte)(omt * ab.color.rgba[i] + t * bc.color.rgba[i]);
+    }
+}
+
+static void EmitWorldVertex(Q3MetalWorldVertex *dest, const drawVert_t *source) {
+    dest->position[0] = LittleFloat(source->xyz[0]);
+    dest->position[1] = LittleFloat(source->xyz[1]);
+    dest->position[2] = LittleFloat(source->xyz[2]);
+    dest->texCoord[0] = LittleFloat(source->st[0]);
+    dest->texCoord[1] = LittleFloat(source->st[1]);
+    dest->color[0] = ByteToVisibleColor(source->color.rgba[0]);
+    dest->color[1] = ByteToVisibleColor(source->color.rgba[1]);
+    dest->color[2] = ByteToVisibleColor(source->color.rgba[2]);
+    dest->color[3] = 1.0f;
+}
+
+static qboolean IsSupportedWorldSurface(const dsurface_t *surface, int drawVertCount, int drawIndexCount) {
+    int surfaceType = LittleLong(surface->surfaceType);
+    int firstVert = LittleLong(surface->firstVert);
+    int numVerts = LittleLong(surface->numVerts);
+    int firstIndex = LittleLong(surface->firstIndex);
+    int numIndexes = LittleLong(surface->numIndexes);
+
+    if (surfaceType == MST_PLANAR || surfaceType == MST_TRIANGLE_SOUP) {
+        if (numVerts <= 0 || numIndexes < 3) {
+            return qfalse;
+        }
+        if (firstVert < 0 || firstIndex < 0 || firstVert + numVerts > drawVertCount || firstIndex + numIndexes > drawIndexCount) {
+            return qfalse;
+        }
+        return qtrue;
+    }
+
+    if (surfaceType == MST_PATCH) {
+        int patchWidth = LittleLong(surface->patchWidth);
+        int patchHeight = LittleLong(surface->patchHeight);
+
+        if (numVerts <= 0 || firstVert < 0 || firstVert + numVerts > drawVertCount) {
+            return qfalse;
+        }
+        if (patchWidth < 3 || patchHeight < 3 || (patchWidth & 1) == 0 || (patchHeight & 1) == 0) {
+            return qfalse;
+        }
+        if (patchWidth * patchHeight > numVerts) {
+            return qfalse;
+        }
+        return qtrue;
+    }
+
+    return qfalse;
+}
+
 static qboolean BuildFallbackSceneView(vec3_t vieworg, vec3_t axis0, vec3_t axis1, vec3_t axis2, float *fovX, float *fovY) {
     vec3_t viewAngles;
     float aspect;
@@ -315,6 +420,9 @@ static qboolean LoadWorldMapData(const char *name) {
     uint32_t indexCursor = 0;
     uint32_t drawCursor = 0;
     uint32_t skyDraws = 0;
+    uint32_t planarDraws = 0;
+    uint32_t patchDraws = 0;
+    uint32_t triSoupDraws = 0;
 
     if (ri.FS_ReadFile(name, &fileBuffer) <= 0 || fileBuffer == NULL) {
         ri.Printf(PRINT_WARNING, "Metal world: failed to read BSP '%s'\n", name);
@@ -341,40 +449,46 @@ static qboolean LoadWorldMapData(const char *name) {
     for (i = 0; i < surfaceCount; ++i) {
         const dsurface_t *surface = &surfaces[i];
         int surfaceType = LittleLong(surface->surfaceType);
-        int firstVert;
-        int numVerts;
-        int firstIndex;
-        int numIndexes;
+        int patchWidth;
+        int patchHeight;
         int shaderNum;
 
-        if (surfaceType != MST_PLANAR && surfaceType != MST_TRIANGLE_SOUP) {
+        if (!IsSupportedWorldSurface(surface, drawVertCount, drawIndexCount)) {
             continue;
         }
 
-        firstVert = LittleLong(surface->firstVert);
-        numVerts = LittleLong(surface->numVerts);
-        firstIndex = LittleLong(surface->firstIndex);
-        numIndexes = LittleLong(surface->numIndexes);
         shaderNum = LittleLong(surface->shaderNum);
-
-        if (numVerts <= 0 || numIndexes < 3) {
-            continue;
-        }
-        if (numIndexes % 3) {
-            numIndexes -= numIndexes % 3;
-        }
-        if (firstVert < 0 || firstIndex < 0 || firstVert + numVerts > drawVertCount || firstIndex + numIndexes > drawIndexCount) {
-            ri.Printf(PRINT_WARNING, "Metal world: skipping invalid surface %d in '%s'\n", i, name);
-            continue;
-        }
         if (shaderNum < 0 || shaderNum >= shaderCount) {
             ri.Printf(PRINT_WARNING, "Metal world: skipping surface %d with invalid shader %d in '%s'\n", i, shaderNum, name);
             continue;
         }
 
-        totalVertices += (uint32_t)numVerts;
-        totalIndices += (uint32_t)numIndexes;
-        totalDraws += 1;
+        if (surfaceType == MST_PATCH) {
+            patchWidth = LittleLong(surface->patchWidth);
+            patchHeight = LittleLong(surface->patchHeight);
+            totalVertices += (uint32_t)((patchWidth - 1) / 2) * (uint32_t)((patchHeight - 1) / 2) *
+                             (Q3_METAL_PATCH_SUBDIVISIONS + 1) * (Q3_METAL_PATCH_SUBDIVISIONS + 1);
+            totalIndices += (uint32_t)((patchWidth - 1) / 2) * (uint32_t)((patchHeight - 1) / 2) *
+                            Q3_METAL_PATCH_SUBDIVISIONS * Q3_METAL_PATCH_SUBDIVISIONS * 6;
+            totalDraws += (uint32_t)((patchWidth - 1) / 2) * (uint32_t)((patchHeight - 1) / 2);
+            patchDraws += (uint32_t)((patchWidth - 1) / 2) * (uint32_t)((patchHeight - 1) / 2);
+        } else {
+            int numVerts = LittleLong(surface->numVerts);
+            int numIndexes = LittleLong(surface->numIndexes);
+
+            if (numIndexes % 3) {
+                numIndexes -= numIndexes % 3;
+            }
+            totalVertices += (uint32_t)numVerts;
+            totalIndices += (uint32_t)numIndexes;
+            totalDraws += 1;
+
+            if (surfaceType == MST_PLANAR) {
+                planarDraws += 1;
+            } else if (surfaceType == MST_TRIANGLE_SOUP) {
+                triSoupDraws += 1;
+            }
+        }
     }
 
     if (totalVertices == 0 || totalIndices == 0 || totalDraws == 0) {
@@ -402,12 +516,14 @@ static qboolean LoadWorldMapData(const char *name) {
         int numVerts;
         int firstIndex;
         int numIndexes;
+        int patchWidth;
+        int patchHeight;
         int shaderNum;
         uint32_t baseVertex;
         qhandle_t textureHandle;
         int j;
 
-        if (surfaceType != MST_PLANAR && surfaceType != MST_TRIANGLE_SOUP) {
+        if (!IsSupportedWorldSurface(surface, drawVertCount, drawIndexCount)) {
             continue;
         }
 
@@ -417,15 +533,6 @@ static qboolean LoadWorldMapData(const char *name) {
         numIndexes = LittleLong(surface->numIndexes);
         shaderNum = LittleLong(surface->shaderNum);
 
-        if (numVerts <= 0 || numIndexes < 3) {
-            continue;
-        }
-        if (numIndexes % 3) {
-            numIndexes -= numIndexes % 3;
-        }
-        if (firstVert < 0 || firstIndex < 0 || firstVert + numVerts > drawVertCount || firstIndex + numIndexes > drawIndexCount) {
-            continue;
-        }
         if (shaderNum < 0 || shaderNum >= shaderCount) {
             continue;
         }
@@ -437,6 +544,77 @@ static qboolean LoadWorldMapData(const char *name) {
             textureHandle = RegisterTexture(shaders[shaderNum].shader);
         }
 
+        if (surfaceType == MST_PATCH) {
+            int patchX;
+            int patchY;
+
+            patchWidth = LittleLong(surface->patchWidth);
+            patchHeight = LittleLong(surface->patchHeight);
+
+            for (patchY = 0; patchY < patchHeight - 1; patchY += 2) {
+                for (patchX = 0; patchX < patchWidth - 1; patchX += 2) {
+                    drawVert_t control[3][3];
+                    int stepY;
+
+                    for (j = 0; j < 3; ++j) {
+                        int k;
+                        for (k = 0; k < 3; ++k) {
+                            control[j][k] = drawVerts[firstVert + (patchY + j) * patchWidth + (patchX + k)];
+                        }
+                    }
+
+                    baseVertex = vertexCursor;
+                    s_world.draws[drawCursor].firstIndex = indexCursor;
+                    s_world.draws[drawCursor].textureHandle = (uint32_t)textureHandle;
+
+                    for (stepY = 0; stepY <= Q3_METAL_PATCH_SUBDIVISIONS; ++stepY) {
+                        float v = (float)stepY / (float)Q3_METAL_PATCH_SUBDIVISIONS;
+                        drawVert_t row[3];
+                        int stepX;
+
+                        for (j = 0; j < 3; ++j) {
+                            EvalQuadraticDrawVert(&control[0][j], &control[1][j], &control[2][j], v, &row[j]);
+                        }
+
+                        for (stepX = 0; stepX <= Q3_METAL_PATCH_SUBDIVISIONS; ++stepX) {
+                            float u = (float)stepX / (float)Q3_METAL_PATCH_SUBDIVISIONS;
+                            drawVert_t evaluated;
+
+                            EvalQuadraticDrawVert(&row[0], &row[1], &row[2], u, &evaluated);
+                            EmitWorldVertex(&s_world.vertices[vertexCursor++], &evaluated);
+                        }
+                    }
+
+                    for (stepY = 0; stepY < Q3_METAL_PATCH_SUBDIVISIONS; ++stepY) {
+                        int stepX;
+                        for (stepX = 0; stepX < Q3_METAL_PATCH_SUBDIVISIONS; ++stepX) {
+                            uint32_t row0 = baseVertex + (uint32_t)stepY * (Q3_METAL_PATCH_SUBDIVISIONS + 1);
+                            uint32_t row1 = row0 + (Q3_METAL_PATCH_SUBDIVISIONS + 1);
+                            uint32_t i0 = row0 + (uint32_t)stepX;
+                            uint32_t i1 = i0 + 1;
+                            uint32_t i2 = row1 + (uint32_t)stepX;
+                            uint32_t i3 = i2 + 1;
+
+                            s_world.indices[indexCursor++] = i0;
+                            s_world.indices[indexCursor++] = i2;
+                            s_world.indices[indexCursor++] = i1;
+                            s_world.indices[indexCursor++] = i1;
+                            s_world.indices[indexCursor++] = i2;
+                            s_world.indices[indexCursor++] = i3;
+                        }
+                    }
+
+                    s_world.draws[drawCursor].indexCount = indexCursor - s_world.draws[drawCursor].firstIndex;
+                    drawCursor += 1;
+                }
+            }
+            continue;
+        }
+
+        if (numIndexes % 3) {
+            numIndexes -= numIndexes % 3;
+        }
+
         baseVertex = vertexCursor;
         s_world.draws[drawCursor].firstIndex = indexCursor;
         s_world.draws[drawCursor].indexCount = (uint32_t)numIndexes;
@@ -444,18 +622,7 @@ static qboolean LoadWorldMapData(const char *name) {
         drawCursor += 1;
 
         for (j = 0; j < numVerts; ++j) {
-            const drawVert_t *source = &drawVerts[firstVert + j];
-            Q3MetalWorldVertex *dest = &s_world.vertices[vertexCursor++];
-
-            dest->position[0] = LittleFloat(source->xyz[0]);
-            dest->position[1] = LittleFloat(source->xyz[1]);
-            dest->position[2] = LittleFloat(source->xyz[2]);
-            dest->texCoord[0] = LittleFloat(source->st[0]);
-            dest->texCoord[1] = LittleFloat(source->st[1]);
-            dest->color[0] = ByteToVisibleColor(source->color.rgba[0]);
-            dest->color[1] = ByteToVisibleColor(source->color.rgba[1]);
-            dest->color[2] = ByteToVisibleColor(source->color.rgba[2]);
-            dest->color[3] = 1.0f;
+            EmitWorldVertex(&s_world.vertices[vertexCursor++], &drawVerts[firstVert + j]);
         }
 
         for (j = 0; j < numIndexes; ++j) {
@@ -475,8 +642,10 @@ static qboolean LoadWorldMapData(const char *name) {
     s_world.drawCount = drawCursor;
     Q_strncpyz(s_world.name, name, sizeof(s_world.name));
 
-    ri.Printf(PRINT_ALL, "Metal world: loaded '%s' with %u verts, %u indices, %u draws (%u sky)\n",
-              name, s_world.vertexCount, s_world.indexCount, s_world.drawCount, skyDraws);
+    ri.Printf(PRINT_ALL,
+              "Metal world: loaded '%s' with %u verts, %u indices, %u draws (%u planar, %u patch, %u trisoup, %u sky)\n",
+              name, s_world.vertexCount, s_world.indexCount, s_world.drawCount,
+              planarDraws, patchDraws, triSoupDraws, skyDraws);
 
     ri.FS_FreeFile(fileBuffer);
     return qtrue;
