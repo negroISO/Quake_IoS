@@ -299,21 +299,25 @@ static void SetupWorldDraw(Q3MetalWorldDrawCmd *draw,
 }
 
 static qboolean TryLoadImageRGBA(const char *name, byte **rgba, int *width, int *height, char *resolvedName, size_t resolvedNameSize) {
-    static const char *extensions[] = { "", ".tga", ".jpg", ".jpeg" };
+    static const char *extensions[] = { ".tga", ".jpg", ".jpeg" };
+    char base[MAX_QPATH];
+    const char *ext;
     int i;
 
     *rgba = NULL;
     *width = 0;
     *height = 0;
 
+    Q_strncpyz(base, name, sizeof(base));
+    ext = COM_GetExtension(base);
+    if (ext[0] != '\0') {
+        COM_StripExtension(base, base, sizeof(base));
+    }
+
     for (i = 0; i < ARRAY_LEN(extensions); ++i) {
         char candidate[MAX_QPATH];
-        if (extensions[i][0] != '\0' && COM_GetExtension(name)[0] != '\0') {
-            continue;
-        }
-
-        Com_sprintf(candidate, sizeof(candidate), "%s%s", name, extensions[i]);
-        if (!Q_stricmp(COM_GetExtension(candidate), "tga")) {
+        Com_sprintf(candidate, sizeof(candidate), "%s%s", base, extensions[i]);
+        if (!Q_stricmp(extensions[i], ".tga")) {
             R_LoadTGA(candidate, rgba, width, height);
         } else {
             R_LoadJPG(candidate, rgba, width, height);
