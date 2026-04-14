@@ -598,12 +598,15 @@ final class GameControllerBridge {
     private var started = false
     private var activeController: GCController?
     private var state = State()
+    private var lastLoggedState: State?
 
     private init() {}
 
     func start() {
         guard !started else { return }
         started = true
+
+        print("[GCController] start")
 
         NotificationCenter.default.addObserver(
             self,
@@ -618,8 +621,13 @@ final class GameControllerBridge {
             object: nil
         )
 
+        print("[GCController] existing controllers: \(GCController.controllers().count)")
+        for controller in GCController.controllers() {
+            print("[GCController] existing \(describe(controller))")
+        }
+
         GCController.startWirelessControllerDiscovery { [weak self] in
-            print("[Metal] Controller discovery completed")
+            print("[GCController] wireless discovery completed")
             Task { @MainActor in
                 self?.pickActiveController()
             }
@@ -629,9 +637,9 @@ final class GameControllerBridge {
 
     @objc private func controllerDidConnect(_ notification: Notification) {
         if let controller = notification.object as? GCController {
-            print("[Metal] Controller connected: \(controller.vendorName ?? "Unknown")")
+            print("[GCController] connected \(describe(controller))")
         } else {
-            print("[Metal] Controller connected")
+            print("[GCController] connected unknown controller")
         }
         pickActiveController(preferred: notification.object as? GCController)
     }
@@ -641,9 +649,14 @@ final class GameControllerBridge {
         if activeController === disconnected {
             activeController = nil
             state = State()
+            lastLoggedState = nil
             pushState()
         }
-        print("[Metal] Controller disconnected")
+        if let disconnected {
+            print("[GCController] disconnected \(describe(disconnected))")
+        } else {
+            print("[GCController] disconnected unknown controller")
+        }
         pickActiveController()
     }
 
@@ -660,21 +673,24 @@ final class GameControllerBridge {
         activeController?.extendedGamepad?.valueChangedHandler = nil
         activeController = nextController
         state = State()
+        lastLoggedState = nil
         pushState()
 
         guard let controller = nextController, let gamepad = controller.extendedGamepad else {
+            print("[GCController] no extended gamepad controller selected")
             return
         }
 
         controller.playerIndex = .index1
-        gamepad.valueChangedHandler = { [weak self] gamepad, _ in
-            self?.ingest(gamepad: gamepad)
+        controller.handlerQueue = .main
+        gamepad.valueChangedHandler = { [weak self] gamepad, element in
+            self?.ingest(gamepad: gamepad, source: element)
         }
-        ingest(gamepad: gamepad)
-        print("[Metal] Using controller: \(controller.vendorName ?? "Unknown")")
+        ingest(gamepad: gamepad, source: nil)
+        print("[GCController] using \(describe(controller))")
     }
 
-    private func ingest(gamepad: GCExtendedGamepad) {
+    private func ingest(gamepad: GCExtendedGamepad, source: GCControllerElement?) {
         state.leftX = gamepad.leftThumbstick.xAxis.value
         state.leftY = gamepad.leftThumbstick.yAxis.value
         state.rightX = gamepad.rightThumbstick.xAxis.value
@@ -682,6 +698,7 @@ final class GameControllerBridge {
         state.firePressed = gamepad.rightTrigger.isPressed ? 1 : 0
         state.jumpPressed = gamepad.buttonA.isPressed ? 1 : 0
         state.crouchPressed = gamepad.buttonB.isPressed ? 1 : 0
+        logStateChange(source: source)
         pushState()
     }
 
@@ -696,5 +713,45 @@ final class GameControllerBridge {
             state.jumpPressed,
             state.crouchPressed
         )
+    }
+
+    private func logStateChange(source: GCControllerElement?) {
+        let shouldLog: Bool
+        if let lastLoggedState {
+            shouldLog =
+                abs(state.leftX - lastLoggedState.leftX) >= 0.05 ||
+                abs(state.leftY - lastLoggedState.leftY) >= 0.05 ||
+                abs(state.rightX - lastLoggedState.rightX) >= 0.05 ||
+                abs(state.rightY - lastLoggedState.rightY) >= 0.05 ||
+                state.firePressed != lastLoggedState.firePressed ||
+                state.jumpPressed != lastLoggedState.jumpPressed ||
+                state.crouchPressed != lastLoggedState.crouchPressed
+        } else {
+            shouldLog = true
+        }
+
+        guard shouldLog else { return }
+        lastLoggedState = state
+
+        let sourceName = source.map { String(describing: type(of: $0)) } ?? "initial"
+        print(
+            String(
+                format: "[GCController] input %@ left=(%.2f, %.2f) right=(%.2f, %.2f) fire=%d jump=%d crouch=%d",
+                sourceName,
+                state.leftX,
+                state.leftY,
+                state.rightX,
+                state.rightY,
+                state.firePressed,
+                state.jumpPressed,
+                state.crouchPressed
+            )
+        )
+    }
+
+    private func describe(_ controller: GCController) -> String {
+        let name = controller.vendorName ?? "Unknown"
+        let profile = controller.extendedGamepad != nil ? "extended" : "non-extended"
+        return "\(name) profile=\(profile)"
     }
 }
