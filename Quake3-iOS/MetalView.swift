@@ -9,7 +9,8 @@ struct MetalView: UIViewRepresentable {
         view.colorPixelFormat = .bgra8Unorm
         view.depthStencilPixelFormat = .depth32Float
         view.delegate = context.coordinator
-        view.preferredFramesPerSecond = 120
+        let maxFPS = UIScreen.main.maximumFramesPerSecond
+        view.preferredFramesPerSecond = maxFPS
         view.enableSetNeedsDisplay = false
         view.isPaused = false
         return view
@@ -158,14 +159,7 @@ struct MetalView: UIViewRepresentable {
                let sceneView = Q3MetalRenderer_GetSceneView()?.pointee,
                let worldVertexBuffer = uploadWorldBuffers(device: view.device, generation: snapshot.worldGeneration),
                let worldIndexBuffer {
-                var worldUniforms = WorldUniforms(
-                    viewProjection: makePerspectiveProjection(
-                        fovX: sceneView.fovX,
-                        fovY: sceneView.fovY,
-                        zNear: 4.0,
-                        zFar: 8192.0
-                    ) * makeWorldViewMatrix(sceneView)
-                )
+                var worldUniforms = WorldUniforms(viewProjection: makeWorldViewProjection(sceneView))
                 encoder.setRenderPipelineState(worldPipelineState)
                 encoder.setDepthStencilState(depthStencilState)
                 encoder.setVertexBuffer(worldVertexBuffer, offset: 0, index: 0)
@@ -400,21 +394,7 @@ struct MetalView: UIViewRepresentable {
             ))
         }
 
-        private func makePerspectiveProjection(fovX: Float, fovY: Float, zNear: Float, zFar: Float) -> simd_float4x4 {
-            let xScale = 1.0 / tan(fovX * .pi / 360.0)
-            let yScale = 1.0 / tan(fovY * .pi / 360.0)
-            let zScale = zFar / (zNear - zFar)
-            let zTranslate = (zNear * zFar) / (zNear - zFar)
-
-            return simd_float4x4(columns: (
-                SIMD4<Float>(xScale, 0, 0, 0),
-                SIMD4<Float>(0, yScale, 0, 0),
-                SIMD4<Float>(0, 0, zScale, -1),
-                SIMD4<Float>(0, 0, zTranslate, 0)
-            ))
-        }
-
-        private func makeWorldViewMatrix(_ sceneView: Q3MetalSceneView) -> simd_float4x4 {
+        private func makeWorldViewProjection(_ sceneView: Q3MetalSceneView) -> simd_float4x4 {
             let origin = SIMD3<Float>(sceneView.viewOrigin.0, sceneView.viewOrigin.1, sceneView.viewOrigin.2)
             let axis0 = SIMD3<Float>(sceneView.viewAxis.0, sceneView.viewAxis.1, sceneView.viewAxis.2)
             let axis1 = SIMD3<Float>(sceneView.viewAxis.3, sceneView.viewAxis.4, sceneView.viewAxis.5)
@@ -434,7 +414,28 @@ struct MetalView: UIViewRepresentable {
                 SIMD4<Float>(0, 0, 0, 1)
             ))
 
-            return viewer * flip
+            let zNear: Float = 4.0
+            let zFar: Float = 8192.0
+            let xScale = 1.0 / tan(sceneView.fovX * .pi / 360.0)
+            let yScale = 1.0 / tan(sceneView.fovY * .pi / 360.0)
+            let depth = zFar - zNear
+            let quakeProjection = simd_float4x4(columns: (
+                SIMD4<Float>(xScale, 0, 0, 0),
+                SIMD4<Float>(0, yScale, 0, 0),
+                SIMD4<Float>(0, 0, -(zFar + zNear) / depth, -1),
+                SIMD4<Float>(0, 0, -(2 * zFar * zNear) / depth, 0)
+            ))
+
+            // Quake's legacy projection targets OpenGL clip space. Metal keeps the
+            // same XY clip rules but uses a 0...1 depth range instead of -1...1.
+            let openGLToMetalClip = simd_float4x4(columns: (
+                SIMD4<Float>(1, 0, 0, 0),
+                SIMD4<Float>(0, 1, 0, 0),
+                SIMD4<Float>(0, 0, 0.5, 0),
+                SIMD4<Float>(0, 0, 0.5, 1)
+            ))
+
+            return openGLToMetalClip * quakeProjection * flip * viewer
         }
     }
 }
