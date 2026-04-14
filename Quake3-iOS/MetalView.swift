@@ -7,6 +7,7 @@ struct MetalView: UIViewRepresentable {
         let view = MTKView()
         view.device = MTLCreateSystemDefaultDevice()
         view.colorPixelFormat = .bgra8Unorm
+        view.depthStencilPixelFormat = .depth32Float
         view.delegate = context.coordinator
         view.preferredFramesPerSecond = 60
         view.enableSetNeedsDisplay = false
@@ -29,6 +30,15 @@ struct MetalView: UIViewRepresentable {
 
         struct Uniforms {
             var projection: simd_float4x4
+        }
+
+        struct GPUWorldVertex {
+            var position: SIMD3<Float>
+            var color: SIMD4<Float>
+        }
+
+        struct WorldUniforms {
+            var viewProjection: simd_float4x4
         }
 
         private let shaderSource = """
@@ -69,14 +79,47 @@ struct MetalView: UIViewRepresentable {
             float4 texel = colorTexture.sample(textureSampler, in.texCoord);
             return texel * in.color;
         }
+
+        struct WorldVertexIn {
+            float3 position;
+            float4 color;
+        };
+
+        struct WorldUniforms {
+            float4x4 viewProjection;
+        };
+
+        struct WorldVertexOut {
+            float4 position [[position]];
+            float4 color;
+        };
+
+        vertex WorldVertexOut q3_world_vertex(const device WorldVertexIn *vertices [[buffer(0)]],
+                                              constant WorldUniforms &uniforms [[buffer(1)]],
+                                              uint vertexID [[vertex_id]]) {
+            WorldVertexOut out;
+            WorldVertexIn inVertex = vertices[vertexID];
+            out.position = uniforms.viewProjection * float4(inVertex.position, 1.0);
+            out.color = inVertex.color;
+            return out;
+        }
+
+        fragment float4 q3_world_fragment(WorldVertexOut in [[stage_in]]) {
+            return in.color;
+        }
         """
 
         private var commandQueue: MTLCommandQueue?
-        private var pipelineState: MTLRenderPipelineState?
+        private var uiPipelineState: MTLRenderPipelineState?
+        private var worldPipelineState: MTLRenderPipelineState?
         private var samplerState: MTLSamplerState?
+        private var depthStencilState: MTLDepthStencilState?
         private var textureCache: [UInt32: (generation: UInt32, texture: MTLTexture)] = [:]
         private var vertexBuffer: MTLBuffer?
         private var vertexBufferCapacity = 0
+        private var worldVertexBuffer: MTLBuffer?
+        private var worldIndexBuffer: MTLBuffer?
+        private var cachedWorldGeneration: UInt32 = 0
 
         func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
             print("[Metal] Drawable size: \(size)")
@@ -95,7 +138,6 @@ struct MetalView: UIViewRepresentable {
             guard let drawable = view.currentDrawable,
                   let descriptor = view.currentRenderPassDescriptor,
                   let commandQueue,
-                  let pipelineState,
                   let samplerState,
                   let commandBuffer = commandQueue.makeCommandBuffer()
             else { return }
@@ -111,6 +153,40 @@ struct MetalView: UIViewRepresentable {
                 return
             }
 
+            if snapshot.worldCommandCount > 0,
+               let worldPipelineState,
+               let sceneView = Q3MetalRenderer_GetSceneView()?.pointee,
+               let worldVertexBuffer = uploadWorldBuffers(device: view.device, generation: snapshot.worldGeneration),
+               let worldIndexBuffer {
+                var worldUniforms = WorldUniforms(
+                    viewProjection: makePerspectiveProjection(
+                        fovX: sceneView.fovX,
+                        fovY: sceneView.fovY,
+                        zNear: 4.0,
+                        zFar: 8192.0
+                    ) * makeWorldViewMatrix(sceneView)
+                )
+                encoder.setRenderPipelineState(worldPipelineState)
+                encoder.setDepthStencilState(depthStencilState)
+                encoder.setVertexBuffer(worldVertexBuffer, offset: 0, index: 0)
+                encoder.setVertexBytes(&worldUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
+
+                if let worldDrawsPointer = Q3MetalRenderer_GetWorldDrawCommands(),
+                   let indicesPointer = Q3MetalRenderer_GetWorldIndices() {
+                    let _ = indicesPointer
+                    let worldDraws = UnsafeBufferPointer(start: worldDrawsPointer, count: Int(snapshot.worldCommandCount))
+                    for draw in worldDraws where draw.indexCount > 0 {
+                        encoder.drawIndexedPrimitives(
+                            type: .triangle,
+                            indexCount: Int(draw.indexCount),
+                            indexType: .uint32,
+                            indexBuffer: worldIndexBuffer,
+                            indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride
+                        )
+                    }
+                }
+            }
+
             let vertexCount = Int(snapshot.vertexCount)
             if vertexCount > 0, let verticesPointer = Q3MetalRenderer_GetVertices() {
                 let vertices = UnsafeBufferPointer(start: verticesPointer, count: vertexCount)
@@ -123,7 +199,10 @@ struct MetalView: UIViewRepresentable {
                     return
                 }
 
-                encoder.setRenderPipelineState(pipelineState)
+                if let uiPipelineState {
+                    encoder.setRenderPipelineState(uiPipelineState)
+                }
+                encoder.setDepthStencilState(nil)
                 encoder.setFragmentSamplerState(samplerState, index: 0)
                 encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
                 encoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
@@ -160,6 +239,7 @@ struct MetalView: UIViewRepresentable {
 
             let pipelineDescriptor = MTLRenderPipelineDescriptor()
             pipelineDescriptor.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            pipelineDescriptor.depthAttachmentPixelFormat = view.depthStencilPixelFormat
             pipelineDescriptor.vertexFunction = library.makeFunction(name: "q3_ui_vertex")
             pipelineDescriptor.fragmentFunction = library.makeFunction(name: "q3_ui_fragment")
             pipelineDescriptor.colorAttachments[0].isBlendingEnabled = true
@@ -171,9 +251,21 @@ struct MetalView: UIViewRepresentable {
             pipelineDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
 
             do {
-                pipelineState = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
+                uiPipelineState = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
             } catch {
                 print("[Metal] Failed to create UI pipeline: \\(error)")
+            }
+
+            let worldPipelineDescriptor = MTLRenderPipelineDescriptor()
+            worldPipelineDescriptor.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            worldPipelineDescriptor.depthAttachmentPixelFormat = view.depthStencilPixelFormat
+            worldPipelineDescriptor.vertexFunction = library.makeFunction(name: "q3_world_vertex")
+            worldPipelineDescriptor.fragmentFunction = library.makeFunction(name: "q3_world_fragment")
+
+            do {
+                worldPipelineState = try device.makeRenderPipelineState(descriptor: worldPipelineDescriptor)
+            } catch {
+                print("[Metal] Failed to create world pipeline: \\(error)")
             }
 
             let samplerDescriptor = MTLSamplerDescriptor()
@@ -182,6 +274,11 @@ struct MetalView: UIViewRepresentable {
             samplerDescriptor.sAddressMode = .clampToEdge
             samplerDescriptor.tAddressMode = .clampToEdge
             samplerState = device.makeSamplerState(descriptor: samplerDescriptor)
+
+            let depthDescriptor = MTLDepthStencilDescriptor()
+            depthDescriptor.isDepthWriteEnabled = true
+            depthDescriptor.depthCompareFunction = .less
+            depthStencilState = device.makeDepthStencilState(descriptor: depthDescriptor)
         }
 
         private func uploadVertices(_ vertices: UnsafeBufferPointer<Q3MetalVertex>, device: MTLDevice?) -> MTLBuffer? {
@@ -212,6 +309,48 @@ struct MetalView: UIViewRepresentable {
             }
 
             return vertexBuffer
+        }
+
+        private func uploadWorldBuffers(device: MTLDevice?, generation: UInt32) -> MTLBuffer? {
+            guard let device,
+                  let verticesPointer = Q3MetalRenderer_GetWorldVertices(),
+                  let indicesPointer = Q3MetalRenderer_GetWorldIndices(),
+                  let snapshot = Q3MetalRenderer_GetFrameSnapshot()?.pointee
+            else { return nil }
+
+            if cachedWorldGeneration == generation, let worldVertexBuffer {
+                return worldVertexBuffer
+            }
+
+            let vertexCount = Int(snapshot.worldVertexCount)
+            let indexCount = Int(snapshot.worldIndexCount)
+            guard vertexCount > 0, indexCount > 0 else { return nil }
+
+            let sourceVertices = UnsafeBufferPointer(start: verticesPointer, count: vertexCount)
+            var gpuVertices = [GPUWorldVertex]()
+            gpuVertices.reserveCapacity(vertexCount)
+            for vertex in sourceVertices {
+                gpuVertices.append(
+                    GPUWorldVertex(
+                        position: SIMD3<Float>(vertex.position.0, vertex.position.1, vertex.position.2),
+                        color: SIMD4<Float>(vertex.color.0, vertex.color.1, vertex.color.2, vertex.color.3)
+                    )
+                )
+            }
+
+            let sourceIndices = UnsafeBufferPointer(start: indicesPointer, count: indexCount)
+            worldVertexBuffer = device.makeBuffer(
+                bytes: gpuVertices,
+                length: gpuVertices.count * MemoryLayout<GPUWorldVertex>.stride,
+                options: .storageModeShared
+            )
+            worldIndexBuffer = device.makeBuffer(
+                bytes: sourceIndices.baseAddress!,
+                length: sourceIndices.count * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared
+            )
+            cachedWorldGeneration = generation
+            return worldVertexBuffer
         }
 
         private func texture(for handle: UInt32, device: MTLDevice?) -> MTLTexture? {
@@ -259,6 +398,43 @@ struct MetalView: UIViewRepresentable {
                 SIMD4<Float>(0, 0, 1, 0),
                 SIMD4<Float>(-1, 1, 0, 1)
             ))
+        }
+
+        private func makePerspectiveProjection(fovX: Float, fovY: Float, zNear: Float, zFar: Float) -> simd_float4x4 {
+            let xScale = 1.0 / tan(fovX * .pi / 360.0)
+            let yScale = 1.0 / tan(fovY * .pi / 360.0)
+            let zScale = zFar / (zNear - zFar)
+            let zTranslate = (zNear * zFar) / (zNear - zFar)
+
+            return simd_float4x4(columns: (
+                SIMD4<Float>(xScale, 0, 0, 0),
+                SIMD4<Float>(0, yScale, 0, 0),
+                SIMD4<Float>(0, 0, zScale, -1),
+                SIMD4<Float>(0, 0, zTranslate, 0)
+            ))
+        }
+
+        private func makeWorldViewMatrix(_ sceneView: Q3MetalSceneView) -> simd_float4x4 {
+            let origin = SIMD3<Float>(sceneView.viewOrigin.0, sceneView.viewOrigin.1, sceneView.viewOrigin.2)
+            let axis0 = SIMD3<Float>(sceneView.viewAxis.0, sceneView.viewAxis.1, sceneView.viewAxis.2)
+            let axis1 = SIMD3<Float>(sceneView.viewAxis.3, sceneView.viewAxis.4, sceneView.viewAxis.5)
+            let axis2 = SIMD3<Float>(sceneView.viewAxis.6, sceneView.viewAxis.7, sceneView.viewAxis.8)
+
+            let viewer = simd_float4x4(columns: (
+                SIMD4<Float>(axis0.x, axis1.x, axis2.x, 0),
+                SIMD4<Float>(axis0.y, axis1.y, axis2.y, 0),
+                SIMD4<Float>(axis0.z, axis1.z, axis2.z, 0),
+                SIMD4<Float>(-simd_dot(origin, axis0), -simd_dot(origin, axis1), -simd_dot(origin, axis2), 1)
+            ))
+
+            let flip = simd_float4x4(columns: (
+                SIMD4<Float>(0, 0, -1, 0),
+                SIMD4<Float>(-1, 0, 0, 0),
+                SIMD4<Float>(0, 1, 0, 0),
+                SIMD4<Float>(0, 0, 0, 1)
+            ))
+
+            return viewer * flip
         }
     }
 }

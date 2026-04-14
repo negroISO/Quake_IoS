@@ -2,6 +2,7 @@
 // Replaces the Vulkan renderer with no-op implementations
 
 #include "../qcommon/q_shared.h"
+#include "../qcommon/qfiles.h"
 #include "../renderercommon/tr_public.h"
 #include "../renderer/tr_common.h"
 #include "metal_renderer_shared.h"
@@ -26,6 +27,7 @@ refimport_t ri;
 
 static glconfig_t s_glConfig;
 static Q3MetalFrameSnapshot s_frameSnapshot;
+static Q3MetalSceneView s_sceneView;
 static Q3MetalVertex s_vertices[Q3_METAL_MAX_VERTICES];
 static Q3MetalDrawCmd s_draws[Q3_METAL_MAX_DRAWS];
 static uint32_t s_vertexCount;
@@ -34,6 +36,20 @@ static float s_currentColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
 static metalTexture_t s_textures[Q3_METAL_MAX_TEXTURES];
 static qhandle_t s_nextTextureHandle = 1;
 static qhandle_t s_whiteTextureHandle;
+
+typedef struct {
+    qboolean loaded;
+    uint32_t generation;
+    uint32_t vertexCount;
+    uint32_t indexCount;
+    uint32_t drawCount;
+    Q3MetalWorldVertex *vertices;
+    uint32_t *indices;
+    Q3MetalWorldDrawCmd *draws;
+    char name[MAX_QPATH];
+} metalWorld_t;
+
+static metalWorld_t s_world;
 
 static void CopyColor(float *dst, const float *src) {
     dst[0] = src[0];
@@ -186,7 +202,185 @@ static void PushStretchPicVertex(float x, float y, float s, float t, const float
     CopyColor(vertex->color, rgba);
 }
 
+static void FreeWorldMapData(void) {
+    if (s_world.vertices != NULL) {
+        ri.Free(s_world.vertices);
+    }
+    if (s_world.indices != NULL) {
+        ri.Free(s_world.indices);
+    }
+    if (s_world.draws != NULL) {
+        ri.Free(s_world.draws);
+    }
+    Com_Memset(&s_world, 0, sizeof(s_world));
+}
+
+static float ByteToVisibleColor(byte value) {
+    float normalized = (float)value / 255.0f;
+    return 0.25f + normalized * 0.75f;
+}
+
+static qboolean LoadWorldMapData(const char *name) {
+    void *fileBuffer = NULL;
+    dheader_t *header;
+    drawVert_t *drawVerts;
+    int *drawIndexes;
+    dsurface_t *surfaces;
+    int drawVertCount;
+    int drawIndexCount;
+    int surfaceCount;
+    int i;
+    uint32_t totalVertices = 0;
+    uint32_t totalIndices = 0;
+    uint32_t totalDraws = 0;
+    uint32_t vertexCursor = 0;
+    uint32_t indexCursor = 0;
+    uint32_t drawCursor = 0;
+
+    if (ri.FS_ReadFile(name, &fileBuffer) <= 0 || fileBuffer == NULL) {
+        ri.Printf(PRINT_WARNING, "Metal world: failed to read BSP '%s'\n", name);
+        return qfalse;
+    }
+
+    header = (dheader_t *)fileBuffer;
+    if (LittleLong(header->version) != BSP_VERSION) {
+        ri.Printf(PRINT_WARNING, "Metal world: '%s' has unsupported BSP version %d\n", name, LittleLong(header->version));
+        ri.FS_FreeFile(fileBuffer);
+        return qfalse;
+    }
+
+    drawVerts = (drawVert_t *)((byte *)fileBuffer + LittleLong(header->lumps[LUMP_DRAWVERTS].fileofs));
+    drawIndexes = (int *)((byte *)fileBuffer + LittleLong(header->lumps[LUMP_DRAWINDEXES].fileofs));
+    surfaces = (dsurface_t *)((byte *)fileBuffer + LittleLong(header->lumps[LUMP_SURFACES].fileofs));
+
+    drawVertCount = LittleLong(header->lumps[LUMP_DRAWVERTS].filelen) / (int)sizeof(drawVert_t);
+    drawIndexCount = LittleLong(header->lumps[LUMP_DRAWINDEXES].filelen) / (int)sizeof(int);
+    surfaceCount = LittleLong(header->lumps[LUMP_SURFACES].filelen) / (int)sizeof(dsurface_t);
+
+    for (i = 0; i < surfaceCount; ++i) {
+        const dsurface_t *surface = &surfaces[i];
+        int surfaceType = LittleLong(surface->surfaceType);
+        int firstVert;
+        int numVerts;
+        int firstIndex;
+        int numIndexes;
+
+        if (surfaceType != MST_PLANAR && surfaceType != MST_TRIANGLE_SOUP) {
+            continue;
+        }
+
+        firstVert = LittleLong(surface->firstVert);
+        numVerts = LittleLong(surface->numVerts);
+        firstIndex = LittleLong(surface->firstIndex);
+        numIndexes = LittleLong(surface->numIndexes);
+
+        if (numVerts <= 0 || numIndexes < 3) {
+            continue;
+        }
+        if (numIndexes % 3) {
+            numIndexes -= numIndexes % 3;
+        }
+        if (firstVert < 0 || firstIndex < 0 || firstVert + numVerts > drawVertCount || firstIndex + numIndexes > drawIndexCount) {
+            ri.Printf(PRINT_WARNING, "Metal world: skipping invalid surface %d in '%s'\n", i, name);
+            continue;
+        }
+
+        totalVertices += (uint32_t)numVerts;
+        totalIndices += (uint32_t)numIndexes;
+        totalDraws += 1;
+    }
+
+    if (totalVertices == 0 || totalIndices == 0 || totalDraws == 0) {
+        ri.Printf(PRINT_WARNING, "Metal world: no drawable BSP surfaces found in '%s'\n", name);
+        ri.FS_FreeFile(fileBuffer);
+        return qfalse;
+    }
+
+    FreeWorldMapData();
+
+    s_world.vertices = ri.Malloc(totalVertices * sizeof(*s_world.vertices));
+    s_world.indices = ri.Malloc(totalIndices * sizeof(*s_world.indices));
+    s_world.draws = ri.Malloc(totalDraws * sizeof(*s_world.draws));
+    if (s_world.vertices == NULL || s_world.indices == NULL || s_world.draws == NULL) {
+        ri.Printf(PRINT_WARNING, "Metal world: allocation failed for '%s'\n", name);
+        FreeWorldMapData();
+        ri.FS_FreeFile(fileBuffer);
+        return qfalse;
+    }
+
+    for (i = 0; i < surfaceCount; ++i) {
+        const dsurface_t *surface = &surfaces[i];
+        int surfaceType = LittleLong(surface->surfaceType);
+        int firstVert;
+        int numVerts;
+        int firstIndex;
+        int numIndexes;
+        uint32_t baseVertex;
+        int j;
+
+        if (surfaceType != MST_PLANAR && surfaceType != MST_TRIANGLE_SOUP) {
+            continue;
+        }
+
+        firstVert = LittleLong(surface->firstVert);
+        numVerts = LittleLong(surface->numVerts);
+        firstIndex = LittleLong(surface->firstIndex);
+        numIndexes = LittleLong(surface->numIndexes);
+
+        if (numVerts <= 0 || numIndexes < 3) {
+            continue;
+        }
+        if (numIndexes % 3) {
+            numIndexes -= numIndexes % 3;
+        }
+        if (firstVert < 0 || firstIndex < 0 || firstVert + numVerts > drawVertCount || firstIndex + numIndexes > drawIndexCount) {
+            continue;
+        }
+
+        baseVertex = vertexCursor;
+        s_world.draws[drawCursor].firstIndex = indexCursor;
+        s_world.draws[drawCursor].indexCount = (uint32_t)numIndexes;
+        drawCursor += 1;
+
+        for (j = 0; j < numVerts; ++j) {
+            const drawVert_t *source = &drawVerts[firstVert + j];
+            Q3MetalWorldVertex *dest = &s_world.vertices[vertexCursor++];
+
+            dest->position[0] = LittleFloat(source->xyz[0]);
+            dest->position[1] = LittleFloat(source->xyz[1]);
+            dest->position[2] = LittleFloat(source->xyz[2]);
+            dest->color[0] = ByteToVisibleColor(source->color.rgba[0]);
+            dest->color[1] = ByteToVisibleColor(source->color.rgba[1]);
+            dest->color[2] = ByteToVisibleColor(source->color.rgba[2]);
+            dest->color[3] = 1.0f;
+        }
+
+        for (j = 0; j < numIndexes; ++j) {
+            int localIndex = LittleLong(drawIndexes[firstIndex + j]);
+            if (localIndex < 0 || localIndex >= numVerts) {
+                s_world.indices[indexCursor++] = baseVertex;
+                continue;
+            }
+            s_world.indices[indexCursor++] = baseVertex + (uint32_t)localIndex;
+        }
+    }
+
+    s_world.loaded = qtrue;
+    s_world.generation += 1;
+    s_world.vertexCount = vertexCursor;
+    s_world.indexCount = indexCursor;
+    s_world.drawCount = drawCursor;
+    Q_strncpyz(s_world.name, name, sizeof(s_world.name));
+
+    ri.Printf(PRINT_ALL, "Metal world: loaded '%s' with %u verts, %u indices, %u draws\n",
+              name, s_world.vertexCount, s_world.indexCount, s_world.drawCount);
+
+    ri.FS_FreeFile(fileBuffer);
+    return qtrue;
+}
+
 static void RE_Shutdown(refShutdownCode_t code) {
+    FreeWorldMapData();
     ri.Printf(PRINT_ALL, "RE_Shutdown: Metal stub\n");
 }
 
@@ -206,9 +400,9 @@ static void RE_BeginRegistration(glconfig_t *config) {
     Q_strncpyz(s_glConfig.version_string, "Metal 4", sizeof(s_glConfig.version_string));
     s_frameSnapshot.drawableWidth = (uint32_t)s_glConfig.vidWidth;
     s_frameSnapshot.drawableHeight = (uint32_t)s_glConfig.vidHeight;
-    s_frameSnapshot.clearColor[0] = 0.05f;
-    s_frameSnapshot.clearColor[1] = 0.05f;
-    s_frameSnapshot.clearColor[2] = 0.10f;
+    s_frameSnapshot.clearColor[0] = 0.0f;
+    s_frameSnapshot.clearColor[1] = 0.0f;
+    s_frameSnapshot.clearColor[2] = 0.0f;
     s_frameSnapshot.clearColor[3] = 1.0f;
     *config = s_glConfig;
 }
@@ -217,7 +411,16 @@ static qhandle_t RE_RegisterModel(const char *name) { return 0; }
 static qhandle_t RE_RegisterSkin(const char *name) { return 0; }
 qhandle_t RE_RegisterShader(const char *name) { return RegisterTexture(name); }
 qhandle_t RE_RegisterShaderNoMip(const char *name) { return RegisterTexture(name); }
-static void RE_LoadWorldMap(const char *name) {}
+static void RE_LoadWorldMap(const char *name) {
+    if (name == NULL || name[0] == '\0') {
+        FreeWorldMapData();
+        return;
+    }
+
+    if (!LoadWorldMapData(name)) {
+        ri.Printf(PRINT_WARNING, "Metal world: falling back to empty world for '%s'\n", name);
+    }
+}
 static void RE_SetWorldVisData(const byte *vis) {}
 static void RE_EndRegistration(void) {}
 
@@ -228,7 +431,33 @@ static int R_LightForPoint(vec3_t point, vec3_t ambientLight, vec3_t directedLig
 static void RE_AddLightToScene(const vec3_t org, float intensity, float r, float g, float b) {}
 static void RE_AddAdditiveLightToScene(const vec3_t org, float intensity, float r, float g, float b) {}
 static void RE_AddLinearLightToScene(const vec3_t start, const vec3_t end, float intensity, float r, float g, float b) {}
-static void RE_RenderScene(const refdef_t *fd) {}
+static void RE_RenderScene(const refdef_t *fd) {
+    if (fd == NULL) {
+        return;
+    }
+
+    s_sceneView.fovX = fd->fov_x;
+    s_sceneView.fovY = fd->fov_y;
+    s_sceneView.viewOrigin[0] = fd->vieworg[0];
+    s_sceneView.viewOrigin[1] = fd->vieworg[1];
+    s_sceneView.viewOrigin[2] = fd->vieworg[2];
+    s_sceneView.viewAxis[0] = fd->viewaxis[0][0];
+    s_sceneView.viewAxis[1] = fd->viewaxis[0][1];
+    s_sceneView.viewAxis[2] = fd->viewaxis[0][2];
+    s_sceneView.viewAxis[3] = fd->viewaxis[1][0];
+    s_sceneView.viewAxis[4] = fd->viewaxis[1][1];
+    s_sceneView.viewAxis[5] = fd->viewaxis[1][2];
+    s_sceneView.viewAxis[6] = fd->viewaxis[2][0];
+    s_sceneView.viewAxis[7] = fd->viewaxis[2][1];
+    s_sceneView.viewAxis[8] = fd->viewaxis[2][2];
+
+    if (s_world.loaded && !(fd->rdflags & RDF_NOWORLDMODEL)) {
+        s_frameSnapshot.worldVertexCount = s_world.vertexCount;
+        s_frameSnapshot.worldIndexCount = s_world.indexCount;
+        s_frameSnapshot.worldCommandCount = s_world.drawCount;
+        s_frameSnapshot.worldGeneration = s_world.generation;
+    }
+}
 
 static void RE_SetColor(const float *rgba) {
     if (rgba == NULL) {
@@ -271,6 +500,10 @@ static void RE_BeginFrame(stereoFrame_t stereoFrame) {
     s_drawCount = 0;
     s_frameSnapshot.vertexCount = 0;
     s_frameSnapshot.commandCount = 0;
+    s_frameSnapshot.worldVertexCount = 0;
+    s_frameSnapshot.worldIndexCount = 0;
+    s_frameSnapshot.worldCommandCount = 0;
+    s_frameSnapshot.worldGeneration = s_world.generation;
 }
 
 static void RE_EndFrame(int *frontEndMsec, int *backEndMsec) {
@@ -321,6 +554,22 @@ const Q3MetalVertex *Q3MetalRenderer_GetVertices(void) {
 
 const Q3MetalDrawCmd *Q3MetalRenderer_GetDrawCommands(void) {
     return s_draws;
+}
+
+const Q3MetalWorldVertex *Q3MetalRenderer_GetWorldVertices(void) {
+    return s_world.vertices;
+}
+
+const uint32_t *Q3MetalRenderer_GetWorldIndices(void) {
+    return s_world.indices;
+}
+
+const Q3MetalWorldDrawCmd *Q3MetalRenderer_GetWorldDrawCommands(void) {
+    return s_world.draws;
+}
+
+const Q3MetalSceneView *Q3MetalRenderer_GetSceneView(void) {
+    return &s_sceneView;
 }
 
 int Q3MetalRenderer_GetTextureInfo(uint32_t textureHandle, Q3MetalTextureInfo *outInfo) {
