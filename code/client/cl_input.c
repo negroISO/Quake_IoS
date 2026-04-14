@@ -426,21 +426,30 @@ static void CL_JoystickMove( usercmd_t *cmd ) {
 	yaw = cl.joystickAxis[AXIS_YAW];
 	pitch = cl.joystickAxis[AXIS_PITCH];
 
+#ifndef IOS_BUILD
+	/* Legacy single-stick fallback — dual-stick controllers should not mix
+	 * strafe with yaw or forward with pitch. */
 	if ( yaw == 0 ) {
 		yaw = side;
 	}
 	if ( pitch == 0 ) {
 		pitch = forward;
 	}
+#endif
 
 	if ( !in_strafe.active ) {
 		cl.viewangles[YAW] += anglespeed * cl_yawspeed->value * yaw;
 	}
 	cmd->rightmove = ClampCharMove( cmd->rightmove + side );
 
+#ifdef IOS_BUILD
+	/* Dual-stick: right stick always drives pitch (free look always on). */
+	cl.viewangles[PITCH] += anglespeed * cl_pitchspeed->value * pitch;
+#else
 	if ( in_mlooking ) {
 		cl.viewangles[PITCH] += anglespeed * cl_pitchspeed->value * pitch;
 	}
+#endif
 	cmd->forwardmove = ClampCharMove( cmd->forwardmove + forward );
 
 	cmd->upmove = ClampCharMove( cmd->upmove + cl.joystickAxis[AXIS_UP] );

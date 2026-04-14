@@ -366,8 +366,9 @@ void IN_Init(void) {
         "seta j_forward_axis 1\n"
         "seta j_side_axis 0\n"
         "seta j_up_axis 2\n"
-        "seta cl_pitchspeed 0\n"
-        "seta cl_yawspeed 0\n"
+        "set cl_pitchspeed 20\n"
+        "set cl_yawspeed 20\n"
+        "set sensitivity 1.0\n"
         "bind PAD0_RIGHTTRIGGER \"+attack\"\n"
         "bind PAD0_A \"+moveup\"\n"
         "bind PAD0_B \"+movedown\"\n"
@@ -385,11 +386,20 @@ void IN_Frame(void) {
     Sys_QueEvent(eventTime, SE_JOYSTICK_AXIS, AXIS_SIDE, leftSide, 0, NULL);
     Sys_QueEvent(eventTime, SE_JOYSTICK_AXIS, AXIS_FORWARD, leftForward, 0, NULL);
     Sys_QueEvent(eventTime, SE_JOYSTICK_AXIS, AXIS_UP, 0, 0, NULL);
-    /* Right stick: X = yaw (look left/right), Y = pitch (look up/down) */
-    Sys_QueEvent(eventTime, SE_JOYSTICK_AXIS, AXIS_YAW,
-                 GamepadAxisToQuake(ApplyDeadzone(s_gamepadState.rightX, 0.12f)), 0, NULL);
-    Sys_QueEvent(eventTime, SE_JOYSTICK_AXIS, AXIS_PITCH,
-                 GamepadAxisToQuake(ApplyDeadzone(s_gamepadState.rightY, 0.12f)), 0, NULL);
+    /* Right stick: X = yaw (look left/right), Y = pitch (look up/down)
+     * Scale down hard because engine applies cl_yawspeed/pitchspeed on top. */
+    {
+        /* Right stick inverted: push left = look right, push up = look down */
+        float rx = -ApplyDeadzone(s_gamepadState.rightX, 0.12f) * 0.07f;
+        float ry = -ApplyDeadzone(s_gamepadState.rightY, 0.12f) * 0.035f;
+        Sys_QueEvent(eventTime, SE_JOYSTICK_AXIS, AXIS_YAW,
+                     GamepadAxisToQuake(rx), 0, NULL);
+        Sys_QueEvent(eventTime, SE_JOYSTICK_AXIS, AXIS_PITCH,
+                     GamepadAxisToQuake(ry), 0, NULL);
+    }
+    /* Clamp pitch so we don't spin 360 vertically */
+    if (cl.viewangles[0] > 89.0f) cl.viewangles[0] = 89.0f;
+    if (cl.viewangles[0] < -89.0f) cl.viewangles[0] = -89.0f;
 
     QueueGamepadButtonEvent(K_PAD0_RIGHTTRIGGER, s_prevGamepadState.firePressed, s_gamepadState.firePressed, eventTime);
     QueueGamepadButtonEvent(K_PAD0_A, s_prevGamepadState.jumpPressed, s_gamepadState.jumpPressed, eventTime);
