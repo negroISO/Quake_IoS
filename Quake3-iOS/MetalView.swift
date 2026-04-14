@@ -50,8 +50,13 @@ struct MetalView: UIViewRepresentable {
             var texCoordScale: SIMD2<Float>
             var texCoordScroll: SIMD2<Float>
             var timeSeconds: Float
-            var _padding: Float
+            var debugMode: Float
         }
+
+        // Render debug: 0 = normal, 1 = base only, 2 = lightmap only,
+        // 3 = uv1 visualization, 4 = vertex color only. Flip to diagnose
+        // lightmap / uv1 issues without touching the build pipeline.
+        private static let worldDebugMode: Float = 0
 
         struct GPUEntityVertex {
             var position: SIMD3<Float>
@@ -124,7 +129,7 @@ struct MetalView: UIViewRepresentable {
             float2 texCoordScale;
             float2 texCoordScroll;
             float timeSeconds;
-            float padding;
+            float debugMode;
         };
 
         struct EntityVertexIn {
@@ -164,6 +169,19 @@ struct MetalView: UIViewRepresentable {
                 + drawUniforms.texCoordScroll * drawUniforms.timeSeconds;
             float4 texel = colorTexture.sample(textureSampler, texCoord);
             float4 lightmap = lightmapTexture.sample(textureSampler, in.lightmapTexCoord);
+            int mode = int(drawUniforms.debugMode + 0.5);
+            if (mode == 1) {
+                return float4(texel.rgb, 1.0);
+            }
+            if (mode == 2) {
+                return float4(lightmap.rgb, 1.0);
+            }
+            if (mode == 3) {
+                return float4(fract(in.lightmapTexCoord.x), fract(in.lightmapTexCoord.y), 0.0, 1.0);
+            }
+            if (mode == 4) {
+                return float4(in.color.rgb, 1.0);
+            }
             float4 result = texel * lightmap * in.color;
             if (result.a < 0.01) {
                 discard_fragment();
@@ -300,7 +318,7 @@ struct MetalView: UIViewRepresentable {
                             texCoordScale: SIMD2<Float>(draw.texCoordScale.0, draw.texCoordScale.1),
                             texCoordScroll: SIMD2<Float>(draw.texCoordScroll.0, draw.texCoordScroll.1),
                             timeSeconds: timeSeconds,
-                            _padding: 0
+                            debugMode: Coordinator.worldDebugMode
                         )
                         encoder.setFragmentTexture(baseTexture, index: 0)
                         encoder.setFragmentTexture(lightmapTexture, index: 1)
