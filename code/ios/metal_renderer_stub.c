@@ -391,3 +391,9 @@ refexport_t *GetRefAPI(int apiVersion, refimport_t *rimp) {
     ri.Printf(PRINT_ALL, "=== Metal Stub Renderer Initialized ===\n");
     return &re;
 }
+
+/* STANDALONE stub — CD key not used on iOS */
+#ifdef STANDALONE
+#include "../qcommon/q_shared.h"
+qboolean UI_usesUniqueCDKey(void) { return qfalse; }
+#endif
