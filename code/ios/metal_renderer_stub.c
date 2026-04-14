@@ -8,9 +8,13 @@
 #include "../renderer/tr_common.h"
 #include "metal_renderer_shared.h"
 
+#define LL(x) x=LittleLong(x)
+
 #define Q3_METAL_MAX_VERTICES 65536
 #define Q3_METAL_MAX_DRAWS 8192
 #define Q3_METAL_MAX_TEXTURES 1024
+#define Q3_METAL_MAX_MODELS 1024
+#define Q3_METAL_MAX_REFENTITIES 1024
 
 typedef struct {
     qboolean inUse;
@@ -45,6 +49,18 @@ static qhandle_t *s_worldLightmapHandles;
 static int s_worldLightmapCount;
 
 typedef struct {
+    qboolean inUse;
+    qhandle_t handle;
+    char name[MAX_QPATH];
+    md3Header_t *md3;
+} metalModel_t;
+
+typedef struct {
+    refEntity_t entity;
+    qboolean mirrored;
+} metalSceneEntity_t;
+
+typedef struct {
     qboolean loaded;
     uint32_t generation;
     uint32_t vertexCount;
@@ -57,6 +73,19 @@ typedef struct {
 } metalWorld_t;
 
 static metalWorld_t s_world;
+static metalModel_t s_models[Q3_METAL_MAX_MODELS];
+static qhandle_t s_nextModelHandle = 1;
+static metalSceneEntity_t s_sceneEntities[Q3_METAL_MAX_REFENTITIES];
+static uint32_t s_sceneEntityCount;
+static Q3MetalEntityVertex *s_entityVertices;
+static uint32_t *s_entityIndices;
+static Q3MetalEntityDrawCmd *s_entityDraws;
+static uint32_t s_entityVertexCount;
+static uint32_t s_entityIndexCount;
+static uint32_t s_entityDrawCount;
+static uint32_t s_entityVertexCapacity;
+static uint32_t s_entityIndexCapacity;
+static uint32_t s_entityDrawCapacity;
 
 static void CopyColor(float *dst, const float *src) {
     dst[0] = src[0];
@@ -94,6 +123,39 @@ static metalTexture_t *AllocTextureSlot(void) {
             s_textures[i].handle = s_nextTextureHandle++;
             s_textures[i].generation = 1;
             return &s_textures[i];
+        }
+    }
+    return NULL;
+}
+
+static metalModel_t *FindModelByHandle(qhandle_t handle) {
+    int i;
+    for (i = 0; i < Q3_METAL_MAX_MODELS; ++i) {
+        if (s_models[i].inUse && s_models[i].handle == handle) {
+            return &s_models[i];
+        }
+    }
+    return NULL;
+}
+
+static metalModel_t *FindModelByName(const char *name) {
+    int i;
+    for (i = 0; i < Q3_METAL_MAX_MODELS; ++i) {
+        if (s_models[i].inUse && !Q_stricmp(s_models[i].name, name)) {
+            return &s_models[i];
+        }
+    }
+    return NULL;
+}
+
+static metalModel_t *AllocModelSlot(void) {
+    int i;
+    for (i = 0; i < Q3_METAL_MAX_MODELS; ++i) {
+        if (!s_models[i].inUse) {
+            Com_Memset(&s_models[i], 0, sizeof(s_models[i]));
+            s_models[i].inUse = qtrue;
+            s_models[i].handle = 0x10000000 + s_nextModelHandle++;
+            return &s_models[i];
         }
     }
     return NULL;
@@ -351,6 +413,80 @@ static void FreeWorldMapData(void) {
     Com_Memset(&s_world, 0, sizeof(s_world));
 }
 
+static void FreeEntitySceneData(void) {
+    if (s_entityVertices != NULL) {
+        ri.Free(s_entityVertices);
+        s_entityVertices = NULL;
+    }
+    if (s_entityIndices != NULL) {
+        ri.Free(s_entityIndices);
+        s_entityIndices = NULL;
+    }
+    if (s_entityDraws != NULL) {
+        ri.Free(s_entityDraws);
+        s_entityDraws = NULL;
+    }
+
+    s_entityVertexCount = 0;
+    s_entityIndexCount = 0;
+    s_entityDrawCount = 0;
+    s_entityVertexCapacity = 0;
+    s_entityIndexCapacity = 0;
+    s_entityDrawCapacity = 0;
+}
+
+static void FreeModelData(void) {
+    int i;
+    for (i = 0; i < Q3_METAL_MAX_MODELS; ++i) {
+        if (s_models[i].inUse && s_models[i].md3 != NULL) {
+            ri.Free(s_models[i].md3);
+            s_models[i].md3 = NULL;
+        }
+    }
+    Com_Memset(s_models, 0, sizeof(s_models));
+    s_nextModelHandle = 1;
+}
+
+static qboolean EnsureEntitySceneCapacity(uint32_t vertexCount, uint32_t indexCount, uint32_t drawCount) {
+    if (vertexCount > s_entityVertexCapacity) {
+        Q3MetalEntityVertex *newVertices = ri.Malloc(vertexCount * sizeof(*newVertices));
+        if (newVertices == NULL) {
+            return qfalse;
+        }
+        if (s_entityVertices != NULL) {
+            ri.Free(s_entityVertices);
+        }
+        s_entityVertices = newVertices;
+        s_entityVertexCapacity = vertexCount;
+    }
+
+    if (indexCount > s_entityIndexCapacity) {
+        uint32_t *newIndices = ri.Malloc(indexCount * sizeof(*newIndices));
+        if (newIndices == NULL) {
+            return qfalse;
+        }
+        if (s_entityIndices != NULL) {
+            ri.Free(s_entityIndices);
+        }
+        s_entityIndices = newIndices;
+        s_entityIndexCapacity = indexCount;
+    }
+
+    if (drawCount > s_entityDrawCapacity) {
+        Q3MetalEntityDrawCmd *newDraws = ri.Malloc(drawCount * sizeof(*newDraws));
+        if (newDraws == NULL) {
+            return qfalse;
+        }
+        if (s_entityDraws != NULL) {
+            ri.Free(s_entityDraws);
+        }
+        s_entityDraws = newDraws;
+        s_entityDrawCapacity = drawCount;
+    }
+
+    return qtrue;
+}
+
 static float ByteToVisibleColor(byte value) {
     float normalized = (float)value / 255.0f;
     return 0.25f + normalized * 0.75f;
@@ -538,6 +674,198 @@ static qboolean BuildFallbackSceneView(vec3_t vieworg, vec3_t axis0, vec3_t axis
     aspect = s_glConfig.vidHeight > 0 ? (float)s_glConfig.vidWidth / (float)s_glConfig.vidHeight : (2796.0f / 1290.0f);
     *fovY = atanf(tanf((*fovX) * (float)M_PI / 360.0f) / aspect) * 360.0f / (float)M_PI;
     return qtrue;
+}
+
+static qboolean LoadMD3ModelData(const char *modName, void *buffer, int fileSize, md3Header_t **outModel) {
+    int i;
+    int j;
+    md3Header_t *pinmodel;
+    md3Header_t *hdr;
+    md3Frame_t *frame;
+    md3Tag_t *tag;
+    md3Surface_t *surf;
+    uint32_t version;
+    uint32_t size;
+    uint32_t bytesToEnd;
+
+    *outModel = NULL;
+    pinmodel = (md3Header_t *)buffer;
+    version = LittleLong(pinmodel->version);
+    if (version != MD3_VERSION) {
+        ri.Printf(PRINT_WARNING, "Metal model: %s has wrong version (%u should be %u)\n", modName, version, MD3_VERSION);
+        return qfalse;
+    }
+
+    size = LittleLong(pinmodel->ofsEnd);
+    if (size == 0 || size > (uint32_t)fileSize) {
+        ri.Printf(PRINT_WARNING, "Metal model: %s has corrupted header\n", modName);
+        return qfalse;
+    }
+
+    hdr = ri.Malloc(size);
+    if (hdr == NULL) {
+        return qfalse;
+    }
+    Com_Memcpy(hdr, buffer, size);
+
+    LL(hdr->ident);
+    LL(hdr->version);
+    LL(hdr->flags);
+    LL(hdr->numFrames);
+    LL(hdr->numTags);
+    LL(hdr->numSurfaces);
+    LL(hdr->numSkins);
+    LL(hdr->ofsFrames);
+    LL(hdr->ofsTags);
+    LL(hdr->ofsSurfaces);
+    LL(hdr->ofsEnd);
+
+    if (hdr->numFrames < 1 || hdr->numSurfaces < 1 ||
+        hdr->ofsFrames > size || hdr->ofsTags > size || hdr->ofsSurfaces > size) {
+        ri.Free(hdr);
+        return qfalse;
+    }
+
+    frame = (md3Frame_t *)((byte *)hdr + hdr->ofsFrames);
+    for (i = 0; i < hdr->numFrames; ++i, ++frame) {
+        frame->radius = LittleFloat(frame->radius);
+        for (j = 0; j < 3; ++j) {
+            frame->bounds[0][j] = LittleFloat(frame->bounds[0][j]);
+            frame->bounds[1][j] = LittleFloat(frame->bounds[1][j]);
+            frame->localOrigin[j] = LittleFloat(frame->localOrigin[j]);
+        }
+    }
+
+    tag = (md3Tag_t *)((byte *)hdr + hdr->ofsTags);
+    for (i = 0; i < hdr->numTags * hdr->numFrames; ++i, ++tag) {
+        tag->name[sizeof(tag->name) - 1] = '\0';
+        for (j = 0; j < 3; ++j) {
+            tag->origin[j] = LittleFloat(tag->origin[j]);
+            tag->axis[0][j] = LittleFloat(tag->axis[0][j]);
+            tag->axis[1][j] = LittleFloat(tag->axis[1][j]);
+            tag->axis[2][j] = LittleFloat(tag->axis[2][j]);
+        }
+    }
+
+    surf = (md3Surface_t *)((byte *)hdr + hdr->ofsSurfaces);
+    for (i = 0; i < hdr->numSurfaces; ++i) {
+        md3Shader_t *shader;
+        md3Triangle_t *tri;
+        md3St_t *st;
+        md3XyzNormal_t *xyz;
+
+        bytesToEnd = size - (uint32_t)((byte *)surf - (byte *)hdr);
+        if (bytesToEnd < sizeof(*surf)) {
+            ri.Free(hdr);
+            return qfalse;
+        }
+
+        LL(surf->ident);
+        LL(surf->flags);
+        LL(surf->numFrames);
+        LL(surf->numShaders);
+        LL(surf->numVerts);
+        LL(surf->numTriangles);
+        LL(surf->ofsTriangles);
+        LL(surf->ofsShaders);
+        LL(surf->ofsSt);
+        LL(surf->ofsXyzNormals);
+        LL(surf->ofsEnd);
+
+        if (surf->ofsTriangles > bytesToEnd || surf->ofsShaders > bytesToEnd ||
+            surf->ofsSt > bytesToEnd || surf->ofsXyzNormals > bytesToEnd || surf->ofsEnd > bytesToEnd) {
+            ri.Free(hdr);
+            return qfalse;
+        }
+
+        surf->name[sizeof(surf->name) - 1] = '\0';
+        Q_strlwr(surf->name);
+
+        shader = (md3Shader_t *)((byte *)surf + surf->ofsShaders);
+        for (j = 0; j < surf->numShaders; ++j, ++shader) {
+            shader->name[sizeof(shader->name) - 1] = '\0';
+        }
+
+        tri = (md3Triangle_t *)((byte *)surf + surf->ofsTriangles);
+        for (j = 0; j < surf->numTriangles; ++j, ++tri) {
+            LL(tri->indexes[0]);
+            LL(tri->indexes[1]);
+            LL(tri->indexes[2]);
+        }
+
+        st = (md3St_t *)((byte *)surf + surf->ofsSt);
+        for (j = 0; j < surf->numVerts; ++j, ++st) {
+            st->st[0] = LittleFloat(st->st[0]);
+            st->st[1] = LittleFloat(st->st[1]);
+        }
+
+        xyz = (md3XyzNormal_t *)((byte *)surf + surf->ofsXyzNormals);
+        for (j = 0; j < surf->numVerts * surf->numFrames; ++j, ++xyz) {
+            xyz->xyz[0] = LittleShort(xyz->xyz[0]);
+            xyz->xyz[1] = LittleShort(xyz->xyz[1]);
+            xyz->xyz[2] = LittleShort(xyz->xyz[2]);
+            xyz->normal = LittleShort(xyz->normal);
+        }
+
+        surf = (md3Surface_t *)((byte *)surf + surf->ofsEnd);
+    }
+
+    *outModel = hdr;
+    return qtrue;
+}
+
+static qboolean TryRegisterModelPath(const char *name, metalModel_t *modelSlot) {
+    void *fileBuffer;
+    int fileSize;
+    md3Header_t *md3;
+
+    fileSize = ri.FS_ReadFile(name, &fileBuffer);
+    if (fileSize <= 0 || fileBuffer == NULL) {
+        return qfalse;
+    }
+
+    if (!LoadMD3ModelData(name, fileBuffer, fileSize, &md3)) {
+        ri.FS_FreeFile(fileBuffer);
+        return qfalse;
+    }
+
+    ri.FS_FreeFile(fileBuffer);
+    Q_strncpyz(modelSlot->name, name, sizeof(modelSlot->name));
+    modelSlot->md3 = md3;
+    return qtrue;
+}
+
+static qhandle_t ResolveAndRegisterModel(const char *name) {
+    metalModel_t *existing;
+    metalModel_t *modelSlot;
+    char candidate[MAX_QPATH];
+
+    existing = FindModelByName(name);
+    if (existing != NULL) {
+        return existing->handle;
+    }
+
+    modelSlot = AllocModelSlot();
+    if (modelSlot == NULL) {
+        ri.Printf(PRINT_WARNING, "Metal model: model registry full, dropping '%s'\n", name);
+        return 0;
+    }
+
+    if (TryRegisterModelPath(name, modelSlot)) {
+        return modelSlot->handle;
+    }
+
+    if (COM_GetExtension(name)[0] == '\0') {
+        Com_sprintf(candidate, sizeof(candidate), "%s.md3", name);
+        if (TryRegisterModelPath(candidate, modelSlot)) {
+            Q_strncpyz(modelSlot->name, name, sizeof(modelSlot->name));
+            return modelSlot->handle;
+        }
+    }
+
+    Com_Memset(modelSlot, 0, sizeof(*modelSlot));
+    ri.Printf(PRINT_WARNING, "Metal model: failed to load '%s'\n", name);
+    return 0;
 }
 
 static qboolean LoadWorldMapData(const char *name) {
@@ -878,6 +1206,8 @@ static qboolean LoadWorldMapData(const char *name) {
 }
 
 static void RE_Shutdown(refShutdownCode_t code) {
+    FreeEntitySceneData();
+    FreeModelData();
     FreeWorldMapData();
     ri.Printf(PRINT_ALL, "RE_Shutdown: Metal stub\n");
 }
@@ -908,18 +1238,13 @@ static void RE_BeginRegistration(glconfig_t *config) {
     *config = s_glConfig;
 }
 
-static qhandle_t s_nextStubModelHandle = 1;
 static qhandle_t s_nextStubSkinHandle = 1;
 
 static qhandle_t RE_RegisterModel(const char *name) {
     if (name == NULL || name[0] == '\0') {
         return 0;
     }
-
-    // Phase 4 only draws BSP world geometry. Return stable non-zero handles so
-    // cgame can finish client/world setup even though MD3 model rendering is not
-    // implemented in the Metal path yet.
-    return 0x10000000 + s_nextStubModelHandle++;
+    return ResolveAndRegisterModel(name);
 }
 
 static qhandle_t RE_RegisterSkin(const char *name) {
@@ -944,8 +1269,28 @@ static void RE_LoadWorldMap(const char *name) {
 static void RE_SetWorldVisData(const byte *vis) {}
 static void RE_EndRegistration(void) {}
 
-static void RE_ClearScene(void) {}
-static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime) {}
+static void RE_ClearScene(void) {
+    s_sceneEntityCount = 0;
+    s_entityVertexCount = 0;
+    s_entityIndexCount = 0;
+    s_entityDrawCount = 0;
+}
+
+static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime) {
+    vec3_t cross;
+
+    if (re == NULL || s_sceneEntityCount >= Q3_METAL_MAX_REFENTITIES) {
+        return;
+    }
+    if (re->reType != RT_MODEL || re->hModel == 0 || FindModelByHandle(re->hModel) == NULL) {
+        return;
+    }
+
+    s_sceneEntities[s_sceneEntityCount].entity = *re;
+    CrossProduct(re->axis[0], re->axis[1], cross);
+    s_sceneEntities[s_sceneEntityCount].mirrored = (DotProduct(re->axis[2], cross) < 0.0f);
+    s_sceneEntityCount += 1;
+}
 static void RE_AddPolyToScene(qhandle_t hShader, int numVerts, const polyVert_t *verts, int num) {}
 static int R_LightForPoint(vec3_t point, vec3_t ambientLight, vec3_t directedLight, vec3_t lightDir) { return 0; }
 static void RE_AddLightToScene(const vec3_t org, float intensity, float r, float g, float b) {}
@@ -1022,6 +1367,187 @@ static void RE_RenderScene(const refdef_t *fd) {
         s_frameSnapshot.worldCommandCount = s_world.drawCount;
         s_frameSnapshot.worldGeneration = s_world.generation;
     }
+
+    s_entityVertexCount = 0;
+    s_entityIndexCount = 0;
+    s_entityDrawCount = 0;
+
+    if (s_sceneEntityCount > 0) {
+        uint32_t totalEntityVerts = 0;
+        uint32_t totalEntityIndices = 0;
+        uint32_t totalEntityDraws = 0;
+        uint32_t entityIndex;
+
+        for (entityIndex = 0; entityIndex < s_sceneEntityCount; ++entityIndex) {
+            const metalSceneEntity_t *sceneEntity = &s_sceneEntities[entityIndex];
+            const metalModel_t *model = FindModelByHandle(sceneEntity->entity.hModel);
+            const md3Header_t *header;
+            const md3Surface_t *surface;
+            int surfaceIndex;
+
+            if (model == NULL || model->md3 == NULL) {
+                continue;
+            }
+
+            header = model->md3;
+            surface = (const md3Surface_t *)((const byte *)header + header->ofsSurfaces);
+            for (surfaceIndex = 0; surfaceIndex < header->numSurfaces; ++surfaceIndex) {
+                totalEntityVerts += (uint32_t)surface->numVerts;
+                totalEntityIndices += (uint32_t)(surface->numTriangles * 3);
+                totalEntityDraws += 1;
+                surface = (const md3Surface_t *)((const byte *)surface + surface->ofsEnd);
+            }
+        }
+
+        if (totalEntityVerts > 0 && totalEntityIndices > 0 && totalEntityDraws > 0 &&
+            EnsureEntitySceneCapacity(totalEntityVerts, totalEntityIndices, totalEntityDraws)) {
+            uint32_t entityVertexCursor = 0;
+            uint32_t entityIndexCursor = 0;
+            uint32_t entityDrawCursor = 0;
+
+            for (entityIndex = 0; entityIndex < s_sceneEntityCount; ++entityIndex) {
+                const metalSceneEntity_t *sceneEntity = &s_sceneEntities[entityIndex];
+                const metalModel_t *model = FindModelByHandle(sceneEntity->entity.hModel);
+                const md3Header_t *header;
+                const md3Surface_t *surface;
+                int frameIndex;
+                int oldFrameIndex;
+                float backlerp;
+                float frontlerp;
+                vec4_t entityColor;
+                int surfaceIndex;
+
+                if (model == NULL || model->md3 == NULL) {
+                    continue;
+                }
+
+                header = model->md3;
+                frameIndex = sceneEntity->entity.frame;
+                oldFrameIndex = sceneEntity->entity.oldframe;
+                if (header->numFrames <= 0) {
+                    continue;
+                }
+                if (frameIndex < 0 || frameIndex >= header->numFrames) {
+                    frameIndex = 0;
+                }
+                if (oldFrameIndex < 0 || oldFrameIndex >= header->numFrames) {
+                    oldFrameIndex = frameIndex;
+                }
+
+                backlerp = sceneEntity->entity.backlerp;
+                if (backlerp < 0.0f) {
+                    backlerp = 0.0f;
+                } else if (backlerp > 1.0f) {
+                    backlerp = 1.0f;
+                }
+                frontlerp = 1.0f - backlerp;
+
+                if (sceneEntity->entity.shader.rgba[3] == 0) {
+                    entityColor[0] = 1.0f;
+                    entityColor[1] = 1.0f;
+                    entityColor[2] = 1.0f;
+                    entityColor[3] = 1.0f;
+                } else {
+                    entityColor[0] = (float)sceneEntity->entity.shader.rgba[0] / 255.0f;
+                    entityColor[1] = (float)sceneEntity->entity.shader.rgba[1] / 255.0f;
+                    entityColor[2] = (float)sceneEntity->entity.shader.rgba[2] / 255.0f;
+                    entityColor[3] = (float)sceneEntity->entity.shader.rgba[3] / 255.0f;
+                }
+
+                surface = (const md3Surface_t *)((const byte *)header + header->ofsSurfaces);
+                for (surfaceIndex = 0; surfaceIndex < header->numSurfaces; ++surfaceIndex) {
+                    const md3Triangle_t *triangles = (const md3Triangle_t *)((const byte *)surface + surface->ofsTriangles);
+                    const md3St_t *st = (const md3St_t *)((const byte *)surface + surface->ofsSt);
+                    const md3XyzNormal_t *currentFrameVerts = (const md3XyzNormal_t *)((const byte *)surface + surface->ofsXyzNormals) + frameIndex * surface->numVerts;
+                    const md3XyzNormal_t *oldFrameVerts = (const md3XyzNormal_t *)((const byte *)surface + surface->ofsXyzNormals) + oldFrameIndex * surface->numVerts;
+                    qhandle_t textureHandle = EnsureWhiteTexture();
+                    uint32_t drawFlags = Q3_METAL_ENTITY_DRAWFLAG_NOCULL;
+                    uint32_t baseVertex = entityVertexCursor;
+                    uint32_t firstIndex = entityIndexCursor;
+                    int vertexIndex;
+                    int triangleIndex;
+
+                    if (sceneEntity->entity.customShader != 0) {
+                        textureHandle = sceneEntity->entity.customShader;
+                    } else if (surface->numShaders > 0) {
+                        const md3Shader_t *shader = (const md3Shader_t *)((const byte *)surface + surface->ofsShaders);
+                        int shaderSlot = sceneEntity->entity.skinNum % surface->numShaders;
+                        if (shaderSlot < 0) {
+                            shaderSlot = 0;
+                        }
+                        textureHandle = RegisterTexture(shader[shaderSlot].name);
+                    }
+
+                    if (sceneEntity->entity.renderfx & RF_DEPTHHACK) {
+                        drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_DEPTHHACK;
+                    }
+
+                    for (vertexIndex = 0; vertexIndex < surface->numVerts; ++vertexIndex) {
+                        vec3_t localPosition;
+                        vec3_t worldPosition;
+                        const md3XyzNormal_t *currentVertex = &currentFrameVerts[vertexIndex];
+                        const md3XyzNormal_t *oldVertex = &oldFrameVerts[vertexIndex];
+                        Q3MetalEntityVertex *outVertex = &s_entityVertices[entityVertexCursor++];
+
+                        localPosition[0] = (frontlerp * currentVertex->xyz[0] + backlerp * oldVertex->xyz[0]) * MD3_XYZ_SCALE;
+                        localPosition[1] = (frontlerp * currentVertex->xyz[1] + backlerp * oldVertex->xyz[1]) * MD3_XYZ_SCALE;
+                        localPosition[2] = (frontlerp * currentVertex->xyz[2] + backlerp * oldVertex->xyz[2]) * MD3_XYZ_SCALE;
+
+                        worldPosition[0] = sceneEntity->entity.origin[0]
+                            + sceneEntity->entity.axis[0][0] * localPosition[0]
+                            + sceneEntity->entity.axis[1][0] * localPosition[1]
+                            + sceneEntity->entity.axis[2][0] * localPosition[2];
+                        worldPosition[1] = sceneEntity->entity.origin[1]
+                            + sceneEntity->entity.axis[0][1] * localPosition[0]
+                            + sceneEntity->entity.axis[1][1] * localPosition[1]
+                            + sceneEntity->entity.axis[2][1] * localPosition[2];
+                        worldPosition[2] = sceneEntity->entity.origin[2]
+                            + sceneEntity->entity.axis[0][2] * localPosition[0]
+                            + sceneEntity->entity.axis[1][2] * localPosition[1]
+                            + sceneEntity->entity.axis[2][2] * localPosition[2];
+
+                        outVertex->position[0] = worldPosition[0];
+                        outVertex->position[1] = worldPosition[1];
+                        outVertex->position[2] = worldPosition[2];
+                        outVertex->texCoord[0] = st[vertexIndex].st[0];
+                        outVertex->texCoord[1] = st[vertexIndex].st[1];
+                        outVertex->color[0] = entityColor[0];
+                        outVertex->color[1] = entityColor[1];
+                        outVertex->color[2] = entityColor[2];
+                        outVertex->color[3] = entityColor[3];
+                    }
+
+                    for (triangleIndex = 0; triangleIndex < surface->numTriangles; ++triangleIndex) {
+                        if (sceneEntity->mirrored) {
+                            s_entityIndices[entityIndexCursor++] = baseVertex + triangles[triangleIndex].indexes[0];
+                            s_entityIndices[entityIndexCursor++] = baseVertex + triangles[triangleIndex].indexes[2];
+                            s_entityIndices[entityIndexCursor++] = baseVertex + triangles[triangleIndex].indexes[1];
+                        } else {
+                            s_entityIndices[entityIndexCursor++] = baseVertex + triangles[triangleIndex].indexes[0];
+                            s_entityIndices[entityIndexCursor++] = baseVertex + triangles[triangleIndex].indexes[1];
+                            s_entityIndices[entityIndexCursor++] = baseVertex + triangles[triangleIndex].indexes[2];
+                        }
+                    }
+
+                    s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
+                    s_entityDraws[entityDrawCursor].indexCount = entityIndexCursor - firstIndex;
+                    s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)textureHandle;
+                    s_entityDraws[entityDrawCursor].flags = drawFlags;
+                    entityDrawCursor += 1;
+
+                    surface = (const md3Surface_t *)((const byte *)surface + surface->ofsEnd);
+                }
+            }
+
+            s_entityVertexCount = entityVertexCursor;
+            s_entityIndexCount = entityIndexCursor;
+            s_entityDrawCount = entityDrawCursor;
+        }
+    }
+
+    s_frameSnapshot.entityVertexCount = s_entityVertexCount;
+    s_frameSnapshot.entityIndexCount = s_entityIndexCount;
+    s_frameSnapshot.entityCommandCount = s_entityDrawCount;
 }
 
 static void RE_SetColor(const float *rgba) {
@@ -1069,6 +1595,9 @@ static void RE_BeginFrame(stereoFrame_t stereoFrame) {
     s_frameSnapshot.worldIndexCount = 0;
     s_frameSnapshot.worldCommandCount = 0;
     s_frameSnapshot.worldGeneration = s_world.generation;
+    s_frameSnapshot.entityVertexCount = 0;
+    s_frameSnapshot.entityIndexCount = 0;
+    s_frameSnapshot.entityCommandCount = 0;
 }
 
 static void RE_EndFrame(int *frontEndMsec, int *backEndMsec) {
@@ -1131,6 +1660,18 @@ const uint32_t *Q3MetalRenderer_GetWorldIndices(void) {
 
 const Q3MetalWorldDrawCmd *Q3MetalRenderer_GetWorldDrawCommands(void) {
     return s_world.draws;
+}
+
+const Q3MetalEntityVertex *Q3MetalRenderer_GetEntityVertices(void) {
+    return s_entityVertices;
+}
+
+const uint32_t *Q3MetalRenderer_GetEntityIndices(void) {
+    return s_entityIndices;
+}
+
+const Q3MetalEntityDrawCmd *Q3MetalRenderer_GetEntityDrawCommands(void) {
+    return s_entityDraws;
 }
 
 const Q3MetalSceneView *Q3MetalRenderer_GetSceneView(void) {

@@ -53,6 +53,16 @@ struct MetalView: UIViewRepresentable {
             var _padding: Float
         }
 
+        struct GPUEntityVertex {
+            var position: SIMD3<Float>
+            var texCoord: SIMD2<Float>
+            var color: SIMD4<Float>
+        }
+
+        struct EntityUniforms {
+            var viewProjection: simd_float4x4
+        }
+
         private let shaderSource = """
         #include <metal_stdlib>
         using namespace metal;
@@ -117,6 +127,22 @@ struct MetalView: UIViewRepresentable {
             float padding;
         };
 
+        struct EntityVertexIn {
+            float3 position;
+            float2 texCoord;
+            float4 color;
+        };
+
+        struct EntityUniforms {
+            float4x4 viewProjection;
+        };
+
+        struct EntityVertexOut {
+            float4 position [[position]];
+            float2 texCoord;
+            float4 color;
+        };
+
         vertex WorldVertexOut q3_world_vertex(const device WorldVertexIn *vertices [[buffer(0)]],
                                               constant WorldUniforms &uniforms [[buffer(1)]],
                                               uint vertexID [[vertex_id]]) {
@@ -140,12 +166,31 @@ struct MetalView: UIViewRepresentable {
             float4 lightmap = lightmapTexture.sample(textureSampler, in.lightmapTexCoord);
             return texel * lightmap * in.color;
         }
+
+        vertex EntityVertexOut q3_entity_vertex(const device EntityVertexIn *vertices [[buffer(0)]],
+                                                constant EntityUniforms &uniforms [[buffer(1)]],
+                                                uint vertexID [[vertex_id]]) {
+            EntityVertexOut out;
+            EntityVertexIn inVertex = vertices[vertexID];
+            out.position = uniforms.viewProjection * float4(inVertex.position, 1.0);
+            out.texCoord = inVertex.texCoord;
+            out.color = inVertex.color;
+            return out;
+        }
+
+        fragment float4 q3_entity_fragment(EntityVertexOut in [[stage_in]],
+                                           texture2d<float> colorTexture [[texture(0)]],
+                                           sampler textureSampler [[sampler(0)]]) {
+            float4 texel = colorTexture.sample(textureSampler, in.texCoord);
+            return texel * in.color;
+        }
         """
 
         private var commandQueue: MTLCommandQueue?
         private var uiPipelineState: MTLRenderPipelineState?
         private var worldPipelineState: MTLRenderPipelineState?
         private var worldAdditivePipelineState: MTLRenderPipelineState?
+        private var entityPipelineState: MTLRenderPipelineState?
         private var uiSamplerState: MTLSamplerState?
         private var worldSamplerState: MTLSamplerState?
         private var depthStencilState: MTLDepthStencilState?
@@ -156,6 +201,10 @@ struct MetalView: UIViewRepresentable {
         private var worldVertexBuffer: MTLBuffer?
         private var worldIndexBuffer: MTLBuffer?
         private var cachedWorldGeneration: UInt32 = 0
+        private var entityVertexBuffer: MTLBuffer?
+        private var entityVertexBufferCapacity = 0
+        private var entityIndexBuffer: MTLBuffer?
+        private var entityIndexBufferCapacity = 0
         private var debugFrameCounter: UInt32 = 0
         private var frameTimeOrigin = CACurrentMediaTime()
 
@@ -268,6 +317,39 @@ struct MetalView: UIViewRepresentable {
                 }
             }
 
+            if snapshot.entityCommandCount > 0,
+               let entityPipelineState,
+               let sceneView = Q3MetalRenderer_GetSceneView()?.pointee,
+               let entityVertexBuffer = uploadEntityBuffers(device: view.device),
+               let entityIndexBuffer {
+                let entityViewProjection = makeWorldViewProjection(sceneView)
+                var entityUniforms = EntityUniforms(viewProjection: entityViewProjection)
+                encoder.setRenderPipelineState(entityPipelineState)
+                encoder.setDepthStencilState(depthStencilState)
+                encoder.setFrontFacing(.clockwise)
+                encoder.setCullMode(.none)
+                encoder.setVertexBuffer(entityVertexBuffer, offset: 0, index: 0)
+                encoder.setVertexBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
+                encoder.setFragmentSamplerState(worldSamplerState, index: 0)
+
+                if let entityDrawsPointer = Q3MetalRenderer_GetEntityDrawCommands() {
+                    let entityDraws = UnsafeBufferPointer(start: entityDrawsPointer, count: Int(snapshot.entityCommandCount))
+                    for draw in entityDraws where draw.indexCount > 0 {
+                        guard let texture = texture(for: draw.textureHandle, device: view.device) else {
+                            continue
+                        }
+                        encoder.setFragmentTexture(texture, index: 0)
+                        encoder.drawIndexedPrimitives(
+                            type: .triangle,
+                            indexCount: Int(draw.indexCount),
+                            indexType: .uint32,
+                            indexBuffer: entityIndexBuffer,
+                            indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride
+                        )
+                    }
+                }
+            }
+
             let vertexCount = Int(snapshot.vertexCount)
             if vertexCount > 0, let verticesPointer = Q3MetalRenderer_GetVertices() {
                 let vertices = UnsafeBufferPointer(start: verticesPointer, count: vertexCount)
@@ -362,6 +444,18 @@ struct MetalView: UIViewRepresentable {
                 worldAdditivePipelineState = try device.makeRenderPipelineState(descriptor: worldAdditivePipelineDescriptor)
             } catch {
                 print("[Metal] Failed to create additive world pipeline: \\(error)")
+            }
+
+            let entityPipelineDescriptor = MTLRenderPipelineDescriptor()
+            entityPipelineDescriptor.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            entityPipelineDescriptor.depthAttachmentPixelFormat = view.depthStencilPixelFormat
+            entityPipelineDescriptor.vertexFunction = library.makeFunction(name: "q3_entity_vertex")
+            entityPipelineDescriptor.fragmentFunction = library.makeFunction(name: "q3_entity_fragment")
+
+            do {
+                entityPipelineState = try device.makeRenderPipelineState(descriptor: entityPipelineDescriptor)
+            } catch {
+                print("[Metal] Failed to create entity pipeline: \\(error)")
             }
 
             let uiSamplerDescriptor = MTLSamplerDescriptor()
@@ -464,6 +558,61 @@ struct MetalView: UIViewRepresentable {
             )
             cachedWorldGeneration = generation
             return worldVertexBuffer
+        }
+
+        private func uploadEntityBuffers(device: MTLDevice?) -> MTLBuffer? {
+            guard let device,
+                  let snapshot = Q3MetalRenderer_GetFrameSnapshot()?.pointee,
+                  let verticesPointer = Q3MetalRenderer_GetEntityVertices(),
+                  let indicesPointer = Q3MetalRenderer_GetEntityIndices()
+            else { return nil }
+
+            let vertexCount = Int(snapshot.entityVertexCount)
+            let indexCount = Int(snapshot.entityIndexCount)
+            guard vertexCount > 0, indexCount > 0 else { return nil }
+
+            let vertexLength = vertexCount * MemoryLayout<GPUEntityVertex>.stride
+            if entityVertexBuffer == nil || vertexLength > entityVertexBufferCapacity {
+                let nextCapacity = max(vertexLength, max(entityVertexBufferCapacity * 2, 4096))
+                entityVertexBuffer = device.makeBuffer(length: nextCapacity, options: .storageModeShared)
+                entityVertexBufferCapacity = nextCapacity
+            }
+
+            guard let entityVertexBuffer,
+                  let rawVertexPointer = entityVertexBuffer.contents().bindMemory(to: GPUEntityVertex.self, capacity: vertexCount) as UnsafeMutablePointer<GPUEntityVertex>?
+            else {
+                return nil
+            }
+
+            let sourceVertices = UnsafeBufferPointer(start: verticesPointer, count: vertexCount)
+            for i in 0..<vertexCount {
+                let vertex = sourceVertices[i]
+                rawVertexPointer[i] = GPUEntityVertex(
+                    position: SIMD3<Float>(vertex.position.0, vertex.position.1, vertex.position.2),
+                    texCoord: SIMD2<Float>(vertex.texCoord.0, vertex.texCoord.1),
+                    color: SIMD4<Float>(vertex.color.0, vertex.color.1, vertex.color.2, vertex.color.3)
+                )
+            }
+
+            let indexLength = indexCount * MemoryLayout<UInt32>.stride
+            if entityIndexBuffer == nil || indexLength > entityIndexBufferCapacity {
+                let nextCapacity = max(indexLength, max(entityIndexBufferCapacity * 2, 4096))
+                entityIndexBuffer = device.makeBuffer(length: nextCapacity, options: .storageModeShared)
+                entityIndexBufferCapacity = nextCapacity
+            }
+
+            guard let entityIndexBuffer,
+                  let rawIndexPointer = entityIndexBuffer.contents().bindMemory(to: UInt32.self, capacity: indexCount) as UnsafeMutablePointer<UInt32>?
+            else {
+                return nil
+            }
+
+            let sourceIndices = UnsafeBufferPointer(start: indicesPointer, count: indexCount)
+            for i in 0..<indexCount {
+                rawIndexPointer[i] = sourceIndices[i]
+            }
+
+            return entityVertexBuffer
         }
 
         private func texture(for handle: UInt32, device: MTLDevice?) -> MTLTexture? {
