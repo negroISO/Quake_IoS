@@ -124,7 +124,6 @@
 		B32395BC3213C057D993AFFE /* jcapimin.c in Sources */ = {isa = PBXBuildFile; fileRef = D4547E4B5282E6F33968990C /* jcapimin.c */; };
 		B51A85351F3AB7427E1F3194 /* lookup.c in Sources */ = {isa = PBXBuildFile; fileRef = E7C9C9A3078B723E4AA32904 /* lookup.c */; };
 		BAB38F1DCD13870BF0B60DBF /* cm_trace.c in Sources */ = {isa = PBXBuildFile; fileRef = 1FD4AFE768876AC121640DEF /* cm_trace.c */; };
-		BB20442D31784630F212D30E /* vm_aarch64.c in Sources */ = {isa = PBXBuildFile; fileRef = F00C5390F09E2150CB08577D /* vm_aarch64.c */; };
 		BED99A87F9956050D343CBAF /* jquant1.c in Sources */ = {isa = PBXBuildFile; fileRef = 9B98913393253C3FCFDFE21E /* jquant1.c */; };
 		C1607D7D435079C3B298D51B /* be_aas_route.c in Sources */ = {isa = PBXBuildFile; fileRef = 0BAB9375258AAF22CD843ECC /* be_aas_route.c */; };
 		C1F784AA7F8C6A3E153ADC80 /* be_aas_optimize.c in Sources */ = {isa = PBXBuildFile; fileRef = CD8443065242DDCE907219F4 /* be_aas_optimize.c */; };
@@ -1187,7 +1186,6 @@
 				ECAB85264CFD87590DCE9A1C /* tr_noise.c in Sources */,
 				E3301C8FF826F31AAE728780 /* unzip.c in Sources */,
 				0CDC7B087D5442D85473E69F /* vm.c in Sources */,
-				/* vm_aarch64.c removed — iOS forbids JIT execution */
 				189F78E68999E48A5EB95A61 /* vm_interpreted.c in Sources */,
 				367C19DBAEA0329FECFB6E35 /* vorbisfile.c in Sources */,
 				1D5893CE8042AAFD238BDF28 /* window.c in Sources */,
@@ -1270,9 +1268,9 @@
 				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = NO;
 				CLANG_ENABLE_OBJC_ARC = YES;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				DEVELOPMENT_TEAM = 72MB2RMPTC;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 72MB2RMPTC;
 				GCC_C_LANGUAGE_STANDARD = c11;
 				GCC_OPTIMIZATION_LEVEL = 0;
 				GCC_PREPROCESSOR_DEFINITIONS = (
@@ -1306,6 +1304,7 @@
 				);
 				INFOPLIST_FILE = "Quake3-iOS/Info.plist";
 				INFOPLIST_GENERATION_MODE = GeneratedByXcode;
+				INFOPLIST_KEY_CFBundleDisplayName = "Q3A - Metal";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.games";
 				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -1324,9 +1323,12 @@
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.quake3ios.app;
 				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SWIFT_OBJC_BRIDGING_HEADER = "Quake3-iOS/Quake3-iOS-Bridging-Header.h";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
-				TARGETED_DEVICE_FAMILY = "1,2";
+				TARGETED_DEVICE_FAMILY = "1,2,7";
 			};
 			name = Debug;
 		};
@@ -1396,9 +1398,9 @@
 				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = NO;
 				CLANG_ENABLE_OBJC_ARC = YES;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				DEVELOPMENT_TEAM = 72MB2RMPTC;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 72MB2RMPTC;
 				GCC_C_LANGUAGE_STANDARD = c11;
 				GCC_OPTIMIZATION_LEVEL = s;
 				GCC_PREPROCESSOR_DEFINITIONS = (
@@ -1432,6 +1434,7 @@
 				);
 				INFOPLIST_FILE = "Quake3-iOS/Info.plist";
 				INFOPLIST_GENERATION_MODE = GeneratedByXcode;
+				INFOPLIST_KEY_CFBundleDisplayName = "Q3A - Metal";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.games";
 				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -1450,9 +1453,12 @@
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.quake3ios.app;
 				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SWIFT_OBJC_BRIDGING_HEADER = "Quake3-iOS/Quake3-iOS-Bridging-Header.h";
 				SWIFT_OPTIMIZATION_LEVEL = "-O";
-				TARGETED_DEVICE_FAMILY = "1,2";
+				TARGETED_DEVICE_FAMILY = "1,2,7";
 			};
 			name = Release;
 		};

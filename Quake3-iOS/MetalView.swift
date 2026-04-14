@@ -4,6 +4,133 @@ import GameController
 import QuartzCore
 import simd
 
+private enum Q3PipelineKind: UInt8, Hashable {
+    case ui = 0
+    case world = 1
+    case entity = 2
+}
+
+private enum Q3BlendMode: UInt8, Hashable {
+    case opaque = 0
+    case alpha = 1
+    case additive = 2
+}
+
+private enum Q3DepthMode: UInt8, Hashable {
+    case none = 0
+    case readWrite = 1
+    case readOnly = 2
+}
+
+private struct Q3PipelineKey: Hashable {
+    var kind: Q3PipelineKind
+    var blend: Q3BlendMode
+    var depth: Q3DepthMode
+    var cull: MTLCullMode
+    var frontFacingCCW: Bool
+}
+
+private final class Q3PipelineCache {
+    private let device: MTLDevice
+    private let library: MTLLibrary
+    private let colorPixelFormat: MTLPixelFormat
+    private let depthPixelFormat: MTLPixelFormat
+
+    private var pipelines: [Q3PipelineKey: MTLRenderPipelineState] = [:]
+    private var depthStates: [Q3DepthMode: MTLDepthStencilState] = [:]
+
+    init(
+        device: MTLDevice,
+        library: MTLLibrary,
+        colorPixelFormat: MTLPixelFormat,
+        depthPixelFormat: MTLPixelFormat
+    ) {
+        self.device = device
+        self.library = library
+        self.colorPixelFormat = colorPixelFormat
+        self.depthPixelFormat = depthPixelFormat
+    }
+
+    func pipeline(for key: Q3PipelineKey) throws -> MTLRenderPipelineState {
+        if let cached = pipelines[key] {
+            return cached
+        }
+
+        let desc = MTLRenderPipelineDescriptor()
+        desc.colorAttachments[0].pixelFormat = colorPixelFormat
+        desc.depthAttachmentPixelFormat = depthPixelFormat
+
+        switch key.kind {
+        case .ui:
+            desc.vertexFunction = library.makeFunction(name: "q3_ui_vertex")
+            desc.fragmentFunction = library.makeFunction(name: "q3_ui_fragment")
+        case .world:
+            desc.vertexFunction = library.makeFunction(name: "q3_world_vertex")
+            desc.fragmentFunction = library.makeFunction(name: "q3_world_fragment")
+        case .entity:
+            desc.vertexFunction = library.makeFunction(name: "q3_entity_vertex")
+            desc.fragmentFunction = library.makeFunction(name: "q3_entity_fragment")
+        }
+
+        let attachment = desc.colorAttachments[0]!
+        switch key.blend {
+        case .opaque:
+            attachment.isBlendingEnabled = false
+        case .alpha:
+            attachment.isBlendingEnabled = true
+            attachment.rgbBlendOperation = .add
+            attachment.alphaBlendOperation = .add
+            attachment.sourceRGBBlendFactor = .sourceAlpha
+            attachment.sourceAlphaBlendFactor = .sourceAlpha
+            attachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
+            attachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        case .additive:
+            attachment.isBlendingEnabled = true
+            attachment.rgbBlendOperation = .add
+            attachment.alphaBlendOperation = .add
+            attachment.sourceRGBBlendFactor = .one
+            attachment.sourceAlphaBlendFactor = .one
+            attachment.destinationRGBBlendFactor = .one
+            attachment.destinationAlphaBlendFactor = .one
+        }
+
+        let pipeline = try device.makeRenderPipelineState(descriptor: desc)
+        pipelines[key] = pipeline
+        return pipeline
+    }
+
+    func depthState(for mode: Q3DepthMode) -> MTLDepthStencilState? {
+        if let cached = depthStates[mode] {
+            return cached
+        }
+
+        let desc = MTLDepthStencilDescriptor()
+        switch mode {
+        case .none:
+            desc.depthCompareFunction = .always
+            desc.isDepthWriteEnabled = false
+        case .readWrite:
+            desc.depthCompareFunction = .lessEqual
+            desc.isDepthWriteEnabled = true
+        case .readOnly:
+            desc.depthCompareFunction = .lessEqual
+            desc.isDepthWriteEnabled = false
+        }
+
+        let state = device.makeDepthStencilState(descriptor: desc)
+        depthStates[mode] = state
+        return state
+    }
+
+    func apply(_ key: Q3PipelineKey, to encoder: MTLRenderCommandEncoder) throws {
+        let pipeline = try pipeline(for: key)
+        encoder.setRenderPipelineState(pipeline)
+        encoder.setDepthStencilState(depthState(for: key.depth))
+        encoder.setCullMode(key.cull)
+        encoder.setFrontFacing(key.frontFacingCCW ? .counterClockwise : .clockwise)
+    }
+}
+
 struct MetalView: UIViewRepresentable {
     func makeUIView(context: Context) -> MTKView {
         let view = MTKView()
@@ -209,26 +336,9 @@ struct MetalView: UIViewRepresentable {
         """
 
         private var commandQueue: MTLCommandQueue?
-        private var uiPipelineState: MTLRenderPipelineState?
-        private var worldPipelineState: MTLRenderPipelineState?
-        private var worldAdditivePipelineState: MTLRenderPipelineState?
-        private var entityPipelineState: MTLRenderPipelineState?
+        private var pipelineCache: Q3PipelineCache?
         private var uiSamplerState: MTLSamplerState?
         private var worldSamplerState: MTLSamplerState?
-        private var depthStencilState: MTLDepthStencilState?
-        private var additiveDepthStencilState: MTLDepthStencilState?
-        private var fallbackDepthStencilState: MTLDepthStencilState?
-
-        private func ensuredDepthStencilState(_ preferred: MTLDepthStencilState?, device: MTLDevice?) -> MTLDepthStencilState? {
-            if let preferred { return preferred }
-            if let fallbackDepthStencilState { return fallbackDepthStencilState }
-            guard let device else { return nil }
-            let desc = MTLDepthStencilDescriptor()
-            desc.depthCompareFunction = .always
-            desc.isDepthWriteEnabled = false
-            fallbackDepthStencilState = device.makeDepthStencilState(descriptor: desc)
-            return fallbackDepthStencilState
-        }
         private var textureCache: [UInt32: (generation: UInt32, texture: MTLTexture)] = [:]
         private var vertexBuffer: MTLBuffer?
         private var vertexBufferCapacity = 0
@@ -280,16 +390,20 @@ struct MetalView: UIViewRepresentable {
             }
 
             if snapshot.worldCommandCount > 0,
-               let worldPipelineState,
+               let pipelineCache,
                let sceneView = Q3MetalRenderer_GetSceneView()?.pointee,
                let worldVertexBuffer = uploadWorldBuffers(device: view.device, generation: snapshot.worldGeneration),
                let worldIndexBuffer {
                 let viewProjection = makeWorldViewProjection(sceneView)
                 var worldUniforms = WorldUniforms(viewProjection: viewProjection)
-                encoder.setRenderPipelineState(worldPipelineState)
-                encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
-                encoder.setFrontFacing(.clockwise)
-                encoder.setCullMode(.none)
+                let worldBaseKey = Q3PipelineKey(
+                    kind: .world,
+                    blend: .opaque,
+                    depth: .readWrite,
+                    cull: .none,
+                    frontFacingCCW: false
+                )
+                try? pipelineCache.apply(worldBaseKey, to: encoder)
                 encoder.setVertexBuffer(worldVertexBuffer, offset: 0, index: 0)
                 encoder.setVertexBytes(&worldUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
                 encoder.setFragmentSamplerState(worldSamplerState, index: 0)
@@ -307,13 +421,16 @@ struct MetalView: UIViewRepresentable {
                             continue
                         }
                         let additive = (draw.flags & UInt32(Q3_METAL_WORLD_DRAWFLAG_ADDITIVE)) != 0
-                        if additive, let worldAdditivePipelineState, let additiveDepthStencilState {
-                            encoder.setRenderPipelineState(worldAdditivePipelineState)
-                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
-                        } else {
-                            encoder.setRenderPipelineState(worldPipelineState)
-                            encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
-                        }
+                        let key = Q3PipelineKey(
+                            kind: .world,
+                            blend: additive ? .additive : .opaque,
+                            depth: additive ? .readOnly : .readWrite,
+                            // Preserve pre-cache behavior until world-side cull flags
+                            // are proven complete for all surface types.
+                            cull: .none,
+                            frontFacingCCW: false
+                        )
+                        try? pipelineCache.apply(key, to: encoder)
                         var drawUniforms = WorldDrawUniforms(
                             texCoordScale: SIMD2<Float>(draw.texCoordScale.0, draw.texCoordScale.1),
                             texCoordScroll: SIMD2<Float>(draw.texCoordScroll.0, draw.texCoordScroll.1),
@@ -352,16 +469,12 @@ struct MetalView: UIViewRepresentable {
             }
 
             if snapshot.entityCommandCount > 0,
-               let entityPipelineState,
+               let pipelineCache,
                let sceneView = Q3MetalRenderer_GetSceneView()?.pointee,
                let entityVertexBuffer = uploadEntityBuffers(device: view.device),
                let entityIndexBuffer {
                 let entityViewProjection = makeWorldViewProjection(sceneView)
                 var entityUniforms = EntityUniforms(viewProjection: entityViewProjection)
-                encoder.setRenderPipelineState(entityPipelineState)
-                encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
-                encoder.setFrontFacing(.clockwise)
-                encoder.setCullMode(.none)
                 encoder.setVertexBuffer(entityVertexBuffer, offset: 0, index: 0)
                 encoder.setVertexBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
                 encoder.setFragmentSamplerState(worldSamplerState, index: 0)
@@ -372,6 +485,16 @@ struct MetalView: UIViewRepresentable {
                         guard let texture = texture(for: draw.textureHandle, device: view.device) else {
                             continue
                         }
+                        let noCull = (draw.flags & UInt32(Q3_METAL_ENTITY_DRAWFLAG_NOCULL)) != 0
+                        let depthHack = (draw.flags & UInt32(Q3_METAL_ENTITY_DRAWFLAG_DEPTHHACK)) != 0
+                        let key = Q3PipelineKey(
+                            kind: .entity,
+                            blend: .opaque,
+                            depth: depthHack ? .readOnly : .readWrite,
+                            cull: .none,
+                            frontFacingCCW: false
+                        )
+                        try? pipelineCache.apply(key, to: encoder)
                         encoder.setFragmentTexture(texture, index: 0)
                         encoder.drawIndexedPrimitives(
                             type: .triangle,
@@ -387,14 +510,19 @@ struct MetalView: UIViewRepresentable {
             let vertexCount = Int(snapshot.vertexCount)
             if vertexCount > 0, let verticesPointer = Q3MetalRenderer_GetVertices(),
                let vertexBuffer = uploadVertices(UnsafeBufferPointer(start: verticesPointer, count: vertexCount), device: view.device) {
-                let vertices = UnsafeBufferPointer(start: verticesPointer, count: vertexCount)
                 let projection = makeOrthoProjection(width: max(Float(snapshot.drawableWidth), 1.0), height: max(Float(snapshot.drawableHeight), 1.0))
                 var uniforms = Uniforms(projection: projection)
 
-                if let uiPipelineState {
-                    encoder.setRenderPipelineState(uiPipelineState)
+                if let pipelineCache {
+                    let uiKey = Q3PipelineKey(
+                        kind: .ui,
+                        blend: .alpha,
+                        depth: .none,
+                        cull: .none,
+                        frontFacingCCW: true
+                    )
+                    try? pipelineCache.apply(uiKey, to: encoder)
                 }
-                encoder.setDepthStencilState(ensuredDepthStencilState(nil, device: view.device))
                 encoder.setFragmentSamplerState(uiSamplerState, index: 0)
                 encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
                 encoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
@@ -425,67 +553,16 @@ struct MetalView: UIViewRepresentable {
             do {
                 library = try device.makeLibrary(source: shaderSource, options: nil)
             } catch {
-                print("[Metal] Failed to compile UI shaders: \\(error)")
+                print("[Metal] Failed to compile shaders: \(error)")
                 return
             }
 
-            let pipelineDescriptor = MTLRenderPipelineDescriptor()
-            pipelineDescriptor.colorAttachments[0].pixelFormat = view.colorPixelFormat
-            pipelineDescriptor.depthAttachmentPixelFormat = view.depthStencilPixelFormat
-            pipelineDescriptor.vertexFunction = library.makeFunction(name: "q3_ui_vertex")
-            pipelineDescriptor.fragmentFunction = library.makeFunction(name: "q3_ui_fragment")
-            pipelineDescriptor.colorAttachments[0].isBlendingEnabled = true
-            pipelineDescriptor.colorAttachments[0].rgbBlendOperation = .add
-            pipelineDescriptor.colorAttachments[0].alphaBlendOperation = .add
-            pipelineDescriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
-            pipelineDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
-            pipelineDescriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
-            pipelineDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
-
-            do {
-                uiPipelineState = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
-            } catch {
-                print("[Metal] Failed to create UI pipeline: \\(error)")
-            }
-
-            let worldPipelineDescriptor = MTLRenderPipelineDescriptor()
-            worldPipelineDescriptor.colorAttachments[0].pixelFormat = view.colorPixelFormat
-            worldPipelineDescriptor.depthAttachmentPixelFormat = view.depthStencilPixelFormat
-            worldPipelineDescriptor.vertexFunction = library.makeFunction(name: "q3_world_vertex")
-            worldPipelineDescriptor.fragmentFunction = library.makeFunction(name: "q3_world_fragment")
-
-            do {
-                worldPipelineState = try device.makeRenderPipelineState(descriptor: worldPipelineDescriptor)
-            } catch {
-                print("[Metal] Failed to create world pipeline: \\(error)")
-            }
-
-            let worldAdditivePipelineDescriptor = worldPipelineDescriptor.copy() as! MTLRenderPipelineDescriptor
-            worldAdditivePipelineDescriptor.colorAttachments[0].isBlendingEnabled = true
-            worldAdditivePipelineDescriptor.colorAttachments[0].rgbBlendOperation = .add
-            worldAdditivePipelineDescriptor.colorAttachments[0].alphaBlendOperation = .add
-            worldAdditivePipelineDescriptor.colorAttachments[0].sourceRGBBlendFactor = .one
-            worldAdditivePipelineDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
-            worldAdditivePipelineDescriptor.colorAttachments[0].destinationRGBBlendFactor = .one
-            worldAdditivePipelineDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .one
-
-            do {
-                worldAdditivePipelineState = try device.makeRenderPipelineState(descriptor: worldAdditivePipelineDescriptor)
-            } catch {
-                print("[Metal] Failed to create additive world pipeline: \\(error)")
-            }
-
-            let entityPipelineDescriptor = MTLRenderPipelineDescriptor()
-            entityPipelineDescriptor.colorAttachments[0].pixelFormat = view.colorPixelFormat
-            entityPipelineDescriptor.depthAttachmentPixelFormat = view.depthStencilPixelFormat
-            entityPipelineDescriptor.vertexFunction = library.makeFunction(name: "q3_entity_vertex")
-            entityPipelineDescriptor.fragmentFunction = library.makeFunction(name: "q3_entity_fragment")
-
-            do {
-                entityPipelineState = try device.makeRenderPipelineState(descriptor: entityPipelineDescriptor)
-            } catch {
-                print("[Metal] Failed to create entity pipeline: \\(error)")
-            }
+            pipelineCache = Q3PipelineCache(
+                device: device,
+                library: library,
+                colorPixelFormat: view.colorPixelFormat,
+                depthPixelFormat: view.depthStencilPixelFormat
+            )
 
             let uiSamplerDescriptor = MTLSamplerDescriptor()
             uiSamplerDescriptor.minFilter = .linear
@@ -500,16 +577,6 @@ struct MetalView: UIViewRepresentable {
             worldSamplerDescriptor.sAddressMode = .repeat
             worldSamplerDescriptor.tAddressMode = .repeat
             worldSamplerState = device.makeSamplerState(descriptor: worldSamplerDescriptor)
-
-            let depthDescriptor = MTLDepthStencilDescriptor()
-            depthDescriptor.isDepthWriteEnabled = true
-            depthDescriptor.depthCompareFunction = .lessEqual
-            depthStencilState = device.makeDepthStencilState(descriptor: depthDescriptor)
-
-            let additiveDepthDescriptor = MTLDepthStencilDescriptor()
-            additiveDepthDescriptor.isDepthWriteEnabled = false
-            additiveDepthDescriptor.depthCompareFunction = .lessEqual
-            additiveDepthStencilState = device.makeDepthStencilState(descriptor: additiveDepthDescriptor)
         }
 
         private func uploadVertices(_ vertices: UnsafeBufferPointer<Q3MetalVertex>, device: MTLDevice?) -> MTLBuffer? {
