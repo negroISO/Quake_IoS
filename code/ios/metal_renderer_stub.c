@@ -407,8 +407,27 @@ static void RE_BeginRegistration(glconfig_t *config) {
     *config = s_glConfig;
 }
 
-static qhandle_t RE_RegisterModel(const char *name) { return 0; }
-static qhandle_t RE_RegisterSkin(const char *name) { return 0; }
+static qhandle_t s_nextStubModelHandle = 1;
+static qhandle_t s_nextStubSkinHandle = 1;
+
+static qhandle_t RE_RegisterModel(const char *name) {
+    if (name == NULL || name[0] == '\0') {
+        return 0;
+    }
+
+    // Phase 4 only draws BSP world geometry. Return stable non-zero handles so
+    // cgame can finish client/world setup even though MD3 model rendering is not
+    // implemented in the Metal path yet.
+    return 0x10000000 + s_nextStubModelHandle++;
+}
+
+static qhandle_t RE_RegisterSkin(const char *name) {
+    if (name == NULL || name[0] == '\0') {
+        return 0;
+    }
+
+    return 0x20000000 + s_nextStubSkinHandle++;
+}
 qhandle_t RE_RegisterShader(const char *name) { return RegisterTexture(name); }
 qhandle_t RE_RegisterShaderNoMip(const char *name) { return RegisterTexture(name); }
 static void RE_LoadWorldMap(const char *name) {
