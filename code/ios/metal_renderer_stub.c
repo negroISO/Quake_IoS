@@ -470,20 +470,16 @@ static void RE_RenderScene(const refdef_t *fd) {
     fovX = fd->fov_x;
     fovY = fd->fov_y;
 
-    if (s_world.loaded &&
-        !(fd->rdflags & RDF_NOWORLDMODEL) &&
-        vieworg[0] == 0.0f && vieworg[1] == 0.0f && vieworg[2] == 0.0f &&
-        axis0[0] == 1.0f && axis0[1] == 0.0f && axis0[2] == 0.0f &&
-        axis1[0] == 0.0f && axis1[1] == 1.0f && axis1[2] == 0.0f &&
-        axis2[0] == 0.0f && axis2[1] == 0.0f && axis2[2] == 1.0f) {
-        vieworg[0] = 0.0f;
-        vieworg[1] = 0.0f;
+    /* HACK: always override camera when fov is suspiciously small (QVM ABI bug) */
+    if (s_world.loaded && fovX < 45.0f) {
+        vieworg[0] = 504.0f;   /* q3dm1 spawn near atrium */
+        vieworg[1] = 296.0f;
         vieworg[2] = 24.0f;
         fovX = 90.0f;
         fovY = 73.7f;
         ri.Printf(
             PRINT_WARNING,
-            "Metal hack: overriding zeroed refdef camera for loaded world with test spawn/FOV\n"
+            "Metal hack: fov=%.1f too small, overriding camera to q3dm1 spawn\n", fd->fov_x
         );
     }
 
