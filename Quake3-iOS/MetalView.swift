@@ -75,6 +75,8 @@ struct MetalView: UIViewRepresentable {
         private var pipelineState: MTLRenderPipelineState?
         private var samplerState: MTLSamplerState?
         private var textureCache: [UInt32: (generation: UInt32, texture: MTLTexture)] = [:]
+        private var vertexBuffer: MTLBuffer?
+        private var vertexBufferCapacity = 0
 
         func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
             print("[Metal] Drawable size: \(size)")
@@ -114,20 +116,16 @@ struct MetalView: UIViewRepresentable {
                 let vertices = UnsafeBufferPointer(start: verticesPointer, count: vertexCount)
                 let projection = makeOrthoProjection(width: max(Float(snapshot.drawableWidth), 1.0), height: max(Float(snapshot.drawableHeight), 1.0))
                 var uniforms = Uniforms(projection: projection)
+                guard let vertexBuffer = uploadVertices(vertices, device: view.device) else {
+                    encoder.endEncoding()
+                    commandBuffer.present(drawable)
+                    commandBuffer.commit()
+                    return
+                }
 
                 encoder.setRenderPipelineState(pipelineState)
                 encoder.setFragmentSamplerState(samplerState, index: 0)
-                encoder.setVertexBytes([GPUVertex](unsafeUninitializedCapacity: vertexCount) { buffer, initializedCount in
-                    initializedCount = vertexCount
-                    for i in 0..<vertexCount {
-                        let vertex = vertices[i]
-                        buffer[i] = GPUVertex(
-                            position: SIMD2<Float>(vertex.position.0, vertex.position.1),
-                            texCoord: SIMD2<Float>(vertex.texCoord.0, vertex.texCoord.1),
-                            color: SIMD4<Float>(vertex.color.0, vertex.color.1, vertex.color.2, vertex.color.3)
-                        )
-                    }
-                }, length: vertexCount * MemoryLayout<GPUVertex>.stride, index: 0)
+                encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
                 encoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
 
                 if let drawCommandsPointer = Q3MetalRenderer_GetDrawCommands() {
@@ -184,6 +182,36 @@ struct MetalView: UIViewRepresentable {
             samplerDescriptor.sAddressMode = .clampToEdge
             samplerDescriptor.tAddressMode = .clampToEdge
             samplerState = device.makeSamplerState(descriptor: samplerDescriptor)
+        }
+
+        private func uploadVertices(_ vertices: UnsafeBufferPointer<Q3MetalVertex>, device: MTLDevice?) -> MTLBuffer? {
+            guard let device else { return nil }
+
+            let requiredLength = vertices.count * MemoryLayout<GPUVertex>.stride
+            if requiredLength == 0 {
+                return nil
+            }
+
+            if vertexBuffer == nil || requiredLength > vertexBufferCapacity {
+                let nextCapacity = max(requiredLength, max(vertexBufferCapacity * 2, 4096))
+                vertexBuffer = device.makeBuffer(length: nextCapacity, options: .storageModeShared)
+                vertexBufferCapacity = nextCapacity
+            }
+
+            guard let vertexBuffer, let rawPointer = vertexBuffer.contents().bindMemory(to: GPUVertex.self, capacity: vertices.count) as UnsafeMutablePointer<GPUVertex>? else {
+                return nil
+            }
+
+            for i in 0..<vertices.count {
+                let vertex = vertices[i]
+                rawPointer[i] = GPUVertex(
+                    position: SIMD2<Float>(vertex.position.0, vertex.position.1),
+                    texCoord: SIMD2<Float>(vertex.texCoord.0, vertex.texCoord.1),
+                    color: SIMD4<Float>(vertex.color.0, vertex.color.1, vertex.color.2, vertex.color.3)
+                )
+            }
+
+            return vertexBuffer
         }
 
         private func texture(for handle: UInt32, device: MTLDevice?) -> MTLTexture? {
