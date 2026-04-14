@@ -39,6 +39,13 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 #include "vm_local.h"
 
+#if defined(__APPLE__)
+#include <libkern/OSCacheControl.h>
+static void __clear_cache(void *start, void *end) {
+	sys_icache_invalidate(start, (char *)end - (char *)start);
+}
+#endif
+
 #define NUM_PASSES	1
 
 #define PASS_INIT	0
