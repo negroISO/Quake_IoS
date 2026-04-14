@@ -39,6 +39,8 @@ static metalTexture_t s_textures[Q3_METAL_MAX_TEXTURES];
 static qhandle_t s_nextTextureHandle = 1;
 static qhandle_t s_whiteTextureHandle;
 static qhandle_t s_skyTextureHandle;
+static qhandle_t s_timHellBaseTextureHandle;
+static qhandle_t s_timHellAddTextureHandle;
 
 typedef struct {
     qboolean loaded;
@@ -165,6 +167,44 @@ static qboolean IsSkyShaderName(const char *name) {
     return qfalse;
 }
 
+static qboolean IsTimHellShaderName(const char *name) {
+    return name != NULL && !Q_stricmp(name, "textures/skies/tim_hell");
+}
+
+static qboolean IsDrawableWorldShader(const dshader_t *shader) {
+    int surfaceFlags;
+
+    if (shader == NULL) {
+        return qfalse;
+    }
+
+    surfaceFlags = LittleLong(shader->surfaceFlags);
+    if (surfaceFlags & SURF_NODRAW) {
+        return qfalse;
+    }
+
+    return qtrue;
+}
+
+static void SetupWorldDraw(Q3MetalWorldDrawCmd *draw,
+                           uint32_t firstIndex,
+                           uint32_t indexCount,
+                           qhandle_t textureHandle,
+                           uint32_t flags,
+                           float scaleS,
+                           float scaleT,
+                           float scrollS,
+                           float scrollT) {
+    draw->firstIndex = firstIndex;
+    draw->indexCount = indexCount;
+    draw->textureHandle = (uint32_t)textureHandle;
+    draw->flags = flags;
+    draw->texCoordScale[0] = scaleS;
+    draw->texCoordScale[1] = scaleT;
+    draw->texCoordScroll[0] = scrollS;
+    draw->texCoordScroll[1] = scrollT;
+}
+
 static qboolean TryLoadImageRGBA(const char *name, byte **rgba, int *width, int *height, char *resolvedName, size_t resolvedNameSize) {
     static const char *extensions[] = { "", ".tga", ".jpg", ".jpeg" };
     int i;
@@ -231,6 +271,20 @@ static qhandle_t RegisterTexture(const char *name) {
         ri.Printf(PRINT_ALL, "Metal stub: loaded '%s' from '%s' (%dx%d)\n", name, resolvedName, width, height);
     }
     return texture->handle;
+}
+
+static qhandle_t EnsureTimHellBaseTexture(void) {
+    if (s_timHellBaseTextureHandle == 0) {
+        s_timHellBaseTextureHandle = RegisterTexture("textures/skies/killsky_1");
+    }
+    return s_timHellBaseTextureHandle != 0 ? s_timHellBaseTextureHandle : EnsureSkyTexture();
+}
+
+static qhandle_t EnsureTimHellAddTexture(void) {
+    if (s_timHellAddTextureHandle == 0) {
+        s_timHellAddTextureHandle = RegisterTexture("textures/skies/killsky_2");
+    }
+    return s_timHellAddTextureHandle != 0 ? s_timHellAddTextureHandle : EnsureSkyTexture();
 }
 
 static void PushStretchPicVertex(float x, float y, float s, float t, const float *rgba) {
@@ -423,6 +477,7 @@ static qboolean LoadWorldMapData(const char *name) {
     uint32_t planarDraws = 0;
     uint32_t patchDraws = 0;
     uint32_t triSoupDraws = 0;
+    uint32_t skippedNoDrawSurfaces = 0;
 
     if (ri.FS_ReadFile(name, &fileBuffer) <= 0 || fileBuffer == NULL) {
         ri.Printf(PRINT_WARNING, "Metal world: failed to read BSP '%s'\n", name);
@@ -462,26 +517,32 @@ static qboolean LoadWorldMapData(const char *name) {
             ri.Printf(PRINT_WARNING, "Metal world: skipping surface %d with invalid shader %d in '%s'\n", i, shaderNum, name);
             continue;
         }
+        if (!IsDrawableWorldShader(&shaders[shaderNum])) {
+            skippedNoDrawSurfaces += 1;
+            continue;
+        }
 
         if (surfaceType == MST_PATCH) {
+            uint32_t stageCount = IsTimHellShaderName(shaders[shaderNum].shader) ? 2u : 1u;
             patchWidth = LittleLong(surface->patchWidth);
             patchHeight = LittleLong(surface->patchHeight);
             totalVertices += (uint32_t)((patchWidth - 1) / 2) * (uint32_t)((patchHeight - 1) / 2) *
                              (Q3_METAL_PATCH_SUBDIVISIONS + 1) * (Q3_METAL_PATCH_SUBDIVISIONS + 1);
             totalIndices += (uint32_t)((patchWidth - 1) / 2) * (uint32_t)((patchHeight - 1) / 2) *
                             Q3_METAL_PATCH_SUBDIVISIONS * Q3_METAL_PATCH_SUBDIVISIONS * 6;
-            totalDraws += (uint32_t)((patchWidth - 1) / 2) * (uint32_t)((patchHeight - 1) / 2);
+            totalDraws += (uint32_t)((patchWidth - 1) / 2) * (uint32_t)((patchHeight - 1) / 2) * stageCount;
             patchDraws += (uint32_t)((patchWidth - 1) / 2) * (uint32_t)((patchHeight - 1) / 2);
         } else {
             int numVerts = LittleLong(surface->numVerts);
             int numIndexes = LittleLong(surface->numIndexes);
+            uint32_t stageCount = IsTimHellShaderName(shaders[shaderNum].shader) ? 2u : 1u;
 
             if (numIndexes % 3) {
                 numIndexes -= numIndexes % 3;
             }
             totalVertices += (uint32_t)numVerts;
             totalIndices += (uint32_t)numIndexes;
-            totalDraws += 1;
+            totalDraws += stageCount;
 
             if (surfaceType == MST_PLANAR) {
                 planarDraws += 1;
@@ -536,6 +597,9 @@ static qboolean LoadWorldMapData(const char *name) {
         if (shaderNum < 0 || shaderNum >= shaderCount) {
             continue;
         }
+        if (!IsDrawableWorldShader(&shaders[shaderNum])) {
+            continue;
+        }
 
         if (IsSkyShaderName(shaders[shaderNum].shader)) {
             textureHandle = EnsureSkyTexture();
@@ -565,7 +629,6 @@ static qboolean LoadWorldMapData(const char *name) {
 
                     baseVertex = vertexCursor;
                     s_world.draws[drawCursor].firstIndex = indexCursor;
-                    s_world.draws[drawCursor].textureHandle = (uint32_t)textureHandle;
 
                     for (stepY = 0; stepY <= Q3_METAL_PATCH_SUBDIVISIONS; ++stepY) {
                         float v = (float)stepY / (float)Q3_METAL_PATCH_SUBDIVISIONS;
@@ -604,8 +667,35 @@ static qboolean LoadWorldMapData(const char *name) {
                         }
                     }
 
-                    s_world.draws[drawCursor].indexCount = indexCursor - s_world.draws[drawCursor].firstIndex;
-                    drawCursor += 1;
+                    if (IsTimHellShaderName(shaders[shaderNum].shader)) {
+                        uint32_t firstIndexForStage = s_world.draws[drawCursor].firstIndex;
+                        uint32_t indexCountForStage = indexCursor - firstIndexForStage;
+
+                        SetupWorldDraw(&s_world.draws[drawCursor++],
+                                       firstIndexForStage,
+                                       indexCountForStage,
+                                       EnsureTimHellBaseTexture(),
+                                       Q3_METAL_WORLD_DRAWFLAG_NOCULL,
+                                       2.0f, 2.0f,
+                                       0.05f, 0.10f);
+                        SetupWorldDraw(&s_world.draws[drawCursor++],
+                                       firstIndexForStage,
+                                       indexCountForStage,
+                                       EnsureTimHellAddTexture(),
+                                       Q3_METAL_WORLD_DRAWFLAG_ADDITIVE | Q3_METAL_WORLD_DRAWFLAG_NOCULL,
+                                       3.0f, 3.0f,
+                                       0.05f, 0.10f);
+                    } else {
+                        uint32_t firstIndexForDraw = s_world.draws[drawCursor].firstIndex;
+                        uint32_t indexCountForDraw = indexCursor - firstIndexForDraw;
+                        SetupWorldDraw(&s_world.draws[drawCursor++],
+                                       firstIndexForDraw,
+                                       indexCountForDraw,
+                                       textureHandle,
+                                       Q3_METAL_WORLD_DRAWFLAG_NOCULL,
+                                       1.0f, 1.0f,
+                                       0.0f, 0.0f);
+                    }
                 }
             }
             continue;
@@ -617,9 +707,6 @@ static qboolean LoadWorldMapData(const char *name) {
 
         baseVertex = vertexCursor;
         s_world.draws[drawCursor].firstIndex = indexCursor;
-        s_world.draws[drawCursor].indexCount = (uint32_t)numIndexes;
-        s_world.draws[drawCursor].textureHandle = (uint32_t)textureHandle;
-        drawCursor += 1;
 
         for (j = 0; j < numVerts; ++j) {
             EmitWorldVertex(&s_world.vertices[vertexCursor++], &drawVerts[firstVert + j]);
@@ -632,6 +719,35 @@ static qboolean LoadWorldMapData(const char *name) {
                 continue;
             }
             s_world.indices[indexCursor++] = baseVertex + (uint32_t)localIndex;
+        }
+
+        if (IsTimHellShaderName(shaders[shaderNum].shader)) {
+            uint32_t firstIndexForStage = s_world.draws[drawCursor].firstIndex;
+            uint32_t indexCountForStage = indexCursor - firstIndexForStage;
+            SetupWorldDraw(&s_world.draws[drawCursor++],
+                           firstIndexForStage,
+                           indexCountForStage,
+                           EnsureTimHellBaseTexture(),
+                           Q3_METAL_WORLD_DRAWFLAG_NOCULL,
+                           2.0f, 2.0f,
+                           0.05f, 0.10f);
+            SetupWorldDraw(&s_world.draws[drawCursor++],
+                           firstIndexForStage,
+                           indexCountForStage,
+                           EnsureTimHellAddTexture(),
+                           Q3_METAL_WORLD_DRAWFLAG_ADDITIVE | Q3_METAL_WORLD_DRAWFLAG_NOCULL,
+                           3.0f, 3.0f,
+                           0.05f, 0.10f);
+        } else {
+            uint32_t firstIndexForDraw = s_world.draws[drawCursor].firstIndex;
+            uint32_t indexCountForDraw = indexCursor - firstIndexForDraw;
+            SetupWorldDraw(&s_world.draws[drawCursor++],
+                           firstIndexForDraw,
+                           indexCountForDraw,
+                           textureHandle,
+                           Q3_METAL_WORLD_DRAWFLAG_NOCULL,
+                           1.0f, 1.0f,
+                           0.0f, 0.0f);
         }
     }
 
@@ -646,6 +762,9 @@ static qboolean LoadWorldMapData(const char *name) {
               "Metal world: loaded '%s' with %u verts, %u indices, %u draws (%u planar, %u patch, %u trisoup, %u sky)\n",
               name, s_world.vertexCount, s_world.indexCount, s_world.drawCount,
               planarDraws, patchDraws, triSoupDraws, skyDraws);
+    if (skippedNoDrawSurfaces > 0) {
+        ri.Printf(PRINT_ALL, "Metal world: skipped %u nodraw surfaces in '%s'\n", skippedNoDrawSurfaces, name);
+    }
 
     ri.FS_FreeFile(fileBuffer);
     return qtrue;
@@ -660,6 +779,8 @@ static void RE_BeginRegistration(glconfig_t *config) {
     ri.Printf(PRINT_ALL, "RE_BeginRegistration: Metal stub\n");
     EnsureWhiteTexture();
     EnsureSkyTexture();
+    EnsureTimHellBaseTexture();
+    EnsureTimHellAddTexture();
     s_glConfig.vidWidth = 2796;
     s_glConfig.vidHeight = 1290;
     s_glConfig.windowAspect = (float)s_glConfig.vidWidth / (float)s_glConfig.vidHeight;

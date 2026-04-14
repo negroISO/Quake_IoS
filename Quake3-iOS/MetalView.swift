@@ -43,6 +43,13 @@ struct MetalView: UIViewRepresentable {
             var viewProjection: simd_float4x4
         }
 
+        struct WorldDrawUniforms {
+            var texCoordScale: SIMD2<Float>
+            var texCoordScroll: SIMD2<Float>
+            var timeSeconds: Float
+            var _padding: Float
+        }
+
         private let shaderSource = """
         #include <metal_stdlib>
         using namespace metal;
@@ -98,6 +105,13 @@ struct MetalView: UIViewRepresentable {
             float4 color;
         };
 
+        struct WorldDrawUniforms {
+            float2 texCoordScale;
+            float2 texCoordScroll;
+            float timeSeconds;
+            float padding;
+        };
+
         vertex WorldVertexOut q3_world_vertex(const device WorldVertexIn *vertices [[buffer(0)]],
                                               constant WorldUniforms &uniforms [[buffer(1)]],
                                               uint vertexID [[vertex_id]]) {
@@ -110,9 +124,12 @@ struct MetalView: UIViewRepresentable {
         }
 
         fragment float4 q3_world_fragment(WorldVertexOut in [[stage_in]],
+                                          constant WorldDrawUniforms &drawUniforms [[buffer(0)]],
                                           texture2d<float> colorTexture [[texture(0)]],
                                           sampler textureSampler [[sampler(0)]]) {
-            float4 texel = colorTexture.sample(textureSampler, in.texCoord);
+            float2 texCoord = in.texCoord * drawUniforms.texCoordScale
+                + drawUniforms.texCoordScroll * drawUniforms.timeSeconds;
+            float4 texel = colorTexture.sample(textureSampler, texCoord);
             return texel * in.color;
         }
         """
@@ -120,8 +137,11 @@ struct MetalView: UIViewRepresentable {
         private var commandQueue: MTLCommandQueue?
         private var uiPipelineState: MTLRenderPipelineState?
         private var worldPipelineState: MTLRenderPipelineState?
-        private var samplerState: MTLSamplerState?
+        private var worldAdditivePipelineState: MTLRenderPipelineState?
+        private var uiSamplerState: MTLSamplerState?
+        private var worldSamplerState: MTLSamplerState?
         private var depthStencilState: MTLDepthStencilState?
+        private var additiveDepthStencilState: MTLDepthStencilState?
         private var textureCache: [UInt32: (generation: UInt32, texture: MTLTexture)] = [:]
         private var vertexBuffer: MTLBuffer?
         private var vertexBufferCapacity = 0
@@ -147,7 +167,8 @@ struct MetalView: UIViewRepresentable {
             guard let drawable = view.currentDrawable,
                   let descriptor = view.currentRenderPassDescriptor,
                   let commandQueue,
-                  let samplerState,
+                  let uiSamplerState,
+                  let worldSamplerState,
                   let commandBuffer = commandQueue.makeCommandBuffer()
             else { return }
 
@@ -171,19 +192,37 @@ struct MetalView: UIViewRepresentable {
                 var worldUniforms = WorldUniforms(viewProjection: viewProjection)
                 encoder.setRenderPipelineState(worldPipelineState)
                 encoder.setDepthStencilState(depthStencilState)
+                encoder.setFrontFacing(.clockwise)
+                encoder.setCullMode(.none)
                 encoder.setVertexBuffer(worldVertexBuffer, offset: 0, index: 0)
                 encoder.setVertexBytes(&worldUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
-                encoder.setFragmentSamplerState(samplerState, index: 0)
+                encoder.setFragmentSamplerState(worldSamplerState, index: 0)
 
                 if let worldDrawsPointer = Q3MetalRenderer_GetWorldDrawCommands(),
                    let indicesPointer = Q3MetalRenderer_GetWorldIndices() {
                     let _ = indicesPointer
                     let worldDraws = UnsafeBufferPointer(start: worldDrawsPointer, count: Int(snapshot.worldCommandCount))
+                    let timeSeconds = Float(Date().timeIntervalSinceReferenceDate)
                     for draw in worldDraws where draw.indexCount > 0 {
                         guard let texture = texture(for: draw.textureHandle, device: view.device) else {
                             continue
                         }
+                        let additive = (draw.flags & UInt32(Q3_METAL_WORLD_DRAWFLAG_ADDITIVE)) != 0
+                        if additive, let worldAdditivePipelineState, let additiveDepthStencilState {
+                            encoder.setRenderPipelineState(worldAdditivePipelineState)
+                            encoder.setDepthStencilState(additiveDepthStencilState)
+                        } else {
+                            encoder.setRenderPipelineState(worldPipelineState)
+                            encoder.setDepthStencilState(depthStencilState)
+                        }
+                        var drawUniforms = WorldDrawUniforms(
+                            texCoordScale: SIMD2<Float>(draw.texCoordScale.0, draw.texCoordScale.1),
+                            texCoordScroll: SIMD2<Float>(draw.texCoordScroll.0, draw.texCoordScroll.1),
+                            timeSeconds: timeSeconds,
+                            _padding: 0
+                        )
                         encoder.setFragmentTexture(texture, index: 0)
+                        encoder.setFragmentBytes(&drawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 0)
                         encoder.drawIndexedPrimitives(
                             type: .triangle,
                             indexCount: Int(draw.indexCount),
@@ -228,7 +267,7 @@ struct MetalView: UIViewRepresentable {
                     encoder.setRenderPipelineState(uiPipelineState)
                 }
                 encoder.setDepthStencilState(nil)
-                encoder.setFragmentSamplerState(samplerState, index: 0)
+                encoder.setFragmentSamplerState(uiSamplerState, index: 0)
                 encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
                 encoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
 
@@ -293,17 +332,44 @@ struct MetalView: UIViewRepresentable {
                 print("[Metal] Failed to create world pipeline: \\(error)")
             }
 
-            let samplerDescriptor = MTLSamplerDescriptor()
-            samplerDescriptor.minFilter = .linear
-            samplerDescriptor.magFilter = .linear
-            samplerDescriptor.sAddressMode = .clampToEdge
-            samplerDescriptor.tAddressMode = .clampToEdge
-            samplerState = device.makeSamplerState(descriptor: samplerDescriptor)
+            let worldAdditivePipelineDescriptor = worldPipelineDescriptor.copy() as! MTLRenderPipelineDescriptor
+            worldAdditivePipelineDescriptor.colorAttachments[0].isBlendingEnabled = true
+            worldAdditivePipelineDescriptor.colorAttachments[0].rgbBlendOperation = .add
+            worldAdditivePipelineDescriptor.colorAttachments[0].alphaBlendOperation = .add
+            worldAdditivePipelineDescriptor.colorAttachments[0].sourceRGBBlendFactor = .one
+            worldAdditivePipelineDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
+            worldAdditivePipelineDescriptor.colorAttachments[0].destinationRGBBlendFactor = .one
+            worldAdditivePipelineDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .one
+
+            do {
+                worldAdditivePipelineState = try device.makeRenderPipelineState(descriptor: worldAdditivePipelineDescriptor)
+            } catch {
+                print("[Metal] Failed to create additive world pipeline: \\(error)")
+            }
+
+            let uiSamplerDescriptor = MTLSamplerDescriptor()
+            uiSamplerDescriptor.minFilter = .linear
+            uiSamplerDescriptor.magFilter = .linear
+            uiSamplerDescriptor.sAddressMode = .clampToEdge
+            uiSamplerDescriptor.tAddressMode = .clampToEdge
+            uiSamplerState = device.makeSamplerState(descriptor: uiSamplerDescriptor)
+
+            let worldSamplerDescriptor = MTLSamplerDescriptor()
+            worldSamplerDescriptor.minFilter = .linear
+            worldSamplerDescriptor.magFilter = .linear
+            worldSamplerDescriptor.sAddressMode = .repeat
+            worldSamplerDescriptor.tAddressMode = .repeat
+            worldSamplerState = device.makeSamplerState(descriptor: worldSamplerDescriptor)
 
             let depthDescriptor = MTLDepthStencilDescriptor()
             depthDescriptor.isDepthWriteEnabled = true
             depthDescriptor.depthCompareFunction = .less
             depthStencilState = device.makeDepthStencilState(descriptor: depthDescriptor)
+
+            let additiveDepthDescriptor = MTLDepthStencilDescriptor()
+            additiveDepthDescriptor.isDepthWriteEnabled = false
+            additiveDepthDescriptor.depthCompareFunction = .lessEqual
+            additiveDepthStencilState = device.makeDepthStencilState(descriptor: additiveDepthDescriptor)
         }
 
         private func uploadVertices(_ vertices: UnsafeBufferPointer<Q3MetalVertex>, device: MTLDevice?) -> MTLBuffer? {

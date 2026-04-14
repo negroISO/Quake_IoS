@@ -29,7 +29,15 @@ typedef struct {
     uint32_t firstIndex;
     uint32_t indexCount;
     uint32_t textureHandle;
+    uint32_t flags;
+    float texCoordScale[2];
+    float texCoordScroll[2];
 } Q3MetalWorldDrawCmd;
+
+enum {
+    Q3_METAL_WORLD_DRAWFLAG_ADDITIVE = 1u << 0,
+    Q3_METAL_WORLD_DRAWFLAG_NOCULL = 1u << 1
+};
 
 typedef struct {
     uint32_t frameNumber;
