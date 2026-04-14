@@ -182,11 +182,20 @@ struct MetalView: UIViewRepresentable {
             if (mode == 4) {
                 return float4(in.color.rgb, 1.0);
             }
-            float4 result = texel * lightmap * in.color;
-            if (result.a < 0.01) {
-                discard_fragment();
-            }
-            return result;
+            // NOTE: No unconditional alpha-test discard here.
+            //
+            // ef21f24 introduced `if (result.a < 0.01) discard_fragment();` to
+            // emulate GL alphaFunc, but Q3 alpha-test is a PER-SHADER-STAGE opt-in
+            // (the `alphaFunc GT0|GE128|LT128` keyword on a stage), not a
+            // world-wide rule. Forcing it on every fragment made q3dm1's two
+            // ornamental arches go see-through whenever their stage0 texture
+            // failed to resolve (see HUD "falling back to white" errors) or when
+            // lightmap*vertexColor multiplied alpha below threshold.
+            //
+            // Until the per-stage shader driver is in place, world fragments must
+            // always write. Alpha-tested stages will be reintroduced through the
+            // Q3 shader parser, not as a global discard.
+            return texel * lightmap * in.color;
         }
 
         vertex EntityVertexOut q3_entity_vertex(const device EntityVertexIn *vertices [[buffer(0)]],
