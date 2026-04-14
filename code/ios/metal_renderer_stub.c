@@ -452,24 +452,55 @@ static void RE_AddLightToScene(const vec3_t org, float intensity, float r, float
 static void RE_AddAdditiveLightToScene(const vec3_t org, float intensity, float r, float g, float b) {}
 static void RE_AddLinearLightToScene(const vec3_t start, const vec3_t end, float intensity, float r, float g, float b) {}
 static void RE_RenderScene(const refdef_t *fd) {
+    vec3_t vieworg;
+    vec3_t axis0;
+    vec3_t axis1;
+    vec3_t axis2;
+    float fovX;
+    float fovY;
+
     if (fd == NULL) {
         return;
     }
 
-    s_sceneView.fovX = fd->fov_x;
-    s_sceneView.fovY = fd->fov_y;
-    s_sceneView.viewOrigin[0] = fd->vieworg[0];
-    s_sceneView.viewOrigin[1] = fd->vieworg[1];
-    s_sceneView.viewOrigin[2] = fd->vieworg[2];
-    s_sceneView.viewAxis[0] = fd->viewaxis[0][0];
-    s_sceneView.viewAxis[1] = fd->viewaxis[0][1];
-    s_sceneView.viewAxis[2] = fd->viewaxis[0][2];
-    s_sceneView.viewAxis[3] = fd->viewaxis[1][0];
-    s_sceneView.viewAxis[4] = fd->viewaxis[1][1];
-    s_sceneView.viewAxis[5] = fd->viewaxis[1][2];
-    s_sceneView.viewAxis[6] = fd->viewaxis[2][0];
-    s_sceneView.viewAxis[7] = fd->viewaxis[2][1];
-    s_sceneView.viewAxis[8] = fd->viewaxis[2][2];
+    VectorCopy(fd->vieworg, vieworg);
+    VectorCopy(fd->viewaxis[0], axis0);
+    VectorCopy(fd->viewaxis[1], axis1);
+    VectorCopy(fd->viewaxis[2], axis2);
+    fovX = fd->fov_x;
+    fovY = fd->fov_y;
+
+    if (s_world.loaded &&
+        !(fd->rdflags & RDF_NOWORLDMODEL) &&
+        vieworg[0] == 0.0f && vieworg[1] == 0.0f && vieworg[2] == 0.0f &&
+        axis0[0] == 1.0f && axis0[1] == 0.0f && axis0[2] == 0.0f &&
+        axis1[0] == 0.0f && axis1[1] == 1.0f && axis1[2] == 0.0f &&
+        axis2[0] == 0.0f && axis2[1] == 0.0f && axis2[2] == 1.0f) {
+        vieworg[0] = 0.0f;
+        vieworg[1] = 0.0f;
+        vieworg[2] = 24.0f;
+        fovX = 90.0f;
+        fovY = 73.7f;
+        ri.Printf(
+            PRINT_WARNING,
+            "Metal hack: overriding zeroed refdef camera for loaded world with test spawn/FOV\n"
+        );
+    }
+
+    s_sceneView.fovX = fovX;
+    s_sceneView.fovY = fovY;
+    s_sceneView.viewOrigin[0] = vieworg[0];
+    s_sceneView.viewOrigin[1] = vieworg[1];
+    s_sceneView.viewOrigin[2] = vieworg[2];
+    s_sceneView.viewAxis[0] = axis0[0];
+    s_sceneView.viewAxis[1] = axis0[1];
+    s_sceneView.viewAxis[2] = axis0[2];
+    s_sceneView.viewAxis[3] = axis1[0];
+    s_sceneView.viewAxis[4] = axis1[1];
+    s_sceneView.viewAxis[5] = axis1[2];
+    s_sceneView.viewAxis[6] = axis2[0];
+    s_sceneView.viewAxis[7] = axis2[1];
+    s_sceneView.viewAxis[8] = axis2[2];
 
     s_sceneLogCounter += 1;
     if ((s_sceneLogCounter % 60) == 0) {
@@ -478,11 +509,11 @@ static void RE_RenderScene(const refdef_t *fd) {
             "Metal debug refdef[%u]: vieworg=(%.2f %.2f %.2f) axis0=(%.3f %.3f %.3f) "
             "axis1=(%.3f %.3f %.3f) axis2=(%.3f %.3f %.3f) fov=(%.2f %.2f) rdflags=0x%x worldLoaded=%d draws=%u\n",
             s_sceneLogCounter,
-            fd->vieworg[0], fd->vieworg[1], fd->vieworg[2],
-            fd->viewaxis[0][0], fd->viewaxis[0][1], fd->viewaxis[0][2],
-            fd->viewaxis[1][0], fd->viewaxis[1][1], fd->viewaxis[1][2],
-            fd->viewaxis[2][0], fd->viewaxis[2][1], fd->viewaxis[2][2],
-            fd->fov_x, fd->fov_y,
+            vieworg[0], vieworg[1], vieworg[2],
+            axis0[0], axis0[1], axis0[2],
+            axis1[0], axis1[1], axis1[2],
+            axis2[0], axis2[1], axis2[2],
+            fovX, fovY,
             fd->rdflags,
             s_world.loaded,
             s_world.drawCount
