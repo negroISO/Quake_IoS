@@ -119,10 +119,6 @@ static qboolean TryLoadImageRGBA(const char *name, byte **rgba, int *width, int 
         }
 
         Com_sprintf(candidate, sizeof(candidate), "%s%s", name, extensions[i]);
-        if (!ri.FS_FileExists(candidate)) {
-            continue;
-        }
-
         if (!Q_stricmp(COM_GetExtension(candidate), "tga")) {
             R_LoadTGA(candidate, rgba, width, height);
         } else {
