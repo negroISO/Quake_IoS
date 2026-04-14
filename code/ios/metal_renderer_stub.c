@@ -86,6 +86,10 @@ static uint32_t s_entityDrawCount;
 static uint32_t s_entityVertexCapacity;
 static uint32_t s_entityIndexCapacity;
 static uint32_t s_entityDrawCapacity;
+static uint32_t s_entityAcceptedThisFrame;
+static uint32_t s_entityRejectedNullThisFrame;
+static uint32_t s_entityRejectedTypeThisFrame;
+static uint32_t s_entityRejectedModelThisFrame;
 
 static void CopyColor(float *dst, const float *src) {
     dst[0] = src[0];
@@ -852,6 +856,8 @@ static qboolean LoadMD3ModelData(const char *modName, void *buffer, int fileSize
     }
 
     *outModel = hdr;
+    ri.Printf(PRINT_ALL, "Metal model: loaded '%s' frames=%d tags=%d surfaces=%d\n",
+        modName, hdr->numFrames, hdr->numTags, hdr->numSurfaces);
     return qtrue;
 }
 
@@ -1317,15 +1323,25 @@ static void RE_ClearScene(void) {
     s_entityVertexCount = 0;
     s_entityIndexCount = 0;
     s_entityDrawCount = 0;
+    s_entityAcceptedThisFrame = 0;
+    s_entityRejectedNullThisFrame = 0;
+    s_entityRejectedTypeThisFrame = 0;
+    s_entityRejectedModelThisFrame = 0;
 }
 
 static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime) {
     vec3_t cross;
 
     if (re == NULL || s_sceneEntityCount >= Q3_METAL_MAX_REFENTITIES) {
+        s_entityRejectedNullThisFrame += 1;
         return;
     }
-    if (re->reType != RT_MODEL || re->hModel == 0 || FindModelByHandle(re->hModel) == NULL) {
+    if (re->reType != RT_MODEL) {
+        s_entityRejectedTypeThisFrame += 1;
+        return;
+    }
+    if (re->hModel == 0 || FindModelByHandle(re->hModel) == NULL) {
+        s_entityRejectedModelThisFrame += 1;
         return;
     }
 
@@ -1333,6 +1349,7 @@ static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime
     CrossProduct(re->axis[0], re->axis[1], cross);
     s_sceneEntities[s_sceneEntityCount].mirrored = (DotProduct(re->axis[2], cross) < 0.0f);
     s_sceneEntityCount += 1;
+    s_entityAcceptedThisFrame += 1;
 }
 static void RE_AddPolyToScene(qhandle_t hShader, int numVerts, const polyVert_t *verts, int num) {}
 static int R_LightForPoint(vec3_t point, vec3_t ambientLight, vec3_t directedLight, vec3_t lightDir) { return 0; }
@@ -1401,6 +1418,16 @@ static void RE_RenderScene(const refdef_t *fd) {
             fd->rdflags,
             s_world.loaded,
             s_world.drawCount
+        );
+        ri.Printf(
+            PRINT_ALL,
+            "Metal entity queue[%u]: accepted=%u rejectNull=%u rejectType=%u rejectModel=%u sceneEntities=%u\n",
+            s_sceneLogCounter,
+            s_entityAcceptedThisFrame,
+            s_entityRejectedNullThisFrame,
+            s_entityRejectedTypeThisFrame,
+            s_entityRejectedModelThisFrame,
+            s_sceneEntityCount
         );
     }
 
@@ -1591,6 +1618,13 @@ static void RE_RenderScene(const refdef_t *fd) {
     s_frameSnapshot.entityVertexCount = s_entityVertexCount;
     s_frameSnapshot.entityIndexCount = s_entityIndexCount;
     s_frameSnapshot.entityCommandCount = s_entityDrawCount;
+    if ((s_sceneLogCounter % 60) == 0) {
+        ri.Printf(
+            PRINT_ALL,
+            "Metal entity frame: sceneEntities=%u drawCmds=%u verts=%u idx=%u\n",
+            s_sceneEntityCount, s_entityDrawCount, s_entityVertexCount, s_entityIndexCount
+        );
+    }
 }
 
 static void RE_SetColor(const float *rgba) {
