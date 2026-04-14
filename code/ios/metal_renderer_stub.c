@@ -224,9 +224,11 @@ static float ByteToVisibleColor(byte value) {
 static qboolean LoadWorldMapData(const char *name) {
     void *fileBuffer = NULL;
     dheader_t *header;
+    dshader_t *shaders;
     drawVert_t *drawVerts;
     int *drawIndexes;
     dsurface_t *surfaces;
+    int shaderCount;
     int drawVertCount;
     int drawIndexCount;
     int surfaceCount;
@@ -253,7 +255,9 @@ static qboolean LoadWorldMapData(const char *name) {
     drawVerts = (drawVert_t *)((byte *)fileBuffer + LittleLong(header->lumps[LUMP_DRAWVERTS].fileofs));
     drawIndexes = (int *)((byte *)fileBuffer + LittleLong(header->lumps[LUMP_DRAWINDEXES].fileofs));
     surfaces = (dsurface_t *)((byte *)fileBuffer + LittleLong(header->lumps[LUMP_SURFACES].fileofs));
+    shaders = (dshader_t *)((byte *)fileBuffer + LittleLong(header->lumps[LUMP_SHADERS].fileofs));
 
+    shaderCount = LittleLong(header->lumps[LUMP_SHADERS].filelen) / (int)sizeof(dshader_t);
     drawVertCount = LittleLong(header->lumps[LUMP_DRAWVERTS].filelen) / (int)sizeof(drawVert_t);
     drawIndexCount = LittleLong(header->lumps[LUMP_DRAWINDEXES].filelen) / (int)sizeof(int);
     surfaceCount = LittleLong(header->lumps[LUMP_SURFACES].filelen) / (int)sizeof(dsurface_t);
@@ -265,6 +269,7 @@ static qboolean LoadWorldMapData(const char *name) {
         int numVerts;
         int firstIndex;
         int numIndexes;
+        int shaderNum;
 
         if (surfaceType != MST_PLANAR && surfaceType != MST_TRIANGLE_SOUP) {
             continue;
@@ -274,6 +279,7 @@ static qboolean LoadWorldMapData(const char *name) {
         numVerts = LittleLong(surface->numVerts);
         firstIndex = LittleLong(surface->firstIndex);
         numIndexes = LittleLong(surface->numIndexes);
+        shaderNum = LittleLong(surface->shaderNum);
 
         if (numVerts <= 0 || numIndexes < 3) {
             continue;
@@ -283,6 +289,10 @@ static qboolean LoadWorldMapData(const char *name) {
         }
         if (firstVert < 0 || firstIndex < 0 || firstVert + numVerts > drawVertCount || firstIndex + numIndexes > drawIndexCount) {
             ri.Printf(PRINT_WARNING, "Metal world: skipping invalid surface %d in '%s'\n", i, name);
+            continue;
+        }
+        if (shaderNum < 0 || shaderNum >= shaderCount) {
+            ri.Printf(PRINT_WARNING, "Metal world: skipping surface %d with invalid shader %d in '%s'\n", i, shaderNum, name);
             continue;
         }
 
@@ -316,7 +326,9 @@ static qboolean LoadWorldMapData(const char *name) {
         int numVerts;
         int firstIndex;
         int numIndexes;
+        int shaderNum;
         uint32_t baseVertex;
+        qhandle_t textureHandle;
         int j;
 
         if (surfaceType != MST_PLANAR && surfaceType != MST_TRIANGLE_SOUP) {
@@ -327,6 +339,7 @@ static qboolean LoadWorldMapData(const char *name) {
         numVerts = LittleLong(surface->numVerts);
         firstIndex = LittleLong(surface->firstIndex);
         numIndexes = LittleLong(surface->numIndexes);
+        shaderNum = LittleLong(surface->shaderNum);
 
         if (numVerts <= 0 || numIndexes < 3) {
             continue;
@@ -337,10 +350,16 @@ static qboolean LoadWorldMapData(const char *name) {
         if (firstVert < 0 || firstIndex < 0 || firstVert + numVerts > drawVertCount || firstIndex + numIndexes > drawIndexCount) {
             continue;
         }
+        if (shaderNum < 0 || shaderNum >= shaderCount) {
+            continue;
+        }
+
+        textureHandle = RegisterTexture(shaders[shaderNum].shader);
 
         baseVertex = vertexCursor;
         s_world.draws[drawCursor].firstIndex = indexCursor;
         s_world.draws[drawCursor].indexCount = (uint32_t)numIndexes;
+        s_world.draws[drawCursor].textureHandle = (uint32_t)textureHandle;
         drawCursor += 1;
 
         for (j = 0; j < numVerts; ++j) {
@@ -350,6 +369,8 @@ static qboolean LoadWorldMapData(const char *name) {
             dest->position[0] = LittleFloat(source->xyz[0]);
             dest->position[1] = LittleFloat(source->xyz[1]);
             dest->position[2] = LittleFloat(source->xyz[2]);
+            dest->texCoord[0] = LittleFloat(source->st[0]);
+            dest->texCoord[1] = LittleFloat(source->st[1]);
             dest->color[0] = ByteToVisibleColor(source->color.rgba[0]);
             dest->color[1] = ByteToVisibleColor(source->color.rgba[1]);
             dest->color[2] = ByteToVisibleColor(source->color.rgba[2]);

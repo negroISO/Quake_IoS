@@ -15,6 +15,7 @@ typedef struct {
 
 typedef struct {
     float position[3];
+    float texCoord[2];
     float color[4];
 } Q3MetalWorldVertex;
 
@@ -27,6 +28,7 @@ typedef struct {
 typedef struct {
     uint32_t firstIndex;
     uint32_t indexCount;
+    uint32_t textureHandle;
 } Q3MetalWorldDrawCmd;
 
 typedef struct {

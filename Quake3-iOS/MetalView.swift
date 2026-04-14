@@ -35,6 +35,7 @@ struct MetalView: UIViewRepresentable {
 
         struct GPUWorldVertex {
             var position: SIMD3<Float>
+            var texCoord: SIMD2<Float>
             var color: SIMD4<Float>
         }
 
@@ -83,6 +84,7 @@ struct MetalView: UIViewRepresentable {
 
         struct WorldVertexIn {
             float3 position;
+            float2 texCoord;
             float4 color;
         };
 
@@ -92,6 +94,7 @@ struct MetalView: UIViewRepresentable {
 
         struct WorldVertexOut {
             float4 position [[position]];
+            float2 texCoord;
             float4 color;
         };
 
@@ -101,12 +104,16 @@ struct MetalView: UIViewRepresentable {
             WorldVertexOut out;
             WorldVertexIn inVertex = vertices[vertexID];
             out.position = uniforms.viewProjection * float4(inVertex.position, 1.0);
+            out.texCoord = inVertex.texCoord;
             out.color = inVertex.color;
             return out;
         }
 
-        fragment float4 q3_world_fragment(WorldVertexOut in [[stage_in]]) {
-            return in.color;
+        fragment float4 q3_world_fragment(WorldVertexOut in [[stage_in]],
+                                          texture2d<float> colorTexture [[texture(0)]],
+                                          sampler textureSampler [[sampler(0)]]) {
+            float4 texel = colorTexture.sample(textureSampler, in.texCoord);
+            return texel * in.color;
         }
         """
 
@@ -166,12 +173,17 @@ struct MetalView: UIViewRepresentable {
                 encoder.setDepthStencilState(depthStencilState)
                 encoder.setVertexBuffer(worldVertexBuffer, offset: 0, index: 0)
                 encoder.setVertexBytes(&worldUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
+                encoder.setFragmentSamplerState(samplerState, index: 0)
 
                 if let worldDrawsPointer = Q3MetalRenderer_GetWorldDrawCommands(),
                    let indicesPointer = Q3MetalRenderer_GetWorldIndices() {
                     let _ = indicesPointer
                     let worldDraws = UnsafeBufferPointer(start: worldDrawsPointer, count: Int(snapshot.worldCommandCount))
                     for draw in worldDraws where draw.indexCount > 0 {
+                        guard let texture = texture(for: draw.textureHandle, device: view.device) else {
+                            continue
+                        }
+                        encoder.setFragmentTexture(texture, index: 0)
                         encoder.drawIndexedPrimitives(
                             type: .triangle,
                             indexCount: Int(draw.indexCount),
@@ -346,19 +358,23 @@ struct MetalView: UIViewRepresentable {
                 gpuVertices.append(
                     GPUWorldVertex(
                         position: SIMD3<Float>(vertex.position.0, vertex.position.1, vertex.position.2),
+                        texCoord: SIMD2<Float>(vertex.texCoord.0, vertex.texCoord.1),
                         color: SIMD4<Float>(vertex.color.0, vertex.color.1, vertex.color.2, vertex.color.3)
                     )
                 )
             }
 
             let sourceIndices = UnsafeBufferPointer(start: indicesPointer, count: indexCount)
+            guard let sourceIndexBase = sourceIndices.baseAddress else {
+                return nil
+            }
             worldVertexBuffer = device.makeBuffer(
                 bytes: gpuVertices,
                 length: gpuVertices.count * MemoryLayout<GPUWorldVertex>.stride,
                 options: .storageModeShared
             )
             worldIndexBuffer = device.makeBuffer(
-                bytes: sourceIndices.baseAddress!,
+                bytes: sourceIndexBase,
                 length: sourceIndices.count * MemoryLayout<UInt32>.stride,
                 options: .storageModeShared
             )
@@ -373,6 +389,10 @@ struct MetalView: UIViewRepresentable {
             guard Q3MetalRenderer_GetTextureInfo(handle, &info) != 0,
                   let rgbaBytes = info.rgbaBytes
             else {
+                return nil
+            }
+
+            guard info.width > 0, info.height > 0 else {
                 return nil
             }
 
