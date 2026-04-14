@@ -38,6 +38,7 @@ static float s_currentColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
 static metalTexture_t s_textures[Q3_METAL_MAX_TEXTURES];
 static qhandle_t s_nextTextureHandle = 1;
 static qhandle_t s_whiteTextureHandle;
+static qhandle_t s_skyTextureHandle;
 
 typedef struct {
     qboolean loaded;
@@ -120,6 +121,48 @@ static qhandle_t EnsureWhiteTexture(void) {
     Q_strncpyz(texture->name, "*white", sizeof(texture->name));
     s_whiteTextureHandle = texture->handle;
     return s_whiteTextureHandle;
+}
+
+static qhandle_t EnsureSkyTexture(void) {
+    metalTexture_t *texture;
+    byte *rgba;
+
+    if (s_skyTextureHandle != 0) {
+        return s_skyTextureHandle;
+    }
+
+    texture = AllocTextureSlot();
+    if (texture == NULL) {
+        return EnsureWhiteTexture();
+    }
+
+    rgba = ri.Malloc(4);
+    rgba[0] = 18;
+    rgba[1] = 14;
+    rgba[2] = 26;
+    rgba[3] = 255;
+
+    texture->width = 1;
+    texture->height = 1;
+    texture->rgbaBytes = rgba;
+    Q_strncpyz(texture->name, "*sky_fallback", sizeof(texture->name));
+    s_skyTextureHandle = texture->handle;
+    return s_skyTextureHandle;
+}
+
+static qboolean IsSkyShaderName(const char *name) {
+    if (name == NULL || name[0] == '\0') {
+        return qfalse;
+    }
+
+    if (!Q_stricmpn(name, "textures/skies/", 15)) {
+        return qtrue;
+    }
+    if (!Q_stricmpn(name, "env/", 4)) {
+        return qtrue;
+    }
+
+    return qfalse;
 }
 
 static qboolean TryLoadImageRGBA(const char *name, byte **rgba, int *width, int *height, char *resolvedName, size_t resolvedNameSize) {
@@ -271,6 +314,7 @@ static qboolean LoadWorldMapData(const char *name) {
     uint32_t vertexCursor = 0;
     uint32_t indexCursor = 0;
     uint32_t drawCursor = 0;
+    uint32_t skyDraws = 0;
 
     if (ri.FS_ReadFile(name, &fileBuffer) <= 0 || fileBuffer == NULL) {
         ri.Printf(PRINT_WARNING, "Metal world: failed to read BSP '%s'\n", name);
@@ -386,7 +430,12 @@ static qboolean LoadWorldMapData(const char *name) {
             continue;
         }
 
-        textureHandle = RegisterTexture(shaders[shaderNum].shader);
+        if (IsSkyShaderName(shaders[shaderNum].shader)) {
+            textureHandle = EnsureSkyTexture();
+            skyDraws += 1;
+        } else {
+            textureHandle = RegisterTexture(shaders[shaderNum].shader);
+        }
 
         baseVertex = vertexCursor;
         s_world.draws[drawCursor].firstIndex = indexCursor;
@@ -426,8 +475,8 @@ static qboolean LoadWorldMapData(const char *name) {
     s_world.drawCount = drawCursor;
     Q_strncpyz(s_world.name, name, sizeof(s_world.name));
 
-    ri.Printf(PRINT_ALL, "Metal world: loaded '%s' with %u verts, %u indices, %u draws\n",
-              name, s_world.vertexCount, s_world.indexCount, s_world.drawCount);
+    ri.Printf(PRINT_ALL, "Metal world: loaded '%s' with %u verts, %u indices, %u draws (%u sky)\n",
+              name, s_world.vertexCount, s_world.indexCount, s_world.drawCount, skyDraws);
 
     ri.FS_FreeFile(fileBuffer);
     return qtrue;
@@ -441,6 +490,7 @@ static void RE_Shutdown(refShutdownCode_t code) {
 static void RE_BeginRegistration(glconfig_t *config) {
     ri.Printf(PRINT_ALL, "RE_BeginRegistration: Metal stub\n");
     EnsureWhiteTexture();
+    EnsureSkyTexture();
     s_glConfig.vidWidth = 2796;
     s_glConfig.vidHeight = 1290;
     s_glConfig.windowAspect = (float)s_glConfig.vidWidth / (float)s_glConfig.vidHeight;
