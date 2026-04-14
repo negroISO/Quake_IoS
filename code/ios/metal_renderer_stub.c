@@ -1429,6 +1429,19 @@ static void RE_RenderScene(const refdef_t *fd) {
             s_entityRejectedModelThisFrame,
             s_sceneEntityCount
         );
+        if (s_sceneEntityCount > 0) {
+            const refEntity_t *firstEntity = &s_sceneEntities[0].entity;
+            ri.Printf(
+                PRINT_ALL,
+                "Metal entity first[%u]: origin=(%.2f %.2f %.2f) axis0=(%.3f %.3f %.3f) renderfx=0x%x hModel=%d reType=%d\n",
+                s_sceneLogCounter,
+                firstEntity->origin[0], firstEntity->origin[1], firstEntity->origin[2],
+                firstEntity->axis[0][0], firstEntity->axis[0][1], firstEntity->axis[0][2],
+                firstEntity->renderfx,
+                firstEntity->hModel,
+                firstEntity->reType
+            );
+        }
     }
 
     if (s_world.loaded && !(fd->rdflags & RDF_NOWORLDMODEL)) {
