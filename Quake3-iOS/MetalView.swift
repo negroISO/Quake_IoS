@@ -363,16 +363,11 @@ struct MetalView: UIViewRepresentable {
             }
 
             let vertexCount = Int(snapshot.vertexCount)
-            if vertexCount > 0, let verticesPointer = Q3MetalRenderer_GetVertices() {
+            if vertexCount > 0, let verticesPointer = Q3MetalRenderer_GetVertices(),
+               let vertexBuffer = uploadVertices(UnsafeBufferPointer(start: verticesPointer, count: vertexCount), device: view.device) {
                 let vertices = UnsafeBufferPointer(start: verticesPointer, count: vertexCount)
                 let projection = makeOrthoProjection(width: max(Float(snapshot.drawableWidth), 1.0), height: max(Float(snapshot.drawableHeight), 1.0))
                 var uniforms = Uniforms(projection: projection)
-                guard let vertexBuffer = uploadVertices(vertices, device: view.device) else {
-                    encoder.endEncoding()
-                    commandBuffer.present(drawable)
-                    commandBuffer.commit()
-                    return
-                }
 
                 if let uiPipelineState {
                     encoder.setRenderPipelineState(uiPipelineState)
