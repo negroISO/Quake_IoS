@@ -340,6 +340,20 @@ static qhandle_t RegisterTexture(const char *name) {
         return EnsureWhiteTexture();
     }
 
+    {
+        static char seen[256][MAX_QPATH];
+        static int seenCount = 0;
+        int i;
+        qboolean alreadySeen = qfalse;
+        for (i = 0; i < seenCount; ++i) {
+            if (!Q_stricmp(seen[i], name)) { alreadySeen = qtrue; break; }
+        }
+        if (!alreadySeen && seenCount < 256) {
+            Q_strncpyz(seen[seenCount++], name, MAX_QPATH);
+            ri.Printf(PRINT_ALL, "Metal asset request: '%s'\n", name);
+        }
+    }
+
     existing = FindTextureByName(name);
     if (existing != NULL) {
         return existing->handle;
