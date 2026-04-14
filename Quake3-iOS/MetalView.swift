@@ -195,6 +195,18 @@ struct MetalView: UIViewRepresentable {
         private var worldSamplerState: MTLSamplerState?
         private var depthStencilState: MTLDepthStencilState?
         private var additiveDepthStencilState: MTLDepthStencilState?
+        private var fallbackDepthStencilState: MTLDepthStencilState?
+
+        private func ensuredDepthStencilState(_ preferred: MTLDepthStencilState?, device: MTLDevice?) -> MTLDepthStencilState? {
+            if let preferred { return preferred }
+            if let fallbackDepthStencilState { return fallbackDepthStencilState }
+            guard let device else { return nil }
+            let desc = MTLDepthStencilDescriptor()
+            desc.depthCompareFunction = .always
+            desc.isDepthWriteEnabled = false
+            fallbackDepthStencilState = device.makeDepthStencilState(descriptor: desc)
+            return fallbackDepthStencilState
+        }
         private var textureCache: [UInt32: (generation: UInt32, texture: MTLTexture)] = [:]
         private var vertexBuffer: MTLBuffer?
         private var vertexBufferCapacity = 0
@@ -231,7 +243,6 @@ struct MetalView: UIViewRepresentable {
                   let commandQueue,
                   let uiSamplerState,
                   let worldSamplerState,
-                  let depthStencilState,
                   let commandBuffer = commandQueue.makeCommandBuffer()
             else { return }
 
@@ -254,7 +265,7 @@ struct MetalView: UIViewRepresentable {
                 let viewProjection = makeWorldViewProjection(sceneView)
                 var worldUniforms = WorldUniforms(viewProjection: viewProjection)
                 encoder.setRenderPipelineState(worldPipelineState)
-                encoder.setDepthStencilState(depthStencilState)
+                encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
                 encoder.setFrontFacing(.clockwise)
                 encoder.setCullMode(.none)
                 encoder.setVertexBuffer(worldVertexBuffer, offset: 0, index: 0)
@@ -276,10 +287,10 @@ struct MetalView: UIViewRepresentable {
                         let additive = (draw.flags & UInt32(Q3_METAL_WORLD_DRAWFLAG_ADDITIVE)) != 0
                         if additive, let worldAdditivePipelineState, let additiveDepthStencilState {
                             encoder.setRenderPipelineState(worldAdditivePipelineState)
-                            encoder.setDepthStencilState(additiveDepthStencilState)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
                         } else {
                             encoder.setRenderPipelineState(worldPipelineState)
-                            encoder.setDepthStencilState(depthStencilState)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
                         }
                         var drawUniforms = WorldDrawUniforms(
                             texCoordScale: SIMD2<Float>(draw.texCoordScale.0, draw.texCoordScale.1),
@@ -326,7 +337,7 @@ struct MetalView: UIViewRepresentable {
                 let entityViewProjection = makeWorldViewProjection(sceneView)
                 var entityUniforms = EntityUniforms(viewProjection: entityViewProjection)
                 encoder.setRenderPipelineState(entityPipelineState)
-                encoder.setDepthStencilState(depthStencilState)
+                encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
                 encoder.setFrontFacing(.clockwise)
                 encoder.setCullMode(.none)
                 encoder.setVertexBuffer(entityVertexBuffer, offset: 0, index: 0)
@@ -366,7 +377,7 @@ struct MetalView: UIViewRepresentable {
                 if let uiPipelineState {
                     encoder.setRenderPipelineState(uiPipelineState)
                 }
-                encoder.setDepthStencilState(nil)
+                encoder.setDepthStencilState(ensuredDepthStencilState(nil, device: view.device))
                 encoder.setFragmentSamplerState(uiSamplerState, index: 0)
                 encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
                 encoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
