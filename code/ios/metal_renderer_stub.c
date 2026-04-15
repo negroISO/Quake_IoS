@@ -70,6 +70,11 @@ typedef struct {
     Q3MetalWorldVertex *vertices;
     uint32_t *indices;
     Q3MetalWorldDrawCmd *draws;
+    /* Parallel table of animated shader slot per draw index.
+     * Slot == -1 means static; >= 0 indexes s_shaderMap for per-frame
+     * retargeting (fire/lava/teleport on world geometry). */
+    int *animShaderSlots;
+    uint32_t animatedDrawCount; /* number of draws with slot >= 0 */
     char name[MAX_QPATH];
 } metalWorld_t;
 
@@ -339,6 +344,10 @@ static qboolean TryLoadImageRGBA(const char *name, byte **rgba, int *width, int 
 
 static const char *ShaderMap_Lookup(const char *name);
 static qhandle_t ShaderMap_ResolveCurrentFrame(const char *name);
+static int ShaderMap_FindAnimatedSlot(const char *name);
+static qhandle_t ShaderMap_AnimatedSlotCurrentHandle(int slot);
+
+static int s_pendingAnimSlot;
 
 static qhandle_t RegisterTexture(const char *name) {
     metalTexture_t *existing;
@@ -443,6 +452,9 @@ static void FreeWorldMapData(void) {
     }
     if (s_world.draws != NULL) {
         ri.Free(s_world.draws);
+    }
+    if (s_world.animShaderSlots != NULL) {
+        ri.Free(s_world.animShaderSlots);
     }
     if (s_worldLightmapHandles != NULL) {
         ri.Free(s_worldLightmapHandles);
@@ -1045,6 +1057,12 @@ static qboolean LoadWorldMapData(const char *name) {
     s_world.vertices = ri.Malloc(totalVertices * sizeof(*s_world.vertices));
     s_world.indices = ri.Malloc(totalIndices * sizeof(*s_world.indices));
     s_world.draws = ri.Malloc(totalDraws * sizeof(*s_world.draws));
+    s_world.animShaderSlots = ri.Malloc(totalDraws * sizeof(*s_world.animShaderSlots));
+    s_world.animatedDrawCount = 0;
+    if (s_world.animShaderSlots != NULL) {
+        uint32_t _i;
+        for (_i = 0; _i < totalDraws; ++_i) s_world.animShaderSlots[_i] = -1;
+    }
     if (s_world.vertices == NULL || s_world.indices == NULL || s_world.draws == NULL) {
         ri.Printf(PRINT_WARNING, "Metal world: allocation failed for '%s'\n", name);
         FreeWorldMapData();
@@ -1095,6 +1113,13 @@ static qboolean LoadWorldMapData(const char *name) {
         } else {
             textureHandle = RegisterTexture(shaders[shaderNum].shader);
         }
+
+        /* Record animated-shader slot for this surface so RE_RenderScene
+         * can re-resolve the textureHandle each frame. Without this,
+         * world fire/lava/teleport surfaces cache frame-0 forever.
+         * Patch surfaces emit multiple draws, so we stash the slot and
+         * apply after each SetupWorldDraw below. */
+        s_pendingAnimSlot = ShaderMap_FindAnimatedSlot(shaders[shaderNum].shader);
         lightmapHandle = EnsureWhiteTexture();
         worldFlags = defaultWorldFlags;
         if (!IsSkyShaderName(shaders[shaderNum].shader) && lightmapNum >= 0 && lightmapNum < s_worldLightmapCount) {
@@ -1185,6 +1210,7 @@ static qboolean LoadWorldMapData(const char *name) {
                     } else {
                         uint32_t firstIndexForDraw = s_world.draws[drawCursor].firstIndex;
                         uint32_t indexCountForDraw = indexCursor - firstIndexForDraw;
+                        uint32_t _dstIdx = drawCursor;
                         SetupWorldDraw(&s_world.draws[drawCursor++],
                                        firstIndexForDraw,
                                        indexCountForDraw,
@@ -1193,6 +1219,10 @@ static qboolean LoadWorldMapData(const char *name) {
                                        worldFlags,
                                        1.0f, 1.0f,
                                        0.0f, 0.0f);
+                        if (s_world.animShaderSlots && s_pendingAnimSlot >= 0) {
+                            s_world.animShaderSlots[_dstIdx] = s_pendingAnimSlot;
+                            s_world.animatedDrawCount += 1;
+                        }
                     }
                 }
             }
@@ -1241,6 +1271,7 @@ static qboolean LoadWorldMapData(const char *name) {
         } else {
             uint32_t firstIndexForDraw = s_world.draws[drawCursor].firstIndex;
             uint32_t indexCountForDraw = indexCursor - firstIndexForDraw;
+            uint32_t _dstIdx = drawCursor;
             SetupWorldDraw(&s_world.draws[drawCursor++],
                            firstIndexForDraw,
                            indexCountForDraw,
@@ -1249,6 +1280,10 @@ static qboolean LoadWorldMapData(const char *name) {
                            worldFlags,
                            1.0f, 1.0f,
                            0.0f, 0.0f);
+            if (s_world.animShaderSlots && s_pendingAnimSlot >= 0) {
+                s_world.animShaderSlots[_dstIdx] = s_pendingAnimSlot;
+                s_world.animatedDrawCount += 1;
+            }
         }
     }
 
@@ -1403,6 +1438,39 @@ static qhandle_t ShaderMap_ResolveCurrentFrame(const char *name) {
         s_shaderMap[slot].animTextures[frameIdx] =
             RegisterTexture(s_shaderMap[slot].animFrames[frameIdx]);
         s_resolving = qfalse;
+    }
+    return s_shaderMap[slot].animTextures[frameIdx];
+}
+
+/* Exact-match slot lookup used when tagging world draws at map-load
+ * for per-frame retargeting. Returns -1 if not animated. */
+static int ShaderMap_FindAnimatedSlot(const char *name) {
+    int i;
+    if (name == NULL || name[0] == '\0') return -1;
+    for (i = 0; i < s_shaderMapCount; ++i) {
+        if (s_shaderMap[i].animFrameCount > 0 &&
+            !Q_stricmp(s_shaderMap[i].shaderName, name)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Current frame's texture handle for a known animated slot. Caller
+ * already validated the slot; returns 0 on bad input to play safe. */
+static qhandle_t ShaderMap_AnimatedSlotCurrentHandle(int slot) {
+    const metalShaderMap_t *entry;
+    float fps;
+    int frameIdx;
+    if (slot < 0 || slot >= s_shaderMapCount) return 0;
+    entry = &s_shaderMap[slot];
+    if (entry->animFrameCount <= 0) return 0;
+    fps = (entry->animFps > 0.0f) ? entry->animFps : 8.0f;
+    frameIdx = (int)((float)cls.realtime * 0.001f * fps) % entry->animFrameCount;
+    if (frameIdx < 0) frameIdx = 0;
+    if (s_shaderMap[slot].animTextures[frameIdx] == 0) {
+        s_shaderMap[slot].animTextures[frameIdx] =
+            RegisterTexture(s_shaderMap[slot].animFrames[frameIdx]);
     }
     return s_shaderMap[slot].animTextures[frameIdx];
 }
@@ -2015,6 +2083,24 @@ static void RE_RenderScene(const refdef_t *fd) {
         return;
     }
     s_renderSceneCalls += 1;
+
+    /* Per-frame world-surface animMap retarget. Walk only the draws we
+     * tagged at map-load (fire/lava/teleport surfaces) and overwrite
+     * their textureHandle with the current animation frame. Zero-cost
+     * when animatedDrawCount == 0 (maps with no animated world shaders). */
+    if (s_world.loaded && s_world.animatedDrawCount > 0 &&
+        s_world.animShaderSlots != NULL && s_world.draws != NULL) {
+        uint32_t i;
+        for (i = 0; i < s_world.drawCount; ++i) {
+            int slot = s_world.animShaderSlots[i];
+            if (slot >= 0) {
+                qhandle_t h = ShaderMap_AnimatedSlotCurrentHandle(slot);
+                if (h != 0) {
+                    s_world.draws[i].textureHandle = (uint32_t)h;
+                }
+            }
+        }
+    }
 
     VectorCopy(fd->vieworg, vieworg);
     VectorCopy(fd->viewaxis[0], axis0);
