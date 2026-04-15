@@ -253,6 +253,13 @@ static qhandle_t EnsureSkyTexture(void) {
     return s_skyTextureHandle;
 }
 
+/* Sky-face texture lookup helper; defined past the metalShaderMap_t
+ * struct. Takes the sky shader name and a normal direction, returns
+ * the handle of the matching face texture, or 0 if the shader has no
+ * skyparms directive (caller falls back to legacy sky). */
+static qhandle_t GetSkyFaceTextureForSurface(const char *shaderName,
+                                             float nx, float ny, float nz);
+
 static qboolean IsSkyShaderName(const char *name) {
     if (name == NULL || name[0] == '\0') {
         return qfalse;
@@ -1111,7 +1118,25 @@ static qboolean LoadWorldMapData(const char *name) {
         }
 
         if (IsSkyShaderName(shaders[shaderNum].shader)) {
-            textureHandle = EnsureSkyTexture();
+            /* Real Q3 skybox: pick the face texture whose outward
+             * direction best matches this surface's vertex normals.
+             * Averages up to 4 vertex normals for stability against
+             * tessellation artifacts. Falls back to the legacy fake
+             * sky if the shader's skyparms haven't been parsed. */
+            qhandle_t skyFace = 0;
+            if (numVerts > 0) {
+                float nx = 0, ny = 0, nz = 0;
+                int nSample = numVerts < 4 ? numVerts : 4;
+                int vi;
+                for (vi = 0; vi < nSample; ++vi) {
+                    const drawVert_t *dv = &drawVerts[firstVert + vi];
+                    nx += dv->normal[0];
+                    ny += dv->normal[1];
+                    nz += dv->normal[2];
+                }
+                skyFace = GetSkyFaceTextureForSurface(shaders[shaderNum].shader, nx, ny, nz);
+            }
+            textureHandle = (skyFace != 0) ? skyFace : EnsureSkyTexture();
             skyDraws += 1;
         } else {
             textureHandle = RegisterTexture(shaders[shaderNum].shader);
@@ -1350,7 +1375,23 @@ typedef struct {
     float animFps;
     char animFrames[METAL_ANIMMAP_MAX_FRAMES][MAX_QPATH];
     qhandle_t animTextures[METAL_ANIMMAP_MAX_FRAMES]; /* lazy resolve */
+    /* skyparms support. `skyparms <basename> <cloudHeight> <nearbox>`
+     * declares a 6-sided skybox. We load six face textures from
+     *   <basename>_up|dn|ft|bk|lf|rt.(tga|jpg)
+     * and pick the right face per world sky surface based on the
+     * surface's dominant vertex normal direction. Empty skyBoxBase =
+     * not a skyparms shader (normal map). */
+    char skyBoxBase[MAX_QPATH];
+    qhandle_t skyFaceTextures[6]; /* up, dn, ft, bk, lf, rt (lazy) */
 } metalShaderMap_t;
+
+/* Sky face enumeration. Order matches Q3 convention. */
+#define METAL_SKY_FACE_UP 0
+#define METAL_SKY_FACE_DN 1
+#define METAL_SKY_FACE_FT 2  /* +X */
+#define METAL_SKY_FACE_BK 3  /* -X */
+#define METAL_SKY_FACE_LF 4  /* +Y */
+#define METAL_SKY_FACE_RT 5  /* -Y */
 static metalShaderMap_t s_shaderMap[MAX_SHADER_MAP_ENTRIES];
 static int s_shaderMapCount = 0;
 static qboolean s_shaderMapLoaded = qfalse;
@@ -1470,6 +1511,45 @@ static int ShaderMap_FindAnimatedSlot(const char *name) {
 
 /* Returns the tcMod scroll (s, t) values parsed from the first stage
  * of the named shader, or (0, 0) if unknown / absent. */
+/* Q3 skybox support. Resolves one of six face textures for a sky
+ * shader based on the surface's dominant normal direction. Returns 0
+ * if the named shader has no skyparms directive; caller falls back
+ * to the legacy fake sky. Lazily registers each face texture. */
+static qhandle_t GetSkyFaceTextureForSurface(const char *shaderName,
+                                             float nx, float ny, float nz) {
+    static const char *kSuffixes[6] = { "_up", "_dn", "_ft", "_bk", "_lf", "_rt" };
+    metalShaderMap_t *entry = NULL;
+    int i, faceIdx;
+    float ax, ay, az;
+    char path[MAX_QPATH];
+    if (shaderName == NULL || shaderName[0] == '\0') return 0;
+
+    for (i = 0; i < s_shaderMapCount; ++i) {
+        if (!Q_stricmp(s_shaderMap[i].shaderName, shaderName) &&
+            s_shaderMap[i].skyBoxBase[0] != '\0') {
+            entry = &s_shaderMap[i];
+            break;
+        }
+    }
+    if (entry == NULL) return 0;
+
+    ax = fabsf(nx); ay = fabsf(ny); az = fabsf(nz);
+    if (az >= ax && az >= ay) {
+        faceIdx = (nz >= 0.0f) ? 0 /*up*/ : 1 /*dn*/;
+    } else if (ax >= ay) {
+        faceIdx = (nx >= 0.0f) ? 2 /*ft*/ : 3 /*bk*/;
+    } else {
+        faceIdx = (ny >= 0.0f) ? 4 /*lf*/ : 5 /*rt*/;
+    }
+
+    if (entry->skyFaceTextures[faceIdx] != 0) {
+        return entry->skyFaceTextures[faceIdx];
+    }
+    Com_sprintf(path, sizeof(path), "%s%s", entry->skyBoxBase, kSuffixes[faceIdx]);
+    entry->skyFaceTextures[faceIdx] = RegisterTexture(path);
+    return entry->skyFaceTextures[faceIdx];
+}
+
 static void ShaderMap_GetScroll(const char *name, float *outS, float *outT) {
     int i;
     if (outS) *outS = 0.0f;
@@ -1562,6 +1642,8 @@ static void ParseShaderText(const char *text) {
         qboolean gotMap;
         qboolean gotAnim;
         qboolean tcGenEnv;
+        char skyBoxBase[MAX_QPATH];
+        qboolean gotSkyParms;
 
         token = COM_ParseExt(&p, qtrue);
         if (!token[0]) break;
@@ -1581,6 +1663,8 @@ static void ParseShaderText(const char *text) {
         gotMap = qfalse;
         gotAnim = qfalse;
         tcGenEnv = qfalse;
+        skyBoxBase[0] = '\0';
+        gotSkyParms = qfalse;
 
         while (depth > 0) {
             token = COM_ParseExt(&p, qtrue);
@@ -1594,6 +1678,24 @@ static void ParseShaderText(const char *text) {
             if (token[0] == '}' && token[1] == '\0') {
                 depth -= 1;
                 inStage = qfalse;
+                continue;
+            }
+
+            /* Top-level directives (outside any stage block). `skyparms`
+             * is the most important one for us — declares the 6-face
+             * skybox basename that the world rendering will use per
+             * sky surface. */
+            if (!inStage) {
+                if (!gotSkyParms && !Q_stricmp(token, "skyparms")) {
+                    /* skyparms <farbox> <cloudHeight> <nearbox>
+                     * `-` means "no farbox / nearbox"; take it as empty. */
+                    token = COM_ParseExt(&p, qfalse);
+                    if (token[0] && Q_stricmp(token, "-") != 0) {
+                        Q_strncpyz(skyBoxBase, token, sizeof(skyBoxBase));
+                        gotSkyParms = qtrue;
+                    }
+                    /* Ignore the remaining two args. */
+                }
                 continue;
             }
 
@@ -1648,15 +1750,24 @@ static void ParseShaderText(const char *text) {
             ShaderMap_RegisterAnimated(shaderName, animFrames, animFrameCount, animFps, tcGenEnv);
         } else if (gotMap) {
             ShaderMap_Register(shaderName, firstMap, tcGenEnv);
+        } else if (gotSkyParms) {
+            /* Sky-only shader (no renderable map stage). Register a
+             * placeholder so the lookup succeeds and the skyparms
+             * back-patch below has a slot to attach to. */
+            ShaderMap_Register(shaderName, "", qfalse);
         }
-        /* Back-patch tcMod scroll onto the just-registered entry (either
-         * animated or static). Deferred so the Register call chooses
-         * the slot. */
-        if ((gotAnim || gotMap) && gotTcScroll && s_shaderMapCount > 0) {
+        /* Back-patch tcMod scroll and skyparms onto the just-registered
+         * entry. Deferred so the Register call chooses the slot. */
+        if ((gotAnim || gotMap || gotSkyParms) && s_shaderMapCount > 0) {
             metalShaderMap_t *last = &s_shaderMap[s_shaderMapCount - 1];
             if (!Q_stricmp(last->shaderName, shaderName)) {
-                last->tcModScrollS = tcScrollS;
-                last->tcModScrollT = tcScrollT;
+                if (gotTcScroll) {
+                    last->tcModScrollS = tcScrollS;
+                    last->tcModScrollT = tcScrollT;
+                }
+                if (gotSkyParms) {
+                    Q_strncpyz(last->skyBoxBase, skyBoxBase, sizeof(last->skyBoxBase));
+                }
             }
         }
     }
