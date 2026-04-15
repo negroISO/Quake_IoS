@@ -1439,6 +1439,141 @@ static void RE_BeginRegistration(glconfig_t *config) {
 
 static qhandle_t s_nextStubSkinHandle = 1;
 
+/* Q3 .skin file support. Each line maps a surface name to a texture:
+ *   h_helmet,models/players/sarge/sarge.jpg
+ *   u_torso,models/players/sarge/sarge.jpg
+ *   tag_weapon,
+ * An empty right-hand side means "hide this surface". */
+#define METAL_SKIN_MAX_SURFACES 32
+#define METAL_SKIN_MAX 256
+
+typedef struct {
+    char surface[MAX_QPATH];
+    char shader[MAX_QPATH];
+    qhandle_t textureHandle; /* 0 if surface should be hidden */
+} metalSkinSurface_t;
+
+typedef struct {
+    qboolean inUse;
+    char name[MAX_QPATH];
+    int numSurfaces;
+    metalSkinSurface_t surfaces[METAL_SKIN_MAX_SURFACES];
+} metalSkin_t;
+
+static metalSkin_t s_skins[METAL_SKIN_MAX];
+
+static metalSkin_t *FindSkinByHandle(qhandle_t handle) {
+    int idx;
+    if (handle < 0x20000000) {
+        return NULL;
+    }
+    idx = handle - 0x20000000;
+    if (idx < 0 || idx >= METAL_SKIN_MAX) {
+        return NULL;
+    }
+    if (!s_skins[idx].inUse) {
+        return NULL;
+    }
+    return &s_skins[idx];
+}
+
+static qboolean ParseSkinText(const char *text, metalSkin_t *skin) {
+    const char *p = text;
+    skin->numSurfaces = 0;
+    while (p && *p) {
+        const char *lineStart = p;
+        const char *lineEnd;
+        const char *comma;
+        char surfaceBuf[MAX_QPATH];
+        char shaderBuf[MAX_QPATH];
+        size_t surfaceLen;
+        size_t shaderLen;
+
+        while (*p && *p != '\n' && *p != '\r') {
+            p++;
+        }
+        lineEnd = p;
+        while (*p == '\n' || *p == '\r') {
+            p++;
+        }
+
+        /* Trim trailing whitespace. */
+        while (lineEnd > lineStart && (lineEnd[-1] == ' ' || lineEnd[-1] == '\t')) {
+            lineEnd--;
+        }
+        /* Skip blank lines and comments. */
+        {
+            const char *skip = lineStart;
+            while (skip < lineEnd && (*skip == ' ' || *skip == '\t')) {
+                skip++;
+            }
+            if (skip >= lineEnd) {
+                continue;
+            }
+            if (skip + 1 < lineEnd && skip[0] == '/' && skip[1] == '/') {
+                continue;
+            }
+            lineStart = skip;
+        }
+
+        comma = memchr(lineStart, ',', (size_t)(lineEnd - lineStart));
+        if (comma == NULL) {
+            continue;
+        }
+
+        surfaceLen = (size_t)(comma - lineStart);
+        if (surfaceLen >= sizeof(surfaceBuf)) {
+            surfaceLen = sizeof(surfaceBuf) - 1;
+        }
+        memcpy(surfaceBuf, lineStart, surfaceLen);
+        surfaceBuf[surfaceLen] = '\0';
+
+        shaderLen = (size_t)(lineEnd - (comma + 1));
+        if (shaderLen >= sizeof(shaderBuf)) {
+            shaderLen = sizeof(shaderBuf) - 1;
+        }
+        memcpy(shaderBuf, comma + 1, shaderLen);
+        shaderBuf[shaderLen] = '\0';
+
+        /* tag_ entries are attachment points, not renderable surfaces. Skip. */
+        if (strncmp(surfaceBuf, "tag_", 4) == 0) {
+            continue;
+        }
+
+        if (skin->numSurfaces >= METAL_SKIN_MAX_SURFACES) {
+            break;
+        }
+        Q_strncpyz(skin->surfaces[skin->numSurfaces].surface, surfaceBuf,
+                   sizeof(skin->surfaces[skin->numSurfaces].surface));
+        Q_strncpyz(skin->surfaces[skin->numSurfaces].shader, shaderBuf,
+                   sizeof(skin->surfaces[skin->numSurfaces].shader));
+        skin->surfaces[skin->numSurfaces].textureHandle = 0; /* lazy resolve */
+        skin->numSurfaces += 1;
+    }
+    return (skin->numSurfaces > 0) ? qtrue : qfalse;
+}
+
+static qhandle_t LookupSkinSurfaceTexture(qhandle_t skinHandle, const char *surfaceName) {
+    metalSkin_t *skin = FindSkinByHandle(skinHandle);
+    int i;
+    if (skin == NULL || surfaceName == NULL || surfaceName[0] == '\0') {
+        return 0;
+    }
+    for (i = 0; i < skin->numSurfaces; ++i) {
+        if (Q_stricmp(skin->surfaces[i].surface, surfaceName) == 0) {
+            if (skin->surfaces[i].shader[0] == '\0') {
+                /* Empty mapping: surface hidden. Return sentinel -1. */
+                return (qhandle_t)-1;
+            }
+            if (skin->surfaces[i].textureHandle == 0) {
+                skin->surfaces[i].textureHandle = RegisterTexture(skin->surfaces[i].shader);
+            }
+            return skin->surfaces[i].textureHandle;
+        }
+    }
+    return 0;
+}
+
 static qhandle_t RE_RegisterModel(const char *name) {
     if (name == NULL || name[0] == '\0') {
         return 0;
@@ -1447,11 +1582,61 @@ static qhandle_t RE_RegisterModel(const char *name) {
 }
 
 static qhandle_t RE_RegisterSkin(const char *name) {
+    int idx;
+    char *text = NULL;
+    int fileLen;
+
     if (name == NULL || name[0] == '\0') {
         return 0;
     }
 
-    return 0x20000000 + s_nextStubSkinHandle++;
+    /* Reuse existing registration. */
+    for (idx = 0; idx < METAL_SKIN_MAX; ++idx) {
+        if (s_skins[idx].inUse && Q_stricmp(s_skins[idx].name, name) == 0) {
+            return (qhandle_t)(0x20000000 + idx);
+        }
+    }
+
+    /* Find a free slot. */
+    for (idx = 0; idx < METAL_SKIN_MAX; ++idx) {
+        if (!s_skins[idx].inUse) {
+            break;
+        }
+    }
+    if (idx >= METAL_SKIN_MAX) {
+        ri.Printf(PRINT_WARNING, "Metal skin: registry full, dropping '%s'\n", name);
+        return 0;
+    }
+
+    fileLen = ri.FS_ReadFile(name, (void **)&text);
+    if (fileLen <= 0 || text == NULL) {
+        ri.Printf(PRINT_DEVELOPER, "Metal skin: cannot read '%s'\n", name);
+        if (text) {
+            ri.FS_FreeFile(text);
+        }
+        /* Return a handle anyway so cgame doesn't treat this as failure;
+         * just with zero surfaces the draw loop will fall back to MD3
+         * shader lookup. */
+        Com_Memset(&s_skins[idx], 0, sizeof(s_skins[idx]));
+        Q_strncpyz(s_skins[idx].name, name, sizeof(s_skins[idx].name));
+        s_skins[idx].inUse = qtrue;
+        s_skins[idx].numSurfaces = 0;
+        return (qhandle_t)(0x20000000 + idx);
+    }
+
+    Com_Memset(&s_skins[idx], 0, sizeof(s_skins[idx]));
+    Q_strncpyz(s_skins[idx].name, name, sizeof(s_skins[idx].name));
+    s_skins[idx].inUse = qtrue;
+    ParseSkinText(text, &s_skins[idx]);
+    ri.FS_FreeFile(text);
+
+    ri.Printf(PRINT_DEVELOPER, "Metal skin: '%s' -> %d surface mappings\n",
+              name, s_skins[idx].numSurfaces);
+
+    if (s_nextStubSkinHandle <= idx) {
+        s_nextStubSkinHandle = idx + 1;
+    }
+    return (qhandle_t)(0x20000000 + idx);
 }
 qhandle_t RE_RegisterShader(const char *name) { return RegisterTexture(name); }
 qhandle_t RE_RegisterShaderNoMip(const char *name) { return RegisterTexture(name); }
@@ -1931,6 +2116,20 @@ static void RE_RenderScene(const refdef_t *fd) {
 
                     if (sceneEntity->entity.customShader != 0) {
                         textureHandle = sceneEntity->entity.customShader;
+                    } else if (sceneEntity->entity.customSkin != 0) {
+                        qhandle_t skinTex = LookupSkinSurfaceTexture(
+                            sceneEntity->entity.customSkin, surface->name);
+                        if (skinTex == (qhandle_t)-1) {
+                            /* Skin explicitly hides this surface. */
+                            surface = (const md3Surface_t *)((const byte *)surface + surface->ofsEnd);
+                            continue;
+                        }
+                        if (skinTex != 0) {
+                            textureHandle = skinTex;
+                        } else if (surface->numShaders > 0) {
+                            const md3Shader_t *shader = (const md3Shader_t *)((const byte *)surface + surface->ofsShaders);
+                            textureHandle = RegisterTexture(shader[0].name);
+                        }
                     } else if (surface->numShaders > 0) {
                         const md3Shader_t *shader = (const md3Shader_t *)((const byte *)surface + surface->ofsShaders);
                         int shaderSlot = sceneEntity->entity.skinNum % surface->numShaders;
