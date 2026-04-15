@@ -580,6 +580,13 @@ void Quake3_Init(const char *basePath) {
     Com_Init(cmdline);
     Cvar_Set("com_maxfps", "120");
     Cvar_Set("com_maxfpsUnfocused", "120");
+    /* Q3's stock client (sdl_input.c / linux_glimp.c) is NOT linked on
+     * iOS — only our ios_main.m defines IN_Init, and nothing in the
+     * engine was calling it. Result: PAD0_* binds never ran and
+     * controller buttons produced SE_KEY events that hit no bindings.
+     * Call it explicitly here, after Com_Init so the cvar and command
+     * subsystems are up. */
+    IN_Init();
     Cbuf_AddText("map q3dm1\n");
     engine_initialized = qtrue;
 
