@@ -1753,6 +1753,70 @@ Used to load a development dll instead of a virtual machine
 TTimo: added some verbosity in debug
 =================
 */
+/*
+===============================================================================
+Native (statically-linked) module registry.
+
+iOS does not permit dlopen() of arbitrary dylibs at runtime, so the normal
+Sys_LoadLibrary path in VM_LoadDll always fails. Instead, modules (cgame,
+game, ui) are compiled into the main app binary and register themselves
+at startup. VM_FindNative lets VM_Create pick up a registered module
+before falling through to the dylib / QVM paths.
+
+A module registers by providing its `vmMain` entry point (intptr_t(*)(int,
+int, int, int, int, int, int, int, int, int, int, int, int)) and its
+`dllEntry` initializer (void(*)(dllSyscall_t)). The function-pointer types
+match the existing dllEntry_t / vmMainFunc_t already used for dylib loads.
+===============================================================================
+*/
+
+typedef struct {
+    char          name[32];
+    vmMainFunc_t  vmMain;
+    dllEntry_t    dllEntry;
+} vmNativeModule_t;
+
+#define VM_MAX_NATIVE_MODULES 4
+static vmNativeModule_t s_nativeModules[VM_MAX_NATIVE_MODULES];
+static int              s_nativeModuleCount;
+
+void VM_RegisterNative( const char *name, vmMainFunc_t vmMain, dllEntry_t dllEntry ) {
+    int i;
+    if ( name == NULL || vmMain == NULL || dllEntry == NULL ) {
+        return;
+    }
+    for ( i = 0; i < s_nativeModuleCount; ++i ) {
+        if ( !Q_stricmp( s_nativeModules[i].name, name ) ) {
+            /* update existing registration */
+            s_nativeModules[i].vmMain = vmMain;
+            s_nativeModules[i].dllEntry = dllEntry;
+            return;
+        }
+    }
+    if ( s_nativeModuleCount >= VM_MAX_NATIVE_MODULES ) {
+        Com_Printf( "VM_RegisterNative: table full, dropping '%s'\n", name );
+        return;
+    }
+    Q_strncpyz( s_nativeModules[s_nativeModuleCount].name, name,
+                sizeof( s_nativeModules[0].name ) );
+    s_nativeModules[s_nativeModuleCount].vmMain = vmMain;
+    s_nativeModules[s_nativeModuleCount].dllEntry = dllEntry;
+    s_nativeModuleCount += 1;
+    Com_Printf( "VM_RegisterNative: '%s' registered (vmMain=%p, dllEntry=%p)\n",
+                name, (void *)vmMain, (void *)dllEntry );
+}
+
+static const vmNativeModule_t *VM_FindNative( const char *name ) {
+    int i;
+    if ( name == NULL ) return NULL;
+    for ( i = 0; i < s_nativeModuleCount; ++i ) {
+        if ( !Q_stricmp( s_nativeModules[i].name, name ) ) {
+            return &s_nativeModules[i];
+        }
+    }
+    return NULL;
+}
+
 static void * QDECL VM_LoadDll( const char *name, vmMainFunc_t *entryPoint, dllSyscall_t systemcalls ) {
 
 	char		filename[ MAX_QPATH ];
@@ -1836,6 +1900,23 @@ vm_t *VM_Create( vmIndex_t index, syscall_t systemCalls, dllSyscall_t dllSyscall
 	}
 
 	if ( interpret == VMI_NATIVE ) {
+		/* First: check the native-module registry. On iOS (and any other
+		 * platform where modules are statically linked into the main
+		 * binary) this is the only native path that works, since
+		 * Sys_LoadLibrary cannot dlopen arbitrary dylibs. */
+		const vmNativeModule_t *native = VM_FindNative( name );
+		if ( native != NULL ) {
+			Com_Printf( "VM_Create: using statically-linked native module '%s'\n", name );
+			vm->dllHandle = (void *)native; /* non-null marker */
+			vm->entryPoint = native->vmMain;
+			native->dllEntry( dllSyscalls );
+			vm->privateFlag = 0;
+			vm->dataAlloc = ~0U;
+			vm->dataMask = ~0U;
+			vm->dataBase = 0;
+			return vm;
+		}
+
 		// try to load as a system dll
 		Com_Printf( "Loading dll file %s.\n", name );
 		vm->dllHandle = VM_LoadDll( name, &vm->entryPoint, dllSyscalls );
@@ -1926,8 +2007,20 @@ void VM_Free( vm_t *vm ) {
 	if ( vm->destroy )
 		vm->destroy( vm );
 
-	if ( vm->dllHandle )
-		Sys_UnloadLibrary( vm->dllHandle );
+	if ( vm->dllHandle ) {
+		/* Skip Sys_UnloadLibrary for statically-linked native modules —
+		 * dllHandle is a pointer into s_nativeModules[], not a dylib
+		 * handle; dlclose-ing it would crash. Detect by range-checking
+		 * against the registry array. */
+		qboolean isNativeStatic = qfalse;
+		if ( vm->dllHandle >= (void *)s_nativeModules &&
+		     vm->dllHandle <  (void *)(s_nativeModules + VM_MAX_NATIVE_MODULES) ) {
+			isNativeStatic = qtrue;
+		}
+		if ( !isNativeStatic ) {
+			Sys_UnloadLibrary( vm->dllHandle );
+		}
+	}
 
 #if 0	// now automatically freed by hunk
 	if ( vm->codeBase.ptr ) {

@@ -402,6 +402,13 @@ typedef void (QDECL *dllEntry_t)( dllSyscall_t syscallptr );
 void	VM_Init( void );
 vm_t	*VM_Create( vmIndex_t index, syscall_t systemCalls, dllSyscall_t dllSyscalls, vmInterpret_t interpret );
 
+/* Register a statically-linked native module so VM_Create with VMI_NATIVE
+ * resolves it without dlopen. Used on iOS where modules are compiled into
+ * the main binary. `name` is the bare module name ("cgame", "qagame",
+ * "ui"). Call from platform init BEFORE the client/server requests the
+ * VM (typically from Quake3_Init in ios_main.m). */
+void	VM_RegisterNative( const char *name, vmMainFunc_t vmMain, dllEntry_t dllEntry );
+
 void	VM_Free( vm_t *vm );
 void	VM_Clear(void);
 void	VM_Forced_Unload_Start(void);
