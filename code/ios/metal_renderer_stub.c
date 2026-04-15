@@ -1849,6 +1849,30 @@ static void RE_RenderScene(const refdef_t *fd) {
                     continue;
                 }
 
+                /* Hide the local player's own head in first-person view.
+                 * The stock engine relies on RF_THIRD_PERSON being set by
+                 * cgame on the local player's body parts, but the current
+                 * cgame.qvm ABI mismatch causes renderfx bits to land in
+                 * the wrong field (see brain.db msg 172). Detect by model
+                 * path + camera proximity instead: any /players/.../head.md3
+                 * within ~40 units of the camera is the local-player head. */
+                if (!sceneEntity->isSynthetic && model->inUse) {
+                    const char *mname = model->name;
+                    if (mname && strstr(mname, "/players/") != NULL) {
+                        size_t mlen = strlen(mname);
+                        if (mlen >= 9 && strcmp(mname + mlen - 9, "/head.md3") == 0) {
+                            float dx = sceneEntity->entity.origin[0] - s_sceneView.viewOrigin[0];
+                            float dy = sceneEntity->entity.origin[1] - s_sceneView.viewOrigin[1];
+                            float dz = sceneEntity->entity.origin[2] - s_sceneView.viewOrigin[2];
+                            float distSq = dx*dx + dy*dy + dz*dz;
+                            /* 40 world units, squared = 1600. */
+                            if (distSq < 1600.0f) {
+                                continue;
+                            }
+                        }
+                    }
+                }
+
                 header = model->md3;
                 frameIndex = sceneEntity->entity.frame;
                 oldFrameIndex = sceneEntity->entity.oldframe;
