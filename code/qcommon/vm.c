@@ -1892,18 +1892,13 @@ vm_t *VM_Create( vmIndex_t index, syscall_t systemCalls, dllSyscall_t dllSyscall
 	vm->dllSyscall = dllSyscalls;
 	vm->privateFlag = CVAR_PRIVATE;
 
-	// never allow dll loading with a demo
-	if ( interpret == VMI_NATIVE ) {
-		if ( Cvar_VariableIntegerValue( "fs_restrict" ) ) {
-			interpret = VMI_COMPILED;
-		}
-	}
-
-	if ( interpret == VMI_NATIVE ) {
-		/* First: check the native-module registry. On iOS (and any other
-		 * platform where modules are statically linked into the main
-		 * binary) this is the only native path that works, since
-		 * Sys_LoadLibrary cannot dlopen arbitrary dylibs. */
+	/* Statically-linked native module trumps ALL interpret modes. The
+	 * `vm_cgame` cvar defaults to VMI_COMPILED on most platforms, so
+	 * gating this check behind `interpret == VMI_NATIVE` (as the stock
+	 * dylib path does) means our iOS-embedded cgame never gets picked
+	 * up and the engine falls through to QVM. Check the registry first,
+	 * unconditionally, before any interpret-specific logic. */
+	{
 		const vmNativeModule_t *native = VM_FindNative( name );
 		if ( native != NULL ) {
 			Com_Printf( "VM_Create: using statically-linked native module '%s'\n", name );
@@ -1916,6 +1911,16 @@ vm_t *VM_Create( vmIndex_t index, syscall_t systemCalls, dllSyscall_t dllSyscall
 			vm->dataBase = 0;
 			return vm;
 		}
+	}
+
+	// never allow dll loading with a demo
+	if ( interpret == VMI_NATIVE ) {
+		if ( Cvar_VariableIntegerValue( "fs_restrict" ) ) {
+			interpret = VMI_COMPILED;
+		}
+	}
+
+	if ( interpret == VMI_NATIVE ) {
 
 		// try to load as a system dll
 		Com_Printf( "Loading dll file %s.\n", name );
