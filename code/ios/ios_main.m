@@ -379,7 +379,12 @@ static void QueueGamepadButtonEvent(int key, qboolean previous, qboolean current
 
 void IN_Init(void) {
     Com_Printf("IN_Init: iOS touch + controller input\n");
-    Cbuf_AddText(
+    /* EXEC_NOW, not deferred Cbuf_AddText. Binds must be installed
+     * before q3config.cfg or any later script can clobber them. A
+     * deferred AddText lands after subsequent Cbuf_Execute cycles,
+     * and any bind <key> line in a loaded cfg overrides ours. Running
+     * synchronously here guarantees our PAD0_* binds win. */
+    Cbuf_ExecuteText(EXEC_NOW,
         "seta cl_freelook 1\n"
         "seta in_joystick 1\n"
         "seta j_yaw -0.005\n"
@@ -492,7 +497,7 @@ void GLimp_Init(glconfig_t *config) {
     config->depthBits = 24;
     config->stencilBits = 8;
     config->isFullscreen = qtrue;
-    config->deviceSupportsGamma = qfalse;
+    config->deviceSupportsGamma = qtrue;
     Q_strncpyz(config->renderer_string, "Apple Metal (iOS)", sizeof(config->renderer_string));
     Q_strncpyz(config->vendor_string, "Apple", sizeof(config->vendor_string));
     Q_strncpyz(config->version_string, "Metal 4", sizeof(config->version_string));
