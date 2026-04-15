@@ -338,6 +338,7 @@ static qboolean TryLoadImageRGBA(const char *name, byte **rgba, int *width, int 
 }
 
 static const char *ShaderMap_Lookup(const char *name);
+static qhandle_t ShaderMap_ResolveCurrentFrame(const char *name);
 
 static qhandle_t RegisterTexture(const char *name) {
     metalTexture_t *existing;
@@ -368,6 +369,13 @@ static qhandle_t RegisterTexture(const char *name) {
     existing = FindTextureByName(name);
     if (existing != NULL) {
         return existing->handle;
+    }
+
+    {
+        qhandle_t animHandle = ShaderMap_ResolveCurrentFrame(name);
+        if (animHandle != 0) {
+            return animHandle;
+        }
     }
 
     if (!TryLoadImageRGBA(name, &rgba, &width, &height, resolvedName, sizeof(resolvedName))) {
@@ -1284,10 +1292,17 @@ static void RE_Shutdown(refShutdownCode_t code) {
  * at least one plausible texture so the geometry is visible instead of white.
  */
 #define MAX_SHADER_MAP_ENTRIES 4096
+#define METAL_ANIMMAP_MAX_FRAMES 16
+
 typedef struct {
     char shaderName[128];
     char mapPath[MAX_QPATH];
     qboolean tcGenEnv;   /* any stage uses tcGen environment */
+    /* animMap support. framePaths[0] == mapPath. 0 frames = not animated. */
+    int animFrameCount;
+    float animFps;
+    char animFrames[METAL_ANIMMAP_MAX_FRAMES][MAX_QPATH];
+    qhandle_t animTextures[METAL_ANIMMAP_MAX_FRAMES]; /* lazy resolve */
 } metalShaderMap_t;
 static metalShaderMap_t s_shaderMap[MAX_SHADER_MAP_ENTRIES];
 static int s_shaderMapCount = 0;
@@ -1346,6 +1361,35 @@ static const char *ShaderMap_Lookup(const char *name) {
     return e ? e->mapPath : NULL;
 }
 
+/* If the shader referenced by `name` is animated, return the current frame's
+ * registered texture handle (lazily registering the frame on first hit).
+ * Returns 0 for non-animated shaders so the caller falls through to the
+ * normal lookup path. */
+static qhandle_t ShaderMap_ResolveCurrentFrame(const char *name) {
+    const metalShaderMap_t *entry = ShaderMap_LookupEntry(name);
+    int slot;
+    float fps;
+    int frameIdx;
+
+    if (entry == NULL || entry->animFrameCount <= 0) {
+        return 0;
+    }
+    slot = (int)(entry - s_shaderMap);
+    if (slot < 0 || slot >= s_shaderMapCount) {
+        return 0;
+    }
+    fps = (entry->animFps > 0.0f) ? entry->animFps : 8.0f;
+    frameIdx = (int)((float)cls.realtime * 0.001f * fps) % entry->animFrameCount;
+    if (frameIdx < 0) frameIdx = 0;
+    if (s_shaderMap[slot].animTextures[frameIdx] == 0) {
+        /* Register the frame texture without re-entering the animation
+         * path (frame paths are direct image files, not shader names). */
+        s_shaderMap[slot].animTextures[frameIdx] =
+            RegisterTexture(s_shaderMap[slot].animFrames[frameIdx]);
+    }
+    return s_shaderMap[slot].animTextures[frameIdx];
+}
+
 static void ShaderMap_Register(const char *name, const char *path, qboolean tcGenEnv) {
     if (s_shaderMapCount >= MAX_SHADER_MAP_ENTRIES) return;
     if (ShaderMap_Lookup(name) != NULL) return; /* first wins */
@@ -1354,6 +1398,36 @@ static void ShaderMap_Register(const char *name, const char *path, qboolean tcGe
     Q_strncpyz(s_shaderMap[s_shaderMapCount].mapPath, path,
         sizeof(s_shaderMap[0].mapPath));
     s_shaderMap[s_shaderMapCount].tcGenEnv = tcGenEnv;
+    s_shaderMap[s_shaderMapCount].animFrameCount = 0;
+    s_shaderMap[s_shaderMapCount].animFps = 0.0f;
+    s_shaderMapCount += 1;
+}
+
+/* Register an animated shader entry. frames[] contains up to frameCount
+ * texture paths. Later animation resolves to the current frame based on
+ * cls.realtime. */
+static void ShaderMap_RegisterAnimated(const char *name,
+                                       char frames[][MAX_QPATH],
+                                       int frameCount,
+                                       float fps,
+                                       qboolean tcGenEnv) {
+    int i;
+    int maxFrames = frameCount < METAL_ANIMMAP_MAX_FRAMES ? frameCount : METAL_ANIMMAP_MAX_FRAMES;
+    if (s_shaderMapCount >= MAX_SHADER_MAP_ENTRIES) return;
+    if (ShaderMap_Lookup(name) != NULL) return;
+    if (maxFrames <= 0) return;
+    Q_strncpyz(s_shaderMap[s_shaderMapCount].shaderName, name,
+        sizeof(s_shaderMap[0].shaderName));
+    Q_strncpyz(s_shaderMap[s_shaderMapCount].mapPath, frames[0],
+        sizeof(s_shaderMap[0].mapPath));
+    s_shaderMap[s_shaderMapCount].tcGenEnv = tcGenEnv;
+    s_shaderMap[s_shaderMapCount].animFrameCount = maxFrames;
+    s_shaderMap[s_shaderMapCount].animFps = (fps > 0.0f) ? fps : 8.0f;
+    for (i = 0; i < maxFrames; ++i) {
+        Q_strncpyz(s_shaderMap[s_shaderMapCount].animFrames[i], frames[i],
+                   sizeof(s_shaderMap[0].animFrames[i]));
+        s_shaderMap[s_shaderMapCount].animTextures[i] = 0;
+    }
     s_shaderMapCount += 1;
 }
 
@@ -1364,9 +1438,13 @@ static void ParseShaderText(const char *text) {
     while (1) {
         char shaderName[128];
         char firstMap[MAX_QPATH];
+        char animFrames[METAL_ANIMMAP_MAX_FRAMES][MAX_QPATH];
+        int animFrameCount;
+        float animFps;
         int depth;
         qboolean inStage;
         qboolean gotMap;
+        qboolean gotAnim;
         qboolean tcGenEnv;
 
         token = COM_ParseExt(&p, qtrue);
@@ -1377,9 +1455,12 @@ static void ParseShaderText(const char *text) {
         if (token[0] != '{') continue;
 
         firstMap[0] = '\0';
+        animFrameCount = 0;
+        animFps = 0.0f;
         depth = 1;
         inStage = qfalse;
         gotMap = qfalse;
+        gotAnim = qfalse;
         tcGenEnv = qfalse;
 
         while (depth > 0) {
@@ -1398,18 +1479,27 @@ static void ParseShaderText(const char *text) {
             }
 
             if (inStage) {
-                if (!gotMap && (!Q_stricmp(token, "map") || !Q_stricmp(token, "clampmap"))) {
+                if (!gotMap && !gotAnim && (!Q_stricmp(token, "map") || !Q_stricmp(token, "clampmap"))) {
                     token = COM_ParseExt(&p, qfalse);
                     if (token[0] && token[0] != '$') {
                         Q_strncpyz(firstMap, token, sizeof(firstMap));
                         gotMap = qtrue;
                     }
-                } else if (!gotMap && !Q_stricmp(token, "animmap")) {
-                    token = COM_ParseExt(&p, qfalse); /* fps */
-                    token = COM_ParseExt(&p, qfalse); /* first frame */
-                    if (token[0] && token[0] != '$') {
-                        Q_strncpyz(firstMap, token, sizeof(firstMap));
-                        gotMap = qtrue;
+                } else if (!gotMap && !gotAnim && !Q_stricmp(token, "animmap")) {
+                    /* animMap <fps> <frame1> <frame2> ... up to end of line. */
+                    token = COM_ParseExt(&p, qfalse);
+                    animFps = (float)atof(token);
+                    while (1) {
+                        token = COM_ParseExt(&p, qfalse);
+                        if (!token[0]) break; /* end of line */
+                        if (token[0] == '$') continue;
+                        if (animFrameCount >= METAL_ANIMMAP_MAX_FRAMES) continue;
+                        Q_strncpyz(animFrames[animFrameCount], token, MAX_QPATH);
+                        animFrameCount += 1;
+                    }
+                    if (animFrameCount > 0) {
+                        Q_strncpyz(firstMap, animFrames[0], sizeof(firstMap));
+                        gotAnim = qtrue;
                     }
                 } else if (!Q_stricmp(token, "tcGen") || !Q_stricmp(token, "tcgen")) {
                     token = COM_ParseExt(&p, qfalse);
@@ -1421,7 +1511,9 @@ static void ParseShaderText(const char *text) {
             }
         }
 
-        if (gotMap) {
+        if (gotAnim) {
+            ShaderMap_RegisterAnimated(shaderName, animFrames, animFrameCount, animFps, tcGenEnv);
+        } else if (gotMap) {
             ShaderMap_Register(shaderName, firstMap, tcGenEnv);
         }
     }
