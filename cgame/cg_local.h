@@ -42,6 +42,23 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #  define vmMain     CG_vmMain
 #  define dllEntry   CG_dllEntry
 #  define syscall    CG_syscall
+
+/* Native cgame is part of the engine translation-unit set, so it sees
+ * qcommon.h directly. QVM cgame never did — cg_public.h references
+ * COM_TRAP_GETVALUE which lives in qcommon.h, not q_shared.h. */
+#  include "../qcommon/qcommon.h"
+
+/* Quake3e's refEntity_t diverges from ioq3's:
+ *   ioq3       ->  Quake3e
+ *   shaderRGBA ->  shader.rgba  (color4ub_t union)
+ * The byte-array semantics are identical; only the member path changed.
+ * This macro lets the imported cgame code keep writing
+ *   ent->shaderRGBA[0] = 255;
+ * without source edits. shaderTime also diverged (float -> floatint_t
+ * union), but requires per-site .f suffixes — handled by patches to
+ * the affected files rather than a macro, because you can't legally
+ * `#define shaderTime shaderTime.f`. */
+#  define shaderRGBA shader.rgba
 #endif
 
 
