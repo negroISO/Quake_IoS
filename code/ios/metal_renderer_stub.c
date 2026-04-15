@@ -1737,6 +1737,32 @@ static qhandle_t GetViewmodelHandle(int weapon) {
     return s_viewmodelHandles[weapon];
 }
 
+static cvar_t *s_cvarVmForward = NULL;
+static cvar_t *s_cvarVmRight = NULL;
+static cvar_t *s_cvarVmUp = NULL;
+static cvar_t *s_cvarVmScale = NULL;
+static cvar_t *s_cvarVmSwayAmp = NULL;
+
+static void EnsureViewmodelCvars(void) {
+    if (s_cvarVmForward == NULL) {
+        /* Live-tunable placement. Adjust from console without a rebuild:
+         *   \metal_vm_forward 10
+         *   \metal_vm_right -5
+         *   \metal_vm_up -6
+         *   \metal_vm_scale 1.0
+         *   \metal_vm_sway 0.4
+         * Defaults below are a tighter second guess than the prior
+         * (70, -18, -24, 0.7) — log coords suggested world scale is
+         * smaller than stock Q3, so large offsets pushed the model off-
+         * screen and scale 0.7 still felt oversized. */
+        s_cvarVmForward = ri.Cvar_Get("metal_vm_forward", "10", CVAR_ARCHIVE);
+        s_cvarVmRight   = ri.Cvar_Get("metal_vm_right",   "-4", CVAR_ARCHIVE);
+        s_cvarVmUp      = ri.Cvar_Get("metal_vm_up",      "-5", CVAR_ARCHIVE);
+        s_cvarVmScale   = ri.Cvar_Get("metal_vm_scale",   "0.6", CVAR_ARCHIVE);
+        s_cvarVmSwayAmp = ri.Cvar_Get("metal_vm_sway",    "0.4", CVAR_ARCHIVE);
+    }
+}
+
 static void SynthesizeViewmodelEntity(const vec3_t vieworg,
                                       const vec3_t axis0,
                                       const vec3_t axis1,
@@ -1746,13 +1772,18 @@ static void SynthesizeViewmodelEntity(const vec3_t vieworg,
     qhandle_t hModel;
     int weapon;
     vec3_t origin;
-    float t, swayRight, swayUp;
-    /* Quake 3-ish placement and apparent size. MD3 has no native scale
-     * field; we fake uniform scale by scaling the basis vectors. */
-    const float kForward = 70.0f;
-    const float kRight   = 18.0f;
-    const float kUp      = -24.0f;
-    const float kScale   = 0.7f;
+    float t, swayRight, swayUp, swayAmp;
+    float kForward, kRight, kUp, kScale;
+
+    EnsureViewmodelCvars();
+    kForward = s_cvarVmForward->value;
+    kRight   = s_cvarVmRight->value;
+    kUp      = s_cvarVmUp->value;
+    kScale   = s_cvarVmScale->value;
+    swayAmp  = s_cvarVmSwayAmp->value;
+    if (kScale <= 0.0f) {
+        kScale = 0.6f;
+    }
 
     if (s_sceneEntityCount >= Q3_METAL_MAX_REFENTITIES) {
         return;
@@ -1785,8 +1816,8 @@ static void SynthesizeViewmodelEntity(const vec3_t vieworg,
 
     /* Idle sway using engine-side time (cls.realtime is in ms). Subtle. */
     t = (float)cls.realtime * 0.002f;
-    swayRight = sinf(t) * 0.5f;
-    swayUp    = cosf(t) * 0.3f;
+    swayRight = sinf(t) * swayAmp;
+    swayUp    = cosf(t) * (swayAmp * 0.6f);
     origin[0] += (-axis1[0] * swayRight) + (axis2[0] * swayUp);
     origin[1] += (-axis1[1] * swayRight) + (axis2[1] * swayUp);
     origin[2] += (-axis1[2] * swayRight) + (axis2[2] * swayUp);
