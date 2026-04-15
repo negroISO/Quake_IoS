@@ -2199,8 +2199,26 @@ static void RE_RenderScene(const refdef_t *fd) {
         s_sceneView.viewAxis[8] = axis2[2];
     }
 
-    /* Inject our own viewmodel entity; cgame is unreliable here. */
-    SynthesizeViewmodelEntity(vieworg, axis0, axis1, axis2);
+    /* Synthetic viewmodel injection — disabled by default now that
+     * native cgame runs and CG_AddViewWeapon submits the real viewmodel
+     * at the correct tag_weapon position with correct animations and
+     * muzzle flash. Toggle via console to fall back if cgame's output
+     * looks wrong:
+     *   \metal_synth_viewmodel 1
+     *
+     * This was a QVM-ABI-mismatch workaround; commit 5977485 made it
+     * obsolete by switching cgame to native. Leaving the code path in
+     * place (behind the cvar) as a safety net during the native cgame
+     * shakedown period. */
+    {
+        static cvar_t *s_cvarSynthVm;
+        if (s_cvarSynthVm == NULL) {
+            s_cvarSynthVm = ri.Cvar_Get("metal_synth_viewmodel", "0", CVAR_ARCHIVE);
+        }
+        if (s_cvarSynthVm->integer) {
+            SynthesizeViewmodelEntity(vieworg, axis0, axis1, axis2);
+        }
+    }
 
     s_sceneLogCounter += 1;
     if ((s_sceneLogCounter % 60) == 0) {
