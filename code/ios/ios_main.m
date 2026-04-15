@@ -602,6 +602,18 @@ void Quake3_Init(const char *basePath) {
     Com_Init(cmdline);
     Cvar_Set("com_maxfps", "120");
     Cvar_Set("com_maxfpsUnfocused", "120");
+
+    /* Register the statically-linked native cgame so VM_Create (called
+     * from CL_InitCGame on map load) resolves to our in-binary cgame
+     * instead of loading baseq3/pak8.pk3's cgame.qvm. Kills the QVM
+     * ABI mismatch that's been driving every workaround commit (head
+     * hide, weapons2 hide, fallback camera, synthetic viewmodel). */
+    {
+        extern vmMainFunc_t CG_Native_GetEntryPoint(void);
+        extern dllEntry_t   CG_Native_GetDllEntry(void);
+        VM_RegisterNative("cgame", CG_Native_GetEntryPoint(), CG_Native_GetDllEntry());
+    }
+
     /* Q3's stock client (sdl_input.c / linux_glimp.c) is NOT linked on
      * iOS — only our ios_main.m defines IN_Init, and nothing in the
      * engine was calling it. Result: PAD0_* binds never ran and
