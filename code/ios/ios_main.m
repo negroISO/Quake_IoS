@@ -379,12 +379,17 @@ static void QueueGamepadButtonEvent(int key, qboolean previous, qboolean current
 
 void IN_Init(void) {
     Com_Printf("IN_Init: iOS touch + controller input\n");
-    /* EXEC_NOW, not deferred Cbuf_AddText. Binds must be installed
-     * before q3config.cfg or any later script can clobber them. A
-     * deferred AddText lands after subsequent Cbuf_Execute cycles,
-     * and any bind <key> line in a loaded cfg overrides ours. Running
-     * synchronously here guarantees our PAD0_* binds win. */
-    Cbuf_ExecuteText(EXEC_NOW,
+    /* Cbuf_AddText + Cbuf_Execute, NOT Cbuf_ExecuteText(EXEC_NOW, ...).
+     * EXEC_NOW calls Cmd_ExecuteString on the whole string, which stops
+     * at the first newline — so for a multi-line script only the FIRST
+     * line (`seta cl_freelook 1`) would run and every bind after it got
+     * silently dropped. Discovered via IN_Init bind-verify diagnostic
+     * returning 'PAD0_A is not bound' (commit 701e736 log capture).
+     *
+     * AddText queues the full multi-line block; Cbuf_Execute then drains
+     * every command to completion. Config files that ran before this
+     * point have already loaded, so our binds still win. */
+    Cbuf_AddText(
         "seta cl_freelook 1\n"
         "seta in_joystick 1\n"
         "seta j_yaw -0.005\n"
@@ -415,6 +420,7 @@ void IN_Init(void) {
         "bind PAD0_DPAD_LEFT \"weapon 5\"\n"
         "bind PAD0_DPAD_RIGHT \"weapon 6\"\n"
     );
+    Cbuf_Execute();
     /* Verify the binds actually installed. `bind PAD0_A` with no second
      * arg prints the current binding. If these come back empty or
      * 'not bound', something clobbered the bind table after IN_Init
