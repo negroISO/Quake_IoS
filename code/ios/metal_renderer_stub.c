@@ -1325,9 +1325,11 @@ static uint32_t s_renderSceneCalls;
 static void RE_ClearScene(void) {
     s_clearSceneCalls += 1;
     s_sceneEntityCount = 0;
-    s_entityVertexCount = 0;
-    s_entityIndexCount = 0;
-    s_entityDrawCount = 0;
+    /* DO NOT reset s_entity{Vertex,Index,Draw}Count here. Cgame calls
+     * ClearScene between every scene (world + HUD + HUD). If we wiped the
+     * draw buffer here, the world scene's draws would be lost before the
+     * HUD scenes' RE_RenderScene runs — which is exactly when Swift reads
+     * s_frameSnapshot. Resets happen in RE_RenderScene (gated on world). */
     s_entityAcceptedThisFrame = 0;
     s_entityRejectedNullThisFrame = 0;
     s_entityRejectedTypeThisFrame = 0;
@@ -1335,11 +1337,6 @@ static void RE_ClearScene(void) {
 }
 
 static uint32_t s_rawEntryCount;  /* unconditional counter for debug */
-/* Cumulative across ALL scenes within a log window (resets only at log). */
-static uint32_t s_acceptedCumulative;
-static uint32_t s_rejectNullCumulative;
-static uint32_t s_rejectTypeCumulative;
-static uint32_t s_rejectModelCumulative;
 
 static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime) {
     vec3_t cross;
@@ -1347,17 +1344,14 @@ static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime
     s_rawEntryCount += 1;  /* counted even for null/invalid */
     if (re == NULL || s_sceneEntityCount >= Q3_METAL_MAX_REFENTITIES) {
         s_entityRejectedNullThisFrame += 1;
-        s_rejectNullCumulative += 1;
         return;
     }
     if (re->reType != RT_MODEL) {
         s_entityRejectedTypeThisFrame += 1;
-        s_rejectTypeCumulative += 1;
         return;
     }
     if (re->hModel == 0 || FindModelByHandle(re->hModel) == NULL) {
         s_entityRejectedModelThisFrame += 1;
-        s_rejectModelCumulative += 1;
         return;
     }
 
@@ -1366,7 +1360,6 @@ static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime
     s_sceneEntities[s_sceneEntityCount].mirrored = (DotProduct(re->axis[2], cross) < 0.0f);
     s_sceneEntityCount += 1;
     s_entityAcceptedThisFrame += 1;
-    s_acceptedCumulative += 1;
 }
 static void RE_AddPolyToScene(qhandle_t hShader, int numVerts, const polyVert_t *verts, int num) {}
 static int R_LightForPoint(vec3_t point, vec3_t ambientLight, vec3_t directedLight, vec3_t lightDir) { return 0; }
@@ -1513,32 +1506,29 @@ static void RE_RenderScene(const refdef_t *fd) {
         }
     }
 
-    s_sceneView.fovX = fovX;
-    s_sceneView.fovY = fovY;
-    s_sceneView.viewOrigin[0] = vieworg[0];
-    s_sceneView.viewOrigin[1] = vieworg[1];
-    s_sceneView.viewOrigin[2] = vieworg[2];
-    s_sceneView.viewAxis[0] = axis0[0];
-    s_sceneView.viewAxis[1] = axis0[1];
-    s_sceneView.viewAxis[2] = axis0[2];
-    s_sceneView.viewAxis[3] = axis1[0];
-    s_sceneView.viewAxis[4] = axis1[1];
-    s_sceneView.viewAxis[5] = axis1[2];
-    s_sceneView.viewAxis[6] = axis2[0];
-    s_sceneView.viewAxis[7] = axis2[1];
-    s_sceneView.viewAxis[8] = axis2[2];
+    /* World-scene-only camera. HUD/portrait scenes would overwrite with
+     * their own view, projecting preserved world entity draws off-screen. */
+    if (fd->rdflags == 0) {
+        s_sceneView.fovX = fovX;
+        s_sceneView.fovY = fovY;
+        s_sceneView.viewOrigin[0] = vieworg[0];
+        s_sceneView.viewOrigin[1] = vieworg[1];
+        s_sceneView.viewOrigin[2] = vieworg[2];
+        s_sceneView.viewAxis[0] = axis0[0];
+        s_sceneView.viewAxis[1] = axis0[1];
+        s_sceneView.viewAxis[2] = axis0[2];
+        s_sceneView.viewAxis[3] = axis1[0];
+        s_sceneView.viewAxis[4] = axis1[1];
+        s_sceneView.viewAxis[5] = axis1[2];
+        s_sceneView.viewAxis[6] = axis2[0];
+        s_sceneView.viewAxis[7] = axis2[1];
+        s_sceneView.viewAxis[8] = axis2[2];
+    }
 
     /* Inject our own viewmodel entity; cgame is unreliable here. */
     SynthesizeViewmodelEntity(vieworg, axis0, axis1, axis2);
 
     s_sceneLogCounter += 1;
-    /* Log every scene for 2 seconds to understand per-scene breakdown. */
-    if (s_sceneLogCounter < 120) {
-        ri.Printf(PRINT_ALL,
-            "[DBG] RE_RenderScene #%u rdflags=0x%x sceneEntities=%u accepted=%u rawSoFar=%u\n",
-            s_sceneLogCounter, fd->rdflags, s_sceneEntityCount,
-            s_entityAcceptedThisFrame, s_rawEntryCount);
-    }
     if ((s_sceneLogCounter % 60) == 0) {
         ri.Printf(
             PRINT_ALL,
@@ -1556,7 +1546,7 @@ static void RE_RenderScene(const refdef_t *fd) {
         );
         ri.Printf(
             PRINT_ALL,
-            "Metal entity queue[%u]: accepted=%u rejectNull=%u rejectType=%u rejectModel=%u sceneEntities=%u clearCalls=%u renderCalls=%u rawEntries=%u cum_accepted=%u cum_rejN=%u cum_rejT=%u cum_rejM=%u\n",
+            "Metal entity queue[%u]: accepted=%u rejectNull=%u rejectType=%u rejectModel=%u sceneEntities=%u clearCalls=%u renderCalls=%u rawEntries=%u\n",
             s_sceneLogCounter,
             s_entityAcceptedThisFrame,
             s_entityRejectedNullThisFrame,
@@ -1565,19 +1555,11 @@ static void RE_RenderScene(const refdef_t *fd) {
             s_sceneEntityCount,
             s_clearSceneCalls,
             s_renderSceneCalls,
-            s_rawEntryCount,
-            s_acceptedCumulative,
-            s_rejectNullCumulative,
-            s_rejectTypeCumulative,
-            s_rejectModelCumulative
+            s_rawEntryCount
         );
         s_clearSceneCalls = 0;
         s_renderSceneCalls = 0;
         s_rawEntryCount = 0;
-        s_acceptedCumulative = 0;
-        s_rejectNullCumulative = 0;
-        s_rejectTypeCumulative = 0;
-        s_rejectModelCumulative = 0;
         if (s_sceneEntityCount > 0) {
             uint32_t logIdx;
             uint32_t loggedNonSynth = 0;
@@ -1657,11 +1639,17 @@ static void RE_RenderScene(const refdef_t *fd) {
         s_frameSnapshot.worldGeneration = s_world.generation;
     }
 
-    s_entityVertexCount = 0;
-    s_entityIndexCount = 0;
-    s_entityDrawCount = 0;
+    /* World-scene-only buffer rebuild. HUD scenes retain the world scene's
+     * draws so Swift's Coordinator.draw can consume them. Combined with
+     * removing buffer resets from RE_ClearScene (which is called between
+     * every scene) this preserves world draws across the frame. */
+    if (fd->rdflags == 0) {
+        s_entityVertexCount = 0;
+        s_entityIndexCount = 0;
+        s_entityDrawCount = 0;
+    }
 
-    if (s_sceneEntityCount > 0) {
+    if (fd->rdflags == 0 && s_sceneEntityCount > 0) {
         uint32_t totalEntityVerts = 0;
         uint32_t totalEntityIndices = 0;
         uint32_t totalEntityDraws = 0;

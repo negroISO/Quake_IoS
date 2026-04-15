@@ -57,7 +57,6 @@ struct MetalView: UIViewRepresentable {
         // 3 = uv1 visualization, 4 = vertex color only. Flip to diagnose
         // lightmap / uv1 issues without touching the build pipeline.
         private static let worldDebugMode: Float = 0
-        nonisolated(unsafe) private static var entityDrawLogCounter: UInt32 = 0
 
         struct GPUEntityVertex {
             var position: SIMD3<Float>
@@ -381,16 +380,10 @@ struct MetalView: UIViewRepresentable {
                     let entityDraws = UnsafeBufferPointer(start: entityDrawsPointer, count: Int(snapshot.entityCommandCount))
                     let depthHackBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_DEPTHHACK)
                     var lastDepthHack = false
-                    var dbgDrawn = 0
-                    var dbgSkippedNoTexture = 0
-                    var dbgSkippedZeroIndex = 0
-                    for draw in entityDraws {
-                        if draw.indexCount == 0 { dbgSkippedZeroIndex += 1; continue }
+                    for draw in entityDraws where draw.indexCount > 0 {
                         guard let texture = texture(for: draw.textureHandle, device: view.device) else {
-                            dbgSkippedNoTexture += 1
                             continue
                         }
-                        dbgDrawn += 1
                         let wantsDepthHack = (draw.flags & depthHackBit) != 0
                         if wantsDepthHack != lastDepthHack {
                             let state = wantsDepthHack ? depthHackDepthStencilState : depthStencilState
@@ -405,10 +398,6 @@ struct MetalView: UIViewRepresentable {
                             indexBuffer: entityIndexBuffer,
                             indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride
                         )
-                    }
-                    Coordinator.entityDrawLogCounter &+= 1
-                    if Coordinator.entityDrawLogCounter % 60 == 0 {
-                        print("[DBG] entityDraws total=\(entityDraws.count) drawn=\(dbgDrawn) skipZeroIdx=\(dbgSkippedZeroIndex) skipNoTex=\(dbgSkippedNoTexture)")
                     }
                 }
             }

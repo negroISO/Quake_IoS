@@ -105,14 +105,8 @@ CL_GetCurrentSnapshotNumber
 ====================
 */
 static void CL_GetCurrentSnapshotNumber( int *snapshotNumber, int *serverTime ) {
-	static int lastMsgNum = -1;
 	*snapshotNumber = cl.snap.messageNum;
 	*serverTime = cl.snap.serverTime;
-	if ( cl.snap.messageNum != lastMsgNum ) {
-		Com_Printf( "[DBG] CL_GetCurrentSnapshotNumber: msgNum=%d serverTime=%d valid=%d\n",
-			cl.snap.messageNum, cl.snap.serverTime, cl.snap.valid );
-		lastMsgNum = cl.snap.messageNum;
-	}
 }
 
 
@@ -652,14 +646,6 @@ static intptr_t CL_CgameSystemCalls( intptr_t *args ) {
 		return 0;
 	case CG_R_ADDREFENTITYTOSCENE:
 		s_cgCallAddRefEntity += 1;
-		{
-			const refEntity_t *dbgRe = VMA(1);
-			if ( dbgRe && s_cgCallAddRefEntity <= 30 && (s_cgSyscallFrame % 60) == 0 ) {
-				Com_Printf( "[DBG] addRefEntity #%u: reType=%d hModel=%d rfx=0x%x origin=(%.1f %.1f %.1f)\n",
-					s_cgCallAddRefEntity, dbgRe->reType, dbgRe->hModel, dbgRe->renderfx,
-					dbgRe->origin[0], dbgRe->origin[1], dbgRe->origin[2] );
-			}
-		}
 		re.AddRefEntityToScene( VMA(1), qfalse );
 		return 0;
 	case CG_R_ADDPOLYTOSCENE:
