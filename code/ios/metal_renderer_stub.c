@@ -1287,29 +1287,73 @@ static void RE_Shutdown(refShutdownCode_t code) {
 typedef struct {
     char shaderName[128];
     char mapPath[MAX_QPATH];
+    qboolean tcGenEnv;   /* any stage uses tcGen environment */
 } metalShaderMap_t;
 static metalShaderMap_t s_shaderMap[MAX_SHADER_MAP_ENTRIES];
 static int s_shaderMapCount = 0;
 static qboolean s_shaderMapLoaded = qfalse;
 
-static const char *ShaderMap_Lookup(const char *name) {
+/* Strip a trailing image extension (.tga/.jpg/.jpeg/.png/.pcx). Caller
+ * supplies out buffer. Returns qtrue if an extension was stripped. */
+static qboolean StripImageExt(const char *name, char *out, size_t outSize) {
+    size_t len;
+    const char *dot;
+    if (name == NULL || out == NULL || outSize == 0) return qfalse;
+    Q_strncpyz(out, name, outSize);
+    len = strlen(out);
+    dot = strrchr(out, '.');
+    if (dot == NULL) return qfalse;
+    /* Only strip if extension looks like an image (4-5 chars incl. dot). */
+    if (strlen(dot) > 5) return qfalse;
+    {
+        const char *exts[] = { ".tga", ".jpg", ".jpeg", ".png", ".pcx", NULL };
+        int i;
+        for (i = 0; exts[i]; ++i) {
+            if (!Q_stricmp(dot, exts[i])) {
+                out[dot - out] = '\0';
+                (void)len;
+                return qtrue;
+            }
+        }
+    }
+    return qfalse;
+}
+
+static const metalShaderMap_t *ShaderMap_LookupEntry(const char *name) {
     int i;
+    char stripped[MAX_QPATH];
     if (name == NULL || name[0] == '\0') return NULL;
     for (i = 0; i < s_shaderMapCount; ++i) {
         if (!Q_stricmp(s_shaderMap[i].shaderName, name)) {
-            return s_shaderMap[i].mapPath;
+            return &s_shaderMap[i];
+        }
+    }
+    /* Fall back: MD3s often embed shader names with an image extension
+     * (models/.../red_sphere.tga) while .shader scripts define the same
+     * material without one. Retry with the extension stripped. */
+    if (StripImageExt(name, stripped, sizeof(stripped))) {
+        for (i = 0; i < s_shaderMapCount; ++i) {
+            if (!Q_stricmp(s_shaderMap[i].shaderName, stripped)) {
+                return &s_shaderMap[i];
+            }
         }
     }
     return NULL;
 }
 
-static void ShaderMap_Register(const char *name, const char *path) {
+static const char *ShaderMap_Lookup(const char *name) {
+    const metalShaderMap_t *e = ShaderMap_LookupEntry(name);
+    return e ? e->mapPath : NULL;
+}
+
+static void ShaderMap_Register(const char *name, const char *path, qboolean tcGenEnv) {
     if (s_shaderMapCount >= MAX_SHADER_MAP_ENTRIES) return;
     if (ShaderMap_Lookup(name) != NULL) return; /* first wins */
     Q_strncpyz(s_shaderMap[s_shaderMapCount].shaderName, name,
         sizeof(s_shaderMap[0].shaderName));
     Q_strncpyz(s_shaderMap[s_shaderMapCount].mapPath, path,
         sizeof(s_shaderMap[0].mapPath));
+    s_shaderMap[s_shaderMapCount].tcGenEnv = tcGenEnv;
     s_shaderMapCount += 1;
 }
 
@@ -1323,6 +1367,7 @@ static void ParseShaderText(const char *text) {
         int depth;
         qboolean inStage;
         qboolean gotMap;
+        qboolean tcGenEnv;
 
         token = COM_ParseExt(&p, qtrue);
         if (!token[0]) break;
@@ -1335,6 +1380,7 @@ static void ParseShaderText(const char *text) {
         depth = 1;
         inStage = qfalse;
         gotMap = qfalse;
+        tcGenEnv = qfalse;
 
         while (depth > 0) {
             token = COM_ParseExt(&p, qtrue);
@@ -1351,26 +1397,32 @@ static void ParseShaderText(const char *text) {
                 continue;
             }
 
-            if (inStage && !gotMap) {
-                if (!Q_stricmp(token, "map") || !Q_stricmp(token, "clampmap")) {
+            if (inStage) {
+                if (!gotMap && (!Q_stricmp(token, "map") || !Q_stricmp(token, "clampmap"))) {
                     token = COM_ParseExt(&p, qfalse);
                     if (token[0] && token[0] != '$') {
                         Q_strncpyz(firstMap, token, sizeof(firstMap));
                         gotMap = qtrue;
                     }
-                } else if (!Q_stricmp(token, "animmap")) {
+                } else if (!gotMap && !Q_stricmp(token, "animmap")) {
                     token = COM_ParseExt(&p, qfalse); /* fps */
                     token = COM_ParseExt(&p, qfalse); /* first frame */
                     if (token[0] && token[0] != '$') {
                         Q_strncpyz(firstMap, token, sizeof(firstMap));
                         gotMap = qtrue;
                     }
+                } else if (!Q_stricmp(token, "tcGen") || !Q_stricmp(token, "tcgen")) {
+                    token = COM_ParseExt(&p, qfalse);
+                    if (token[0] && (!Q_stricmp(token, "environment") ||
+                                     !Q_stricmp(token, "env"))) {
+                        tcGenEnv = qtrue;
+                    }
                 }
             }
         }
 
         if (gotMap) {
-            ShaderMap_Register(shaderName, firstMap);
+            ShaderMap_Register(shaderName, firstMap, tcGenEnv);
         }
     }
 }
