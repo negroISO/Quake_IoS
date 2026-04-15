@@ -2374,33 +2374,49 @@ static void RE_RenderScene(const refdef_t *fd) {
                     continue;
                 }
 
-                /* Hide the local player's own body parts in first-person
-                 * view. The stock engine relies on RF_THIRD_PERSON being
-                 * set by cgame on the local player's body parts, but the
-                 * current cgame.qvm ABI mismatch causes renderfx bits to
-                 * land in the wrong field (see brain.db msg 172). Detect
-                 * by model path + camera proximity instead: any
-                 * /players/.../{head,upper,lower}.md3 within ~40 units
-                 * of the camera is the local player. Extended from just
-                 * head (commit 40fb558) after screenshots showed the
-                 * user looking down could see into upper/lower meshes. */
+                /* Hide local-player entities that cgame submits with
+                 * broken transforms (QVM ABI bug — renderfx bits land
+                 * in the wrong field, see brain.db msg 172). Three
+                 * classes of near-camera models get filtered:
+                 *
+                 *   /players/.../{head,upper,lower}.md3
+                 *     — the body parts; without suppression, looking
+                 *       down shows your own torso.
+                 *
+                 *   /weapons2/...
+                 *     — cgame's first-person viewmodel (CG_AddViewWeapon
+                 *       submits the weapon + flash + barrel + hand
+                 *       tag chain). With ABI breakage these render at
+                 *       garbage origins; user screenshots showed a
+                 *       ghost shotgun floating on the left and red
+                 *       polygon slashes when turning. Our own synthetic
+                 *       viewmodel (isSynthetic == qtrue) stays since
+                 *       it's correctly placed in view space.
+                 *
+                 * Proximity: 40 world units (sqrt(1600)). Distant
+                 * players + their weapons (other clients, bots) still
+                 * render normally. */
                 if (!sceneEntity->isSynthetic && model->inUse) {
                     const char *mname = model->name;
-                    if (mname && strstr(mname, "/players/") != NULL) {
+                    qboolean isLocalPart = qfalse;
+                    if (mname) {
                         size_t mlen = strlen(mname);
-                        qboolean isLocalPart = qfalse;
-                        if (mlen >= 9  && strcmp(mname + mlen - 9,  "/head.md3")  == 0) isLocalPart = qtrue;
-                        if (mlen >= 10 && strcmp(mname + mlen - 10, "/upper.md3") == 0) isLocalPart = qtrue;
-                        if (mlen >= 10 && strcmp(mname + mlen - 10, "/lower.md3") == 0) isLocalPart = qtrue;
-                        if (isLocalPart) {
-                            float dx = sceneEntity->entity.origin[0] - s_sceneView.viewOrigin[0];
-                            float dy = sceneEntity->entity.origin[1] - s_sceneView.viewOrigin[1];
-                            float dz = sceneEntity->entity.origin[2] - s_sceneView.viewOrigin[2];
-                            float distSq = dx*dx + dy*dy + dz*dz;
-                            /* 40 world units, squared = 1600. */
-                            if (distSq < 1600.0f) {
-                                continue;
-                            }
+                        if (strstr(mname, "/players/") != NULL) {
+                            if (mlen >= 9  && strcmp(mname + mlen - 9,  "/head.md3")  == 0) isLocalPart = qtrue;
+                            if (mlen >= 10 && strcmp(mname + mlen - 10, "/upper.md3") == 0) isLocalPart = qtrue;
+                            if (mlen >= 10 && strcmp(mname + mlen - 10, "/lower.md3") == 0) isLocalPart = qtrue;
+                        }
+                        if (strstr(mname, "/weapons2/") != NULL) {
+                            isLocalPart = qtrue;
+                        }
+                    }
+                    if (isLocalPart) {
+                        float dx = sceneEntity->entity.origin[0] - s_sceneView.viewOrigin[0];
+                        float dy = sceneEntity->entity.origin[1] - s_sceneView.viewOrigin[1];
+                        float dz = sceneEntity->entity.origin[2] - s_sceneView.viewOrigin[2];
+                        float distSq = dx*dx + dy*dy + dz*dz;
+                        if (distSq < 1600.0f) {
+                            continue;
                         }
                     }
                 }
