@@ -337,6 +337,8 @@ static qboolean TryLoadImageRGBA(const char *name, byte **rgba, int *width, int 
     return qfalse;
 }
 
+static const char *ShaderMap_Lookup(const char *name);
+
 static qhandle_t RegisterTexture(const char *name) {
     metalTexture_t *existing;
     metalTexture_t *texture;
@@ -369,8 +371,14 @@ static qhandle_t RegisterTexture(const char *name) {
     }
 
     if (!TryLoadImageRGBA(name, &rgba, &width, &height, resolvedName, sizeof(resolvedName))) {
-        ri.Printf(PRINT_WARNING, "Metal stub: failed to load UI texture '%s', falling back to white\n", name);
-        return EnsureWhiteTexture();
+        const char *mapped = ShaderMap_Lookup(name);
+        if (mapped != NULL
+            && TryLoadImageRGBA(mapped, &rgba, &width, &height, resolvedName, sizeof(resolvedName))) {
+            ri.Printf(PRINT_DEVELOPER, "Metal shader: resolved '%s' -> '%s'\n", name, mapped);
+        } else {
+            ri.Printf(PRINT_WARNING, "Metal stub: failed to load UI texture '%s', falling back to white\n", name);
+            return EnsureWhiteTexture();
+        }
     }
 
     texture = AllocTextureSlot();
@@ -1262,8 +1270,149 @@ static void RE_Shutdown(refShutdownCode_t code) {
     ri.Printf(PRINT_ALL, "RE_Shutdown: Metal stub\n");
 }
 
+/*
+ * Minimal Q3 shader parser.
+ *
+ * Many MD3 surfaces reference shader names (e.g. "models/powerups/health/red_sphere")
+ * whose actual texture lives under a different path (e.g. "textures/effects/envmapgold2.tga")
+ * via a .shader script. Without resolving this, the stub falls back to a white texture
+ * for any model that uses the shader system. We walk every .shader file under scripts/, extract
+ * the first stage's first map directive, and hash shader_name -> texture_path.
+ * RegisterTexture consults this table as a fallback when direct path load fails.
+ *
+ * Ignored: tcGen environment, animMap frame sequencing, blendFunc, tcMod — bind
+ * at least one plausible texture so the geometry is visible instead of white.
+ */
+#define MAX_SHADER_MAP_ENTRIES 4096
+typedef struct {
+    char shaderName[128];
+    char mapPath[MAX_QPATH];
+} metalShaderMap_t;
+static metalShaderMap_t s_shaderMap[MAX_SHADER_MAP_ENTRIES];
+static int s_shaderMapCount = 0;
+static qboolean s_shaderMapLoaded = qfalse;
+
+static const char *ShaderMap_Lookup(const char *name) {
+    int i;
+    if (name == NULL || name[0] == '\0') return NULL;
+    for (i = 0; i < s_shaderMapCount; ++i) {
+        if (!Q_stricmp(s_shaderMap[i].shaderName, name)) {
+            return s_shaderMap[i].mapPath;
+        }
+    }
+    return NULL;
+}
+
+static void ShaderMap_Register(const char *name, const char *path) {
+    if (s_shaderMapCount >= MAX_SHADER_MAP_ENTRIES) return;
+    if (ShaderMap_Lookup(name) != NULL) return; /* first wins */
+    Q_strncpyz(s_shaderMap[s_shaderMapCount].shaderName, name,
+        sizeof(s_shaderMap[0].shaderName));
+    Q_strncpyz(s_shaderMap[s_shaderMapCount].mapPath, path,
+        sizeof(s_shaderMap[0].mapPath));
+    s_shaderMapCount += 1;
+}
+
+static void ParseShaderText(const char *text) {
+    const char *p = text;
+    const char *token;
+
+    while (1) {
+        char shaderName[128];
+        char firstMap[MAX_QPATH];
+        int depth;
+        qboolean inStage;
+        qboolean gotMap;
+
+        token = COM_ParseExt(&p, qtrue);
+        if (!token[0]) break;
+        Q_strncpyz(shaderName, token, sizeof(shaderName));
+
+        token = COM_ParseExt(&p, qtrue);
+        if (token[0] != '{') continue;
+
+        firstMap[0] = '\0';
+        depth = 1;
+        inStage = qfalse;
+        gotMap = qfalse;
+
+        while (depth > 0) {
+            token = COM_ParseExt(&p, qtrue);
+            if (!token[0]) break;
+
+            if (token[0] == '{' && token[1] == '\0') {
+                depth += 1;
+                inStage = qtrue;
+                continue;
+            }
+            if (token[0] == '}' && token[1] == '\0') {
+                depth -= 1;
+                inStage = qfalse;
+                continue;
+            }
+
+            if (inStage && !gotMap) {
+                if (!Q_stricmp(token, "map") || !Q_stricmp(token, "clampmap")) {
+                    token = COM_ParseExt(&p, qfalse);
+                    if (token[0] && token[0] != '$') {
+                        Q_strncpyz(firstMap, token, sizeof(firstMap));
+                        gotMap = qtrue;
+                    }
+                } else if (!Q_stricmp(token, "animmap")) {
+                    token = COM_ParseExt(&p, qfalse); /* fps */
+                    token = COM_ParseExt(&p, qfalse); /* first frame */
+                    if (token[0] && token[0] != '$') {
+                        Q_strncpyz(firstMap, token, sizeof(firstMap));
+                        gotMap = qtrue;
+                    }
+                }
+            }
+        }
+
+        if (gotMap) {
+            ShaderMap_Register(shaderName, firstMap);
+        }
+    }
+}
+
+static void LoadAllShaders(void) {
+    char **fileList;
+    int numFiles;
+    int i;
+
+    if (s_shaderMapLoaded) return;
+    s_shaderMapLoaded = qtrue;
+
+    fileList = ri.FS_ListFiles("scripts", ".shader", &numFiles);
+    if (fileList == NULL || numFiles == 0) {
+        if (fileList) ri.FS_FreeFileList(fileList);
+        ri.Printf(PRINT_WARNING, "Metal shader parser: no scripts/*.shader found\n");
+        return;
+    }
+
+    for (i = 0; i < numFiles; ++i) {
+        char path[MAX_QPATH];
+        char *buf;
+        int len;
+
+        Com_sprintf(path, sizeof(path), "scripts/%s", fileList[i]);
+        len = ri.FS_ReadFile(path, (void **)&buf);
+        if (len <= 0 || buf == NULL) {
+            if (buf) ri.FS_FreeFile(buf);
+            continue;
+        }
+        ParseShaderText(buf);
+        ri.FS_FreeFile(buf);
+    }
+
+    ri.FS_FreeFileList(fileList);
+    ri.Printf(PRINT_ALL, "Metal shader parser: %d shader->map entries loaded from %d files\n",
+        s_shaderMapCount, numFiles);
+}
+
 static void RE_BeginRegistration(glconfig_t *config) {
     ri.Printf(PRINT_ALL, "RE_BeginRegistration: Metal stub\n");
+    LoadAllShaders();
     EnsureWhiteTexture();
     EnsureSkyTexture();
     EnsureTimHellBaseTexture();
