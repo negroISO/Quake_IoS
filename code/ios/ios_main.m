@@ -415,6 +415,15 @@ void IN_Init(void) {
         "bind PAD0_DPAD_LEFT \"weapon 5\"\n"
         "bind PAD0_DPAD_RIGHT \"weapon 6\"\n"
     );
+    /* Verify the binds actually installed. `bind PAD0_A` with no second
+     * arg prints the current binding. If these come back empty or
+     * 'not bound', something clobbered the bind table after IN_Init
+     * (probably q3config.cfg re-exec). */
+    Com_Printf("IN_Init: verifying bindings...\n");
+    Cbuf_ExecuteText(EXEC_NOW, "bind PAD0_A\n");
+    Cbuf_ExecuteText(EXEC_NOW, "bind PAD0_B\n");
+    Cbuf_ExecuteText(EXEC_NOW, "bind PAD0_Y\n");
+    Cbuf_ExecuteText(EXEC_NOW, "bind PAD0_RIGHTTRIGGER\n");
 }
 void IN_Frame(void) {
     int eventTime = Sys_Milliseconds();
@@ -460,6 +469,13 @@ void IN_Frame(void) {
                 if (changed & bit) {
                     qboolean down = (cur & bit) ? qtrue : qfalse;
                     Sys_QueEvent(eventTime, SE_KEY, s_gamepadBitMap[bitIdx].key, down, 0, NULL);
+                    /* Diagnostic: log every SE_KEY we hand to the engine
+                     * so we can tell whether events reach Com_EventLoop.
+                     * If this prints but the game ignores the press, the
+                     * keyCatcher or bind table is at fault, not the
+                     * input pipeline. */
+                    Com_Printf("IN: queued SE_KEY key=%d down=%d (mask prev=0x%X cur=0x%X)\n",
+                               s_gamepadBitMap[bitIdx].key, (int)down, prev, cur);
                 }
             }
         }
@@ -587,7 +603,7 @@ void Quake3_Init(const char *basePath) {
      * Call it explicitly here, after Com_Init so the cvar and command
      * subsystems are up. */
     IN_Init();
-    Cbuf_AddText("map q3dm1\n");
+    Cbuf_AddText("map q3dm16\n");
     engine_initialized = qtrue;
 
     Com_Printf("=== Quake3 iOS Engine Initialized ===\n");
