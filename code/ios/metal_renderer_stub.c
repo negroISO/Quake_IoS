@@ -2407,7 +2407,17 @@ static void RE_RenderScene(const refdef_t *fd) {
                             if (mlen >= 10 && strcmp(mname + mlen - 10, "/lower.md3") == 0) isLocalPart = qtrue;
                         }
                         if (strstr(mname, "/weapons2/") != NULL) {
-                            isLocalPart = qtrue;
+                            /* Suppress cgame's first-person weapon chain
+                             * with one exception: *_flash.md3 muzzle
+                             * flashes. They're transient (one frame per
+                             * shot), submitted via tag_flash on fire,
+                             * and even mispositioned they give useful
+                             * 'weapon is firing' feedback. Without this
+                             * exemption the machinegun/plasma/rail look
+                             * dead when you pull the trigger. */
+                            if (!(mlen >= 10 && strcmp(mname + mlen - 10, "_flash.md3") == 0)) {
+                                isLocalPart = qtrue;
+                            }
                         }
                     }
                     if (isLocalPart) {
