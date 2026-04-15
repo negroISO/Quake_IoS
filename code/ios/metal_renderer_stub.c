@@ -2167,16 +2167,29 @@ static void RE_RenderScene(const refdef_t *fd) {
     fovX = fd->fov_x;
     fovY = fd->fov_y;
 
-    if (s_world.loaded && fovX < 45.0f) {
-        if (BuildFallbackSceneView(vieworg, axis0, axis1, axis2, &fovX, &fovY) && (s_sceneLogCounter % 60) == 0) {
-            ri.Printf(
-                PRINT_WARNING,
-                "Metal fallback camera[%u]: repaired invalid refdef using cl.snap.ps origin=(%.2f %.2f %.2f) angles=(%.2f %.2f %.2f) fov=(%.2f %.2f)\n",
-                s_sceneLogCounter + 1,
-                cl.snap.ps.origin[0], cl.snap.ps.origin[1], cl.snap.ps.origin[2],
-                cl.viewangles[0], cl.viewangles[1], cl.viewangles[2],
-                fovX, fovY
-            );
+    /* Refdef fallback camera — gated behind cvar now that native cgame
+     * writes a valid refdef. With cgame.qvm's broken ABI the refdef
+     * arrived with invalid fov (< 45) and we'd synthesize one from
+     * cl.snap.ps.origin. Unnecessary after commit 5977485.
+     *   \metal_fallback_camera 1  (re-enable fallback)
+     * If native cgame regresses, flip this on and watch the log for
+     * 'Metal fallback camera[...]' to reconfirm the ABI issue. */
+    {
+        static cvar_t *s_cvarFallbackCam = NULL;
+        if (s_cvarFallbackCam == NULL) {
+            s_cvarFallbackCam = ri.Cvar_Get("metal_fallback_camera", "0", CVAR_ARCHIVE);
+        }
+        if (s_cvarFallbackCam->integer && s_world.loaded && fovX < 45.0f) {
+            if (BuildFallbackSceneView(vieworg, axis0, axis1, axis2, &fovX, &fovY) && (s_sceneLogCounter % 60) == 0) {
+                ri.Printf(
+                    PRINT_WARNING,
+                    "Metal fallback camera[%u]: repaired invalid refdef using cl.snap.ps origin=(%.2f %.2f %.2f) angles=(%.2f %.2f %.2f) fov=(%.2f %.2f)\n",
+                    s_sceneLogCounter + 1,
+                    cl.snap.ps.origin[0], cl.snap.ps.origin[1], cl.snap.ps.origin[2],
+                    cl.viewangles[0], cl.viewangles[1], cl.viewangles[2],
+                    fovX, fovY
+                );
+            }
         }
     }
 
