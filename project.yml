@@ -45,6 +45,36 @@ targets:
         excludes:
           - "vulkan/**"
       # renderervk excluded — stub Metal renderer provides GetRefAPI
+
+      # Native cgame: ioquake3 cgame source + iOS shim, compiled into
+      # the main app binary so VM_RegisterNative can route cgame calls
+      # directly (no dlopen, no QVM bytecode interpretation). CGAME_NATIVE
+      # is file-scoped to these translation units only so the rename
+      # macros in cg_local.h (vmMain -> CG_vmMain, dllEntry -> CG_dllEntry,
+      # syscall -> CG_syscall) don't leak into engine code that shares
+      # those symbol names.
+      - path: code/cgame
+        type: group
+        excludes:
+          # Team Arena (MISSIONPACK) only. Classic Q3 build errors at
+          # an '#error This file not be used for classic Q3A' guard.
+          - "cg_newdraw.c"
+        compilerFlags:
+          - "-DCGAME_NATIVE=1"
+          - "-Wno-strict-prototypes"
+          - "-Wno-pointer-sign"
+
+      # Shared game/cgame code (trajectory math, item list, pmove,
+      # string library). Required by cgame for prediction, item pickup,
+      # and packet-entity translation. Adding the bg_*.c files WITHOUT
+      # the rest of code/game/ so we don't clash with qagame.qvm's
+      # vmMain until the qagame port lands.
+      - path: code/game/bg_misc.c
+      - path: code/game/bg_pmove.c
+      - path: code/game/bg_slidemove.c
+      - path: code/game/bg_lib.c
+        buildPhase: none  # string helpers — only needed for QVM/nolibc
+        optional: true
       - path: code/libjpeg
         type: group
       - path: code/libogg

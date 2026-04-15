@@ -21,9 +21,6 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 */
 //
 #include "../qcommon/q_shared.h"
-#include "../renderercommon/tr_types.h"
-#include "../game/bg_public.h"
-#include "cg_public.h"
 
 /* CGAME_NATIVE: when defined (by the Xcode target for iOS), the imported
  * cgame's canonical entry points are renamed so they can coexist with
@@ -37,17 +34,34 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  * The engine picks up CG_vmMain / CG_dllEntry via VM_RegisterNative,
  * called from platform init (code/ios/ios_main.m). Renames are inactive
  * for QVM builds so the standard QVM toolchain still sees the canonical
- * names. */
+ * names.
+ *
+ * qcommon.h must be included BEFORE cg_public.h in native mode because
+ * cg_public.h references COM_TRAP_GETVALUE (defined in qcommon.h). QVM
+ * builds never saw qcommon.h — they use the Quake3e-extended cg_public.h
+ * with the COM_TRAP_GETVALUE reference guarded at a higher level. */
 #ifdef CGAME_NATIVE
 #  define vmMain     CG_vmMain
 #  define dllEntry   CG_dllEntry
 #  define syscall    CG_syscall
-
-/* Native cgame is part of the engine translation-unit set, so it sees
- * qcommon.h directly. QVM cgame never did — cg_public.h references
- * COM_TRAP_GETVALUE which lives in qcommon.h, not q_shared.h. */
 #  include "../qcommon/qcommon.h"
+/* ioq3 cgame declares printf-family functions with Q_PRINTF_FUNC /
+ * Q_NO_RETURN compiler attributes defined in ioq3's q_shared.h.
+ * Quake3e's q_shared.h doesn't ship them. They're purely optional
+ * static-analysis hints, so stub them to no-ops for native builds. */
+#  ifndef Q_PRINTF_FUNC
+#    define Q_PRINTF_FUNC(fmt, va)
+#  endif
+#  ifndef Q_NO_RETURN
+#    define Q_NO_RETURN
+#  endif
+#endif
 
+#include "../renderercommon/tr_types.h"
+#include "../game/bg_public.h"
+#include "cg_public.h"
+
+#ifdef CGAME_NATIVE
 /* Quake3e's refEntity_t diverges from ioq3's:
  *   ioq3       ->  Quake3e
  *   shaderRGBA ->  shader.rgba  (color4ub_t union)

@@ -54,6 +54,15 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #define CROUCH_VIEWHEIGHT	12
 #define	DEAD_VIEWHEIGHT		-16
 
+/* Player bounding box constants. Defined unconditionally here because
+ * bg_pmove.c references them outside MISSIONPACK guards. Values match
+ * stock ioquake3 / classic Q3. */
+#define PLAYER_WIDTH		15
+#define DEFAULT_HEIGHT		32
+#define CROUCH_HEIGHT		16
+#define DEAD_HEIGHT			-8
+#define INVUL_RADIUS		42
+
 //
 // config strings are a general means of communicating variable length strings
 // from the server to all connected clients.

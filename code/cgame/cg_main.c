@@ -442,6 +442,9 @@ void QDECL CG_Error( const char *msg, ... ) {
 	trap_Error( text );
 }
 
+#ifndef CGAME_NATIVE
+/* In native builds, Com_Error is provided by the engine (qcommon.h).
+ * Stock QVM cgame defines its own stub that trampolines to trap_Error. */
 void QDECL Com_Error( int level, const char *error, ... ) {
 	va_list		argptr;
 	char		text[1024];
@@ -452,7 +455,11 @@ void QDECL Com_Error( int level, const char *error, ... ) {
 
 	trap_Error( text );
 }
+#endif
 
+#ifndef CGAME_NATIVE
+/* Native builds get Com_Printf from the engine. QVM builds use this
+ * trampoline. */
 void QDECL Com_Printf( const char *msg, ... ) {
 	va_list		argptr;
 	char		text[1024];
@@ -463,6 +470,7 @@ void QDECL Com_Printf( const char *msg, ... ) {
 
 	trap_Print( text );
 }
+#endif
 
 /*
 ================
