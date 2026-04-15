@@ -305,11 +305,37 @@ typedef struct {
     qboolean firePressed;
     qboolean jumpPressed;
     qboolean crouchPressed;
+    unsigned int buttonMask; /* extended Q3_PAD_* bits from Swift */
 } iosGamepadState_t;
 
 static iosGamepadState_t s_gamepadState;
 static iosGamepadState_t s_prevGamepadState;
 static int s_lastGamepadPollMsec;
+
+/* Map Q3_PAD_* bits to Q3 key codes. Order matters only for iteration. */
+typedef struct {
+    unsigned int bit;
+    int key;
+} gamepadBitMap_t;
+
+static const gamepadBitMap_t s_gamepadBitMap[] = {
+    { Q3_PAD_A,              K_PAD0_A },
+    { Q3_PAD_B,              K_PAD0_B },
+    { Q3_PAD_X,              K_PAD0_X },
+    { Q3_PAD_Y,              K_PAD0_Y },
+    { Q3_PAD_LEFT_SHOULDER,  K_PAD0_LEFTSHOULDER },
+    { Q3_PAD_RIGHT_SHOULDER, K_PAD0_RIGHTSHOULDER },
+    { Q3_PAD_LEFT_TRIGGER,   K_PAD0_LEFTTRIGGER },
+    { Q3_PAD_RIGHT_TRIGGER,  K_PAD0_RIGHTTRIGGER },
+    { Q3_PAD_DPAD_UP,        K_PAD0_DPAD_UP },
+    { Q3_PAD_DPAD_DOWN,      K_PAD0_DPAD_DOWN },
+    { Q3_PAD_DPAD_LEFT,      K_PAD0_DPAD_LEFT },
+    { Q3_PAD_DPAD_RIGHT,     K_PAD0_DPAD_RIGHT },
+    { Q3_PAD_MENU,           K_PAD0_START },
+    { Q3_PAD_OPTIONS,        K_PAD0_BACK },
+    { Q3_PAD_LEFT_THUMB,     K_PAD0_LEFTSTICK_CLICK },
+    { Q3_PAD_RIGHT_THUMB,    K_PAD0_RIGHTSTICK_CLICK },
+};
 
 static float ClampUnitAxis(float value) {
     if (value < -1.0f) {
@@ -370,8 +396,19 @@ void IN_Init(void) {
         "set cl_yawspeed 20\n"
         "set sensitivity 1.0\n"
         "bind PAD0_RIGHTTRIGGER \"+attack\"\n"
+        "bind PAD0_LEFTTRIGGER \"+zoom\"\n"
         "bind PAD0_A \"+moveup\"\n"
         "bind PAD0_B \"+movedown\"\n"
+        "bind PAD0_X \"+activate\"\n"
+        "bind PAD0_Y \"weapnext\"\n"
+        "bind PAD0_LEFTSHOULDER \"weapprev\"\n"
+        "bind PAD0_RIGHTSHOULDER \"weapnext\"\n"
+        "bind PAD0_START \"togglemenu\"\n"
+        "bind PAD0_BACK \"+scores\"\n"
+        "bind PAD0_DPAD_UP \"weapon 7\"\n"
+        "bind PAD0_DPAD_DOWN \"weapon 2\"\n"
+        "bind PAD0_DPAD_LEFT \"weapon 5\"\n"
+        "bind PAD0_DPAD_RIGHT \"weapon 6\"\n"
     );
 }
 void IN_Frame(void) {
@@ -404,6 +441,25 @@ void IN_Frame(void) {
     QueueGamepadButtonEvent(K_PAD0_RIGHTTRIGGER, s_prevGamepadState.firePressed, s_gamepadState.firePressed, eventTime);
     QueueGamepadButtonEvent(K_PAD0_A, s_prevGamepadState.jumpPressed, s_gamepadState.jumpPressed, eventTime);
     QueueGamepadButtonEvent(K_PAD0_B, s_prevGamepadState.crouchPressed, s_gamepadState.crouchPressed, eventTime);
+
+    /* Extended button mask from Swift. Diff against previous and queue
+     * SE_KEY events for each bit that toggled. */
+    {
+        unsigned int prev = s_prevGamepadState.buttonMask;
+        unsigned int cur = s_gamepadState.buttonMask;
+        unsigned int changed = prev ^ cur;
+        size_t bitIdx;
+        if (changed != 0) {
+            for (bitIdx = 0; bitIdx < sizeof(s_gamepadBitMap)/sizeof(s_gamepadBitMap[0]); ++bitIdx) {
+                unsigned int bit = s_gamepadBitMap[bitIdx].bit;
+                if (changed & bit) {
+                    qboolean down = (cur & bit) ? qtrue : qfalse;
+                    Sys_QueEvent(eventTime, SE_KEY, s_gamepadBitMap[bitIdx].key, down, 0, NULL);
+                }
+            }
+        }
+    }
+
     s_prevGamepadState = s_gamepadState;
 }
 void IN_Shutdown(void) {}
@@ -417,6 +473,10 @@ void Q3Gamepad_SetState(float leftX, float leftY, float rightX, float rightY,
     s_gamepadState.firePressed = firePressed ? qtrue : qfalse;
     s_gamepadState.jumpPressed = jumpPressed ? qtrue : qfalse;
     s_gamepadState.crouchPressed = crouchPressed ? qtrue : qfalse;
+}
+
+void Q3Gamepad_SetButtons(unsigned int buttonMask) {
+    s_gamepadState.buttonMask = buttonMask;
 }
 
 // =============================================================

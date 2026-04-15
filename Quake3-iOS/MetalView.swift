@@ -797,6 +797,27 @@ final class GameControllerBridge {
         var firePressed: Int32 = 0
         var jumpPressed: Int32 = 0
         var crouchPressed: Int32 = 0
+        var buttonMask: UInt32 = 0
+    }
+
+    /* Mirror of code/ios/ios_local.h Q3_PAD_* bits. */
+    private struct PadBit {
+        static let a:              UInt32 = 1 << 0
+        static let b:              UInt32 = 1 << 1
+        static let x:              UInt32 = 1 << 2
+        static let y:              UInt32 = 1 << 3
+        static let leftShoulder:   UInt32 = 1 << 4
+        static let rightShoulder:  UInt32 = 1 << 5
+        static let leftTrigger:    UInt32 = 1 << 6
+        static let rightTrigger:   UInt32 = 1 << 7
+        static let dpadUp:         UInt32 = 1 << 8
+        static let dpadDown:       UInt32 = 1 << 9
+        static let dpadLeft:       UInt32 = 1 << 10
+        static let dpadRight:      UInt32 = 1 << 11
+        static let menu:           UInt32 = 1 << 12
+        static let options:        UInt32 = 1 << 13
+        static let leftThumb:      UInt32 = 1 << 14
+        static let rightThumb:     UInt32 = 1 << 15
     }
 
     private var started = false
@@ -902,6 +923,26 @@ final class GameControllerBridge {
         state.firePressed = gamepad.rightTrigger.isPressed ? 1 : 0
         state.jumpPressed = gamepad.buttonA.isPressed ? 1 : 0
         state.crouchPressed = gamepad.buttonB.isPressed ? 1 : 0
+
+        var mask: UInt32 = 0
+        if gamepad.buttonA.isPressed             { mask |= PadBit.a }
+        if gamepad.buttonB.isPressed             { mask |= PadBit.b }
+        if gamepad.buttonX.isPressed             { mask |= PadBit.x }
+        if gamepad.buttonY.isPressed             { mask |= PadBit.y }
+        if gamepad.leftShoulder.isPressed        { mask |= PadBit.leftShoulder }
+        if gamepad.rightShoulder.isPressed       { mask |= PadBit.rightShoulder }
+        if gamepad.leftTrigger.isPressed         { mask |= PadBit.leftTrigger }
+        if gamepad.rightTrigger.isPressed        { mask |= PadBit.rightTrigger }
+        if gamepad.dpad.up.isPressed             { mask |= PadBit.dpadUp }
+        if gamepad.dpad.down.isPressed           { mask |= PadBit.dpadDown }
+        if gamepad.dpad.left.isPressed           { mask |= PadBit.dpadLeft }
+        if gamepad.dpad.right.isPressed          { mask |= PadBit.dpadRight }
+        if gamepad.buttonMenu.isPressed          { mask |= PadBit.menu }
+        if gamepad.buttonOptions?.isPressed == true { mask |= PadBit.options }
+        if gamepad.leftThumbstickButton?.isPressed == true  { mask |= PadBit.leftThumb }
+        if gamepad.rightThumbstickButton?.isPressed == true { mask |= PadBit.rightThumb }
+        state.buttonMask = mask
+
         logStateChange(source: source)
         pushState()
     }
@@ -917,6 +958,7 @@ final class GameControllerBridge {
             state.jumpPressed,
             state.crouchPressed
         )
+        Q3Gamepad_SetButtons(state.buttonMask)
     }
 
     private func logStateChange(source: GCControllerElement?) {

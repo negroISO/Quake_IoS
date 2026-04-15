@@ -8,4 +8,7 @@ void Quake3_Frame(void);
 void Q3Gamepad_SetState(float leftX, float leftY, float rightX, float rightY,
                         int firePressed, int jumpPressed, int crouchPressed);
 
+/* Extended button state bitmask. Bit layout in code/ios/ios_local.h (Q3_PAD_*). */
+void Q3Gamepad_SetButtons(unsigned int buttonMask);
+
 #endif
