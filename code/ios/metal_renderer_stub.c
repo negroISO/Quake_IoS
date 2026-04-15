@@ -346,8 +346,11 @@ static const char *ShaderMap_Lookup(const char *name);
 static qhandle_t ShaderMap_ResolveCurrentFrame(const char *name);
 static int ShaderMap_FindAnimatedSlot(const char *name);
 static qhandle_t ShaderMap_AnimatedSlotCurrentHandle(int slot);
+static void ShaderMap_GetScroll(const char *name, float *outS, float *outT);
 
 static int s_pendingAnimSlot;
+static float s_pendingScrollS;
+static float s_pendingScrollT;
 
 static qhandle_t RegisterTexture(const char *name) {
     metalTexture_t *existing;
@@ -1120,6 +1123,9 @@ static qboolean LoadWorldMapData(const char *name) {
          * Patch surfaces emit multiple draws, so we stash the slot and
          * apply after each SetupWorldDraw below. */
         s_pendingAnimSlot = ShaderMap_FindAnimatedSlot(shaders[shaderNum].shader);
+        /* Per-shader tcMod scroll (s,t) for lava-flow, scrolling fog,
+         * etc. MSL applies `uv + scroll * timeSeconds` each frame. */
+        ShaderMap_GetScroll(shaders[shaderNum].shader, &s_pendingScrollS, &s_pendingScrollT);
         lightmapHandle = EnsureWhiteTexture();
         worldFlags = defaultWorldFlags;
         if (!IsSkyShaderName(shaders[shaderNum].shader) && lightmapNum >= 0 && lightmapNum < s_worldLightmapCount) {
@@ -1218,7 +1224,7 @@ static qboolean LoadWorldMapData(const char *name) {
                                        hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
                                        worldFlags,
                                        1.0f, 1.0f,
-                                       0.0f, 0.0f);
+                                       s_pendingScrollS, s_pendingScrollT);
                         if (s_world.animShaderSlots && s_pendingAnimSlot >= 0) {
                             s_world.animShaderSlots[_dstIdx] = s_pendingAnimSlot;
                             s_world.animatedDrawCount += 1;
@@ -1333,6 +1339,12 @@ typedef struct {
     char shaderName[128];
     char mapPath[MAX_QPATH];
     qboolean tcGenEnv;   /* any stage uses tcGen environment */
+    /* First stage's `tcMod scroll sx sy` values. Zero when absent.
+     * The Q3MetalWorldDrawUniforms shader already multiplies
+     * texCoordScroll by timeSeconds, so these flow directly into the
+     * per-draw uniform with no further math needed. */
+    float tcModScrollS;
+    float tcModScrollT;
     /* animMap support. framePaths[0] == mapPath. 0 frames = not animated. */
     int animFrameCount;
     float animFps;
@@ -1456,6 +1468,22 @@ static int ShaderMap_FindAnimatedSlot(const char *name) {
     return -1;
 }
 
+/* Returns the tcMod scroll (s, t) values parsed from the first stage
+ * of the named shader, or (0, 0) if unknown / absent. */
+static void ShaderMap_GetScroll(const char *name, float *outS, float *outT) {
+    int i;
+    if (outS) *outS = 0.0f;
+    if (outT) *outT = 0.0f;
+    if (name == NULL || name[0] == '\0') return;
+    for (i = 0; i < s_shaderMapCount; ++i) {
+        if (!Q_stricmp(s_shaderMap[i].shaderName, name)) {
+            if (outS) *outS = s_shaderMap[i].tcModScrollS;
+            if (outT) *outT = s_shaderMap[i].tcModScrollT;
+            return;
+        }
+    }
+}
+
 /* Current frame's texture handle for a known animated slot. Caller
  * already validated the slot; returns 0 on bad input to play safe. */
 static qhandle_t ShaderMap_AnimatedSlotCurrentHandle(int slot) {
@@ -1526,6 +1554,9 @@ static void ParseShaderText(const char *text) {
         char animFrames[METAL_ANIMMAP_MAX_FRAMES][MAX_QPATH];
         int animFrameCount;
         float animFps;
+        float tcScrollS;
+        float tcScrollT;
+        qboolean gotTcScroll;
         int depth;
         qboolean inStage;
         qboolean gotMap;
@@ -1542,6 +1573,9 @@ static void ParseShaderText(const char *text) {
         firstMap[0] = '\0';
         animFrameCount = 0;
         animFps = 0.0f;
+        tcScrollS = 0.0f;
+        tcScrollT = 0.0f;
+        gotTcScroll = qfalse;
         depth = 1;
         inStage = qfalse;
         gotMap = qfalse;
@@ -1592,6 +1626,20 @@ static void ParseShaderText(const char *text) {
                                      !Q_stricmp(token, "env"))) {
                         tcGenEnv = qtrue;
                     }
+                } else if (!gotTcScroll && (!Q_stricmp(token, "tcMod") || !Q_stricmp(token, "tcmod"))) {
+                    /* Capture only the first stage's tcMod scroll.
+                     * tcMod rotate/scale are stubbed; full matrix math
+                     * comes with a later commit. */
+                    token = COM_ParseExt(&p, qfalse);
+                    if (token[0] && !Q_stricmp(token, "scroll")) {
+                        const char *sTok = COM_ParseExt(&p, qfalse);
+                        const char *tTok = COM_ParseExt(&p, qfalse);
+                        if (sTok[0] && tTok[0]) {
+                            tcScrollS = (float)atof(sTok);
+                            tcScrollT = (float)atof(tTok);
+                            gotTcScroll = qtrue;
+                        }
+                    }
                 }
             }
         }
@@ -1600,6 +1648,16 @@ static void ParseShaderText(const char *text) {
             ShaderMap_RegisterAnimated(shaderName, animFrames, animFrameCount, animFps, tcGenEnv);
         } else if (gotMap) {
             ShaderMap_Register(shaderName, firstMap, tcGenEnv);
+        }
+        /* Back-patch tcMod scroll onto the just-registered entry (either
+         * animated or static). Deferred so the Register call chooses
+         * the slot. */
+        if ((gotAnim || gotMap) && gotTcScroll && s_shaderMapCount > 0) {
+            metalShaderMap_t *last = &s_shaderMap[s_shaderMapCount - 1];
+            if (!Q_stricmp(last->shaderName, shaderName)) {
+                last->tcModScrollS = tcScrollS;
+                last->tcModScrollT = tcScrollT;
+            }
         }
     }
 }
