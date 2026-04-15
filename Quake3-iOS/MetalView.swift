@@ -971,7 +971,8 @@ final class GameControllerBridge {
                 abs(state.rightY - lastLoggedState.rightY) >= 0.05 ||
                 state.firePressed != lastLoggedState.firePressed ||
                 state.jumpPressed != lastLoggedState.jumpPressed ||
-                state.crouchPressed != lastLoggedState.crouchPressed
+                state.crouchPressed != lastLoggedState.crouchPressed ||
+                state.buttonMask != lastLoggedState.buttonMask
         } else {
             shouldLog = true
         }
@@ -980,9 +981,28 @@ final class GameControllerBridge {
         lastLoggedState = state
 
         let sourceName = source.map { String(describing: type(of: $0)) } ?? "initial"
+        let maskHex = String(format: "0x%04X", state.buttonMask)
+        var btns: [String] = []
+        if state.buttonMask & PadBit.a != 0             { btns.append("A") }
+        if state.buttonMask & PadBit.b != 0             { btns.append("B") }
+        if state.buttonMask & PadBit.x != 0             { btns.append("X") }
+        if state.buttonMask & PadBit.y != 0             { btns.append("Y") }
+        if state.buttonMask & PadBit.leftShoulder != 0  { btns.append("LB") }
+        if state.buttonMask & PadBit.rightShoulder != 0 { btns.append("RB") }
+        if state.buttonMask & PadBit.leftTrigger != 0   { btns.append("LT") }
+        if state.buttonMask & PadBit.rightTrigger != 0  { btns.append("RT") }
+        if state.buttonMask & PadBit.dpadUp != 0        { btns.append("dU") }
+        if state.buttonMask & PadBit.dpadDown != 0      { btns.append("dD") }
+        if state.buttonMask & PadBit.dpadLeft != 0      { btns.append("dL") }
+        if state.buttonMask & PadBit.dpadRight != 0     { btns.append("dR") }
+        if state.buttonMask & PadBit.menu != 0          { btns.append("MENU") }
+        if state.buttonMask & PadBit.options != 0       { btns.append("OPT") }
+        if state.buttonMask & PadBit.leftThumb != 0     { btns.append("L3") }
+        if state.buttonMask & PadBit.rightThumb != 0    { btns.append("R3") }
+        let btnStr = btns.isEmpty ? "-" : btns.joined(separator: "+")
         print(
             String(
-                format: "[GCController] input %@ left=(%.2f, %.2f) right=(%.2f, %.2f) fire=%d jump=%d crouch=%d",
+                format: "[GCController] input %@ left=(%.2f, %.2f) right=(%.2f, %.2f) fire=%d jump=%d crouch=%d buttons=%@ mask=%@",
                 sourceName,
                 state.leftX,
                 state.leftY,
@@ -990,7 +1010,9 @@ final class GameControllerBridge {
                 state.rightY,
                 state.firePressed,
                 state.jumpPressed,
-                state.crouchPressed
+                state.crouchPressed,
+                btnStr,
+                maskHex
             )
         )
     }
