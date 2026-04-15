@@ -25,6 +25,25 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "../game/bg_public.h"
 #include "cg_public.h"
 
+/* CGAME_NATIVE: when defined (by the Xcode target for iOS), the imported
+ * cgame's canonical entry points are renamed so they can coexist with
+ * qagame's and ui's identically-named symbols when all three modules are
+ * linked into the same binary.
+ *
+ *   vmMain   -> CG_vmMain    (intptr_t (int cmd, int arg0..arg11))
+ *   dllEntry -> CG_dllEntry  (void (dllSyscall_t syscallptr))
+ *   syscall  -> CG_syscall   (file-static in cg_syscalls.c)
+ *
+ * The engine picks up CG_vmMain / CG_dllEntry via VM_RegisterNative,
+ * called from platform init (code/ios/ios_main.m). Renames are inactive
+ * for QVM builds so the standard QVM toolchain still sees the canonical
+ * names. */
+#ifdef CGAME_NATIVE
+#  define vmMain     CG_vmMain
+#  define dllEntry   CG_dllEntry
+#  define syscall    CG_syscall
+#endif
+
 
 // The entire cgame module is unloaded and reloaded on each level change,
 // so there is NO persistant data between levels on the client side.
