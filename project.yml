@@ -95,6 +95,13 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         SWIFT_OBJC_BRIDGING_HEADER: Quake3-iOS/Quake3-iOS-Bridging-Header.h
         TARGETED_DEVICE_FAMILY: "1,2"
+        # Apple Development signing team. Pinned in project.yml so
+        # xcodegen regen doesn't strip the setting Xcode added when
+        # the user originally configured signing. Value recovered from
+        # the pre-xcodegen pbxproj at commit 7ee20ac.
+        DEVELOPMENT_TEAM: 72MB2RMPTC
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: "iPhone Developer"
         GCC_C_LANGUAGE_STANDARD: c11
         CLANG_ENABLE_OBJC_ARC: YES
         HEADER_SEARCH_PATHS:
