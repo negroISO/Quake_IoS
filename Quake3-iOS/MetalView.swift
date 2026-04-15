@@ -195,7 +195,14 @@ struct MetalView: UIViewRepresentable {
             // Until the per-stage shader driver is in place, world fragments must
             // always write. Alpha-tested stages will be reintroduced through the
             // Q3 shader parser, not as a global discard.
-            return texel * lightmap * in.color;
+            //
+            // Overbright: Q3 lightmaps are authored expecting a 2x boost (stock
+            // r_overBrightBits default = 1, i.e. multiply by 2^1). Without the
+            // boost the whole world renders at half brightness — user reported
+            // the game was 'awfully dark even with phone brightness all the way
+            // up'. saturate() clamps to [0,1] so bright spots don't wrap.
+            float3 lit = saturate(texel.rgb * lightmap.rgb * 2.0) * in.color.rgb;
+            return float4(lit, texel.a * in.color.a);
         }
 
         vertex EntityVertexOut q3_entity_vertex(const device EntityVertexIn *vertices [[buffer(0)]],
