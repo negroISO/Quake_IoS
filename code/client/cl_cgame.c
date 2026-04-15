@@ -27,6 +27,19 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 
 extern	botlib_export_t	*botlib_export;
 
+static uint32_t s_cgSyscallFrame;
+static uint32_t s_cgCallAddRefEntity;
+static uint32_t s_cgCallAddPoly;
+static uint32_t s_cgCallAddLight;
+static uint32_t s_cgCallGetSnapshot;
+static qboolean s_cgLastSnapshotValid;
+static int s_cgLastSnapshotNumEntities;
+static int s_cgLastSnapshotEntityNum[3];
+static int s_cgLastSnapshotEntityType[3];
+static int s_cgLastSnapshotEntityFlags[3];
+static int s_cgLastSnapshotModelIndex[3];
+static vec3_t s_cgLastSnapshotOrigin[3];
+
 //extern qboolean loadCamera(const char *name);
 //extern void startCamera(int time);
 //extern qboolean getCameraInfo(int time, vec3_t *origin, vec3_t *angles);
@@ -143,6 +156,25 @@ static qboolean CL_GetSnapshot( int snapshotNumber, snapshot_t *snapshot ) {
 	for ( i = 0 ; i < count ; i++ ) {
 		snapshot->entities[i] =
 			cl.parseEntities[ ( clSnap->parseEntitiesNum + i ) & (MAX_PARSE_ENTITIES-1) ];
+	}
+
+	s_cgLastSnapshotValid = qtrue;
+	s_cgLastSnapshotNumEntities = count;
+	for ( i = 0 ; i < 3 ; i++ ) {
+		if ( i < count ) {
+			const entityState_t *ent = &snapshot->entities[i];
+			s_cgLastSnapshotEntityNum[i] = ent->number;
+			s_cgLastSnapshotEntityType[i] = ent->eType;
+			s_cgLastSnapshotEntityFlags[i] = ent->eFlags;
+			s_cgLastSnapshotModelIndex[i] = ent->modelindex;
+			VectorCopy( ent->origin, s_cgLastSnapshotOrigin[i] );
+		} else {
+			s_cgLastSnapshotEntityNum[i] = -1;
+			s_cgLastSnapshotEntityType[i] = -1;
+			s_cgLastSnapshotEntityFlags[i] = 0;
+			s_cgLastSnapshotModelIndex[i] = -1;
+			VectorClear( s_cgLastSnapshotOrigin[i] );
+		}
 	}
 
 	// FIXME: configstring changes and server commands!!!
@@ -613,17 +645,21 @@ static intptr_t CL_CgameSystemCalls( intptr_t *args ) {
 		re.ClearScene();
 		return 0;
 	case CG_R_ADDREFENTITYTOSCENE:
+		s_cgCallAddRefEntity += 1;
 		re.AddRefEntityToScene( VMA(1), qfalse );
 		return 0;
 	case CG_R_ADDPOLYTOSCENE:
+		s_cgCallAddPoly += 1;
 		re.AddPolyToScene( args[1], args[2], VMA(3), 1 );
 		return 0;
 	case CG_R_ADDPOLYSTOSCENE:
+		s_cgCallAddPoly += 1;
 		re.AddPolyToScene( args[1], args[2], VMA(3), args[4] );
 		return 0;
 	case CG_R_LIGHTFORPOINT:
 		return re.LightForPoint( VMA(1), VMA(2), VMA(3), VMA(4) );
 	case CG_R_ADDLIGHTTOSCENE:
+		s_cgCallAddLight += 1;
 		re.AddLightToScene( VMA(1), VMF(2), VMF(3), VMF(4), VMF(5) );
 		return 0;
 	case CG_R_ADDADDITIVELIGHTTOSCENE:
@@ -655,6 +691,7 @@ static intptr_t CL_CgameSystemCalls( intptr_t *args ) {
 		CL_GetCurrentSnapshotNumber( VMA(1), VMA(2) );
 		return 0;
 	case CG_GETSNAPSHOT:
+		s_cgCallGetSnapshot += 1;
 		return CL_GetSnapshot( args[1], VMA(2) );
 	case CG_GETSERVERCOMMAND:
 		return CL_GetServerCommand( args[1] );
@@ -773,10 +810,12 @@ static intptr_t CL_CgameSystemCalls( intptr_t *args ) {
 
 	// engine extensions
 	case CG_R_ADDREFENTITYTOSCENE2:
+		s_cgCallAddRefEntity += 1;
 		re.AddRefEntityToScene( VMA(1), qtrue );
 		return 0;
 
 	case CG_R_ADDLINEARLIGHTTOSCENE:
+		s_cgCallAddLight += 1;
 		re.AddLinearLightToScene( VMA(1), VMA(2), VMF(3), VMF(4), VMF(5), VMF(6) );
 		return 0;
 
@@ -932,7 +971,39 @@ CL_CGameRendering
 =====================
 */
 void CL_CGameRendering( stereoFrame_t stereo ) {
+	s_cgSyscallFrame += 1;
+	s_cgCallAddRefEntity = 0;
+	s_cgCallAddPoly = 0;
+	s_cgCallAddLight = 0;
+	s_cgCallGetSnapshot = 0;
+	s_cgLastSnapshotValid = qfalse;
 	VM_Call( cgvm, 3, CG_DRAW_ACTIVE_FRAME, cl.serverTime, stereo, clc.demoplaying );
+	if ( ( s_cgSyscallFrame % 60 ) == 0 ) {
+		Com_Printf(
+			"[cgame syscalls] frame=%u addRefEntity=%u addPoly=%u addLight=%u getSnapshot=%u\n",
+			s_cgSyscallFrame,
+			s_cgCallAddRefEntity,
+			s_cgCallAddPoly,
+			s_cgCallAddLight,
+			s_cgCallGetSnapshot
+		);
+		if ( s_cgLastSnapshotValid ) {
+			Com_Printf(
+				"[cgame snapshot] numEntities=%d ent0={num:%d type:%d flags:0x%x model:%d origin:(%.1f %.1f %.1f)} "
+				"ent1={num:%d type:%d flags:0x%x model:%d origin:(%.1f %.1f %.1f)} "
+				"ent2={num:%d type:%d flags:0x%x model:%d origin:(%.1f %.1f %.1f)}\n",
+				s_cgLastSnapshotNumEntities,
+				s_cgLastSnapshotEntityNum[0], s_cgLastSnapshotEntityType[0], s_cgLastSnapshotEntityFlags[0], s_cgLastSnapshotModelIndex[0],
+				s_cgLastSnapshotOrigin[0][0], s_cgLastSnapshotOrigin[0][1], s_cgLastSnapshotOrigin[0][2],
+				s_cgLastSnapshotEntityNum[1], s_cgLastSnapshotEntityType[1], s_cgLastSnapshotEntityFlags[1], s_cgLastSnapshotModelIndex[1],
+				s_cgLastSnapshotOrigin[1][0], s_cgLastSnapshotOrigin[1][1], s_cgLastSnapshotOrigin[1][2],
+				s_cgLastSnapshotEntityNum[2], s_cgLastSnapshotEntityType[2], s_cgLastSnapshotEntityFlags[2], s_cgLastSnapshotModelIndex[2],
+				s_cgLastSnapshotOrigin[2][0], s_cgLastSnapshotOrigin[2][1], s_cgLastSnapshotOrigin[2][2]
+			);
+		} else {
+			Com_Printf( "[cgame snapshot] unavailable this frame\n" );
+		}
+	}
 #ifdef DEBUG
 	VM_Debug( 0 );
 #endif
