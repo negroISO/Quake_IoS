@@ -2414,7 +2414,16 @@ static void RE_RenderScene(const refdef_t *fd) {
                  * Proximity: 40 world units (sqrt(1600)). Distant
                  * players + their weapons (other clients, bots) still
                  * render normally. */
-                if (!sceneEntity->isSynthetic && model->inUse) {
+                /* Legacy proximity filter — gated behind cvar now that
+                 * native cgame places body parts + weapons correctly
+                 * via RF_THIRD_PERSON. Toggle back if cgame somehow
+                 * still exhibits the ABI artifacts:
+                 *   \metal_hide_nearby 1  (re-enable filter) */
+                static cvar_t *s_cvarHideNearby = NULL;
+                if (s_cvarHideNearby == NULL) {
+                    s_cvarHideNearby = ri.Cvar_Get("metal_hide_nearby", "0", CVAR_ARCHIVE);
+                }
+                if (s_cvarHideNearby->integer && !sceneEntity->isSynthetic && model->inUse) {
                     const char *mname = model->name;
                     qboolean isLocalPart = qfalse;
                     if (mname) {
