@@ -57,6 +57,7 @@ struct MetalView: UIViewRepresentable {
         // 3 = uv1 visualization, 4 = vertex color only. Flip to diagnose
         // lightmap / uv1 issues without touching the build pipeline.
         private static let worldDebugMode: Float = 0
+        nonisolated(unsafe) private static var entityDrawLogCounter: UInt32 = 0
 
         struct GPUEntityVertex {
             var position: SIMD3<Float>
@@ -226,6 +227,7 @@ struct MetalView: UIViewRepresentable {
         private var worldSamplerState: MTLSamplerState?
         private var depthStencilState: MTLDepthStencilState?
         private var additiveDepthStencilState: MTLDepthStencilState?
+        private var depthHackDepthStencilState: MTLDepthStencilState?
         private var fallbackDepthStencilState: MTLDepthStencilState?
 
         private func ensuredDepthStencilState(_ preferred: MTLDepthStencilState?, device: MTLDevice?) -> MTLDepthStencilState? {
@@ -377,9 +379,23 @@ struct MetalView: UIViewRepresentable {
 
                 if let entityDrawsPointer = Q3MetalRenderer_GetEntityDrawCommands() {
                     let entityDraws = UnsafeBufferPointer(start: entityDrawsPointer, count: Int(snapshot.entityCommandCount))
-                    for draw in entityDraws where draw.indexCount > 0 {
+                    let depthHackBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_DEPTHHACK)
+                    var lastDepthHack = false
+                    var dbgDrawn = 0
+                    var dbgSkippedNoTexture = 0
+                    var dbgSkippedZeroIndex = 0
+                    for draw in entityDraws {
+                        if draw.indexCount == 0 { dbgSkippedZeroIndex += 1; continue }
                         guard let texture = texture(for: draw.textureHandle, device: view.device) else {
+                            dbgSkippedNoTexture += 1
                             continue
+                        }
+                        dbgDrawn += 1
+                        let wantsDepthHack = (draw.flags & depthHackBit) != 0
+                        if wantsDepthHack != lastDepthHack {
+                            let state = wantsDepthHack ? depthHackDepthStencilState : depthStencilState
+                            encoder.setDepthStencilState(ensuredDepthStencilState(state, device: view.device))
+                            lastDepthHack = wantsDepthHack
                         }
                         encoder.setFragmentTexture(texture, index: 0)
                         encoder.drawIndexedPrimitives(
@@ -389,6 +405,10 @@ struct MetalView: UIViewRepresentable {
                             indexBuffer: entityIndexBuffer,
                             indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride
                         )
+                    }
+                    Coordinator.entityDrawLogCounter &+= 1
+                    if Coordinator.entityDrawLogCounter % 60 == 0 {
+                        print("[DBG] entityDraws total=\(entityDraws.count) drawn=\(dbgDrawn) skipZeroIdx=\(dbgSkippedZeroIndex) skipNoTex=\(dbgSkippedNoTexture)")
                     }
                 }
             }
@@ -519,6 +539,14 @@ struct MetalView: UIViewRepresentable {
             additiveDepthDescriptor.isDepthWriteEnabled = false
             additiveDepthDescriptor.depthCompareFunction = .lessEqual
             additiveDepthStencilState = device.makeDepthStencilState(descriptor: additiveDepthDescriptor)
+
+            // Depth-hack state for first-person viewmodel: always pass depth
+            // test so the gun is never occluded by world geometry, while
+            // still writing depth so model self-occlusion stays correct.
+            let depthHackDescriptor = MTLDepthStencilDescriptor()
+            depthHackDescriptor.isDepthWriteEnabled = true
+            depthHackDescriptor.depthCompareFunction = .always
+            depthHackDepthStencilState = device.makeDepthStencilState(descriptor: depthHackDescriptor)
         }
 
         private func uploadVertices(_ vertices: UnsafeBufferPointer<Q3MetalVertex>, device: MTLDevice?) -> MTLBuffer? {

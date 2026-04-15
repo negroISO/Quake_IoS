@@ -58,6 +58,7 @@ typedef struct {
 typedef struct {
     refEntity_t entity;
     qboolean mirrored;
+    qboolean isSynthetic;  /* set by SynthesizeViewmodelEntity; cgame entities clear */
 } metalSceneEntity_t;
 
 typedef struct {
@@ -1318,7 +1319,11 @@ static void RE_LoadWorldMap(const char *name) {
 static void RE_SetWorldVisData(const byte *vis) {}
 static void RE_EndRegistration(void) {}
 
+static uint32_t s_clearSceneCalls;
+static uint32_t s_renderSceneCalls;
+
 static void RE_ClearScene(void) {
+    s_clearSceneCalls += 1;
     s_sceneEntityCount = 0;
     s_entityVertexCount = 0;
     s_entityIndexCount = 0;
@@ -1329,19 +1334,30 @@ static void RE_ClearScene(void) {
     s_entityRejectedModelThisFrame = 0;
 }
 
+static uint32_t s_rawEntryCount;  /* unconditional counter for debug */
+/* Cumulative across ALL scenes within a log window (resets only at log). */
+static uint32_t s_acceptedCumulative;
+static uint32_t s_rejectNullCumulative;
+static uint32_t s_rejectTypeCumulative;
+static uint32_t s_rejectModelCumulative;
+
 static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime) {
     vec3_t cross;
 
+    s_rawEntryCount += 1;  /* counted even for null/invalid */
     if (re == NULL || s_sceneEntityCount >= Q3_METAL_MAX_REFENTITIES) {
         s_entityRejectedNullThisFrame += 1;
+        s_rejectNullCumulative += 1;
         return;
     }
     if (re->reType != RT_MODEL) {
         s_entityRejectedTypeThisFrame += 1;
+        s_rejectTypeCumulative += 1;
         return;
     }
     if (re->hModel == 0 || FindModelByHandle(re->hModel) == NULL) {
         s_entityRejectedModelThisFrame += 1;
+        s_rejectModelCumulative += 1;
         return;
     }
 
@@ -1350,12 +1366,120 @@ static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime
     s_sceneEntities[s_sceneEntityCount].mirrored = (DotProduct(re->axis[2], cross) < 0.0f);
     s_sceneEntityCount += 1;
     s_entityAcceptedThisFrame += 1;
+    s_acceptedCumulative += 1;
 }
 static void RE_AddPolyToScene(qhandle_t hShader, int numVerts, const polyVert_t *verts, int num) {}
 static int R_LightForPoint(vec3_t point, vec3_t ambientLight, vec3_t directedLight, vec3_t lightDir) { return 0; }
 static void RE_AddLightToScene(const vec3_t org, float intensity, float r, float g, float b) {}
 static void RE_AddAdditiveLightToScene(const vec3_t org, float intensity, float r, float g, float b) {}
 static void RE_AddLinearLightToScene(const vec3_t start, const vec3_t end, float intensity, float r, float g, float b) {}
+/*
+ * Synthetic first-person viewmodel.
+ *
+ * The bundled cgame.qvm only submits one entity per frame (its scene-build
+ * loop appears to abort after the first add, probably due to a refEntity_t
+ * ABI mismatch), so we cannot rely on it for a stable viewmodel. Instead we
+ * inject our own viewmodel entity each frame using the live client state
+ * (cl.snap.ps.weapon) and the camera transform. The cgame-submitted
+ * entity, whatever it is, renders normally through the standard path.
+ */
+static qhandle_t s_viewmodelHandles[16];  /* WP_NUM_WEAPONS is 11; pad for safety */
+
+static qhandle_t RE_RegisterModel(const char *name);
+
+static qhandle_t GetViewmodelHandle(int weapon) {
+    static const char *names[] = {
+        NULL,                                         /* WP_NONE */
+        "models/weapons2/gauntlet/gauntlet.md3",      /* WP_GAUNTLET */
+        "models/weapons2/machinegun/machinegun.md3",  /* WP_MACHINEGUN */
+        "models/weapons2/shotgun/shotgun.md3",        /* WP_SHOTGUN */
+        "models/weapons2/grenadel/grenadel.md3",      /* WP_GRENADE_LAUNCHER */
+        "models/weapons2/rocketl/rocketl.md3",        /* WP_ROCKET_LAUNCHER */
+        "models/weapons2/lightning/lightning.md3",    /* WP_LIGHTNING */
+        "models/weapons2/railgun/railgun.md3",        /* WP_RAILGUN */
+        "models/weapons2/plasma/plasma.md3",          /* WP_PLASMAGUN */
+        "models/weapons2/bfg/bfg.md3",                /* WP_BFG */
+        "models/weapons2/grapple/grapple.md3"         /* WP_GRAPPLING_HOOK */
+    };
+    if (weapon <= 0 || weapon >= (int)(sizeof(names) / sizeof(names[0])) || names[weapon] == NULL) {
+        return 0;
+    }
+    if (s_viewmodelHandles[weapon] == 0) {
+        s_viewmodelHandles[weapon] = RE_RegisterModel(names[weapon]);
+    }
+    return s_viewmodelHandles[weapon];
+}
+
+static void SynthesizeViewmodelEntity(const vec3_t vieworg,
+                                      const vec3_t axis0,
+                                      const vec3_t axis1,
+                                      const vec3_t axis2) {
+    metalSceneEntity_t *slot;
+    refEntity_t *e;
+    qhandle_t hModel;
+    int weapon;
+    vec3_t origin;
+    float t, swayRight, swayUp;
+    /* Quake 3-ish placement and apparent size. MD3 has no native scale
+     * field; we fake uniform scale by scaling the basis vectors. */
+    const float kForward = 70.0f;
+    const float kRight   = 18.0f;
+    const float kUp      = -24.0f;
+    const float kScale   = 0.7f;
+
+    if (s_sceneEntityCount >= Q3_METAL_MAX_REFENTITIES) {
+        return;
+    }
+    if (!s_world.loaded) {
+        return;
+    }
+
+    weapon = cl.snap.ps.weapon;
+    hModel = GetViewmodelHandle(weapon);
+    if (hModel == 0) {
+        return;
+    }
+
+    slot = &s_sceneEntities[s_sceneEntityCount];
+    Com_Memset(slot, 0, sizeof(*slot));
+    e = &slot->entity;
+    e->reType = RT_MODEL;
+    e->hModel = hModel;
+    e->renderfx = RF_DEPTHHACK;
+    e->shader.rgba[0] = 255;
+    e->shader.rgba[1] = 255;
+    e->shader.rgba[2] = 255;
+    e->shader.rgba[3] = 255;
+
+    /* Build origin in view space. axis1 is Q3 "left" → subtract for right. */
+    origin[0] = vieworg[0] + kForward * axis0[0] - kRight * axis1[0] + kUp * axis2[0];
+    origin[1] = vieworg[1] + kForward * axis0[1] - kRight * axis1[1] + kUp * axis2[1];
+    origin[2] = vieworg[2] + kForward * axis0[2] - kRight * axis1[2] + kUp * axis2[2];
+
+    /* Idle sway using engine-side time (cls.realtime is in ms). Subtle. */
+    t = (float)cls.realtime * 0.002f;
+    swayRight = sinf(t) * 0.5f;
+    swayUp    = cosf(t) * 0.3f;
+    origin[0] += (-axis1[0] * swayRight) + (axis2[0] * swayUp);
+    origin[1] += (-axis1[1] * swayRight) + (axis2[1] * swayUp);
+    origin[2] += (-axis1[2] * swayRight) + (axis2[2] * swayUp);
+
+    VectorCopy(origin, e->origin);
+
+    /* Copy camera axes, then uniformly scale them to fake MD3 scale. */
+    VectorCopy(axis0, e->axis[0]);
+    VectorCopy(axis1, e->axis[1]);
+    VectorCopy(axis2, e->axis[2]);
+    VectorScale(e->axis[0], kScale, e->axis[0]);
+    VectorScale(e->axis[1], kScale, e->axis[1]);
+    VectorScale(e->axis[2], kScale, e->axis[2]);
+
+    slot->mirrored = qfalse;
+    slot->isSynthetic = qtrue;
+    s_sceneEntityCount += 1;
+    s_entityAcceptedThisFrame += 1;
+}
+
 static void RE_RenderScene(const refdef_t *fd) {
     vec3_t vieworg;
     vec3_t axis0;
@@ -1367,6 +1491,7 @@ static void RE_RenderScene(const refdef_t *fd) {
     if (fd == NULL) {
         return;
     }
+    s_renderSceneCalls += 1;
 
     VectorCopy(fd->vieworg, vieworg);
     VectorCopy(fd->viewaxis[0], axis0);
@@ -1403,7 +1528,17 @@ static void RE_RenderScene(const refdef_t *fd) {
     s_sceneView.viewAxis[7] = axis2[1];
     s_sceneView.viewAxis[8] = axis2[2];
 
+    /* Inject our own viewmodel entity; cgame is unreliable here. */
+    SynthesizeViewmodelEntity(vieworg, axis0, axis1, axis2);
+
     s_sceneLogCounter += 1;
+    /* Log every scene for 2 seconds to understand per-scene breakdown. */
+    if (s_sceneLogCounter < 120) {
+        ri.Printf(PRINT_ALL,
+            "[DBG] RE_RenderScene #%u rdflags=0x%x sceneEntities=%u accepted=%u rawSoFar=%u\n",
+            s_sceneLogCounter, fd->rdflags, s_sceneEntityCount,
+            s_entityAcceptedThisFrame, s_rawEntryCount);
+    }
     if ((s_sceneLogCounter % 60) == 0) {
         ri.Printf(
             PRINT_ALL,
@@ -1421,26 +1556,97 @@ static void RE_RenderScene(const refdef_t *fd) {
         );
         ri.Printf(
             PRINT_ALL,
-            "Metal entity queue[%u]: accepted=%u rejectNull=%u rejectType=%u rejectModel=%u sceneEntities=%u\n",
+            "Metal entity queue[%u]: accepted=%u rejectNull=%u rejectType=%u rejectModel=%u sceneEntities=%u clearCalls=%u renderCalls=%u rawEntries=%u cum_accepted=%u cum_rejN=%u cum_rejT=%u cum_rejM=%u\n",
             s_sceneLogCounter,
             s_entityAcceptedThisFrame,
             s_entityRejectedNullThisFrame,
             s_entityRejectedTypeThisFrame,
             s_entityRejectedModelThisFrame,
-            s_sceneEntityCount
+            s_sceneEntityCount,
+            s_clearSceneCalls,
+            s_renderSceneCalls,
+            s_rawEntryCount,
+            s_acceptedCumulative,
+            s_rejectNullCumulative,
+            s_rejectTypeCumulative,
+            s_rejectModelCumulative
         );
+        s_clearSceneCalls = 0;
+        s_renderSceneCalls = 0;
+        s_rawEntryCount = 0;
+        s_acceptedCumulative = 0;
+        s_rejectNullCumulative = 0;
+        s_rejectTypeCumulative = 0;
+        s_rejectModelCumulative = 0;
         if (s_sceneEntityCount > 0) {
-            const refEntity_t *firstEntity = &s_sceneEntities[0].entity;
-            ri.Printf(
-                PRINT_ALL,
-                "Metal entity first[%u]: origin=(%.2f %.2f %.2f) axis0=(%.3f %.3f %.3f) renderfx=0x%x hModel=%d reType=%d\n",
-                s_sceneLogCounter,
-                firstEntity->origin[0], firstEntity->origin[1], firstEntity->origin[2],
-                firstEntity->axis[0][0], firstEntity->axis[0][1], firstEntity->axis[0][2],
-                firstEntity->renderfx,
-                firstEntity->hModel,
-                firstEntity->reType
-            );
+            uint32_t logIdx;
+            uint32_t loggedNonSynth = 0;
+            for (logIdx = 0; logIdx < s_sceneEntityCount && loggedNonSynth < 10; ++logIdx) {
+                const metalSceneEntity_t *se = &s_sceneEntities[logIdx];
+                const metalModel_t *mdl;
+                const char *name;
+                vec3_t firstVertWorld;
+                qboolean haveFirstVert = qfalse;
+                int depthHack;
+                if (se->isSynthetic) {
+                    continue;
+                }
+                mdl = FindModelByHandle(se->entity.hModel);
+                name = (mdl && mdl->inUse) ? mdl->name : "<unknown>";
+                depthHack = (se->entity.renderfx & RF_DEPTHHACK) ? 1 : 0;
+
+                /* Compute the first vertex's world position to verify the
+                 * transform produces sensible coords. */
+                if (mdl && mdl->md3) {
+                    const md3Header_t *hdr = mdl->md3;
+                    if (hdr->numSurfaces > 0) {
+                        const md3Surface_t *surf = (const md3Surface_t *)((const byte *)hdr + hdr->ofsSurfaces);
+                        if (surf->numVerts > 0) {
+                            const md3XyzNormal_t *v = (const md3XyzNormal_t *)((const byte *)surf + surf->ofsXyzNormals);
+                            float lx = v->xyz[0] * MD3_XYZ_SCALE;
+                            float ly = v->xyz[1] * MD3_XYZ_SCALE;
+                            float lz = v->xyz[2] * MD3_XYZ_SCALE;
+                            firstVertWorld[0] = se->entity.origin[0]
+                                + se->entity.axis[0][0]*lx + se->entity.axis[1][0]*ly + se->entity.axis[2][0]*lz;
+                            firstVertWorld[1] = se->entity.origin[1]
+                                + se->entity.axis[0][1]*lx + se->entity.axis[1][1]*ly + se->entity.axis[2][1]*lz;
+                            firstVertWorld[2] = se->entity.origin[2]
+                                + se->entity.axis[0][2]*lx + se->entity.axis[1][2]*ly + se->entity.axis[2][2]*lz;
+                            haveFirstVert = qtrue;
+                        }
+                    }
+                }
+
+                if (haveFirstVert) {
+                    ri.Printf(
+                        PRINT_ALL,
+                        "Metal cgame ent[%u/%u]: model='%s' origin=(%.1f %.1f %.1f) axis0=(%.2f %.2f %.2f) "
+                        "rfx=0x%x hMdl=%d reType=%d cShader=%d cSkin=%d depthHack=%d firstVtxWorld=(%.1f %.1f %.1f)\n",
+                        s_sceneLogCounter, logIdx,
+                        name,
+                        se->entity.origin[0], se->entity.origin[1], se->entity.origin[2],
+                        se->entity.axis[0][0], se->entity.axis[0][1], se->entity.axis[0][2],
+                        se->entity.renderfx, se->entity.hModel, se->entity.reType,
+                        se->entity.customShader, se->entity.customSkin,
+                        depthHack,
+                        firstVertWorld[0], firstVertWorld[1], firstVertWorld[2]
+                    );
+                } else {
+                    ri.Printf(
+                        PRINT_ALL,
+                        "Metal cgame ent[%u/%u]: model='%s' origin=(%.1f %.1f %.1f) axis0=(%.2f %.2f %.2f) "
+                        "rfx=0x%x hMdl=%d reType=%d cShader=%d cSkin=%d depthHack=%d firstVtxWorld=N/A\n",
+                        s_sceneLogCounter, logIdx,
+                        name,
+                        se->entity.origin[0], se->entity.origin[1], se->entity.origin[2],
+                        se->entity.axis[0][0], se->entity.axis[0][1], se->entity.axis[0][2],
+                        se->entity.renderfx, se->entity.hModel, se->entity.reType,
+                        se->entity.customShader, se->entity.customSkin,
+                        depthHack
+                    );
+                }
+                loggedNonSynth += 1;
+            }
         }
     }
 
@@ -1491,6 +1697,8 @@ static void RE_RenderScene(const refdef_t *fd) {
             for (entityIndex = 0; entityIndex < s_sceneEntityCount; ++entityIndex) {
                 const metalSceneEntity_t *sceneEntity = &s_sceneEntities[entityIndex];
                 const metalModel_t *model = FindModelByHandle(sceneEntity->entity.hModel);
+                vec3_t effectiveOrigin;
+                vec3_t effectiveAxis[3];
                 const md3Header_t *header;
                 const md3Surface_t *surface;
                 int frameIndex;
@@ -1537,6 +1745,16 @@ static void RE_RenderScene(const refdef_t *fd) {
                     entityColor[3] = (float)sceneEntity->entity.shader.rgba[3] / 255.0f;
                 }
 
+                /* Use the entity transform as submitted. The synthetic
+                 * viewmodel path (SynthesizeViewmodelEntity) appends its own
+                 * entity with correct camera-relative origin/axis; cgame-
+                 * submitted entities (pickups, etc.) use their world
+                 * placement. */
+                VectorCopy(sceneEntity->entity.origin, effectiveOrigin);
+                VectorCopy(sceneEntity->entity.axis[0], effectiveAxis[0]);
+                VectorCopy(sceneEntity->entity.axis[1], effectiveAxis[1]);
+                VectorCopy(sceneEntity->entity.axis[2], effectiveAxis[2]);
+
                 surface = (const md3Surface_t *)((const byte *)header + header->ofsSurfaces);
                 for (surfaceIndex = 0; surfaceIndex < header->numSurfaces; ++surfaceIndex) {
                     const md3Triangle_t *triangles = (const md3Triangle_t *)((const byte *)surface + surface->ofsTriangles);
@@ -1576,18 +1794,18 @@ static void RE_RenderScene(const refdef_t *fd) {
                         localPosition[1] = (frontlerp * currentVertex->xyz[1] + backlerp * oldVertex->xyz[1]) * MD3_XYZ_SCALE;
                         localPosition[2] = (frontlerp * currentVertex->xyz[2] + backlerp * oldVertex->xyz[2]) * MD3_XYZ_SCALE;
 
-                        worldPosition[0] = sceneEntity->entity.origin[0]
-                            + sceneEntity->entity.axis[0][0] * localPosition[0]
-                            + sceneEntity->entity.axis[1][0] * localPosition[1]
-                            + sceneEntity->entity.axis[2][0] * localPosition[2];
-                        worldPosition[1] = sceneEntity->entity.origin[1]
-                            + sceneEntity->entity.axis[0][1] * localPosition[0]
-                            + sceneEntity->entity.axis[1][1] * localPosition[1]
-                            + sceneEntity->entity.axis[2][1] * localPosition[2];
-                        worldPosition[2] = sceneEntity->entity.origin[2]
-                            + sceneEntity->entity.axis[0][2] * localPosition[0]
-                            + sceneEntity->entity.axis[1][2] * localPosition[1]
-                            + sceneEntity->entity.axis[2][2] * localPosition[2];
+                        worldPosition[0] = effectiveOrigin[0]
+                            + effectiveAxis[0][0] * localPosition[0]
+                            + effectiveAxis[1][0] * localPosition[1]
+                            + effectiveAxis[2][0] * localPosition[2];
+                        worldPosition[1] = effectiveOrigin[1]
+                            + effectiveAxis[0][1] * localPosition[0]
+                            + effectiveAxis[1][1] * localPosition[1]
+                            + effectiveAxis[2][1] * localPosition[2];
+                        worldPosition[2] = effectiveOrigin[2]
+                            + effectiveAxis[0][2] * localPosition[0]
+                            + effectiveAxis[1][2] * localPosition[1]
+                            + effectiveAxis[2][2] * localPosition[2];
 
                         outVertex->position[0] = worldPosition[0];
                         outVertex->position[1] = worldPosition[1];
