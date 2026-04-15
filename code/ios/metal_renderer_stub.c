@@ -1916,10 +1916,14 @@ static void EnsureViewmodelCvars(void) {
          * (70, -18, -24, 0.7) — log coords suggested world scale is
          * smaller than stock Q3, so large offsets pushed the model off-
          * screen and scale 0.7 still felt oversized. */
-        s_cvarVmForward = ri.Cvar_Get("metal_vm_forward", "10", CVAR_ARCHIVE);
-        s_cvarVmRight   = ri.Cvar_Get("metal_vm_right",   "-4", CVAR_ARCHIVE);
-        s_cvarVmUp      = ri.Cvar_Get("metal_vm_up",      "-5", CVAR_ARCHIVE);
-        s_cvarVmScale   = ri.Cvar_Get("metal_vm_scale",   "0.6", CVAR_ARCHIVE);
+        /* Sign convention: origin formula uses `-kRight * axis1`, and
+         * axis1 is Q3 "left". Positive kRight → subtract left → move
+         * right (screen). Previous default of -4 placed the model 4
+         * units LEFT of center; screenshots confirmed wrong-side bug. */
+        s_cvarVmForward = ri.Cvar_Get("metal_vm_forward", "6",   CVAR_ARCHIVE);
+        s_cvarVmRight   = ri.Cvar_Get("metal_vm_right",   "5",   CVAR_ARCHIVE);
+        s_cvarVmUp      = ri.Cvar_Get("metal_vm_up",      "-4",  CVAR_ARCHIVE);
+        s_cvarVmScale   = ri.Cvar_Get("metal_vm_scale",   "0.3", CVAR_ARCHIVE);
         s_cvarVmSwayAmp = ri.Cvar_Get("metal_vm_sway",    "0.4", CVAR_ARCHIVE);
     }
 }
