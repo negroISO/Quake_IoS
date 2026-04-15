@@ -1364,28 +1364,45 @@ static const char *ShaderMap_Lookup(const char *name) {
 /* If the shader referenced by `name` is animated, return the current frame's
  * registered texture handle (lazily registering the frame on first hit).
  * Returns 0 for non-animated shaders so the caller falls through to the
- * normal lookup path. */
+ * normal lookup path.
+ *
+ * IMPORTANT: exact-name match only. Extension-stripped fallback would
+ * recurse: a frame path like 'textures/sfx/flame1.tga' could strip to
+ * 'textures/sfx/flame1', match a shader whose animMap lists flame1.tga
+ * as a frame, and re-enter RegisterTexture for the same file until the
+ * iOS watchdog SIGKILLs. */
 static qhandle_t ShaderMap_ResolveCurrentFrame(const char *name) {
-    const metalShaderMap_t *entry = ShaderMap_LookupEntry(name);
-    int slot;
+    int i;
+    int slot = -1;
+    const metalShaderMap_t *entry = NULL;
     float fps;
     int frameIdx;
+    static qboolean s_resolving = qfalse;
 
-    if (entry == NULL || entry->animFrameCount <= 0) {
-        return 0;
+    if (name == NULL || name[0] == '\0') return 0;
+    /* Re-entry guard: if a frame's own registration somehow ends up in
+     * this function, break the cycle. Belt-and-suspenders with the
+     * exact-name-only policy above. */
+    if (s_resolving) return 0;
+
+    for (i = 0; i < s_shaderMapCount; ++i) {
+        if (!Q_stricmp(s_shaderMap[i].shaderName, name)) {
+            entry = &s_shaderMap[i];
+            slot = i;
+            break;
+        }
     }
-    slot = (int)(entry - s_shaderMap);
-    if (slot < 0 || slot >= s_shaderMapCount) {
+    if (entry == NULL || entry->animFrameCount <= 0) {
         return 0;
     }
     fps = (entry->animFps > 0.0f) ? entry->animFps : 8.0f;
     frameIdx = (int)((float)cls.realtime * 0.001f * fps) % entry->animFrameCount;
     if (frameIdx < 0) frameIdx = 0;
     if (s_shaderMap[slot].animTextures[frameIdx] == 0) {
-        /* Register the frame texture without re-entering the animation
-         * path (frame paths are direct image files, not shader names). */
+        s_resolving = qtrue;
         s_shaderMap[slot].animTextures[frameIdx] =
             RegisterTexture(s_shaderMap[slot].animFrames[frameIdx]);
+        s_resolving = qfalse;
     }
     return s_shaderMap[slot].animTextures[frameIdx];
 }
