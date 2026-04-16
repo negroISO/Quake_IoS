@@ -363,13 +363,13 @@ struct MetalView: UIViewRepresentable {
                             encoder.setRenderPipelineState(worldPipelineState)
                             encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
                         }
-                        // Heuristic alpha test: surfaces with NOCULL that
-                        // aren't additive are almost always alpha-tested
-                        // (torch brackets, fences, grates). Apply GE128
-                        // threshold (0.5) for them. Proper per-shader
-                        // alphaFunc flag will replace this heuristic later.
-                        let hasNoCull = (draw.flags & UInt32(Q3_METAL_WORLD_DRAWFLAG_NOCULL)) != 0
-                        let alphaTest: Float = (!isAdditive && hasNoCull) ? 0.5 : 0.0
+                        // Alpha test disabled for now. The NOCULL heuristic
+                        // was too broad — many opaque walls have cull=none +
+                        // alpha=0 in their textures, causing entire walls to
+                        // vanish. Per-texture alphaFunc from the C-side shader
+                        // map needs to flow through a draw-command field to
+                        // enable this correctly. Parked for next session.
+                        let alphaTest: Float = 0.0
                         var drawUniforms = WorldDrawUniforms(
                             texCoordScale: SIMD2<Float>(draw.texCoordScale.0, draw.texCoordScale.1),
                             texCoordScroll: SIMD2<Float>(draw.texCoordScroll.0, draw.texCoordScroll.1),
