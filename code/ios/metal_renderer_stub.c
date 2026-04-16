@@ -1607,14 +1607,14 @@ static qhandle_t GetSkyFaceTextureForSurface(const char *shaderName,
 }
 
 static int ShaderMap_GetBlendMode(const char *name) {
-    int i;
+    const metalShaderMap_t *entry;
     if (name == NULL || name[0] == '\0') return 0;
-    for (i = 0; i < s_shaderMapCount; ++i) {
-        if (!Q_stricmp(s_shaderMap[i].shaderName, name)) {
-            return s_shaderMap[i].blendMode;
-        }
-    }
-    return 0;
+    /* Use ShaderMap_LookupEntry which handles extension-stripped
+     * fallback (e.g. 'yellow.tga' → 'yellow'). A plain stricmp
+     * loop missed entity textures registered with their file
+     * extension while shader definitions omit it. */
+    entry = ShaderMap_LookupEntry(name);
+    return entry ? entry->blendMode : 0;
 }
 
 static void ShaderMap_GetScroll(const char *name, float *outS, float *outT) {
