@@ -26,6 +26,8 @@ typedef struct {
     int height;
     byte *rgbaBytes;
     char name[MAX_QPATH];
+    int blendMode; /* 0=opaque, 1=additive, 2=alpha, 3=filter; propagated
+                    * from the shader-map entry that resolved this texture. */
 } metalTexture_t;
 
 refimport_t ri;
@@ -421,6 +423,9 @@ static qhandle_t RegisterTexture(const char *name) {
     texture->height = height;
     texture->rgbaBytes = rgba;
     Q_strncpyz(texture->name, name, sizeof(texture->name));
+    /* Propagate blend mode from the shader-map entry that resolved
+     * this texture. Used by entity draw to decide additive pipeline. */
+    texture->blendMode = ShaderMap_GetBlendMode(name);
     if (Q_stricmp(name, resolvedName)) {
         ri.Printf(PRINT_ALL, "Metal stub: loaded '%s' from '%s' (%dx%d)\n", name, resolvedName, width, height);
     }
@@ -2755,12 +2760,12 @@ static void RE_RenderScene(const refdef_t *fd) {
                         drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_DEPTHHACK;
                     }
                     /* Check entity's shader for additive blending (e.g.
-                     * health orbs, glow effects, flame pickups). Uses the
-                     * resolved texture name to look up the shader map
-                     * entry's blendMode. */
+                     * health orbs, glow effects, flame pickups). The
+                     * texture's blendMode was propagated from the shader-
+                     * map entry at RegisterTexture time. */
                     {
                         const metalTexture_t *tex = FindTextureByHandle(textureHandle);
-                        if (tex != NULL && ShaderMap_GetBlendMode(tex->name) == 1) {
+                        if (tex != NULL && tex->blendMode == 1) {
                             drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
                         }
                     }
