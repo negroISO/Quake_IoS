@@ -397,6 +397,16 @@ static qhandle_t RegisterTexture(const char *name) {
     {
         qhandle_t animHandle = ShaderMap_ResolveCurrentFrame(name);
         if (animHandle != 0) {
+            /* Propagate the parent shader's blendMode to the frame
+             * texture. Frame textures are registered under their own
+             * filenames (flame4.tga, etc.) which have no shader-map
+             * entry → blendMode stays 0. But the PARENT shader
+             * (flame1_hell) has blendMode=1 (additive). Without this
+             * propagation, additive flames render opaque. */
+            metalTexture_t *animTex = FindTextureByHandle(animHandle);
+            if (animTex != NULL && animTex->blendMode == 0) {
+                animTex->blendMode = ShaderMap_GetBlendMode(name);
+            }
             return animHandle;
         }
     }
