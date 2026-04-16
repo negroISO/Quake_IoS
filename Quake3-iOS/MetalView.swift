@@ -51,6 +51,7 @@ struct MetalView: UIViewRepresentable {
             var texCoordScroll: SIMD2<Float>
             var timeSeconds: Float
             var debugMode: Float
+            var forceWhiteVertColor: Float  // 1.0 for additive (skip BSP vertex color)
         }
 
         // Render debug: 0 = normal, 1 = base only, 2 = lightmap only,
@@ -130,6 +131,7 @@ struct MetalView: UIViewRepresentable {
             float2 texCoordScroll;
             float timeSeconds;
             float debugMode;
+            float forceWhiteVertColor;
         };
 
         struct EntityVertexIn {
@@ -201,8 +203,14 @@ struct MetalView: UIViewRepresentable {
             // boost the whole world renders at half brightness — user reported
             // the game was 'awfully dark even with phone brightness all the way
             // up'. saturate() clamps to [0,1] so bright spots don't wrap.
-            float3 lit = saturate(texel.rgb * lightmap.rgb * 2.0) * in.color.rgb;
-            return float4(lit, texel.a * in.color.a);
+            // For additive surfaces (flames, glow), BSP vertex color is
+            // typically (0,0,0) because Q3 shaders use rgbGen identity.
+            // forceWhiteVertColor=1.0 substitutes white, preventing the
+            // multiply from zeroing out the fragment.
+            float3 vc = mix(in.color.rgb, float3(1.0), drawUniforms.forceWhiteVertColor);
+            float  va = mix(in.color.a,   1.0,          drawUniforms.forceWhiteVertColor);
+            float3 lit = saturate(texel.rgb * lightmap.rgb * 2.0) * vc;
+            return float4(lit, texel.a * va);
         }
 
         vertex EntityVertexOut q3_entity_vertex(const device EntityVertexIn *vertices [[buffer(0)]],
@@ -348,7 +356,8 @@ struct MetalView: UIViewRepresentable {
                             texCoordScale: SIMD2<Float>(draw.texCoordScale.0, draw.texCoordScale.1),
                             texCoordScroll: SIMD2<Float>(draw.texCoordScroll.0, draw.texCoordScroll.1),
                             timeSeconds: timeSeconds,
-                            debugMode: Coordinator.worldDebugMode
+                            debugMode: Coordinator.worldDebugMode,
+                            forceWhiteVertColor: isAdditive ? 1.0 : 0.0
                         )
                         encoder.setFragmentTexture(baseTexture, index: 0)
                         encoder.setFragmentTexture(lightmapTexture, index: 1)
