@@ -33,14 +33,24 @@ typedef struct {
 } Q3MetalDrawCmd;
 
 typedef struct {
+    uint32_t textureHandle;
+    uint32_t blendMode;   /* 0=opaque,1=add,2=alpha,3=filter */
+    uint32_t tcGen;       /* 0=base,1=environment */
+    uint32_t tcMod;       /* 0=none,1=scroll,2=turb,3=rotate,4=scale */
+    float tcModParams[4];
+    uint32_t rgbGen;      /* 0=identity,1=vertex */
+    uint32_t alphaFunc;   /* 0=none, 1=GT0, 2=GE128, 3=LT128 */
+} Q3MetalWorldStage;
+
+#define Q3_METAL_MAX_STAGES 4
+
+typedef struct {
     uint32_t firstIndex;
     uint32_t indexCount;
-    uint32_t textureHandle;
     uint32_t lightmapTextureHandle;
     uint32_t flags;
-    uint32_t alphaFunc; /* 0=none, 1=GT0, 2=GE128, 3=LT128 */
-    float texCoordScale[2];
-    float texCoordScroll[2];
+    uint32_t stageCount;
+    Q3MetalWorldStage stages[Q3_METAL_MAX_STAGES];
 } Q3MetalWorldDrawCmd;
 
 typedef struct {

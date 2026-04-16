@@ -78,6 +78,15 @@ typedef struct {
      * retargeting (fire/lava/teleport on world geometry). */
     int *animShaderSlots;
     uint32_t animatedDrawCount; /* number of draws with slot >= 0 */
+    /* BSP lightgrid. LUMP_LIGHTGRID is an array of 8-byte cells
+     * (ambient[3] + directed[3] + latLong[2]) sampled at a regular grid
+     * over the map volume. Used by SetupEntityLighting to compute
+     * per-entity ambient+directed+lightDir so MD3 entities pick up
+     * the local room lighting instead of rendering full-white. */
+    const byte *lightGrid;
+    vec3_t lightGridOrigin;
+    vec3_t lightGridSize;     /* cell dims — default (64,64,128) */
+    int    lightGridBounds[3]; /* cell counts per axis */
     char name[MAX_QPATH];
 } metalWorld_t;
 
@@ -306,24 +315,41 @@ static qboolean IsDrawableWorldShader(const dshader_t *shader) {
 static void SetupWorldDraw(Q3MetalWorldDrawCmd *draw,
                            uint32_t firstIndex,
                            uint32_t indexCount,
-                           qhandle_t textureHandle,
                            qhandle_t lightmapTextureHandle,
-                           uint32_t flags,
-                           int alphaFunc,
-                           float scaleS,
-                           float scaleT,
-                           float scrollS,
-                           float scrollT) {
+                           uint32_t flags) {
     draw->firstIndex = firstIndex;
     draw->indexCount = indexCount;
-    draw->textureHandle = (uint32_t)textureHandle;
     draw->lightmapTextureHandle = (uint32_t)lightmapTextureHandle;
     draw->flags = flags;
-    draw->alphaFunc = (uint32_t)alphaFunc;
-    draw->texCoordScale[0] = scaleS;
-    draw->texCoordScale[1] = scaleT;
-    draw->texCoordScroll[0] = scrollS;
-    draw->texCoordScroll[1] = scrollT;
+    draw->stageCount = 0;
+}
+
+static void AddWorldDrawStage(Q3MetalWorldDrawCmd *draw,
+                              qhandle_t textureHandle,
+                              int blendMode,
+                              int tcGenEnv,
+                              int tcModType,
+                              float tcModP0,
+                              float tcModP1,
+                              float tcModP2,
+                              float tcModP3,
+                              int rgbGen,
+                              int alphaFunc) {
+    Q3MetalWorldStage *stage;
+    if (draw == NULL || draw->stageCount >= Q3_METAL_MAX_STAGES) {
+        return;
+    }
+    stage = &draw->stages[draw->stageCount++];
+    stage->textureHandle = (uint32_t)textureHandle;
+    stage->blendMode = (uint32_t)blendMode;
+    stage->tcGen = (uint32_t)((tcGenEnv != 0) ? 1 : 0);
+    stage->tcMod = (uint32_t)tcModType;
+    stage->tcModParams[0] = tcModP0;
+    stage->tcModParams[1] = tcModP1;
+    stage->tcModParams[2] = tcModP2;
+    stage->tcModParams[3] = tcModP3;
+    stage->rgbGen = (uint32_t)rgbGen;
+    stage->alphaFunc = (uint32_t)alphaFunc;
 }
 
 static qboolean TryLoadImageRGBA(const char *name, byte **rgba, int *width, int *height, char *resolvedName, size_t resolvedNameSize) {
@@ -365,8 +391,15 @@ static qhandle_t ShaderMap_ResolveCurrentFrame(const char *name);
 static int ShaderMap_FindAnimatedSlot(const char *name);
 static qhandle_t ShaderMap_AnimatedSlotCurrentHandle(int slot);
 static void ShaderMap_GetScroll(const char *name, float *outS, float *outT);
+static void ShaderMap_GetScale(const char *name, float *outS, float *outT);
 static int ShaderMap_GetBlendMode(const char *name);
 static int ShaderMap_GetAlphaFunc(const char *name);
+static int ShaderMap_GetTcGenEnv(const char *name);
+static qboolean ShaderMap_GetSecondStage(const char *name,
+                                         char *outMap, size_t outMapSize,
+                                         int *outBlendMode,
+                                         float *outScaleS, float *outScaleT,
+                                         float *outScrollS, float *outScrollT);
 
 static int s_pendingAnimSlot;
 static float s_pendingScrollS;
@@ -992,6 +1025,202 @@ static qhandle_t ResolveAndRegisterModel(const char *name) {
     return 0;
 }
 
+/*
+===============================================================================
+BSP lightgrid — per-entity ambient + directed lighting.
+
+Loads LUMP_LIGHTGRID (15). Each cell is 8 bytes:
+    byte ambient[3]    0..255 RGB ambient
+    byte directed[3]   0..255 RGB directed
+    byte latLong[2]    packed direction: lat*255/(2π), long*255/(2π)
+
+Cells are laid out in Z-Y-X order at a regular grid sized by
+worldspawn's `gridsize` (default (64,64,128)). The grid origin and
+bounds are derived from the world BSP's model 0 mins/maxs.
+
+SampleLightgrid does trilinear interpolation across 8 neighboring
+cells and returns normalized (0..1) ambient/directed plus a
+normalized lightDir. SetupEntityLighting uses the entity's
+`lightingOrigin` (falls back to `origin`) as the sample point.
+===============================================================================
+*/
+
+static void LoadLightgrid(const dheader_t *header, const dmodel_t *worldModel) {
+    int lumpLen = LittleLong(header->lumps[LUMP_LIGHTGRID].filelen);
+    int lumpOfs = LittleLong(header->lumps[LUMP_LIGHTGRID].fileofs);
+    const byte *lumpData;
+    int i, expectedCells, expectedBytes;
+    vec3_t mins, maxs;
+
+    s_world.lightGrid = NULL;
+    s_world.lightGridBounds[0] = 0;
+    s_world.lightGridBounds[1] = 0;
+    s_world.lightGridBounds[2] = 0;
+
+    if (lumpLen <= 0 || worldModel == NULL) {
+        ri.Printf(PRINT_DEVELOPER, "Metal lightgrid: lump empty or no world model\n");
+        return;
+    }
+
+    /* Stock Q3 default cell size. Some maps override via worldspawn
+     * `gridsize` but parsing entities is out of scope for this pass;
+     * default covers q3dm1 and nearly all stock maps. */
+    s_world.lightGridSize[0] = 64.0f;
+    s_world.lightGridSize[1] = 64.0f;
+    s_world.lightGridSize[2] = 128.0f;
+
+    for (i = 0; i < 3; ++i) {
+        mins[i] = worldModel->mins[i];
+        maxs[i] = worldModel->maxs[i];
+    }
+
+    /* Grid origin at the first cell boundary inside the map, grid
+     * bounds at the last boundary inside. Matches stock Q3's
+     * R_LoadLightGrid derivation. */
+    for (i = 0; i < 3; ++i) {
+        s_world.lightGridOrigin[i] = s_world.lightGridSize[i] * ceilf(mins[i] / s_world.lightGridSize[i]);
+        {
+            float maxBound = s_world.lightGridSize[i] * floorf(maxs[i] / s_world.lightGridSize[i]);
+            s_world.lightGridBounds[i] = (int)((maxBound - s_world.lightGridOrigin[i]) / s_world.lightGridSize[i]) + 1;
+        }
+        if (s_world.lightGridBounds[i] < 1) {
+            s_world.lightGridBounds[i] = 1;
+        }
+    }
+
+    expectedCells = s_world.lightGridBounds[0] * s_world.lightGridBounds[1] * s_world.lightGridBounds[2];
+    expectedBytes = expectedCells * 8;
+
+    if (lumpLen != expectedBytes) {
+        ri.Printf(PRINT_WARNING,
+            "Metal lightgrid: size mismatch (%d bytes, expected %d for %dx%dx%d grid); disabling\n",
+            lumpLen, expectedBytes,
+            s_world.lightGridBounds[0], s_world.lightGridBounds[1], s_world.lightGridBounds[2]);
+        s_world.lightGridBounds[0] = 0;
+        return;
+    }
+
+    lumpData = (const byte *)header + lumpOfs;
+    s_world.lightGrid = lumpData;
+
+    ri.Printf(PRINT_ALL,
+        "Metal lightgrid: loaded %dx%dx%d grid (%d cells, origin=(%.0f,%.0f,%.0f))\n",
+        s_world.lightGridBounds[0], s_world.lightGridBounds[1], s_world.lightGridBounds[2],
+        expectedCells,
+        s_world.lightGridOrigin[0], s_world.lightGridOrigin[1], s_world.lightGridOrigin[2]);
+}
+
+static void SampleLightgrid(const vec3_t worldPos, vec3_t outAmbient, vec3_t outDirected, vec3_t outLightDir) {
+    vec3_t pos;
+    float fx, fy, fz, tx, ty, tz;
+    int ix, iy, iz, dx, dy, dz;
+    vec3_t ambient = {0, 0, 0};
+    vec3_t directed = {0, 0, 0};
+    vec3_t dir = {0, 0, 0};
+
+    /* Sensible fallback when grid unavailable — dim ambient, straight-up
+     * light from above. Keeps entities visible without blowing highlights. */
+    outAmbient[0] = outAmbient[1] = outAmbient[2] = 0.5f;
+    outDirected[0] = outDirected[1] = outDirected[2] = 0.5f;
+    outLightDir[0] = 0.0f;
+    outLightDir[1] = 0.0f;
+    outLightDir[2] = 1.0f;
+
+    if (s_world.lightGrid == NULL || s_world.lightGridBounds[0] < 1) {
+        return;
+    }
+
+    VectorSubtract(worldPos, s_world.lightGridOrigin, pos);
+    fx = pos[0] / s_world.lightGridSize[0];
+    fy = pos[1] / s_world.lightGridSize[1];
+    fz = pos[2] / s_world.lightGridSize[2];
+
+    ix = (int)floorf(fx);
+    iy = (int)floorf(fy);
+    iz = (int)floorf(fz);
+    tx = fx - ix;
+    ty = fy - iy;
+    tz = fz - iz;
+
+    for (dz = 0; dz <= 1; ++dz) {
+        for (dy = 0; dy <= 1; ++dy) {
+            for (dx = 0; dx <= 1; ++dx) {
+                int x = ix + dx;
+                int y = iy + dy;
+                int z = iz + dz;
+                const byte *cell;
+                float w, lat, lng;
+                vec3_t l;
+
+                if (x < 0 || y < 0 || z < 0 ||
+                    x >= s_world.lightGridBounds[0] ||
+                    y >= s_world.lightGridBounds[1] ||
+                    z >= s_world.lightGridBounds[2]) {
+                    continue;
+                }
+
+                cell = s_world.lightGrid + 8 * (x +
+                    y * s_world.lightGridBounds[0] +
+                    z * s_world.lightGridBounds[0] * s_world.lightGridBounds[1]);
+
+                w = (dx ? tx : (1.0f - tx)) *
+                    (dy ? ty : (1.0f - ty)) *
+                    (dz ? tz : (1.0f - tz));
+
+                ambient[0] += cell[0] * w;
+                ambient[1] += cell[1] * w;
+                ambient[2] += cell[2] * w;
+                directed[0] += cell[3] * w;
+                directed[1] += cell[4] * w;
+                directed[2] += cell[5] * w;
+
+                /* Q3 lat/long direction encoding:
+                 *   lat byte → 0..2π latitude
+                 *   long byte → 0..2π longitude
+                 *   dir = (cos(lat)sin(long), sin(lat)sin(long), cos(long)) */
+                lat = (float)cell[7] * ((float)M_PI * 2.0f / 255.0f);
+                lng = (float)cell[6] * ((float)M_PI * 2.0f / 255.0f);
+                l[0] = cosf(lat) * sinf(lng);
+                l[1] = sinf(lat) * sinf(lng);
+                l[2] = cosf(lng);
+
+                dir[0] += l[0] * w;
+                dir[1] += l[1] * w;
+                dir[2] += l[2] * w;
+            }
+        }
+    }
+
+    VectorNormalize(dir);
+
+    outAmbient[0]  = ambient[0]  / 255.0f;
+    outAmbient[1]  = ambient[1]  / 255.0f;
+    outAmbient[2]  = ambient[2]  / 255.0f;
+    outDirected[0] = directed[0] / 255.0f;
+    outDirected[1] = directed[1] / 255.0f;
+    outDirected[2] = directed[2] / 255.0f;
+    outLightDir[0] = dir[0];
+    outLightDir[1] = dir[1];
+    outLightDir[2] = dir[2];
+}
+
+/* Given a refEntity_t, compute ambient + directed + lightDir at its
+ * lighting origin (falls back to origin if lightingOrigin is zero). */
+static void SetupEntityLighting(const refEntity_t *ent,
+                                vec3_t outAmbient,
+                                vec3_t outDirected,
+                                vec3_t outLightDir) {
+    vec3_t origin;
+    if (ent->lightingOrigin[0] != 0.0f ||
+        ent->lightingOrigin[1] != 0.0f ||
+        ent->lightingOrigin[2] != 0.0f) {
+        VectorCopy(ent->lightingOrigin, origin);
+    } else {
+        VectorCopy(ent->origin, origin);
+    }
+    SampleLightgrid(origin, outAmbient, outDirected, outLightDir);
+}
+
 static qboolean LoadWorldMapData(const char *name) {
     void *fileBuffer = NULL;
     dheader_t *header;
@@ -1062,26 +1291,24 @@ static qboolean LoadWorldMapData(const char *name) {
         }
 
         if (surfaceType == MST_PATCH) {
-            uint32_t stageCount = IsTimHellShaderName(shaders[shaderNum].shader) ? 2u : 1u;
             patchWidth = LittleLong(surface->patchWidth);
             patchHeight = LittleLong(surface->patchHeight);
             totalVertices += (uint32_t)((patchWidth - 1) / 2) * (uint32_t)((patchHeight - 1) / 2) *
                              (Q3_METAL_PATCH_SUBDIVISIONS + 1) * (Q3_METAL_PATCH_SUBDIVISIONS + 1);
             totalIndices += (uint32_t)((patchWidth - 1) / 2) * (uint32_t)((patchHeight - 1) / 2) *
                             Q3_METAL_PATCH_SUBDIVISIONS * Q3_METAL_PATCH_SUBDIVISIONS * 6;
-            totalDraws += (uint32_t)((patchWidth - 1) / 2) * (uint32_t)((patchHeight - 1) / 2) * stageCount;
+            totalDraws += (uint32_t)((patchWidth - 1) / 2) * (uint32_t)((patchHeight - 1) / 2);
             patchDraws += (uint32_t)((patchWidth - 1) / 2) * (uint32_t)((patchHeight - 1) / 2);
         } else {
             int numVerts = LittleLong(surface->numVerts);
             int numIndexes = LittleLong(surface->numIndexes);
-            uint32_t stageCount = IsTimHellShaderName(shaders[shaderNum].shader) ? 2u : 1u;
 
             if (numIndexes % 3) {
                 numIndexes -= numIndexes % 3;
             }
             totalVertices += (uint32_t)numVerts;
             totalIndices += (uint32_t)numIndexes;
-            totalDraws += stageCount;
+            totalDraws += 1;
 
             if (surfaceType == MST_PLANAR) {
                 planarDraws += 1;
@@ -1099,6 +1326,17 @@ static qboolean LoadWorldMapData(const char *name) {
 
     FreeWorldMapData();
     LoadWorldLightmaps(header, name);
+
+    /* Load the lightgrid (LUMP_LIGHTGRID). World model is model 0 in
+     * LUMP_MODELS — its mins/maxs define the grid bounds. */
+    {
+        const dmodel_t *models = (const dmodel_t *)((const byte *)fileBuffer +
+                                                    LittleLong(header->lumps[LUMP_MODELS].fileofs));
+        int modelLen = LittleLong(header->lumps[LUMP_MODELS].filelen);
+        if (modelLen >= (int)sizeof(dmodel_t)) {
+            LoadLightgrid(header, &models[0]);
+        }
+    }
 
     s_world.vertices = ri.Malloc(totalVertices * sizeof(*s_world.vertices));
     s_world.indices = ri.Malloc(totalIndices * sizeof(*s_world.indices));
@@ -1129,7 +1367,17 @@ static qboolean LoadWorldMapData(const char *name) {
         uint32_t baseVertex;
         qhandle_t textureHandle;
         qhandle_t lightmapHandle;
-        int drawAlphaFunc;
+        qhandle_t stage2TextureHandle;
+        int stage0BlendMode;
+        int stage0AlphaFunc;
+        int stage0TcGenEnv;
+        int stage0TcModType;
+        float stage0TcModParams[4];
+        char skyStage2Map[MAX_QPATH];
+        int skyStage2BlendMode;
+        int skyStage2TcModType;
+        float skyStage2TcModParams[4];
+        qboolean hasSkyStage2;
         int lightmapNum;
         qboolean hasLightmap;
         uint32_t worldFlags;
@@ -1146,6 +1394,23 @@ static qboolean LoadWorldMapData(const char *name) {
         shaderNum = LittleLong(surface->shaderNum);
         lightmapNum = LittleLong(surface->lightmapNum);
         hasLightmap = qfalse;
+        stage2TextureHandle = 0;
+        stage0BlendMode = 0;
+        stage0AlphaFunc = 0;
+        stage0TcGenEnv = 0;
+        stage0TcModType = 0;
+        stage0TcModParams[0] = 0.0f;
+        stage0TcModParams[1] = 0.0f;
+        stage0TcModParams[2] = 0.0f;
+        stage0TcModParams[3] = 0.0f;
+        skyStage2Map[0] = '\0';
+        skyStage2BlendMode = 0;
+        skyStage2TcModType = 0;
+        skyStage2TcModParams[0] = 0.0f;
+        skyStage2TcModParams[1] = 0.0f;
+        skyStage2TcModParams[2] = 0.0f;
+        skyStage2TcModParams[3] = 0.0f;
+        hasSkyStage2 = qfalse;
 
         if (shaderNum < 0 || shaderNum >= shaderCount) {
             continue;
@@ -1208,23 +1473,42 @@ static qboolean LoadWorldMapData(const char *name) {
         /* Per-shader tcMod scroll (s,t) for lava-flow, scrolling fog,
          * etc. MSL applies `uv + scroll * timeSeconds` each frame. */
         ShaderMap_GetScroll(shaders[shaderNum].shader, &s_pendingScrollS, &s_pendingScrollT);
-        drawAlphaFunc = ShaderMap_GetAlphaFunc(shaders[shaderNum].shader);
-        lightmapHandle = EnsureWhiteTexture();
-        worldFlags = defaultWorldFlags;
-        /* Per-shader blendFunc — additive surfaces (flames, glow) need
-         * the additive pipeline. 0=opaque, 1=additive, 2=alpha, 3=filter. */
-        {
-            int bm = ShaderMap_GetBlendMode(shaders[shaderNum].shader);
-            if (bm == 1) {
-                worldFlags |= Q3_METAL_WORLD_DRAWFLAG_ADDITIVE | Q3_METAL_WORLD_DRAWFLAG_NOCULL;
-                ri.Printf(PRINT_ALL, "Metal world additive: surface shader '%s' bm=%d\n",
-                           shaders[shaderNum].shader, bm);
-            } else if (bm == 2) {
-                worldFlags |= Q3_METAL_WORLD_DRAWFLAG_ALPHA | Q3_METAL_WORLD_DRAWFLAG_NOCULL;
-            } else if (bm == 3) {
-                worldFlags |= Q3_METAL_WORLD_DRAWFLAG_FILTER | Q3_METAL_WORLD_DRAWFLAG_NOCULL;
+        stage0AlphaFunc = ShaderMap_GetAlphaFunc(shaders[shaderNum].shader);
+        stage0BlendMode = ShaderMap_GetBlendMode(shaders[shaderNum].shader);
+        stage0TcGenEnv = ShaderMap_GetTcGenEnv(shaders[shaderNum].shader);
+        if (IsSkyShaderName(shaders[shaderNum].shader)) {
+            float scaleS = 1.0f;
+            float scaleT = 1.0f;
+            stage0TcModType = (fabsf(s_pendingScrollS) > 0.00001f || fabsf(s_pendingScrollT) > 0.00001f) ? 1 : 0;
+            stage0TcModParams[0] = s_pendingScrollS;
+            stage0TcModParams[1] = s_pendingScrollT;
+            ShaderMap_GetScale(shaders[shaderNum].shader, &scaleS, &scaleT);
+            if (fabsf(scaleS - 1.0f) > 0.00001f || fabsf(scaleT - 1.0f) > 0.00001f) {
+                stage0TcModType = 4;
+                stage0TcModParams[0] = scaleS;
+                stage0TcModParams[1] = scaleT;
+            }
+            hasSkyStage2 = ShaderMap_GetSecondStage(
+                shaders[shaderNum].shader,
+                skyStage2Map, sizeof(skyStage2Map),
+                &skyStage2BlendMode,
+                &skyStage2TcModParams[0], &skyStage2TcModParams[1],
+                &skyStage2TcModParams[2], &skyStage2TcModParams[3]);
+            if (hasSkyStage2) {
+                stage2TextureHandle = RegisterTexture(skyStage2Map);
+                if (fabsf(skyStage2TcModParams[2]) > 0.00001f || fabsf(skyStage2TcModParams[3]) > 0.00001f) {
+                    skyStage2TcModType = 1;
+                    skyStage2TcModParams[0] = skyStage2TcModParams[2];
+                    skyStage2TcModParams[1] = skyStage2TcModParams[3];
+                }
+                if (fabsf(skyStage2TcModParams[0] - 1.0f) > 0.00001f ||
+                    fabsf(skyStage2TcModParams[1] - 1.0f) > 0.00001f) {
+                    skyStage2TcModType = 4;
+                }
             }
         }
+        lightmapHandle = EnsureWhiteTexture();
+        worldFlags = defaultWorldFlags;
         if (!IsSkyShaderName(shaders[shaderNum].shader) && lightmapNum >= 0 && lightmapNum < s_worldLightmapCount) {
             lightmapHandle = s_worldLightmapHandles[lightmapNum];
             hasLightmap = qtrue;
@@ -1290,44 +1574,42 @@ static qboolean LoadWorldMapData(const char *name) {
                         }
                     }
 
-                    if (IsTimHellShaderName(shaders[shaderNum].shader)) {
-                        uint32_t firstIndexForStage = s_world.draws[drawCursor].firstIndex;
-                        uint32_t indexCountForStage = indexCursor - firstIndexForStage;
-
-                        SetupWorldDraw(&s_world.draws[drawCursor++],
-                                       firstIndexForStage,
-                                       indexCountForStage,
-                                       EnsureTimHellBaseTexture(),
-                                       EnsureWhiteTexture(),
-                                       Q3_METAL_WORLD_DRAWFLAG_NOCULL,
-                                       0,
-                                       2.0f, 2.0f,
-                                       0.05f, 0.10f);
-                        SetupWorldDraw(&s_world.draws[drawCursor++],
-                                       firstIndexForStage,
-                                       indexCountForStage,
-                                       EnsureTimHellAddTexture(),
-                                       EnsureWhiteTexture(),
-                                       Q3_METAL_WORLD_DRAWFLAG_ADDITIVE | Q3_METAL_WORLD_DRAWFLAG_NOCULL,
-                                       0,
-                                       3.0f, 3.0f,
-                                       0.05f, 0.10f);
-                    } else {
+                    {
                         uint32_t firstIndexForDraw = s_world.draws[drawCursor].firstIndex;
                         uint32_t indexCountForDraw = indexCursor - firstIndexForDraw;
                         uint32_t _dstIdx = drawCursor;
                         SetupWorldDraw(&s_world.draws[drawCursor++],
                                        firstIndexForDraw,
                                        indexCountForDraw,
-                                       textureHandle,
                                        hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
-                                       worldFlags,
-                                       drawAlphaFunc,
-                                       1.0f, 1.0f,
-                                       s_pendingScrollS, s_pendingScrollT);
+                                       worldFlags);
+                        AddWorldDrawStage(&s_world.draws[_dstIdx],
+                                          textureHandle,
+                                          stage0BlendMode,
+                                          stage0TcGenEnv,
+                                          stage0TcModType,
+                                          stage0TcModParams[0],
+                                          stage0TcModParams[1],
+                                          stage0TcModParams[2],
+                                          stage0TcModParams[3],
+                                          0,
+                                          stage0AlphaFunc);
                         if (s_world.animShaderSlots && s_pendingAnimSlot >= 0) {
                             s_world.animShaderSlots[_dstIdx] = s_pendingAnimSlot;
                             s_world.animatedDrawCount += 1;
+                        }
+                        if (hasSkyStage2 && stage2TextureHandle != 0) {
+                            AddWorldDrawStage(&s_world.draws[_dstIdx],
+                                              stage2TextureHandle,
+                                              skyStage2BlendMode,
+                                              0,
+                                              skyStage2TcModType,
+                                              skyStage2TcModParams[0],
+                                              skyStage2TcModParams[1],
+                                              skyStage2TcModParams[2],
+                                              skyStage2TcModParams[3],
+                                              0,
+                                              0);
                         }
                     }
                 }
@@ -1355,43 +1637,42 @@ static qboolean LoadWorldMapData(const char *name) {
             s_world.indices[indexCursor++] = baseVertex + (uint32_t)localIndex;
         }
 
-        if (IsTimHellShaderName(shaders[shaderNum].shader)) {
-            uint32_t firstIndexForStage = s_world.draws[drawCursor].firstIndex;
-            uint32_t indexCountForStage = indexCursor - firstIndexForStage;
-            SetupWorldDraw(&s_world.draws[drawCursor++],
-                           firstIndexForStage,
-                           indexCountForStage,
-                           EnsureTimHellBaseTexture(),
-                           EnsureWhiteTexture(),
-                           Q3_METAL_WORLD_DRAWFLAG_NOCULL,
-                           0,
-                           2.0f, 2.0f,
-                           0.05f, 0.10f);
-            SetupWorldDraw(&s_world.draws[drawCursor++],
-                           firstIndexForStage,
-                           indexCountForStage,
-                           EnsureTimHellAddTexture(),
-                           EnsureWhiteTexture(),
-                           Q3_METAL_WORLD_DRAWFLAG_ADDITIVE | Q3_METAL_WORLD_DRAWFLAG_NOCULL,
-                           0,
-                           3.0f, 3.0f,
-                           0.05f, 0.10f);
-        } else {
+        {
             uint32_t firstIndexForDraw = s_world.draws[drawCursor].firstIndex;
             uint32_t indexCountForDraw = indexCursor - firstIndexForDraw;
             uint32_t _dstIdx = drawCursor;
             SetupWorldDraw(&s_world.draws[drawCursor++],
                            firstIndexForDraw,
                            indexCountForDraw,
-                           textureHandle,
                            hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
-                           worldFlags,
-                           drawAlphaFunc,
-                           1.0f, 1.0f,
-                           0.0f, 0.0f);
+                           worldFlags);
+            AddWorldDrawStage(&s_world.draws[_dstIdx],
+                              textureHandle,
+                              stage0BlendMode,
+                              stage0TcGenEnv,
+                              stage0TcModType,
+                              stage0TcModParams[0],
+                              stage0TcModParams[1],
+                              stage0TcModParams[2],
+                              stage0TcModParams[3],
+                              0,
+                              stage0AlphaFunc);
             if (s_world.animShaderSlots && s_pendingAnimSlot >= 0) {
                 s_world.animShaderSlots[_dstIdx] = s_pendingAnimSlot;
                 s_world.animatedDrawCount += 1;
+            }
+            if (hasSkyStage2 && stage2TextureHandle != 0) {
+                AddWorldDrawStage(&s_world.draws[_dstIdx],
+                                  stage2TextureHandle,
+                                  skyStage2BlendMode,
+                                  0,
+                                  skyStage2TcModType,
+                                  skyStage2TcModParams[0],
+                                  skyStage2TcModParams[1],
+                                  skyStage2TcModParams[2],
+                                  skyStage2TcModParams[3],
+                                  0,
+                                  0);
             }
         }
     }
@@ -1448,6 +1729,8 @@ typedef struct {
      * per-draw uniform with no further math needed. */
     float tcModScrollS;
     float tcModScrollT;
+    float tcModScaleS;
+    float tcModScaleT;
     /* blendFunc from first stage. 0=opaque, 1=additive (GL_ONE GL_ONE),
      * 2=alpha-blend (GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA or 'blend'),
      * 3=filter (GL_DST_COLOR GL_ZERO or 'filter'). */
@@ -1467,6 +1750,12 @@ typedef struct {
      * not a skyparms shader (normal map). */
     char skyBoxBase[MAX_QPATH];
     qhandle_t skyFaceTextures[6]; /* up, dn, ft, bk, lf, rt (lazy) */
+    char stage2MapPath[MAX_QPATH];
+    int stage2BlendMode;
+    float stage2TcModScrollS;
+    float stage2TcModScrollT;
+    float stage2TcModScaleS;
+    float stage2TcModScaleT;
 } metalShaderMap_t;
 
 /* Sky face enumeration. Order matches Q3 convention. */
@@ -1645,11 +1934,37 @@ static int ShaderMap_GetBlendMode(const char *name) {
     return entry ? entry->blendMode : 0;
 }
 
+static int BlendModeFromTokens(const char *src, const char *dst) {
+    if (src == NULL || src[0] == '\0') return 0;
+    if (!Q_stricmp(src, "add") ||
+        (!Q_stricmp(src, "GL_ONE") && dst != NULL && !Q_stricmp(dst, "GL_ONE"))) {
+        return 1;
+    }
+    if (!Q_stricmp(src, "blend") ||
+        (!Q_stricmp(src, "GL_SRC_ALPHA") && dst != NULL &&
+         !Q_stricmp(dst, "GL_ONE_MINUS_SRC_ALPHA"))) {
+        return 2;
+    }
+    if (!Q_stricmp(src, "filter") ||
+        (!Q_stricmp(src, "GL_DST_COLOR") && dst != NULL &&
+         !Q_stricmp(dst, "GL_ZERO"))) {
+        return 3;
+    }
+    return 0;
+}
+
 static int ShaderMap_GetAlphaFunc(const char *name) {
     const metalShaderMap_t *entry;
     if (name == NULL || name[0] == '\0') return 0;
     entry = ShaderMap_LookupEntry(name);
     return entry ? entry->alphaFunc : 0;
+}
+
+static int ShaderMap_GetTcGenEnv(const char *name) {
+    const metalShaderMap_t *entry;
+    if (name == NULL || name[0] == '\0') return 0;
+    entry = ShaderMap_LookupEntry(name);
+    return (entry && entry->tcGenEnv) ? 1 : 0;
 }
 
 static void ShaderMap_GetScroll(const char *name, float *outS, float *outT) {
@@ -1664,6 +1979,41 @@ static void ShaderMap_GetScroll(const char *name, float *outS, float *outT) {
             return;
         }
     }
+}
+
+static void ShaderMap_GetScale(const char *name, float *outS, float *outT) {
+    const metalShaderMap_t *entry;
+    if (outS) *outS = 1.0f;
+    if (outT) *outT = 1.0f;
+    if (name == NULL || name[0] == '\0') return;
+    entry = ShaderMap_LookupEntry(name);
+    if (entry == NULL) return;
+    if (outS) *outS = entry->tcModScaleS;
+    if (outT) *outT = entry->tcModScaleT;
+}
+
+static qboolean ShaderMap_GetSecondStage(const char *name,
+                                         char *outMap, size_t outMapSize,
+                                         int *outBlendMode,
+                                         float *outScaleS, float *outScaleT,
+                                         float *outScrollS, float *outScrollT) {
+    const metalShaderMap_t *entry = ShaderMap_LookupEntry(name);
+    if (outMap && outMapSize > 0) outMap[0] = '\0';
+    if (outBlendMode) *outBlendMode = 0;
+    if (outScaleS) *outScaleS = 1.0f;
+    if (outScaleT) *outScaleT = 1.0f;
+    if (outScrollS) *outScrollS = 0.0f;
+    if (outScrollT) *outScrollT = 0.0f;
+    if (entry == NULL || entry->stage2MapPath[0] == '\0') return qfalse;
+    if (outMap && outMapSize > 0) {
+        Q_strncpyz(outMap, entry->stage2MapPath, outMapSize);
+    }
+    if (outBlendMode) *outBlendMode = entry->stage2BlendMode;
+    if (outScaleS) *outScaleS = entry->stage2TcModScaleS;
+    if (outScaleT) *outScaleT = entry->stage2TcModScaleT;
+    if (outScrollS) *outScrollS = entry->stage2TcModScrollS;
+    if (outScrollT) *outScrollT = entry->stage2TcModScrollT;
+    return qtrue;
 }
 
 /* Current frame's texture handle for a known animated slot. Caller
@@ -1693,6 +2043,10 @@ static void ShaderMap_Register(const char *name, const char *path, qboolean tcGe
     Q_strncpyz(s_shaderMap[s_shaderMapCount].mapPath, path,
         sizeof(s_shaderMap[0].mapPath));
     s_shaderMap[s_shaderMapCount].tcGenEnv = tcGenEnv;
+    s_shaderMap[s_shaderMapCount].tcModScaleS = 1.0f;
+    s_shaderMap[s_shaderMapCount].tcModScaleT = 1.0f;
+    s_shaderMap[s_shaderMapCount].stage2TcModScaleS = 1.0f;
+    s_shaderMap[s_shaderMapCount].stage2TcModScaleT = 1.0f;
     s_shaderMap[s_shaderMapCount].animFrameCount = 0;
     s_shaderMap[s_shaderMapCount].animFps = 0.0f;
     s_shaderMapCount += 1;
@@ -1716,6 +2070,10 @@ static void ShaderMap_RegisterAnimated(const char *name,
     Q_strncpyz(s_shaderMap[s_shaderMapCount].mapPath, frames[0],
         sizeof(s_shaderMap[0].mapPath));
     s_shaderMap[s_shaderMapCount].tcGenEnv = tcGenEnv;
+    s_shaderMap[s_shaderMapCount].tcModScaleS = 1.0f;
+    s_shaderMap[s_shaderMapCount].tcModScaleT = 1.0f;
+    s_shaderMap[s_shaderMapCount].stage2TcModScaleS = 1.0f;
+    s_shaderMap[s_shaderMapCount].stage2TcModScaleT = 1.0f;
     s_shaderMap[s_shaderMapCount].animFrameCount = maxFrames;
     s_shaderMap[s_shaderMapCount].animFps = (fps > 0.0f) ? fps : 8.0f;
     for (i = 0; i < maxFrames; ++i) {
@@ -1738,7 +2096,19 @@ static void ParseShaderText(const char *text) {
         float animFps;
         float tcScrollS;
         float tcScrollT;
+        float tcScaleS;
+        float tcScaleT;
         qboolean gotTcScroll;
+        qboolean gotTcScale;
+        char stage2Map[MAX_QPATH];
+        qboolean gotStage2Map;
+        float stage2ScrollS;
+        float stage2ScrollT;
+        float stage2ScaleS;
+        float stage2ScaleT;
+        qboolean gotStage2Scroll;
+        qboolean gotStage2Scale;
+        int stage2BlendMode;
         int depth;
         qboolean inStage;
         int stageIndex;
@@ -1760,7 +2130,19 @@ static void ParseShaderText(const char *text) {
         animFps = 0.0f;
         tcScrollS = 0.0f;
         tcScrollT = 0.0f;
+        tcScaleS = 1.0f;
+        tcScaleT = 1.0f;
         gotTcScroll = qfalse;
+        gotTcScale = qfalse;
+        stage2Map[0] = '\0';
+        gotStage2Map = qfalse;
+        stage2ScrollS = 0.0f;
+        stage2ScrollT = 0.0f;
+        stage2ScaleS = 1.0f;
+        stage2ScaleT = 1.0f;
+        gotStage2Scroll = qfalse;
+        gotStage2Scale = qfalse;
+        stage2BlendMode = 0;
         depth = 1;
         inStage = qfalse;
         stageIndex = 0;
@@ -1817,6 +2199,13 @@ static void ParseShaderText(const char *text) {
                         Q_strncpyz(firstMap, token, sizeof(firstMap));
                         gotMap = qtrue;
                     }
+                } else if (stageIndex == 2 && !gotStage2Map &&
+                           (!Q_stricmp(token, "map") || !Q_stricmp(token, "clampmap"))) {
+                    token = COM_ParseExt(&p, qfalse);
+                    if (token[0] && token[0] != '$') {
+                        Q_strncpyz(stage2Map, token, sizeof(stage2Map));
+                        gotStage2Map = qtrue;
+                    }
                 } else if (!gotMap && !gotAnim && !Q_stricmp(token, "animmap")) {
                     /* animMap <fps> <frame1> <frame2> ... up to end of line. */
                     token = COM_ParseExt(&p, qfalse);
@@ -1850,21 +2239,13 @@ static void ParseShaderText(const char *text) {
                     const char *src = COM_ParseExt(&p, qfalse);
                     const char *dst = COM_ParseExt(&p, qfalse);
                     if (src[0]) {
-                        if (!Q_stricmp(src, "add") ||
-                            (!Q_stricmp(src, "GL_ONE") && !Q_stricmp(dst, "GL_ONE"))) {
-                            s_pendingBlendMode = 1; /* additive */
-                        } else if (!Q_stricmp(src, "blend") ||
-                                   (!Q_stricmp(src, "GL_SRC_ALPHA") &&
-                                    !Q_stricmp(dst, "GL_ONE_MINUS_SRC_ALPHA"))) {
-                            s_pendingBlendMode = 2; /* alpha blend */
-                        } else if (!Q_stricmp(src, "filter") ||
-                                   (!Q_stricmp(src, "GL_DST_COLOR") &&
-                                    !Q_stricmp(dst, "GL_ZERO"))) {
-                            s_pendingBlendMode = 3; /* filter */
-                        } else if (!Q_stricmp(src, "GL_ONE") &&
-                                   !Q_stricmp(dst, "GL_ZERO")) {
-                            s_pendingBlendMode = 0; /* opaque (explicit) */
-                        }
+                        s_pendingBlendMode = BlendModeFromTokens(src, dst);
+                    }
+                } else if (stageIndex == 2 && (!Q_stricmp(token, "blendFunc") || !Q_stricmp(token, "blendfunc"))) {
+                    const char *src = COM_ParseExt(&p, qfalse);
+                    const char *dst = COM_ParseExt(&p, qfalse);
+                    if (src[0]) {
+                        stage2BlendMode = BlendModeFromTokens(src, dst);
                     }
                 } else if (stageIndex == 1 && (!Q_stricmp(token, "alphaFunc") || !Q_stricmp(token, "alphafunc"))) {
                     token = COM_ParseExt(&p, qfalse);
@@ -1887,6 +2268,33 @@ static void ParseShaderText(const char *text) {
                             tcScrollS = (float)atof(sTok);
                             tcScrollT = (float)atof(tTok);
                             gotTcScroll = qtrue;
+                        }
+                    } else if (token[0] && !Q_stricmp(token, "scale")) {
+                        const char *sTok = COM_ParseExt(&p, qfalse);
+                        const char *tTok = COM_ParseExt(&p, qfalse);
+                        if (sTok[0] && tTok[0]) {
+                            tcScaleS = (float)atof(sTok);
+                            tcScaleT = (float)atof(tTok);
+                            gotTcScale = qtrue;
+                        }
+                    }
+                } else if (stageIndex == 2 && (!Q_stricmp(token, "tcMod") || !Q_stricmp(token, "tcmod"))) {
+                    token = COM_ParseExt(&p, qfalse);
+                    if (token[0] && !Q_stricmp(token, "scroll")) {
+                        const char *sTok = COM_ParseExt(&p, qfalse);
+                        const char *tTok = COM_ParseExt(&p, qfalse);
+                        if (sTok[0] && tTok[0]) {
+                            stage2ScrollS = (float)atof(sTok);
+                            stage2ScrollT = (float)atof(tTok);
+                            gotStage2Scroll = qtrue;
+                        }
+                    } else if (token[0] && !Q_stricmp(token, "scale")) {
+                        const char *sTok = COM_ParseExt(&p, qfalse);
+                        const char *tTok = COM_ParseExt(&p, qfalse);
+                        if (sTok[0] && tTok[0]) {
+                            stage2ScaleS = (float)atof(sTok);
+                            stage2ScaleT = (float)atof(tTok);
+                            gotStage2Scale = qtrue;
                         }
                     }
                 }
@@ -1912,6 +2320,10 @@ static void ParseShaderText(const char *text) {
                     last->tcModScrollS = tcScrollS;
                     last->tcModScrollT = tcScrollT;
                 }
+                if (gotTcScale) {
+                    last->tcModScaleS = tcScaleS;
+                    last->tcModScaleT = tcScaleT;
+                }
                 if (s_pendingBlendMode != 0) {
                     last->blendMode = s_pendingBlendMode;
                 }
@@ -1920,6 +2332,18 @@ static void ParseShaderText(const char *text) {
                 }
                 if (gotSkyParms) {
                     Q_strncpyz(last->skyBoxBase, skyBoxBase, sizeof(last->skyBoxBase));
+                }
+                if (gotStage2Map) {
+                    Q_strncpyz(last->stage2MapPath, stage2Map, sizeof(last->stage2MapPath));
+                    last->stage2BlendMode = stage2BlendMode;
+                    if (gotStage2Scroll) {
+                        last->stage2TcModScrollS = stage2ScrollS;
+                        last->stage2TcModScrollT = stage2ScrollT;
+                    }
+                    if (gotStage2Scale) {
+                        last->stage2TcModScaleS = stage2ScaleS;
+                        last->stage2TcModScaleT = stage2ScaleT;
+                    }
                 }
             }
         }
@@ -2408,7 +2832,7 @@ static void RE_RenderScene(const refdef_t *fd) {
 
     /* Per-frame world-surface animMap retarget. Walk only the draws we
      * tagged at map-load (fire/lava/teleport surfaces) and overwrite
-     * their textureHandle with the current animation frame. Zero-cost
+     * stage-0 textureHandle with the current animation frame. Zero-cost
      * when animatedDrawCount == 0 (maps with no animated world shaders). */
     if (s_world.loaded && s_world.animatedDrawCount > 0 &&
         s_world.animShaderSlots != NULL && s_world.draws != NULL) {
@@ -2417,8 +2841,8 @@ static void RE_RenderScene(const refdef_t *fd) {
             int slot = s_world.animShaderSlots[i];
             if (slot >= 0) {
                 qhandle_t h = ShaderMap_AnimatedSlotCurrentHandle(slot);
-                if (h != 0) {
-                    s_world.draws[i].textureHandle = (uint32_t)h;
+                if (h != 0 && s_world.draws[i].stageCount > 0) {
+                    s_world.draws[i].stages[0].textureHandle = (uint32_t)h;
                 }
             }
         }
@@ -2780,6 +3204,12 @@ static void RE_RenderScene(const refdef_t *fd) {
                     entityColor[3] = (float)sceneEntity->entity.shader.rgba[3] / 255.0f;
                 }
 
+                /* Sample BSP lightgrid at the entity's lighting origin.
+                 * Ambient + directed are 0..1; lightDir is a unit vec.
+                 * Applied per-vertex in the inner loop as Lambert diffuse. */
+                vec3_t entityAmbient, entityDirected, entityLightDir;
+                SetupEntityLighting(&sceneEntity->entity, entityAmbient, entityDirected, entityLightDir);
+
                 /* Use the entity transform as submitted. The synthetic
                  * viewmodel path (SynthesizeViewmodelEntity) appends its own
                  * entity with correct camera-relative origin/axis; cgame-
@@ -2886,10 +3316,54 @@ static void RE_RenderScene(const refdef_t *fd) {
                         outVertex->position[2] = worldPosition[2];
                         outVertex->texCoord[0] = st[vertexIndex].st[0];
                         outVertex->texCoord[1] = st[vertexIndex].st[1];
-                        outVertex->color[0] = entityColor[0];
-                        outVertex->color[1] = entityColor[1];
-                        outVertex->color[2] = entityColor[2];
-                        outVertex->color[3] = entityColor[3];
+
+                        /* Per-vertex Lambert diffuse from BSP lightgrid.
+                         * 1. Decode MD3 lat/long normal (2 bytes packed).
+                         *    `currentVertex->normal` is stored as
+                         *    high=lat, low=long in Q3's short format.
+                         * 2. Rotate to world space by entity axis.
+                         * 3. Lambert: N·L clamped to 0.
+                         * 4. diffuse = ambient + directed * NdotL,
+                         *    modulated by shaderRGBA (entityColor). */
+                        {
+                            int latByte = (currentVertex->normal >> 8) & 0xff;
+                            int lngByte = currentVertex->normal & 0xff;
+                            float latRad = latByte * ((float)M_PI * 2.0f / 255.0f);
+                            float lngRad = lngByte * ((float)M_PI * 2.0f / 255.0f);
+                            vec3_t localN, worldN;
+                            float ndotl, rgb0, rgb1, rgb2;
+
+                            localN[0] = cosf(latRad) * sinf(lngRad);
+                            localN[1] = sinf(latRad) * sinf(lngRad);
+                            localN[2] = cosf(lngRad);
+
+                            worldN[0] = effectiveAxis[0][0] * localN[0]
+                                      + effectiveAxis[1][0] * localN[1]
+                                      + effectiveAxis[2][0] * localN[2];
+                            worldN[1] = effectiveAxis[0][1] * localN[0]
+                                      + effectiveAxis[1][1] * localN[1]
+                                      + effectiveAxis[2][1] * localN[2];
+                            worldN[2] = effectiveAxis[0][2] * localN[0]
+                                      + effectiveAxis[1][2] * localN[1]
+                                      + effectiveAxis[2][2] * localN[2];
+
+                            ndotl = worldN[0] * entityLightDir[0]
+                                  + worldN[1] * entityLightDir[1]
+                                  + worldN[2] * entityLightDir[2];
+                            if (ndotl < 0.0f) ndotl = 0.0f;
+
+                            rgb0 = (entityAmbient[0] + entityDirected[0] * ndotl) * entityColor[0];
+                            rgb1 = (entityAmbient[1] + entityDirected[1] * ndotl) * entityColor[1];
+                            rgb2 = (entityAmbient[2] + entityDirected[2] * ndotl) * entityColor[2];
+                            if (rgb0 > 1.0f) rgb0 = 1.0f;
+                            if (rgb1 > 1.0f) rgb1 = 1.0f;
+                            if (rgb2 > 1.0f) rgb2 = 1.0f;
+
+                            outVertex->color[0] = rgb0;
+                            outVertex->color[1] = rgb1;
+                            outVertex->color[2] = rgb2;
+                            outVertex->color[3] = entityColor[3];
+                        }
                     }
 
                     for (triangleIndex = 0; triangleIndex < surface->numTriangles; ++triangleIndex) {

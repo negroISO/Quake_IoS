@@ -47,12 +47,15 @@ struct MetalView: UIViewRepresentable {
         }
 
         struct WorldDrawUniforms {
-            var texCoordScale: SIMD2<Float>
-            var texCoordScroll: SIMD2<Float>
+            var tcGen: Float
+            var tcMod: Float
+            var rgbGen: Float
             var timeSeconds: Float
+            var tcModParams: SIMD4<Float>
             var debugMode: Float
             var forceWhiteVertColor: Float  // 1.0 for additive (skip BSP vertex color)
             var alphaTestThreshold: Float   // >0: discard if a<thresh; <0: discard if a>=|thresh|; 0: none
+            var _pad0: Float
         }
 
         // Render debug: 0 = normal, 1 = base only, 2 = lightmap only,
@@ -67,6 +70,19 @@ struct MetalView: UIViewRepresentable {
             case 3: return -0.5  // LT128 (negative means invert test)
             default: return 0.0  // disabled
             }
+        }
+
+        private static func worldStage(_ draw: Q3MetalWorldDrawCmd, _ index: Int) -> Q3MetalWorldStage {
+            switch index {
+            case 0: return draw.stages.0
+            case 1: return draw.stages.1
+            case 2: return draw.stages.2
+            default: return draw.stages.3
+            }
+        }
+
+        private static func stageTcModParams(_ stage: Q3MetalWorldStage) -> SIMD4<Float> {
+            SIMD4<Float>(stage.tcModParams.0, stage.tcModParams.1, stage.tcModParams.2, stage.tcModParams.3)
         }
 
         struct GPUEntityVertex {
@@ -137,12 +153,15 @@ struct MetalView: UIViewRepresentable {
         };
 
         struct WorldDrawUniforms {
-            float2 texCoordScale;
-            float2 texCoordScroll;
+            float tcGen;
+            float tcMod;
+            float rgbGen;
             float timeSeconds;
+            float4 tcModParams;
             float debugMode;
             float forceWhiteVertColor;
             float alphaTestThreshold;
+            float _pad0;
         };
 
         struct EntityVertexIn {
@@ -178,8 +197,23 @@ struct MetalView: UIViewRepresentable {
                                           texture2d<float> colorTexture [[texture(0)]],
                                           texture2d<float> lightmapTexture [[texture(1)]],
                                           sampler textureSampler [[sampler(0)]]) {
-            float2 texCoord = in.texCoord * drawUniforms.texCoordScale
-                + drawUniforms.texCoordScroll * drawUniforms.timeSeconds;
+            float2 texCoord = in.texCoord;
+            int tcMod = int(drawUniforms.tcMod + 0.5);
+            int rgbGen = int(drawUniforms.rgbGen + 0.5);
+            if (tcMod == 1) {
+                texCoord += drawUniforms.tcModParams.xy * drawUniforms.timeSeconds;
+            } else if (tcMod == 2) {
+                float s = sin(drawUniforms.timeSeconds * drawUniforms.tcModParams.w) * drawUniforms.tcModParams.y;
+                texCoord += float2(s, s);
+            } else if (tcMod == 3) {
+                float a = drawUniforms.tcModParams.x * drawUniforms.timeSeconds;
+                float c = cos(a);
+                float s = sin(a);
+                float2 p = texCoord - 0.5;
+                texCoord = float2(p.x * c - p.y * s, p.x * s + p.y * c) + 0.5;
+            } else if (tcMod == 4) {
+                texCoord *= drawUniforms.tcModParams.xy;
+            }
             float4 texel = colorTexture.sample(textureSampler, texCoord);
             float4 lightmap = lightmapTexture.sample(textureSampler, in.lightmapTexCoord);
             int mode = int(drawUniforms.debugMode + 0.5);
@@ -227,9 +261,15 @@ struct MetalView: UIViewRepresentable {
             // typically (0,0,0) because Q3 shaders use rgbGen identity.
             // forceWhiteVertColor=1.0 substitutes white, preventing the
             // multiply from zeroing out the fragment.
-            float3 vc = mix(in.color.rgb, float3(1.0), drawUniforms.forceWhiteVertColor);
+            // Overbright 2x boost reverted (commit ed461eb). Now using the
+            // straightforward texel * lightmap * vertColor combine so the
+            // lighting baseline is unboosted — lets us see real lightmap
+            // output before entity lighting work. Bring the 2x back later
+            // as a tunable r_overBrightBits-style cvar if needed.
+            float3 vertexColor = (rgbGen == 1) ? in.color.rgb : float3(1.0);
+            float3 vc = mix(vertexColor, float3(1.0), drawUniforms.forceWhiteVertColor);
             float  va = mix(in.color.a,   1.0,          drawUniforms.forceWhiteVertColor);
-            float3 lit = saturate(texel.rgb * lightmap.rgb * 2.0) * vc;
+            float3 lit = texel.rgb * lightmap.rgb * vc;
             return float4(lit, texel.a * va);
         }
 
@@ -350,58 +390,60 @@ struct MetalView: UIViewRepresentable {
                     let _ = indicesPointer
                     let worldDraws = UnsafeBufferPointer(start: worldDrawsPointer, count: Int(snapshot.worldCommandCount))
                     let timeSeconds = Float(CACurrentMediaTime() - frameTimeOrigin)
-                    let additiveBitW = UInt32(Q3_METAL_WORLD_DRAWFLAG_ADDITIVE)
-                    let alphaBitW = UInt32(Q3_METAL_WORLD_DRAWFLAG_ALPHA)
-                    let filterBitW = UInt32(Q3_METAL_WORLD_DRAWFLAG_FILTER)
 
                     // Ordered world passes:
                     // 0 = opaque, 1 = filter, 2 = alpha, 3 = additive.
                     for worldPass in 0..<4 {
                     for draw in worldDraws where draw.indexCount > 0 {
-                        let isAdditive = (draw.flags & additiveBitW) != 0
-                        let isAlpha = (draw.flags & alphaBitW) != 0
-                        let isFilter = (draw.flags & filterBitW) != 0
-                        let drawPass = isAdditive ? 3 : (isAlpha ? 2 : (isFilter ? 1 : 0))
-                        guard drawPass == worldPass else { continue }
-
-                        guard let baseTexture = texture(for: draw.textureHandle, device: view.device) else {
-                            continue
-                        }
                         guard let lightmapTexture = texture(for: draw.lightmapTextureHandle, device: view.device) else {
                             continue
                         }
-                        if drawPass == 3, let worldAdditivePipelineState {
-                            encoder.setRenderPipelineState(worldAdditivePipelineState)
-                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
-                        } else if drawPass == 2, let worldAlphaPipelineState {
-                            encoder.setRenderPipelineState(worldAlphaPipelineState)
-                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
-                        } else if drawPass == 1, let worldFilterPipelineState {
-                            encoder.setRenderPipelineState(worldFilterPipelineState)
-                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
-                        } else {
-                            encoder.setRenderPipelineState(worldPipelineState)
-                            encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
+                        let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+                        guard stageCount > 0 else { continue }
+                        for stageIndex in 0..<stageCount {
+                            let stage = Self.worldStage(draw, stageIndex)
+                            let blendMode = Int(stage.blendMode)
+                            let drawPass = (blendMode == 1) ? 3 : ((blendMode == 2) ? 2 : ((blendMode == 3) ? 1 : 0))
+                            guard drawPass == worldPass else { continue }
+                            guard let baseTexture = texture(for: stage.textureHandle, device: view.device) else {
+                                continue
+                            }
+                            if drawPass == 3, let worldAdditivePipelineState {
+                                encoder.setRenderPipelineState(worldAdditivePipelineState)
+                                encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
+                            } else if drawPass == 2, let worldAlphaPipelineState {
+                                encoder.setRenderPipelineState(worldAlphaPipelineState)
+                                encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
+                            } else if drawPass == 1, let worldFilterPipelineState {
+                                encoder.setRenderPipelineState(worldFilterPipelineState)
+                                encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
+                            } else {
+                                encoder.setRenderPipelineState(worldPipelineState)
+                                encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
+                            }
+                            let alphaTest = Self.alphaTestThreshold(for: stage.alphaFunc)
+                            var drawUniforms = WorldDrawUniforms(
+                                tcGen: Float(stage.tcGen),
+                                tcMod: Float(stage.tcMod),
+                                rgbGen: Float(stage.rgbGen),
+                                timeSeconds: timeSeconds,
+                                tcModParams: Self.stageTcModParams(stage),
+                                debugMode: Coordinator.worldDebugMode,
+                                forceWhiteVertColor: (blendMode == 1) ? 1.0 : 0.0,
+                                alphaTestThreshold: alphaTest,
+                                _pad0: 0.0
+                            )
+                            encoder.setFragmentTexture(baseTexture, index: 0)
+                            encoder.setFragmentTexture(lightmapTexture, index: 1)
+                            encoder.setFragmentBytes(&drawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 0)
+                            encoder.drawIndexedPrimitives(
+                                type: .triangle,
+                                indexCount: Int(draw.indexCount),
+                                indexType: .uint32,
+                                indexBuffer: worldIndexBuffer,
+                                indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride
+                            )
                         }
-                        let alphaTest = Self.alphaTestThreshold(for: draw.alphaFunc)
-                        var drawUniforms = WorldDrawUniforms(
-                            texCoordScale: SIMD2<Float>(draw.texCoordScale.0, draw.texCoordScale.1),
-                            texCoordScroll: SIMD2<Float>(draw.texCoordScroll.0, draw.texCoordScroll.1),
-                            timeSeconds: timeSeconds,
-                            debugMode: Coordinator.worldDebugMode,
-                            forceWhiteVertColor: isAdditive ? 1.0 : 0.0,
-                            alphaTestThreshold: alphaTest
-                        )
-                        encoder.setFragmentTexture(baseTexture, index: 0)
-                        encoder.setFragmentTexture(lightmapTexture, index: 1)
-                        encoder.setFragmentBytes(&drawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 0)
-                        encoder.drawIndexedPrimitives(
-                            type: .triangle,
-                            indexCount: Int(draw.indexCount),
-                            indexType: .uint32,
-                            indexBuffer: worldIndexBuffer,
-                            indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride
-                        )
                     }
                     } // end worldPass loop
                 }
