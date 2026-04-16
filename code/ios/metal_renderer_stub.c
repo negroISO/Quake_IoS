@@ -405,7 +405,12 @@ static qhandle_t RegisterTexture(const char *name) {
              * propagation, additive flames render opaque. */
             metalTexture_t *animTex = FindTextureByHandle(animHandle);
             if (animTex != NULL && animTex->blendMode == 0) {
-                animTex->blendMode = ShaderMap_GetBlendMode(name);
+                int parentBM = ShaderMap_GetBlendMode(name);
+                if (parentBM != 0) {
+                    animTex->blendMode = parentBM;
+                    ri.Printf(PRINT_ALL, "Metal blendMode propagate: '%s' → frame tex '%s' mode=%d\n",
+                              name, animTex->name, parentBM);
+                }
             }
             return animHandle;
         }
@@ -1194,6 +1199,8 @@ static qboolean LoadWorldMapData(const char *name) {
             int bm = ShaderMap_GetBlendMode(shaders[shaderNum].shader);
             if (bm == 1) {
                 worldFlags |= Q3_METAL_WORLD_DRAWFLAG_ADDITIVE | Q3_METAL_WORLD_DRAWFLAG_NOCULL;
+                ri.Printf(PRINT_ALL, "Metal world additive: surface shader '%s' bm=%d\n",
+                           shaders[shaderNum].shader, bm);
             }
         }
         lightmapHandle = EnsureWhiteTexture();
@@ -1855,6 +1862,8 @@ static void ParseShaderText(const char *text) {
                 }
                 if (s_pendingBlendMode != 0) {
                     last->blendMode = s_pendingBlendMode;
+                    ri.Printf(PRINT_ALL, "Metal blendMode: '%s' → mode=%d\n",
+                              shaderName, s_pendingBlendMode);
                 }
                 if (gotSkyParms) {
                     Q_strncpyz(last->skyBoxBase, skyBoxBase, sizeof(last->skyBoxBase));
