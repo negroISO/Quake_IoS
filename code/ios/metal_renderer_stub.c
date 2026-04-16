@@ -28,6 +28,7 @@ typedef struct {
     char name[MAX_QPATH];
     int blendMode; /* 0=opaque, 1=additive, 2=alpha, 3=filter; propagated
                     * from the shader-map entry that resolved this texture. */
+    int alphaFunc; /* 0=none, 1=GT0, 2=GE128, 3=LT128 */
 } metalTexture_t;
 
 refimport_t ri;
@@ -357,11 +358,13 @@ static int ShaderMap_FindAnimatedSlot(const char *name);
 static qhandle_t ShaderMap_AnimatedSlotCurrentHandle(int slot);
 static void ShaderMap_GetScroll(const char *name, float *outS, float *outT);
 static int ShaderMap_GetBlendMode(const char *name);
+static int ShaderMap_GetAlphaFunc(const char *name);
 
 static int s_pendingAnimSlot;
 static float s_pendingScrollS;
 static float s_pendingScrollT;
 static int s_pendingBlendMode;
+static int s_pendingAlphaFunc;
 
 static qhandle_t RegisterTexture(const char *name) {
     metalTexture_t *existing;
@@ -404,12 +407,14 @@ static qhandle_t RegisterTexture(const char *name) {
              * (flame1_hell) has blendMode=1 (additive). Without this
              * propagation, additive flames render opaque. */
             metalTexture_t *animTex = FindTextureByHandle(animHandle);
-            if (animTex != NULL && animTex->blendMode == 0) {
-                int parentBM = ShaderMap_GetBlendMode(name);
-                if (parentBM != 0) {
-                    animTex->blendMode = parentBM;
-                    ri.Printf(PRINT_ALL, "Metal blendMode propagate: '%s' → frame tex '%s' mode=%d\n",
-                              name, animTex->name, parentBM);
+            if (animTex != NULL) {
+                if (animTex->blendMode == 0) {
+                    int parentBM = ShaderMap_GetBlendMode(name);
+                    if (parentBM != 0) animTex->blendMode = parentBM;
+                }
+                if (animTex->alphaFunc == 0) {
+                    int parentAF = ShaderMap_GetAlphaFunc(name);
+                    if (parentAF != 0) animTex->alphaFunc = parentAF;
                 }
             }
             return animHandle;
@@ -441,6 +446,7 @@ static qhandle_t RegisterTexture(const char *name) {
     /* Propagate blend mode from the shader-map entry that resolved
      * this texture. Used by entity draw to decide additive pipeline. */
     texture->blendMode = ShaderMap_GetBlendMode(name);
+    texture->alphaFunc = ShaderMap_GetAlphaFunc(name);
     if (Q_stricmp(name, resolvedName)) {
         ri.Printf(PRINT_ALL, "Metal stub: loaded '%s' from '%s' (%dx%d)\n", name, resolvedName, width, height);
     }
@@ -1426,6 +1432,8 @@ typedef struct {
      * 2=alpha-blend (GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA or 'blend'),
      * 3=filter (GL_DST_COLOR GL_ZERO or 'filter'). */
     int blendMode;
+    /* alphaFunc from first stage. 0=none, 1=GT0, 2=GE128, 3=LT128. */
+    int alphaFunc;
     /* animMap support. framePaths[0] == mapPath. 0 frames = not animated. */
     int animFrameCount;
     float animFps;
@@ -1617,6 +1625,13 @@ static int ShaderMap_GetBlendMode(const char *name) {
     return entry ? entry->blendMode : 0;
 }
 
+static int ShaderMap_GetAlphaFunc(const char *name) {
+    const metalShaderMap_t *entry;
+    if (name == NULL || name[0] == '\0') return 0;
+    entry = ShaderMap_LookupEntry(name);
+    return entry ? entry->alphaFunc : 0;
+}
+
 static void ShaderMap_GetScroll(const char *name, float *outS, float *outT) {
     int i;
     if (outS) *outS = 0.0f;
@@ -1733,6 +1748,7 @@ static void ParseShaderText(const char *text) {
         skyBoxBase[0] = '\0';
         gotSkyParms = qfalse;
         s_pendingBlendMode = 0;
+        s_pendingAlphaFunc = 0;
 
         while (depth > 0) {
             token = COM_ParseExt(&p, qtrue);
@@ -1823,6 +1839,15 @@ static void ParseShaderText(const char *text) {
                             s_pendingBlendMode = 0; /* opaque (explicit) */
                         }
                     }
+                } else if (!Q_stricmp(token, "alphaFunc") || !Q_stricmp(token, "alphafunc")) {
+                    token = COM_ParseExt(&p, qfalse);
+                    if (!Q_stricmp(token, "GT0")) {
+                        s_pendingAlphaFunc = 1;
+                    } else if (!Q_stricmp(token, "GE128")) {
+                        s_pendingAlphaFunc = 2;
+                    } else if (!Q_stricmp(token, "LT128")) {
+                        s_pendingAlphaFunc = 3;
+                    }
                 } else if (!gotTcScroll && (!Q_stricmp(token, "tcMod") || !Q_stricmp(token, "tcmod"))) {
                     /* Capture only the first stage's tcMod scroll.
                      * tcMod rotate/scale are stubbed; full matrix math
@@ -1862,8 +1887,9 @@ static void ParseShaderText(const char *text) {
                 }
                 if (s_pendingBlendMode != 0) {
                     last->blendMode = s_pendingBlendMode;
-                    ri.Printf(PRINT_ALL, "Metal blendMode: '%s' → mode=%d\n",
-                              shaderName, s_pendingBlendMode);
+                }
+                if (s_pendingAlphaFunc != 0) {
+                    last->alphaFunc = s_pendingAlphaFunc;
                 }
                 if (gotSkyParms) {
                     Q_strncpyz(last->skyBoxBase, skyBoxBase, sizeof(last->skyBoxBase));

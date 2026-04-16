@@ -52,6 +52,7 @@ struct MetalView: UIViewRepresentable {
             var timeSeconds: Float
             var debugMode: Float
             var forceWhiteVertColor: Float  // 1.0 for additive (skip BSP vertex color)
+            var alphaTestThreshold: Float   // >0: discard if a<thresh; <0: discard if a>=|thresh|; 0: none
         }
 
         // Render debug: 0 = normal, 1 = base only, 2 = lightmap only,
@@ -132,6 +133,7 @@ struct MetalView: UIViewRepresentable {
             float timeSeconds;
             float debugMode;
             float forceWhiteVertColor;
+            float alphaTestThreshold;
         };
 
         struct EntityVertexIn {
@@ -203,6 +205,15 @@ struct MetalView: UIViewRepresentable {
             // boost the whole world renders at half brightness — user reported
             // the game was 'awfully dark even with phone brightness all the way
             // up'. saturate() clamps to [0,1] so bright spots don't wrap.
+            // Per-shader alphaFunc: GT0 / GE128 / LT128.
+            // Threshold >0 → discard if alpha < threshold (GT0=0.004, GE128=0.5)
+            // Threshold <0 → discard if alpha >= |threshold| (LT128=-0.5)
+            if (drawUniforms.alphaTestThreshold > 0.0) {
+                if (texel.a < drawUniforms.alphaTestThreshold) discard_fragment();
+            } else if (drawUniforms.alphaTestThreshold < 0.0) {
+                if (texel.a >= -drawUniforms.alphaTestThreshold) discard_fragment();
+            }
+
             // For additive surfaces (flames, glow), BSP vertex color is
             // typically (0,0,0) because Q3 shaders use rgbGen identity.
             // forceWhiteVertColor=1.0 substitutes white, preventing the
@@ -352,12 +363,20 @@ struct MetalView: UIViewRepresentable {
                             encoder.setRenderPipelineState(worldPipelineState)
                             encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
                         }
+                        // Heuristic alpha test: surfaces with NOCULL that
+                        // aren't additive are almost always alpha-tested
+                        // (torch brackets, fences, grates). Apply GE128
+                        // threshold (0.5) for them. Proper per-shader
+                        // alphaFunc flag will replace this heuristic later.
+                        let hasNoCull = (draw.flags & UInt32(Q3_METAL_WORLD_DRAWFLAG_NOCULL)) != 0
+                        let alphaTest: Float = (!isAdditive && hasNoCull) ? 0.5 : 0.0
                         var drawUniforms = WorldDrawUniforms(
                             texCoordScale: SIMD2<Float>(draw.texCoordScale.0, draw.texCoordScale.1),
                             texCoordScroll: SIMD2<Float>(draw.texCoordScroll.0, draw.texCoordScroll.1),
                             timeSeconds: timeSeconds,
                             debugMode: Coordinator.worldDebugMode,
-                            forceWhiteVertColor: isAdditive ? 1.0 : 0.0
+                            forceWhiteVertColor: isAdditive ? 1.0 : 0.0,
+                            alphaTestThreshold: alphaTest
                         )
                         encoder.setFragmentTexture(baseTexture, index: 0)
                         encoder.setFragmentTexture(lightmapTexture, index: 1)
