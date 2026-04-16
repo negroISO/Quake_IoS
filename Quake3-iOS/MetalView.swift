@@ -318,15 +318,26 @@ struct MetalView: UIViewRepresentable {
                     let _ = indicesPointer
                     let worldDraws = UnsafeBufferPointer(start: worldDrawsPointer, count: Int(snapshot.worldCommandCount))
                     let timeSeconds = Float(CACurrentMediaTime() - frameTimeOrigin)
+                    let additiveBitW = UInt32(Q3_METAL_WORLD_DRAWFLAG_ADDITIVE)
+
+                    // Two-pass: opaque first, then additive on top.
+                    // Additive surfaces (flames, glow) must blend ON TOP
+                    // of the opaque geometry behind them. Without two-pass,
+                    // a flame that draws before its wall adds onto the
+                    // cleared black framebuffer → dark rectangle.
+                    for worldPass in 0..<2 {
+                    let wantAdditive = (worldPass == 1)
                     for draw in worldDraws where draw.indexCount > 0 {
+                        let isAdditive = (draw.flags & additiveBitW) != 0
+                        guard isAdditive == wantAdditive else { continue }
+
                         guard let baseTexture = texture(for: draw.textureHandle, device: view.device) else {
                             continue
                         }
                         guard let lightmapTexture = texture(for: draw.lightmapTextureHandle, device: view.device) else {
                             continue
                         }
-                        let additive = (draw.flags & UInt32(Q3_METAL_WORLD_DRAWFLAG_ADDITIVE)) != 0
-                        if additive, let worldAdditivePipelineState, let additiveDepthStencilState {
+                        if isAdditive, let worldAdditivePipelineState, let additiveDepthStencilState {
                             encoder.setRenderPipelineState(worldAdditivePipelineState)
                             encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
                         } else {
@@ -350,6 +361,7 @@ struct MetalView: UIViewRepresentable {
                             indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride
                         )
                     }
+                    } // end worldPass loop
                 }
 
                 debugFrameCounter &+= 1
