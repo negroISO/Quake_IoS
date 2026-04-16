@@ -2787,6 +2787,15 @@ static void RE_RenderScene(const refdef_t *fd) {
                         if (tex != NULL && tex->blendMode == 1) {
                             drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
                         }
+                        /* Diagnostic: first 5 per frame */
+                        {
+                            static int s_entityBlendLog = 0;
+                            if (s_entityBlendLog < 5 && tex != NULL) {
+                                ri.Printf(PRINT_ALL, "Metal entity blend: tex='%s' bm=%d flags=0x%x\n",
+                                          tex->name, tex->blendMode, drawFlags);
+                                s_entityBlendLog++;
+                            }
+                        }
                     }
 
                     for (vertexIndex = 0; vertexIndex < surface->numVerts; ++vertexIndex) {
