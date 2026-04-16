@@ -401,9 +401,16 @@ struct MetalView: UIViewRepresentable {
                     let entityDraws = UnsafeBufferPointer(start: entityDrawsPointer, count: Int(snapshot.entityCommandCount))
                     let depthHackBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_DEPTHHACK)
                     let additiveBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE)
+
+                    // Two-pass entities: opaque first, additive second
+                    // (same rationale as world two-pass)
+                    for entityPass in 0..<2 {
+                    let wantEntityAdditive = (entityPass == 1)
                     var lastDepthHack = false
                     var lastAdditive = false
                     for draw in entityDraws where draw.indexCount > 0 {
+                        let isEntityAdditive = (draw.flags & additiveBit) != 0
+                        guard isEntityAdditive == wantEntityAdditive else { continue }
                         guard let texture = texture(for: draw.textureHandle, device: view.device) else {
                             continue
                         }
@@ -438,6 +445,7 @@ struct MetalView: UIViewRepresentable {
                             indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride
                         )
                     }
+                    } // end entityPass loop
                 }
             }
 
