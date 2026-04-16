@@ -2834,7 +2834,62 @@ static void RE_EndFrame(int *frontEndMsec, int *backEndMsec) {
 
 static int R_MarkFragments(int numPoints, const vec3_t *points, const vec3_t projection,
                            int maxPoints, vec3_t pointBuffer, int maxFragments, markFragment_t *fragmentBuffer) { return 0; }
-static int R_LerpTag(orientation_t *tag, qhandle_t model, int startFrame, int endFrame, float frac, const char *tagName) { return 0; }
+static int R_LerpTag(orientation_t *tag, qhandle_t handle, int startFrame, int endFrame, float frac, const char *tagName) {
+    const metalModel_t *model;
+    const md3Header_t *hdr;
+    const md3Tag_t *tags;
+    int numTags, tagIndex;
+    const md3Tag_t *start, *end;
+    int i;
+
+    if (tag == NULL || tagName == NULL || tagName[0] == '\0') {
+        return -1;
+    }
+    Com_Memset(tag, 0, sizeof(*tag));
+
+    model = FindModelByHandle(handle);
+    if (model == NULL || !model->inUse || model->md3 == NULL) {
+        return -1;
+    }
+    hdr = model->md3;
+    numTags = hdr->numTags;
+    if (numTags <= 0) {
+        return -1;
+    }
+
+    if (startFrame < 0 || startFrame >= hdr->numFrames) startFrame = 0;
+    if (endFrame < 0 || endFrame >= hdr->numFrames) endFrame = 0;
+    if (frac < 0.0f) frac = 0.0f;
+    if (frac > 1.0f) frac = 1.0f;
+
+    tags = (const md3Tag_t *)((const byte *)hdr + hdr->ofsTags);
+
+    tagIndex = -1;
+    for (i = 0; i < numTags; ++i) {
+        if (!Q_stricmp(tags[i].name, tagName)) {
+            tagIndex = i;
+            break;
+        }
+    }
+    if (tagIndex < 0) {
+        return -1;
+    }
+
+    start = &tags[startFrame * numTags + tagIndex];
+    end   = &tags[endFrame   * numTags + tagIndex];
+
+    for (i = 0; i < 3; ++i) {
+        tag->origin[i] = start->origin[i] + frac * (end->origin[i] - start->origin[i]);
+        tag->axis[0][i] = start->axis[0][i] + frac * (end->axis[0][i] - start->axis[0][i]);
+        tag->axis[1][i] = start->axis[1][i] + frac * (end->axis[1][i] - start->axis[1][i]);
+        tag->axis[2][i] = start->axis[2][i] + frac * (end->axis[2][i] - start->axis[2][i]);
+    }
+    VectorNormalize(tag->axis[0]);
+    VectorNormalize(tag->axis[1]);
+    VectorNormalize(tag->axis[2]);
+
+    return 0;
+}
 static void R_ModelBounds(qhandle_t model, vec3_t mins, vec3_t maxs) {}
 
 static void RE_RemapShader(const char *oldShader, const char *newShader, const char *offsetTime) {}
