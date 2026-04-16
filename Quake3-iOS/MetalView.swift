@@ -60,6 +60,15 @@ struct MetalView: UIViewRepresentable {
         // lightmap / uv1 issues without touching the build pipeline.
         private static let worldDebugMode: Float = 0
 
+        private static func alphaTestThreshold(for alphaFunc: UInt32) -> Float {
+            switch alphaFunc {
+            case 1: return 0.004 // GT0
+            case 2: return 0.5   // GE128
+            case 3: return -0.5  // LT128 (negative means invert test)
+            default: return 0.0  // disabled
+            }
+        }
+
         struct GPUEntityVertex {
             var position: SIMD3<Float>
             var texCoord: SIMD2<Float>
@@ -246,8 +255,12 @@ struct MetalView: UIViewRepresentable {
         private var commandQueue: MTLCommandQueue?
         private var uiPipelineState: MTLRenderPipelineState?
         private var worldPipelineState: MTLRenderPipelineState?
+        private var worldFilterPipelineState: MTLRenderPipelineState?
+        private var worldAlphaPipelineState: MTLRenderPipelineState?
         private var worldAdditivePipelineState: MTLRenderPipelineState?
         private var entityPipelineState: MTLRenderPipelineState?
+        private var entityFilterPipelineState: MTLRenderPipelineState?
+        private var entityAlphaPipelineState: MTLRenderPipelineState?
         private var entityAdditivePipelineState: MTLRenderPipelineState?
         private var additiveEntityDepthStencilState: MTLDepthStencilState?
         private var uiSamplerState: MTLSamplerState?
@@ -338,17 +351,18 @@ struct MetalView: UIViewRepresentable {
                     let worldDraws = UnsafeBufferPointer(start: worldDrawsPointer, count: Int(snapshot.worldCommandCount))
                     let timeSeconds = Float(CACurrentMediaTime() - frameTimeOrigin)
                     let additiveBitW = UInt32(Q3_METAL_WORLD_DRAWFLAG_ADDITIVE)
+                    let alphaBitW = UInt32(Q3_METAL_WORLD_DRAWFLAG_ALPHA)
+                    let filterBitW = UInt32(Q3_METAL_WORLD_DRAWFLAG_FILTER)
 
-                    // Two-pass: opaque first, then additive on top.
-                    // Additive surfaces (flames, glow) must blend ON TOP
-                    // of the opaque geometry behind them. Without two-pass,
-                    // a flame that draws before its wall adds onto the
-                    // cleared black framebuffer → dark rectangle.
-                    for worldPass in 0..<2 {
-                    let wantAdditive = (worldPass == 1)
+                    // Ordered world passes:
+                    // 0 = opaque, 1 = filter, 2 = alpha, 3 = additive.
+                    for worldPass in 0..<4 {
                     for draw in worldDraws where draw.indexCount > 0 {
                         let isAdditive = (draw.flags & additiveBitW) != 0
-                        guard isAdditive == wantAdditive else { continue }
+                        let isAlpha = (draw.flags & alphaBitW) != 0
+                        let isFilter = (draw.flags & filterBitW) != 0
+                        let drawPass = isAdditive ? 3 : (isAlpha ? 2 : (isFilter ? 1 : 0))
+                        guard drawPass == worldPass else { continue }
 
                         guard let baseTexture = texture(for: draw.textureHandle, device: view.device) else {
                             continue
@@ -356,20 +370,20 @@ struct MetalView: UIViewRepresentable {
                         guard let lightmapTexture = texture(for: draw.lightmapTextureHandle, device: view.device) else {
                             continue
                         }
-                        if isAdditive, let worldAdditivePipelineState, let additiveDepthStencilState {
+                        if drawPass == 3, let worldAdditivePipelineState {
                             encoder.setRenderPipelineState(worldAdditivePipelineState)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
+                        } else if drawPass == 2, let worldAlphaPipelineState {
+                            encoder.setRenderPipelineState(worldAlphaPipelineState)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
+                        } else if drawPass == 1, let worldFilterPipelineState {
+                            encoder.setRenderPipelineState(worldFilterPipelineState)
                             encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
                         } else {
                             encoder.setRenderPipelineState(worldPipelineState)
                             encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
                         }
-                        // Alpha test disabled for now. The NOCULL heuristic
-                        // was too broad — many opaque walls have cull=none +
-                        // alpha=0 in their textures, causing entire walls to
-                        // vanish. Per-texture alphaFunc from the C-side shader
-                        // map needs to flow through a draw-command field to
-                        // enable this correctly. Parked for next session.
-                        let alphaTest: Float = 0.0
+                        let alphaTest = Self.alphaTestThreshold(for: draw.alphaFunc)
                         var drawUniforms = WorldDrawUniforms(
                             texCoordScale: SIMD2<Float>(draw.texCoordScale.0, draw.texCoordScale.1),
                             texCoordScroll: SIMD2<Float>(draw.texCoordScroll.0, draw.texCoordScroll.1),
@@ -429,40 +443,35 @@ struct MetalView: UIViewRepresentable {
                     let entityDraws = UnsafeBufferPointer(start: entityDrawsPointer, count: Int(snapshot.entityCommandCount))
                     let depthHackBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_DEPTHHACK)
                     let additiveBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE)
+                    let alphaBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ALPHA)
+                    let filterBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_FILTER)
 
-                    // Two-pass entities: opaque first, additive second
-                    // (same rationale as world two-pass)
-                    for entityPass in 0..<2 {
-                    let wantEntityAdditive = (entityPass == 1)
-                    var lastDepthHack = false
-                    var lastAdditive = false
+                    // Ordered entity passes:
+                    // 0 = opaque, 1 = filter, 2 = alpha, 3 = additive.
+                    for entityPass in 0..<4 {
                     for draw in entityDraws where draw.indexCount > 0 {
                         let isEntityAdditive = (draw.flags & additiveBit) != 0
-                        guard isEntityAdditive == wantEntityAdditive else { continue }
+                        let isEntityAlpha = (draw.flags & alphaBit) != 0
+                        let isEntityFilter = (draw.flags & filterBit) != 0
+                        let drawPass = isEntityAdditive ? 3 : (isEntityAlpha ? 2 : (isEntityFilter ? 1 : 0))
+                        guard drawPass == entityPass else { continue }
                         guard let texture = texture(for: draw.textureHandle, device: view.device) else {
                             continue
                         }
                         let wantsDepthHack = (draw.flags & depthHackBit) != 0
-                        let wantsAdditive = (draw.flags & additiveBit) != 0
-                        if wantsDepthHack != lastDepthHack {
+                        if drawPass == 3, let entityAdditivePipelineState {
+                            encoder.setRenderPipelineState(entityAdditivePipelineState)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveEntityDepthStencilState, device: view.device))
+                        } else if drawPass == 2, let entityAlphaPipelineState {
+                            encoder.setRenderPipelineState(entityAlphaPipelineState)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveEntityDepthStencilState, device: view.device))
+                        } else if drawPass == 1, let entityFilterPipelineState {
+                            encoder.setRenderPipelineState(entityFilterPipelineState)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveEntityDepthStencilState, device: view.device))
+                        } else {
+                            encoder.setRenderPipelineState(entityPipelineState)
                             let state = wantsDepthHack ? depthHackDepthStencilState : depthStencilState
                             encoder.setDepthStencilState(ensuredDepthStencilState(state, device: view.device))
-                            lastDepthHack = wantsDepthHack
-                        }
-                        if wantsAdditive != lastAdditive {
-                            if wantsAdditive {
-                                if let addPipeline = entityAdditivePipelineState {
-                                    encoder.setRenderPipelineState(addPipeline)
-                                }
-                                if let addDepth = additiveEntityDepthStencilState {
-                                    encoder.setDepthStencilState(addDepth)
-                                }
-                            } else {
-                                encoder.setRenderPipelineState(entityPipelineState)
-                                let state = lastDepthHack ? depthHackDepthStencilState : depthStencilState
-                                encoder.setDepthStencilState(ensuredDepthStencilState(state, device: view.device))
-                            }
-                            lastAdditive = wantsAdditive
                         }
                         encoder.setFragmentTexture(texture, index: 0)
                         encoder.drawIndexedPrimitives(
@@ -553,6 +562,34 @@ struct MetalView: UIViewRepresentable {
                 print("[Metal] Failed to create world pipeline: \\(error)")
             }
 
+            let worldFilterPipelineDescriptor = worldPipelineDescriptor.copy() as! MTLRenderPipelineDescriptor
+            worldFilterPipelineDescriptor.colorAttachments[0].isBlendingEnabled = true
+            worldFilterPipelineDescriptor.colorAttachments[0].rgbBlendOperation = .add
+            worldFilterPipelineDescriptor.colorAttachments[0].alphaBlendOperation = .add
+            worldFilterPipelineDescriptor.colorAttachments[0].sourceRGBBlendFactor = .destinationColor
+            worldFilterPipelineDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
+            worldFilterPipelineDescriptor.colorAttachments[0].destinationRGBBlendFactor = .zero
+            worldFilterPipelineDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .zero
+            do {
+                worldFilterPipelineState = try device.makeRenderPipelineState(descriptor: worldFilterPipelineDescriptor)
+            } catch {
+                print("[Metal] Failed to create filter world pipeline: \\(error)")
+            }
+
+            let worldAlphaPipelineDescriptor = worldPipelineDescriptor.copy() as! MTLRenderPipelineDescriptor
+            worldAlphaPipelineDescriptor.colorAttachments[0].isBlendingEnabled = true
+            worldAlphaPipelineDescriptor.colorAttachments[0].rgbBlendOperation = .add
+            worldAlphaPipelineDescriptor.colorAttachments[0].alphaBlendOperation = .add
+            worldAlphaPipelineDescriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+            worldAlphaPipelineDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+            worldAlphaPipelineDescriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+            worldAlphaPipelineDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            do {
+                worldAlphaPipelineState = try device.makeRenderPipelineState(descriptor: worldAlphaPipelineDescriptor)
+            } catch {
+                print("[Metal] Failed to create alpha world pipeline: \\(error)")
+            }
+
             let worldAdditivePipelineDescriptor = worldPipelineDescriptor.copy() as! MTLRenderPipelineDescriptor
             worldAdditivePipelineDescriptor.colorAttachments[0].isBlendingEnabled = true
             worldAdditivePipelineDescriptor.colorAttachments[0].rgbBlendOperation = .add
@@ -595,6 +632,38 @@ struct MetalView: UIViewRepresentable {
                 entityAdditivePipelineState = try device.makeRenderPipelineState(descriptor: entityAdditiveDesc)
             } catch {
                 print("[Metal] Failed to create additive entity pipeline: \\(error)")
+            }
+
+            let entityAlphaDesc = MTLRenderPipelineDescriptor()
+            entityAlphaDesc.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            entityAlphaDesc.colorAttachments[0].isBlendingEnabled = true
+            entityAlphaDesc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+            entityAlphaDesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+            entityAlphaDesc.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+            entityAlphaDesc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            entityAlphaDesc.depthAttachmentPixelFormat = view.depthStencilPixelFormat
+            entityAlphaDesc.vertexFunction = library.makeFunction(name: "q3_entity_vertex")
+            entityAlphaDesc.fragmentFunction = library.makeFunction(name: "q3_entity_fragment")
+            do {
+                entityAlphaPipelineState = try device.makeRenderPipelineState(descriptor: entityAlphaDesc)
+            } catch {
+                print("[Metal] Failed to create alpha entity pipeline: \\(error)")
+            }
+
+            let entityFilterDesc = MTLRenderPipelineDescriptor()
+            entityFilterDesc.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            entityFilterDesc.colorAttachments[0].isBlendingEnabled = true
+            entityFilterDesc.colorAttachments[0].sourceRGBBlendFactor = .destinationColor
+            entityFilterDesc.colorAttachments[0].destinationRGBBlendFactor = .zero
+            entityFilterDesc.colorAttachments[0].sourceAlphaBlendFactor = .one
+            entityFilterDesc.colorAttachments[0].destinationAlphaBlendFactor = .zero
+            entityFilterDesc.depthAttachmentPixelFormat = view.depthStencilPixelFormat
+            entityFilterDesc.vertexFunction = library.makeFunction(name: "q3_entity_vertex")
+            entityFilterDesc.fragmentFunction = library.makeFunction(name: "q3_entity_fragment")
+            do {
+                entityFilterPipelineState = try device.makeRenderPipelineState(descriptor: entityFilterDesc)
+            } catch {
+                print("[Metal] Failed to create filter entity pipeline: \\(error)")
             }
 
             // Depth state for additive entities — read but no write

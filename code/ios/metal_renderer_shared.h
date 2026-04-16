@@ -38,6 +38,7 @@ typedef struct {
     uint32_t textureHandle;
     uint32_t lightmapTextureHandle;
     uint32_t flags;
+    uint32_t alphaFunc; /* 0=none, 1=GT0, 2=GE128, 3=LT128 */
     float texCoordScale[2];
     float texCoordScroll[2];
 } Q3MetalWorldDrawCmd;
@@ -52,13 +53,17 @@ typedef struct {
 enum {
     Q3_METAL_WORLD_DRAWFLAG_ADDITIVE = 1u << 0,
     Q3_METAL_WORLD_DRAWFLAG_NOCULL = 1u << 1,
-    Q3_METAL_WORLD_DRAWFLAG_LIGHTMAP_MULTIPLY = 1u << 2
+    Q3_METAL_WORLD_DRAWFLAG_LIGHTMAP_MULTIPLY = 1u << 2,
+    Q3_METAL_WORLD_DRAWFLAG_ALPHA = 1u << 3,
+    Q3_METAL_WORLD_DRAWFLAG_FILTER = 1u << 4
 };
 
 enum {
     Q3_METAL_ENTITY_DRAWFLAG_DEPTHHACK = 1u << 0,
     Q3_METAL_ENTITY_DRAWFLAG_NOCULL = 1u << 1,
-    Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE = 1u << 2
+    Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE = 1u << 2,
+    Q3_METAL_ENTITY_DRAWFLAG_ALPHA = 1u << 3,
+    Q3_METAL_ENTITY_DRAWFLAG_FILTER = 1u << 4
 };
 
 typedef struct {

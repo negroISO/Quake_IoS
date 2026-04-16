@@ -279,7 +279,13 @@ static qboolean IsSkyShaderName(const char *name) {
 }
 
 static qboolean IsTimHellShaderName(const char *name) {
-    return name != NULL && !Q_stricmp(name, "textures/skies/tim_hell");
+    (void)name;
+    /* Legacy local-geometry tim_hell special-case is disabled.
+     * It renders sky shader stages directly on BSP polys, which causes
+     * obvious rectangular artifacts around q3dm1's teleporter area.
+     * Sky shaders should flow through the generic sky path until full
+     * multi-stage sky rendering is implemented. */
+    return qfalse;
 }
 
 static qboolean IsDrawableWorldShader(const dshader_t *shader) {
@@ -303,6 +309,7 @@ static void SetupWorldDraw(Q3MetalWorldDrawCmd *draw,
                            qhandle_t textureHandle,
                            qhandle_t lightmapTextureHandle,
                            uint32_t flags,
+                           int alphaFunc,
                            float scaleS,
                            float scaleT,
                            float scrollS,
@@ -312,6 +319,7 @@ static void SetupWorldDraw(Q3MetalWorldDrawCmd *draw,
     draw->textureHandle = (uint32_t)textureHandle;
     draw->lightmapTextureHandle = (uint32_t)lightmapTextureHandle;
     draw->flags = flags;
+    draw->alphaFunc = (uint32_t)alphaFunc;
     draw->texCoordScale[0] = scaleS;
     draw->texCoordScale[1] = scaleT;
     draw->texCoordScroll[0] = scrollS;
@@ -1121,6 +1129,7 @@ static qboolean LoadWorldMapData(const char *name) {
         uint32_t baseVertex;
         qhandle_t textureHandle;
         qhandle_t lightmapHandle;
+        int drawAlphaFunc;
         int lightmapNum;
         qboolean hasLightmap;
         uint32_t worldFlags;
@@ -1199,6 +1208,9 @@ static qboolean LoadWorldMapData(const char *name) {
         /* Per-shader tcMod scroll (s,t) for lava-flow, scrolling fog,
          * etc. MSL applies `uv + scroll * timeSeconds` each frame. */
         ShaderMap_GetScroll(shaders[shaderNum].shader, &s_pendingScrollS, &s_pendingScrollT);
+        drawAlphaFunc = ShaderMap_GetAlphaFunc(shaders[shaderNum].shader);
+        lightmapHandle = EnsureWhiteTexture();
+        worldFlags = defaultWorldFlags;
         /* Per-shader blendFunc — additive surfaces (flames, glow) need
          * the additive pipeline. 0=opaque, 1=additive, 2=alpha, 3=filter. */
         {
@@ -1207,10 +1219,12 @@ static qboolean LoadWorldMapData(const char *name) {
                 worldFlags |= Q3_METAL_WORLD_DRAWFLAG_ADDITIVE | Q3_METAL_WORLD_DRAWFLAG_NOCULL;
                 ri.Printf(PRINT_ALL, "Metal world additive: surface shader '%s' bm=%d\n",
                            shaders[shaderNum].shader, bm);
+            } else if (bm == 2) {
+                worldFlags |= Q3_METAL_WORLD_DRAWFLAG_ALPHA | Q3_METAL_WORLD_DRAWFLAG_NOCULL;
+            } else if (bm == 3) {
+                worldFlags |= Q3_METAL_WORLD_DRAWFLAG_FILTER | Q3_METAL_WORLD_DRAWFLAG_NOCULL;
             }
         }
-        lightmapHandle = EnsureWhiteTexture();
-        worldFlags = defaultWorldFlags;
         if (!IsSkyShaderName(shaders[shaderNum].shader) && lightmapNum >= 0 && lightmapNum < s_worldLightmapCount) {
             lightmapHandle = s_worldLightmapHandles[lightmapNum];
             hasLightmap = qtrue;
@@ -1286,6 +1300,7 @@ static qboolean LoadWorldMapData(const char *name) {
                                        EnsureTimHellBaseTexture(),
                                        EnsureWhiteTexture(),
                                        Q3_METAL_WORLD_DRAWFLAG_NOCULL,
+                                       0,
                                        2.0f, 2.0f,
                                        0.05f, 0.10f);
                         SetupWorldDraw(&s_world.draws[drawCursor++],
@@ -1294,6 +1309,7 @@ static qboolean LoadWorldMapData(const char *name) {
                                        EnsureTimHellAddTexture(),
                                        EnsureWhiteTexture(),
                                        Q3_METAL_WORLD_DRAWFLAG_ADDITIVE | Q3_METAL_WORLD_DRAWFLAG_NOCULL,
+                                       0,
                                        3.0f, 3.0f,
                                        0.05f, 0.10f);
                     } else {
@@ -1306,6 +1322,7 @@ static qboolean LoadWorldMapData(const char *name) {
                                        textureHandle,
                                        hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
                                        worldFlags,
+                                       drawAlphaFunc,
                                        1.0f, 1.0f,
                                        s_pendingScrollS, s_pendingScrollT);
                         if (s_world.animShaderSlots && s_pendingAnimSlot >= 0) {
@@ -1347,6 +1364,7 @@ static qboolean LoadWorldMapData(const char *name) {
                            EnsureTimHellBaseTexture(),
                            EnsureWhiteTexture(),
                            Q3_METAL_WORLD_DRAWFLAG_NOCULL,
+                           0,
                            2.0f, 2.0f,
                            0.05f, 0.10f);
             SetupWorldDraw(&s_world.draws[drawCursor++],
@@ -1355,6 +1373,7 @@ static qboolean LoadWorldMapData(const char *name) {
                            EnsureTimHellAddTexture(),
                            EnsureWhiteTexture(),
                            Q3_METAL_WORLD_DRAWFLAG_ADDITIVE | Q3_METAL_WORLD_DRAWFLAG_NOCULL,
+                           0,
                            3.0f, 3.0f,
                            0.05f, 0.10f);
         } else {
@@ -1367,6 +1386,7 @@ static qboolean LoadWorldMapData(const char *name) {
                            textureHandle,
                            hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
                            worldFlags,
+                           drawAlphaFunc,
                            1.0f, 1.0f,
                            0.0f, 0.0f);
             if (s_world.animShaderSlots && s_pendingAnimSlot >= 0) {
@@ -1721,6 +1741,7 @@ static void ParseShaderText(const char *text) {
         qboolean gotTcScroll;
         int depth;
         qboolean inStage;
+        int stageIndex;
         qboolean gotMap;
         qboolean gotAnim;
         qboolean tcGenEnv;
@@ -1742,6 +1763,7 @@ static void ParseShaderText(const char *text) {
         gotTcScroll = qfalse;
         depth = 1;
         inStage = qfalse;
+        stageIndex = 0;
         gotMap = qfalse;
         gotAnim = qfalse;
         tcGenEnv = qfalse;
@@ -1756,12 +1778,17 @@ static void ParseShaderText(const char *text) {
 
             if (token[0] == '{' && token[1] == '\0') {
                 depth += 1;
-                inStage = qtrue;
+                if (depth == 2) {
+                    stageIndex += 1;
+                    inStage = qtrue;
+                }
                 continue;
             }
             if (token[0] == '}' && token[1] == '\0') {
                 depth -= 1;
-                inStage = qfalse;
+                if (depth <= 1) {
+                    inStage = qfalse;
+                }
                 continue;
             }
 
@@ -1812,7 +1839,7 @@ static void ParseShaderText(const char *text) {
                                      !Q_stricmp(token, "env"))) {
                         tcGenEnv = qtrue;
                     }
-                } else if (!Q_stricmp(token, "blendFunc") || !Q_stricmp(token, "blendfunc")) {
+                } else if (stageIndex == 1 && (!Q_stricmp(token, "blendFunc") || !Q_stricmp(token, "blendfunc"))) {
                     /* Capture the first stage's blendFunc. Common combos:
                      *   GL_ONE GL_ONE          → additive (flames, glow)
                      *   GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA → alpha blend
@@ -1839,7 +1866,7 @@ static void ParseShaderText(const char *text) {
                             s_pendingBlendMode = 0; /* opaque (explicit) */
                         }
                     }
-                } else if (!Q_stricmp(token, "alphaFunc") || !Q_stricmp(token, "alphafunc")) {
+                } else if (stageIndex == 1 && (!Q_stricmp(token, "alphaFunc") || !Q_stricmp(token, "alphafunc"))) {
                     token = COM_ParseExt(&p, qfalse);
                     if (!Q_stricmp(token, "GT0")) {
                         s_pendingAlphaFunc = 1;
@@ -1848,7 +1875,7 @@ static void ParseShaderText(const char *text) {
                     } else if (!Q_stricmp(token, "LT128")) {
                         s_pendingAlphaFunc = 3;
                     }
-                } else if (!gotTcScroll && (!Q_stricmp(token, "tcMod") || !Q_stricmp(token, "tcmod"))) {
+                } else if (stageIndex == 1 && !gotTcScroll && (!Q_stricmp(token, "tcMod") || !Q_stricmp(token, "tcmod"))) {
                     /* Capture only the first stage's tcMod scroll.
                      * tcMod rotate/scale are stubbed; full matrix math
                      * comes with a later commit. */
@@ -2810,8 +2837,14 @@ static void RE_RenderScene(const refdef_t *fd) {
                      * map entry at RegisterTexture time. */
                     {
                         const metalTexture_t *tex = FindTextureByHandle(textureHandle);
-                        if (tex != NULL && tex->blendMode == 1) {
-                            drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                        if (tex != NULL) {
+                            if (tex->blendMode == 1) {
+                                drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                            } else if (tex->blendMode == 2) {
+                                drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_ALPHA;
+                            } else if (tex->blendMode == 3) {
+                                drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_FILTER;
+                            }
                         }
                         /* Diagnostic: first 5 per frame */
                         {
