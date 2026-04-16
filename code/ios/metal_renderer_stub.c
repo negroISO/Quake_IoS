@@ -1118,11 +1118,23 @@ static qboolean LoadWorldMapData(const char *name) {
         }
 
         if (IsSkyShaderName(shaders[shaderNum].shader)) {
-            /* Real Q3 skybox: pick the face texture whose outward
-             * direction best matches this surface's vertex normals.
-             * Averages up to 4 vertex normals for stability against
-             * tessellation artifacts. Falls back to the legacy fake
-             * sky if the shader's skyparms haven't been parsed. */
+            /* Sky surface rendering picks one of three paths:
+             *
+             *  1. True 6-face cubemap (skyparms has a non-dash farbox):
+             *     pick the face whose outward direction best matches
+             *     the surface's averaged vertex normals.
+             *
+             *  2. Cloud-dome sky (skyparms farbox=='-' e.g. q3dm1's
+             *     killsky): render with the shader's first-stage map
+             *     (killsky_1) plus the parsed tcMod scroll. This gives
+             *     real scrolling clouds instead of a flat 1-pixel sky.
+             *     RegisterTexture consults the shader map and resolves
+             *     to the underlying texture; s_pendingScrollS/T already
+             *     holds the scroll values for this shader.
+             *
+             *  3. Last-resort fallback (shader not in map at all):
+             *     EnsureSkyTexture() 1-pixel color. Dark but harmless.
+             */
             qhandle_t skyFace = 0;
             if (numVerts > 0) {
                 float nx = 0, ny = 0, nz = 0;
@@ -1136,7 +1148,15 @@ static qboolean LoadWorldMapData(const char *name) {
                 }
                 skyFace = GetSkyFaceTextureForSurface(shaders[shaderNum].shader, nx, ny, nz);
             }
-            textureHandle = (skyFace != 0) ? skyFace : EnsureSkyTexture();
+            if (skyFace != 0) {
+                textureHandle = skyFace;
+            } else {
+                /* No farbox cubemap — use parsed cloud texture. */
+                textureHandle = RegisterTexture(shaders[shaderNum].shader);
+                if (textureHandle == 0) {
+                    textureHandle = EnsureSkyTexture();
+                }
+            }
             skyDraws += 1;
         } else {
             textureHandle = RegisterTexture(shaders[shaderNum].shader);
