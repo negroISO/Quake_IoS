@@ -354,10 +354,12 @@ static qhandle_t ShaderMap_ResolveCurrentFrame(const char *name);
 static int ShaderMap_FindAnimatedSlot(const char *name);
 static qhandle_t ShaderMap_AnimatedSlotCurrentHandle(int slot);
 static void ShaderMap_GetScroll(const char *name, float *outS, float *outT);
+static int ShaderMap_GetBlendMode(const char *name);
 
 static int s_pendingAnimSlot;
 static float s_pendingScrollS;
 static float s_pendingScrollT;
+static int s_pendingBlendMode;
 
 static qhandle_t RegisterTexture(const char *name) {
     metalTexture_t *existing;
@@ -1171,6 +1173,14 @@ static qboolean LoadWorldMapData(const char *name) {
         /* Per-shader tcMod scroll (s,t) for lava-flow, scrolling fog,
          * etc. MSL applies `uv + scroll * timeSeconds` each frame. */
         ShaderMap_GetScroll(shaders[shaderNum].shader, &s_pendingScrollS, &s_pendingScrollT);
+        /* Per-shader blendFunc — additive surfaces (flames, glow) need
+         * the additive pipeline. 0=opaque, 1=additive, 2=alpha, 3=filter. */
+        {
+            int bm = ShaderMap_GetBlendMode(shaders[shaderNum].shader);
+            if (bm == 1) {
+                worldFlags |= Q3_METAL_WORLD_DRAWFLAG_ADDITIVE | Q3_METAL_WORLD_DRAWFLAG_NOCULL;
+            }
+        }
         lightmapHandle = EnsureWhiteTexture();
         worldFlags = defaultWorldFlags;
         if (!IsSkyShaderName(shaders[shaderNum].shader) && lightmapNum >= 0 && lightmapNum < s_worldLightmapCount) {
@@ -1390,6 +1400,10 @@ typedef struct {
      * per-draw uniform with no further math needed. */
     float tcModScrollS;
     float tcModScrollT;
+    /* blendFunc from first stage. 0=opaque, 1=additive (GL_ONE GL_ONE),
+     * 2=alpha-blend (GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA or 'blend'),
+     * 3=filter (GL_DST_COLOR GL_ZERO or 'filter'). */
+    int blendMode;
     /* animMap support. framePaths[0] == mapPath. 0 frames = not animated. */
     int animFrameCount;
     float animFps;
@@ -1570,6 +1584,17 @@ static qhandle_t GetSkyFaceTextureForSurface(const char *shaderName,
     return entry->skyFaceTextures[faceIdx];
 }
 
+static int ShaderMap_GetBlendMode(const char *name) {
+    int i;
+    if (name == NULL || name[0] == '\0') return 0;
+    for (i = 0; i < s_shaderMapCount; ++i) {
+        if (!Q_stricmp(s_shaderMap[i].shaderName, name)) {
+            return s_shaderMap[i].blendMode;
+        }
+    }
+    return 0;
+}
+
 static void ShaderMap_GetScroll(const char *name, float *outS, float *outT) {
     int i;
     if (outS) *outS = 0.0f;
@@ -1685,6 +1710,7 @@ static void ParseShaderText(const char *text) {
         tcGenEnv = qfalse;
         skyBoxBase[0] = '\0';
         gotSkyParms = qfalse;
+        s_pendingBlendMode = 0;
 
         while (depth > 0) {
             token = COM_ParseExt(&p, qtrue);
@@ -1748,6 +1774,33 @@ static void ParseShaderText(const char *text) {
                                      !Q_stricmp(token, "env"))) {
                         tcGenEnv = qtrue;
                     }
+                } else if (!Q_stricmp(token, "blendFunc") || !Q_stricmp(token, "blendfunc")) {
+                    /* Capture the first stage's blendFunc. Common combos:
+                     *   GL_ONE GL_ONE          → additive (flames, glow)
+                     *   GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA → alpha blend
+                     *   GL_DST_COLOR GL_ZERO   → filter (lightmap multiply)
+                     *   add / blend / filter    → shorthand names
+                     * We only store a coarse category (additive vs alpha
+                     * vs filter vs opaque) and skip uncommon combos. */
+                    const char *src = COM_ParseExt(&p, qfalse);
+                    const char *dst = COM_ParseExt(&p, qfalse);
+                    if (src[0]) {
+                        if (!Q_stricmp(src, "add") ||
+                            (!Q_stricmp(src, "GL_ONE") && !Q_stricmp(dst, "GL_ONE"))) {
+                            s_pendingBlendMode = 1; /* additive */
+                        } else if (!Q_stricmp(src, "blend") ||
+                                   (!Q_stricmp(src, "GL_SRC_ALPHA") &&
+                                    !Q_stricmp(dst, "GL_ONE_MINUS_SRC_ALPHA"))) {
+                            s_pendingBlendMode = 2; /* alpha blend */
+                        } else if (!Q_stricmp(src, "filter") ||
+                                   (!Q_stricmp(src, "GL_DST_COLOR") &&
+                                    !Q_stricmp(dst, "GL_ZERO"))) {
+                            s_pendingBlendMode = 3; /* filter */
+                        } else if (!Q_stricmp(src, "GL_ONE") &&
+                                   !Q_stricmp(dst, "GL_ZERO")) {
+                            s_pendingBlendMode = 0; /* opaque (explicit) */
+                        }
+                    }
                 } else if (!gotTcScroll && (!Q_stricmp(token, "tcMod") || !Q_stricmp(token, "tcmod"))) {
                     /* Capture only the first stage's tcMod scroll.
                      * tcMod rotate/scale are stubbed; full matrix math
@@ -1784,6 +1837,9 @@ static void ParseShaderText(const char *text) {
                 if (gotTcScroll) {
                     last->tcModScrollS = tcScrollS;
                     last->tcModScrollT = tcScrollT;
+                }
+                if (s_pendingBlendMode != 0) {
+                    last->blendMode = s_pendingBlendMode;
                 }
                 if (gotSkyParms) {
                     Q_strncpyz(last->skyBoxBase, skyBoxBase, sizeof(last->skyBoxBase));
@@ -2697,6 +2753,16 @@ static void RE_RenderScene(const refdef_t *fd) {
 
                     if (sceneEntity->entity.renderfx & RF_DEPTHHACK) {
                         drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_DEPTHHACK;
+                    }
+                    /* Check entity's shader for additive blending (e.g.
+                     * health orbs, glow effects, flame pickups). Uses the
+                     * resolved texture name to look up the shader map
+                     * entry's blendMode. */
+                    {
+                        const metalTexture_t *tex = FindTextureByHandle(textureHandle);
+                        if (tex != NULL && ShaderMap_GetBlendMode(tex->name) == 1) {
+                            drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                        }
                     }
 
                     for (vertexIndex = 0; vertexIndex < surface->numVerts; ++vertexIndex) {

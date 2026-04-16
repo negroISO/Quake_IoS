@@ -57,7 +57,8 @@ enum {
 
 enum {
     Q3_METAL_ENTITY_DRAWFLAG_DEPTHHACK = 1u << 0,
-    Q3_METAL_ENTITY_DRAWFLAG_NOCULL = 1u << 1
+    Q3_METAL_ENTITY_DRAWFLAG_NOCULL = 1u << 1,
+    Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE = 1u << 2
 };
 
 typedef struct {
