@@ -2602,6 +2602,18 @@ static void RE_RenderScene(const refdef_t *fd) {
                     }
                 }
 
+                /* Q3 renderfx visibility filtering.
+                 * RF_THIRD_PERSON: body parts of local player — skip in
+                 *   first-person view (render only in mirrors / third-
+                 *   person cameras). Fixes "looking down shows own body".
+                 * No need for RF_FIRST_PERSON whitelist: stock cgame
+                 *   flags the viewmodel with RF_FIRST_PERSON|RF_DEPTHHACK;
+                 *   we already handle DEPTHHACK and we want it to render
+                 *   in our (first-person) view so don't skip it. */
+                if (sceneEntity->entity.renderfx & RF_THIRD_PERSON) {
+                    continue;
+                }
+
                 header = model->md3;
                 frameIndex = sceneEntity->entity.frame;
                 oldFrameIndex = sceneEntity->entity.oldframe;
