@@ -95,6 +95,27 @@ static metalModel_t s_models[Q3_METAL_MAX_MODELS];
 static qhandle_t s_nextModelHandle = 1;
 static metalSceneEntity_t s_sceneEntities[Q3_METAL_MAX_REFENTITIES];
 static uint32_t s_sceneEntityCount;
+
+/* Audit: once-per-session dedup log for missing-feature tracking. Copies
+ * the message string into owned storage so callers can safely pass stack
+ * buffers. Only used for genuinely missing renderer features — do NOT
+ * add hooks for features we implement; stale warnings create false work.
+ * Kept intentionally small (256 slots × 128 chars) to bound memory. */
+#define METAL_AUDIT_MAX 256
+static char s_auditSeen[METAL_AUDIT_MAX][128];
+static int s_auditCount = 0;
+
+static void AuditOnce(const char *msg) {
+    int i;
+    for (i = 0; i < s_auditCount; ++i) {
+        if (strcmp(s_auditSeen[i], msg) == 0) return;
+    }
+    if (s_auditCount < METAL_AUDIT_MAX) {
+        Q_strncpyz(s_auditSeen[s_auditCount], msg, sizeof(s_auditSeen[0]));
+        s_auditCount += 1;
+    }
+    ri.Printf(PRINT_WARNING, "[Q3-AUDIT] %s\n", msg);
+}
 static Q3MetalEntityVertex *s_entityVertices;
 static uint32_t *s_entityIndices;
 static Q3MetalEntityDrawCmd *s_entityDraws;
@@ -392,6 +413,7 @@ static int ShaderMap_FindAnimatedSlot(const char *name);
 static qhandle_t ShaderMap_AnimatedSlotCurrentHandle(int slot);
 static void ShaderMap_GetScroll(const char *name, float *outS, float *outT);
 static void ShaderMap_GetScale(const char *name, float *outS, float *outT);
+static qboolean ShaderMap_GetTurb(const char *name, float *outAmp, float *outPhase, float *outFreq);
 static int ShaderMap_GetBlendMode(const char *name);
 static int ShaderMap_GetAlphaFunc(const char *name);
 static int ShaderMap_GetTcGenEnv(const char *name);
@@ -1211,6 +1233,15 @@ static void SetupEntityLighting(const refEntity_t *ent,
                                 vec3_t outDirected,
                                 vec3_t outLightDir) {
     vec3_t origin;
+    int c;
+    /* Stock Q3 identityLight = 1 / (1 << r_overBrightBits). At default
+     * r_overBrightBits=1, identityLight = 0.5 — the minimum per-channel
+     * ambient that guarantees models never render black in dim lightgrid
+     * cells. Matches tr_light.c's post-sample ambient floor. Without it,
+     * pickups in dark rooms (q3dm1 railgun alcove etc.) sample 0.02
+     * ambient and stay invisible even after NdotL kicks in. */
+    const float kAmbientFloor = 0.5f;
+
     if (ent->lightingOrigin[0] != 0.0f ||
         ent->lightingOrigin[1] != 0.0f ||
         ent->lightingOrigin[2] != 0.0f) {
@@ -1219,6 +1250,12 @@ static void SetupEntityLighting(const refEntity_t *ent,
         VectorCopy(ent->origin, origin);
     }
     SampleLightgrid(origin, outAmbient, outDirected, outLightDir);
+
+    for (c = 0; c < 3; ++c) {
+        if (outAmbient[c] < kAmbientFloor) {
+            outAmbient[c] = kAmbientFloor;
+        }
+    }
 }
 
 static qboolean LoadWorldMapData(const char *name) {
@@ -1476,17 +1513,59 @@ static qboolean LoadWorldMapData(const char *name) {
         stage0AlphaFunc = ShaderMap_GetAlphaFunc(shaders[shaderNum].shader);
         stage0BlendMode = ShaderMap_GetBlendMode(shaders[shaderNum].shader);
         stage0TcGenEnv = ShaderMap_GetTcGenEnv(shaders[shaderNum].shader);
+
+        /* Resolve tcMod for NON-sky surfaces (lava, scrolling fog, etc.).
+         * Sky branch below overrides this with its own sky-aware logic.
+         * Preference turb > scroll > scale because turb is the most
+         * visually distinctive — lava without turb looks dead. Only one
+         * tcMod slot per stage in the current draw-uniform layout, so
+         * we pick the most impactful. */
+        if (!IsSkyShaderName(shaders[shaderNum].shader)) {
+            float turbAmp = 0.0f, turbPhase = 0.0f, turbFreq = 0.0f;
+            qboolean nsHasTurb = ShaderMap_GetTurb(shaders[shaderNum].shader, &turbAmp, &turbPhase, &turbFreq);
+            qboolean nsHasScroll = (fabsf(s_pendingScrollS) > 0.00001f || fabsf(s_pendingScrollT) > 0.00001f);
+            float nsScaleS = 1.0f, nsScaleT = 1.0f;
+            ShaderMap_GetScale(shaders[shaderNum].shader, &nsScaleS, &nsScaleT);
+            qboolean nsHasScale = (fabsf(nsScaleS - 1.0f) > 0.00001f || fabsf(nsScaleT - 1.0f) > 0.00001f);
+            if (nsHasTurb) {
+                stage0TcModType = 5;
+                stage0TcModParams[0] = turbAmp;
+                stage0TcModParams[1] = turbFreq;
+                stage0TcModParams[2] = turbPhase;
+                stage0TcModParams[3] = 0.0f;
+            } else if (nsHasScroll) {
+                stage0TcModType = 1;
+                stage0TcModParams[0] = s_pendingScrollS;
+                stage0TcModParams[1] = s_pendingScrollT;
+            } else if (nsHasScale) {
+                stage0TcModType = 4;
+                stage0TcModParams[0] = nsScaleS;
+                stage0TcModParams[1] = nsScaleT;
+            }
+        }
         if (IsSkyShaderName(shaders[shaderNum].shader)) {
             float scaleS = 1.0f;
             float scaleT = 1.0f;
-            stage0TcModType = (fabsf(s_pendingScrollS) > 0.00001f || fabsf(s_pendingScrollT) > 0.00001f) ? 1 : 0;
-            stage0TcModParams[0] = s_pendingScrollS;
-            stage0TcModParams[1] = s_pendingScrollT;
+            qboolean stage0HasScroll = (fabsf(s_pendingScrollS) > 0.00001f || fabsf(s_pendingScrollT) > 0.00001f);
             ShaderMap_GetScale(shaders[shaderNum].shader, &scaleS, &scaleT);
-            if (fabsf(scaleS - 1.0f) > 0.00001f || fabsf(scaleT - 1.0f) > 0.00001f) {
+            qboolean stage0HasScale = (fabsf(scaleS - 1.0f) > 0.00001f || fabsf(scaleT - 1.0f) > 0.00001f);
+            /* Scroll wins over scale — Q3 killsky has both but scroll
+             * is the animation; scale is a one-time tile. The old
+             * logic unconditionally overrode scroll→scale whenever
+             * the scale wasn't 1.0, which is exactly the "if anything
+             * interesting happens, ruin it" bug. */
+            if (stage0HasScroll) {
+                stage0TcModType = 1;
+                stage0TcModParams[0] = s_pendingScrollS;
+                stage0TcModParams[1] = s_pendingScrollT;
+            } else if (stage0HasScale) {
                 stage0TcModType = 4;
                 stage0TcModParams[0] = scaleS;
                 stage0TcModParams[1] = scaleT;
+            } else {
+                stage0TcModType = 0;
+                stage0TcModParams[0] = 0.0f;
+                stage0TcModParams[1] = 0.0f;
             }
             hasSkyStage2 = ShaderMap_GetSecondStage(
                 shaders[shaderNum].shader,
@@ -1495,16 +1574,31 @@ static qboolean LoadWorldMapData(const char *name) {
                 &skyStage2TcModParams[0], &skyStage2TcModParams[1],
                 &skyStage2TcModParams[2], &skyStage2TcModParams[3]);
             if (hasSkyStage2) {
+                qboolean stage2HasScroll = (fabsf(skyStage2TcModParams[2]) > 0.00001f || fabsf(skyStage2TcModParams[3]) > 0.00001f);
+                qboolean stage2HasScale = (fabsf(skyStage2TcModParams[0] - 1.0f) > 0.00001f || fabsf(skyStage2TcModParams[1] - 1.0f) > 0.00001f);
+                /* Preserve raw values for diagnostic BEFORE branches mutate params[0][1]. */
+                float rawScaleS = skyStage2TcModParams[0];
+                float rawScaleT = skyStage2TcModParams[1];
+                float rawScrollS = skyStage2TcModParams[2];
+                float rawScrollT = skyStage2TcModParams[3];
                 stage2TextureHandle = RegisterTexture(skyStage2Map);
-                if (fabsf(skyStage2TcModParams[2]) > 0.00001f || fabsf(skyStage2TcModParams[3]) > 0.00001f) {
+                if (stage2HasScroll) {
                     skyStage2TcModType = 1;
                     skyStage2TcModParams[0] = skyStage2TcModParams[2];
                     skyStage2TcModParams[1] = skyStage2TcModParams[3];
-                }
-                if (fabsf(skyStage2TcModParams[0] - 1.0f) > 0.00001f ||
-                    fabsf(skyStage2TcModParams[1] - 1.0f) > 0.00001f) {
+                } else if (stage2HasScale) {
                     skyStage2TcModType = 4;
+                    /* params[0][1] already hold scale; nothing to do. */
+                } else {
+                    skyStage2TcModType = 0;
+                    skyStage2TcModParams[0] = 0.0f;
+                    skyStage2TcModParams[1] = 0.0f;
                 }
+                ri.Printf(PRINT_DEVELOPER,
+                          "Metal sky tcMod: '%s' stage1 raw_scale=(%.3f,%.3f) raw_scroll=(%.3f,%.3f) resolved=type=%d,(%.3f,%.3f)\n",
+                          shaders[shaderNum].shader,
+                          rawScaleS, rawScaleT, rawScrollS, rawScrollT,
+                          skyStage2TcModType, skyStage2TcModParams[0], skyStage2TcModParams[1]);
             }
         }
         lightmapHandle = EnsureWhiteTexture();
@@ -1513,6 +1607,12 @@ static qboolean LoadWorldMapData(const char *name) {
             lightmapHandle = s_worldLightmapHandles[lightmapNum];
             hasLightmap = qtrue;
             worldFlags |= Q3_METAL_WORLD_DRAWFLAG_LIGHTMAP_MULTIPLY;
+        }
+        if (IsSkyShaderName(shaders[shaderNum].shader)) {
+            /* Flag sky draws so the Swift side can route them through the
+             * sky pipeline (view-direction projection, no depth write).
+             * Must be set after LIGHTMAP_MULTIPLY gate above. */
+            worldFlags |= Q3_METAL_WORLD_DRAWFLAG_SKY;
         }
 
         if (surfaceType == MST_PATCH) {
@@ -1731,6 +1831,16 @@ typedef struct {
     float tcModScrollT;
     float tcModScaleS;
     float tcModScaleT;
+    /* tcMod turb (turbulence) — `tcMod turb <base> <amp> <phase> <freq>`.
+     * Q3 lava / water surfaces use it for the wobbly warp. Stored
+     * separately from scroll; stage1 resolution picks turb > scroll >
+     * scale as the visible tcMod type since turb produces the most
+     * recognizable "molten" look. Base is unused in our impl (stock
+     * Q3 folds it into the wave-table lookup offset). */
+    qboolean hasTurb;
+    float tcModTurbAmp;
+    float tcModTurbPhase;
+    float tcModTurbFreq;
     /* blendFunc from first stage. 0=opaque, 1=additive (GL_ONE GL_ONE),
      * 2=alpha-blend (GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA or 'blend'),
      * 3=filter (GL_DST_COLOR GL_ZERO or 'filter'). */
@@ -1992,6 +2102,20 @@ static void ShaderMap_GetScale(const char *name, float *outS, float *outT) {
     if (outT) *outT = entry->tcModScaleT;
 }
 
+static qboolean ShaderMap_GetTurb(const char *name, float *outAmp, float *outPhase, float *outFreq) {
+    const metalShaderMap_t *entry;
+    if (outAmp) *outAmp = 0.0f;
+    if (outPhase) *outPhase = 0.0f;
+    if (outFreq) *outFreq = 0.0f;
+    if (name == NULL || name[0] == '\0') return qfalse;
+    entry = ShaderMap_LookupEntry(name);
+    if (entry == NULL || !entry->hasTurb) return qfalse;
+    if (outAmp) *outAmp = entry->tcModTurbAmp;
+    if (outPhase) *outPhase = entry->tcModTurbPhase;
+    if (outFreq) *outFreq = entry->tcModTurbFreq;
+    return qtrue;
+}
+
 static qboolean ShaderMap_GetSecondStage(const char *name,
                                          char *outMap, size_t outMapSize,
                                          int *outBlendMode,
@@ -2098,8 +2222,12 @@ static void ParseShaderText(const char *text) {
         float tcScrollT;
         float tcScaleS;
         float tcScaleT;
+        float tcTurbAmp;
+        float tcTurbPhase;
+        float tcTurbFreq;
         qboolean gotTcScroll;
         qboolean gotTcScale;
+        qboolean gotTcTurb;
         char stage2Map[MAX_QPATH];
         qboolean gotStage2Map;
         float stage2ScrollS;
@@ -2132,8 +2260,12 @@ static void ParseShaderText(const char *text) {
         tcScrollT = 0.0f;
         tcScaleS = 1.0f;
         tcScaleT = 1.0f;
+        tcTurbAmp = 0.0f;
+        tcTurbPhase = 0.0f;
+        tcTurbFreq = 0.0f;
         gotTcScroll = qfalse;
         gotTcScale = qfalse;
+        gotTcTurb = qfalse;
         stage2Map[0] = '\0';
         gotStage2Map = qfalse;
         stage2ScrollS = 0.0f;
@@ -2256,10 +2388,16 @@ static void ParseShaderText(const char *text) {
                     } else if (!Q_stricmp(token, "LT128")) {
                         s_pendingAlphaFunc = 3;
                     }
-                } else if (stageIndex == 1 && !gotTcScroll && (!Q_stricmp(token, "tcMod") || !Q_stricmp(token, "tcmod"))) {
-                    /* Capture only the first stage's tcMod scroll.
-                     * tcMod rotate/scale are stubbed; full matrix math
-                     * comes with a later commit. */
+                } else if (stageIndex == 1 && (!Q_stricmp(token, "tcMod") || !Q_stricmp(token, "tcmod"))) {
+                    /* Capture first-stage tcMod directives. Q3 stages
+                     * frequently stack multiple tcMods (e.g. lava has
+                     * both `tcMod turb …` AND `tcMod scroll …` on the
+                     * same stage). All three are captured independently;
+                     * the draw-setup site later picks a visible mod in
+                     * preference order turb > scroll > scale. Unhandled
+                     * variants (rotate, stretch, transform) must still
+                     * consume their params so the outer parse loop
+                     * doesn't then treat float tokens as keywords. */
                     token = COM_ParseExt(&p, qfalse);
                     if (token[0] && !Q_stricmp(token, "scroll")) {
                         const char *sTok = COM_ParseExt(&p, qfalse);
@@ -2277,6 +2415,35 @@ static void ParseShaderText(const char *text) {
                             tcScaleT = (float)atof(tTok);
                             gotTcScale = qtrue;
                         }
+                    } else if (token[0] && !Q_stricmp(token, "turb")) {
+                        /* Stock Q3: `tcMod turb <base> <amp> <phase> <freq>`.
+                         * <base> is an unused legacy offset into the
+                         * sin-wave table. We consume but ignore it. */
+                        const char *baseTok = COM_ParseExt(&p, qfalse);
+                        const char *ampTok = COM_ParseExt(&p, qfalse);
+                        const char *phaseTok = COM_ParseExt(&p, qfalse);
+                        const char *freqTok = COM_ParseExt(&p, qfalse);
+                        (void)baseTok;
+                        if (ampTok[0] && phaseTok[0] && freqTok[0]) {
+                            tcTurbAmp = (float)atof(ampTok);
+                            tcTurbPhase = (float)atof(phaseTok);
+                            tcTurbFreq = (float)atof(freqTok);
+                            gotTcTurb = qtrue;
+                        }
+                    } else if (token[0] && !Q_stricmp(token, "rotate")) {
+                        COM_ParseExt(&p, qfalse); /* swallow 1 param */
+                    } else if (token[0] && !Q_stricmp(token, "stretch")) {
+                        COM_ParseExt(&p, qfalse); /* swallow 4 params */
+                        COM_ParseExt(&p, qfalse);
+                        COM_ParseExt(&p, qfalse);
+                        COM_ParseExt(&p, qfalse);
+                    } else if (token[0] && !Q_stricmp(token, "transform")) {
+                        COM_ParseExt(&p, qfalse); /* 6 params */
+                        COM_ParseExt(&p, qfalse);
+                        COM_ParseExt(&p, qfalse);
+                        COM_ParseExt(&p, qfalse);
+                        COM_ParseExt(&p, qfalse);
+                        COM_ParseExt(&p, qfalse);
                     }
                 } else if (stageIndex == 2 && (!Q_stricmp(token, "tcMod") || !Q_stricmp(token, "tcmod"))) {
                     token = COM_ParseExt(&p, qfalse);
@@ -2323,6 +2490,12 @@ static void ParseShaderText(const char *text) {
                 if (gotTcScale) {
                     last->tcModScaleS = tcScaleS;
                     last->tcModScaleT = tcScaleT;
+                }
+                if (gotTcTurb) {
+                    last->hasTurb = qtrue;
+                    last->tcModTurbAmp = tcTurbAmp;
+                    last->tcModTurbPhase = tcTurbPhase;
+                    last->tcModTurbFreq = tcTurbFreq;
                 }
                 if (s_pendingBlendMode != 0) {
                     last->blendMode = s_pendingBlendMode;
@@ -2655,7 +2828,27 @@ static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime
         s_entityRejectedNullThisFrame += 1;
         return;
     }
+    /* RT_SPRITE: billboard quad (plasma bolts, rail core, muzzle flashes,
+     * smoke puffs). We accept sprites into the scene-entity list and emit
+     * their geometry at RE_RenderScene time (camera-facing math requires
+     * the view axes, which aren't known here). All other reTypes
+     * (RT_BEAM, RT_RAIL_CORE, etc.) are still rejected for now and emit
+     * an audit entry so we can see what else the map submits. */
+    if (re->reType == RT_SPRITE) {
+        AuditOnce("ENTITY:RT_SPRITE");
+        s_sceneEntities[s_sceneEntityCount].entity = *re;
+        s_sceneEntities[s_sceneEntityCount].mirrored = qfalse;
+        s_sceneEntityCount += 1;
+        s_entityAcceptedThisFrame += 1;
+        return;
+    }
     if (re->reType != RT_MODEL) {
+        if (re->reType == RT_BEAM) AuditOnce("ENTITY:RT_BEAM");
+        else if (re->reType == RT_RAIL_CORE) AuditOnce("ENTITY:RT_RAIL_CORE");
+        else if (re->reType == RT_RAIL_RINGS) AuditOnce("ENTITY:RT_RAIL_RINGS");
+        else if (re->reType == RT_LIGHTNING) AuditOnce("ENTITY:RT_LIGHTNING");
+        else if (re->reType == RT_PORTALSURFACE) AuditOnce("ENTITY:RT_PORTALSURFACE");
+        else AuditOnce("ENTITY:reType unknown");
         s_entityRejectedTypeThisFrame += 1;
         return;
     }
@@ -2670,7 +2863,10 @@ static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime
     s_sceneEntityCount += 1;
     s_entityAcceptedThisFrame += 1;
 }
-static void RE_AddPolyToScene(qhandle_t hShader, int numVerts, const polyVert_t *verts, int num) {}
+static void RE_AddPolyToScene(qhandle_t hShader, int numVerts, const polyVert_t *verts, int num) {
+    AuditOnce("POLY:RE_AddPolyToScene");
+    (void)hShader; (void)numVerts; (void)verts; (void)num;
+}
 static int R_LightForPoint(vec3_t point, vec3_t ambientLight, vec3_t directedLight, vec3_t lightDir) { return 0; }
 static void RE_AddLightToScene(const vec3_t org, float intensity, float r, float g, float b) {}
 static void RE_AddAdditiveLightToScene(const vec3_t org, float intensity, float r, float g, float b) {}
@@ -3050,11 +3246,20 @@ static void RE_RenderScene(const refdef_t *fd) {
 
         for (entityIndex = 0; entityIndex < s_sceneEntityCount; ++entityIndex) {
             const metalSceneEntity_t *sceneEntity = &s_sceneEntities[entityIndex];
-            const metalModel_t *model = FindModelByHandle(sceneEntity->entity.hModel);
+            const metalModel_t *model;
             const md3Header_t *header;
             const md3Surface_t *surface;
             int surfaceIndex;
 
+            /* Sprites reserve a single quad: 4 verts, 6 indices, 1 draw. */
+            if (sceneEntity->entity.reType == RT_SPRITE) {
+                totalEntityVerts += 4;
+                totalEntityIndices += 6;
+                totalEntityDraws += 1;
+                continue;
+            }
+
+            model = FindModelByHandle(sceneEntity->entity.hModel);
             if (model == NULL || model->md3 == NULL) {
                 continue;
             }
@@ -3077,7 +3282,7 @@ static void RE_RenderScene(const refdef_t *fd) {
 
             for (entityIndex = 0; entityIndex < s_sceneEntityCount; ++entityIndex) {
                 const metalSceneEntity_t *sceneEntity = &s_sceneEntities[entityIndex];
-                const metalModel_t *model = FindModelByHandle(sceneEntity->entity.hModel);
+                const metalModel_t *model;
                 vec3_t effectiveOrigin;
                 vec3_t effectiveAxis[3];
                 const md3Header_t *header;
@@ -3089,6 +3294,83 @@ static void RE_RenderScene(const refdef_t *fd) {
                 vec4_t entityColor;
                 int surfaceIndex;
 
+                /* RT_SPRITE: billboard quad facing the camera. Q3 view
+                 * axis convention: axis[0]=forward, axis[1]=left,
+                 * axis[2]=up — so right_world = -axis1, up_world = axis2.
+                 * Uses additive blend (flags bit) + the additive entity
+                 * pipeline which already runs depth-read-only (no write)
+                 * via additiveEntityDepthStencilState. Covers plasma
+                 * bolts, rail core, muzzle flashes, smoke puffs. */
+                if (sceneEntity->entity.reType == RT_SPRITE) {
+                    uint32_t baseVertex = entityVertexCursor;
+                    uint32_t firstIndex = entityIndexCursor;
+                    float radius = sceneEntity->entity.radius;
+                    vec3_t right, up;
+                    vec3_t v0, v1, v2, v3;
+                    float r, g, b, a;
+                    int i;
+                    if (radius < 0.5f) radius = 8.0f;  /* sensible default */
+                    VectorScale(axis1, -radius, right);
+                    VectorScale(axis2,  radius, up);
+                    /* Four billboard corners. CCW order with UV
+                     * origin at top-left (Q3 tex convention). */
+                    VectorSubtract(sceneEntity->entity.origin, right, v0);
+                    VectorSubtract(v0, up, v0);
+                    VectorAdd(sceneEntity->entity.origin, right, v1);
+                    VectorSubtract(v1, up, v1);
+                    VectorAdd(sceneEntity->entity.origin, right, v2);
+                    VectorAdd(v2, up, v2);
+                    VectorSubtract(sceneEntity->entity.origin, right, v3);
+                    VectorAdd(v3, up, v3);
+                    r = (float)sceneEntity->entity.shader.rgba[0] / 255.0f;
+                    g = (float)sceneEntity->entity.shader.rgba[1] / 255.0f;
+                    b = (float)sceneEntity->entity.shader.rgba[2] / 255.0f;
+                    a = (float)sceneEntity->entity.shader.rgba[3] / 255.0f;
+                    /* Emit 4 verts: BL, BR, TR, TL */
+                    s_entityVertices[baseVertex + 0].position[0] = v0[0];
+                    s_entityVertices[baseVertex + 0].position[1] = v0[1];
+                    s_entityVertices[baseVertex + 0].position[2] = v0[2];
+                    s_entityVertices[baseVertex + 0].texCoord[0] = 0.0f;
+                    s_entityVertices[baseVertex + 0].texCoord[1] = 1.0f;
+                    s_entityVertices[baseVertex + 1].position[0] = v1[0];
+                    s_entityVertices[baseVertex + 1].position[1] = v1[1];
+                    s_entityVertices[baseVertex + 1].position[2] = v1[2];
+                    s_entityVertices[baseVertex + 1].texCoord[0] = 1.0f;
+                    s_entityVertices[baseVertex + 1].texCoord[1] = 1.0f;
+                    s_entityVertices[baseVertex + 2].position[0] = v2[0];
+                    s_entityVertices[baseVertex + 2].position[1] = v2[1];
+                    s_entityVertices[baseVertex + 2].position[2] = v2[2];
+                    s_entityVertices[baseVertex + 2].texCoord[0] = 1.0f;
+                    s_entityVertices[baseVertex + 2].texCoord[1] = 0.0f;
+                    s_entityVertices[baseVertex + 3].position[0] = v3[0];
+                    s_entityVertices[baseVertex + 3].position[1] = v3[1];
+                    s_entityVertices[baseVertex + 3].position[2] = v3[2];
+                    s_entityVertices[baseVertex + 3].texCoord[0] = 0.0f;
+                    s_entityVertices[baseVertex + 3].texCoord[1] = 0.0f;
+                    for (i = 0; i < 4; ++i) {
+                        s_entityVertices[baseVertex + i].color[0] = r;
+                        s_entityVertices[baseVertex + i].color[1] = g;
+                        s_entityVertices[baseVertex + i].color[2] = b;
+                        s_entityVertices[baseVertex + i].color[3] = a;
+                    }
+                    /* Two triangles: 0-1-2, 0-2-3. */
+                    s_entityIndices[entityIndexCursor + 0] = baseVertex + 0;
+                    s_entityIndices[entityIndexCursor + 1] = baseVertex + 1;
+                    s_entityIndices[entityIndexCursor + 2] = baseVertex + 2;
+                    s_entityIndices[entityIndexCursor + 3] = baseVertex + 0;
+                    s_entityIndices[entityIndexCursor + 4] = baseVertex + 2;
+                    s_entityIndices[entityIndexCursor + 5] = baseVertex + 3;
+                    entityVertexCursor += 4;
+                    entityIndexCursor += 6;
+                    s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
+                    s_entityDraws[entityDrawCursor].indexCount = 6;
+                    s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)sceneEntity->entity.customShader;
+                    s_entityDraws[entityDrawCursor].flags = Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE | Q3_METAL_ENTITY_DRAWFLAG_NOCULL;
+                    entityDrawCursor += 1;
+                    continue;
+                }
+
+                model = FindModelByHandle(sceneEntity->entity.hModel);
                 if (model == NULL || model->md3 == NULL) {
                     continue;
                 }
@@ -3346,6 +3628,16 @@ static void RE_RenderScene(const refdef_t *fd) {
                             worldN[2] = effectiveAxis[0][2] * localN[0]
                                       + effectiveAxis[1][2] * localN[1]
                                       + effectiveAxis[2][2] * localN[2];
+
+                            /* Defensive normalize. localN is unit by
+                             * construction (sin²+cos²=1), but cgame's
+                             * entity.axis can drift out of orthonormality
+                             * over time — the rotated worldN ends up
+                             * slightly >1 or <1 and Lambert's N·L
+                             * produces clamped/bogus values on those
+                             * entities. VectorNormalize returns early
+                             * on zero-length vectors so it's safe. */
+                            VectorNormalize(worldN);
 
                             ndotl = worldN[0] * entityLightDir[0]
                                   + worldN[1] * entityLightDir[1]

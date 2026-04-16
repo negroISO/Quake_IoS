@@ -44,6 +44,8 @@ struct MetalView: UIViewRepresentable {
 
         struct WorldUniforms {
             var viewProjection: simd_float4x4
+            var cameraPos: SIMD3<Float>    // for sky sphere-mapping
+            var _pad: Float = 0            // pad to 16-byte alignment
         }
 
         struct WorldDrawUniforms {
@@ -62,6 +64,13 @@ struct MetalView: UIViewRepresentable {
         // 3 = uv1 visualization, 4 = vertex color only. Flip to diagnose
         // lightmap / uv1 issues without touching the build pipeline.
         private static let worldDebugMode: Float = 0
+
+        // One-shot: logs the first sky draw's stage layout once per launch.
+        // Confirms killsky_1 + killsky_2 are both wired through as stages.
+        // Instance property (not static) to sidestep Swift 6 strict global
+        // concurrency — Coordinator itself is main-actor driven, so the
+        // bool is safe here without any isolation attribute.
+        private var skyStagesLogged: Bool = false
 
         private static func alphaTestThreshold(for alphaFunc: UInt32) -> Float {
             switch alphaFunc {
@@ -143,6 +152,8 @@ struct MetalView: UIViewRepresentable {
 
         struct WorldUniforms {
             float4x4 viewProjection;
+            packed_float3 cameraPos;
+            float _pad;
         };
 
         struct WorldVertexOut {
@@ -213,6 +224,19 @@ struct MetalView: UIViewRepresentable {
                 texCoord = float2(p.x * c - p.y * s, p.x * s + p.y * c) + 0.5;
             } else if (tcMod == 4) {
                 texCoord *= drawUniforms.tcModParams.xy;
+            } else if (tcMod == 5) {
+                // tcMod turb — position-dependent sine UV warp, drives
+                // Q3 lava/water surfaces. Stock Q3 uses per-vertex world
+                // position; we don't have it in the world fragment, so
+                // we approximate using texCoord as a position proxy.
+                // Produces the molten-wobble look on lava.
+                // params: (amp, freq, phase, unused)
+                float amp = drawUniforms.tcModParams.x;
+                float freq = drawUniforms.tcModParams.y;
+                float phase = drawUniforms.tcModParams.z;
+                float t = (drawUniforms.timeSeconds + phase) * freq * 2.0 * 3.14159265;
+                texCoord.x += sin(t + texCoord.y * 4.0) * amp;
+                texCoord.y += sin(t + texCoord.x * 4.0) * amp;
             }
             float4 texel = colorTexture.sample(textureSampler, texCoord);
             float4 lightmap = lightmapTexture.sample(textureSampler, in.lightmapTexCoord);
@@ -290,6 +314,105 @@ struct MetalView: UIViewRepresentable {
             float4 texel = colorTexture.sample(textureSampler, in.texCoord);
             return texel * in.color;
         }
+
+        /* ================ Sky rendering ================
+         * Q3 sky is NOT drawn with mesh UVs. The BSP's sky brushes
+         * mark a region of screen; actual sky texture is sampled by
+         * view direction (spherical projection for cloud-dome skies,
+         * or cubemap for skybox skies). We do the spherical map.
+         *
+         * Vertex: output world-space position.
+         * Fragment: direction = normalize(worldPos - cameraPos);
+         *           uv.x = atan2(dir.y, dir.x) mapped to [0,1]
+         *           uv.y = asin(dir.z) mapped to [0,1]
+         * Pipeline: no depth write, no lightmap, no vertex color.
+         */
+        struct SkyVertexOut {
+            float4 position [[position]];
+            float3 worldPos;
+            float2 scrollTex;  // raw mesh UV (used for scrolling cloud uv-dome optional)
+        };
+
+        vertex SkyVertexOut q3_sky_vertex(const device WorldVertexIn *vertices [[buffer(0)]],
+                                          constant WorldUniforms &uniforms [[buffer(1)]],
+                                          uint vertexID [[vertex_id]]) {
+            SkyVertexOut out;
+            WorldVertexIn inVertex = vertices[vertexID];
+            out.position = uniforms.viewProjection * float4(inVertex.position, 1.0);
+            // Push to max depth so sky always renders behind everything
+            out.position.z = out.position.w;
+            out.worldPos = inVertex.position;
+            out.scrollTex = inVertex.texCoord;
+            return out;
+        }
+
+        fragment float4 q3_sky_fragment(SkyVertexOut in [[stage_in]],
+                                        constant WorldUniforms &uniforms [[buffer(1)]],
+                                        constant WorldDrawUniforms &drawUniforms [[buffer(0)]],
+                                        texture2d<float> skyTexture [[texture(0)]],
+                                        sampler textureSampler [[sampler(0)]]) {
+            // Q3 cloud-dome sky: a single texture projected onto a
+            // virtual sphere around the camera. NOT lat-lon (zenith
+            // singularity), NOT hard cube-face switch (visible seams
+            // where faces meet — the diagonal bands we saw in the
+            // prior build). Instead we sample all three axis-aligned
+            // cube projections and blend with weights that sharpen
+            // toward the dominant axis, so the sum is smooth
+            // everywhere. `pow(abs(dir), 4)` gives a narrow bell
+            // around each axis; normalization keeps the final color
+            // energy-preserving. This matches Q3's "fake spherical
+            // projection without poles" look without true cubemaps.
+            float3 dir = normalize(in.worldPos - uniforms.cameraPos);
+            float3 a = abs(dir);
+
+            // Blend weights: pow(|dir|, 4) sharpens each axis's
+            // contribution near its face, softens it into adjacent
+            // faces across the seams. Divide by sum to normalize —
+            // keeps total contribution = 1.
+            float3 w = pow(a, float3(4.0));
+            float wSum = max(w.x + w.y + w.z, 1e-4);
+            w /= wSum;
+
+            // Three axis-aligned cube projections. NO V-flip on the
+            // negative-axis half — with blended sampling the apparent
+            // "mirror" at each axis center is invisible (the `pow(4)`
+            // weight near zero collapses that face's contribution to
+            // ~0 anyway). Adding a V-flip here would create a
+            // discontinuity inside the blend, re-introducing seams.
+            // 1e-4 floor prevents divide-by-zero exactly on the axis
+            // (dir = (±1, 0, 0) etc.) where the other two components
+            // collapse.
+            float2 uvX = float2(-dir.y, dir.z) / max(a.x, 1e-4) * 0.5 + 0.5;
+            float2 uvY = float2( dir.x, dir.z) / max(a.y, 1e-4) * 0.5 + 0.5;
+            float2 uvZ = float2( dir.x, -dir.y) / max(a.z, 1e-4) * 0.5 + 0.5;
+
+            // tcMod as stacked scale+scroll. Q3 killsky has both
+            // `tcMod scale` and `tcMod scroll` on the same stage —
+            // Q3's runtime applies scale first, then scroll. Until
+            // the per-stage uniform carries both simultaneously, we
+            // derive them from the single `tcMod` + `tcModParams`
+            // slot: if tcMod==1 use .xy as scroll; if tcMod==4 use
+            // .xy as scale; otherwise no-op. Applied to all three
+            // projections identically so motion stays coherent.
+            int tcMod = int(drawUniforms.tcMod + 0.5);
+            if (tcMod == 1) {
+                float2 scroll = drawUniforms.tcModParams.xy * drawUniforms.timeSeconds;
+                uvX += scroll;
+                uvY += scroll;
+                uvZ += scroll;
+            } else if (tcMod == 4) {
+                uvX *= drawUniforms.tcModParams.xy;
+                uvY *= drawUniforms.tcModParams.xy;
+                uvZ *= drawUniforms.tcModParams.xy;
+            }
+
+            float4 sX = skyTexture.sample(textureSampler, uvX);
+            float4 sY = skyTexture.sample(textureSampler, uvY);
+            float4 sZ = skyTexture.sample(textureSampler, uvZ);
+
+            float3 sky = sX.rgb * w.x + sY.rgb * w.y + sZ.rgb * w.z;
+            return float4(sky, 1.0);
+        }
         """
 
         private var commandQueue: MTLCommandQueue?
@@ -298,6 +421,9 @@ struct MetalView: UIViewRepresentable {
         private var worldFilterPipelineState: MTLRenderPipelineState?
         private var worldAlphaPipelineState: MTLRenderPipelineState?
         private var worldAdditivePipelineState: MTLRenderPipelineState?
+        private var skyPipelineState: MTLRenderPipelineState?
+        private var skyAdditivePipelineState: MTLRenderPipelineState?
+        private var skyDepthStencilState: MTLDepthStencilState?
         private var entityPipelineState: MTLRenderPipelineState?
         private var entityFilterPipelineState: MTLRenderPipelineState?
         private var entityAlphaPipelineState: MTLRenderPipelineState?
@@ -376,13 +502,20 @@ struct MetalView: UIViewRepresentable {
                let worldVertexBuffer = uploadWorldBuffers(device: view.device, generation: snapshot.worldGeneration),
                let worldIndexBuffer {
                 let viewProjection = makeWorldViewProjection(sceneView)
-                var worldUniforms = WorldUniforms(viewProjection: viewProjection)
+                let cameraPos = SIMD3<Float>(sceneView.viewOrigin.0, sceneView.viewOrigin.1, sceneView.viewOrigin.2)
+                var worldUniforms = WorldUniforms(viewProjection: viewProjection, cameraPos: cameraPos)
                 encoder.setRenderPipelineState(worldPipelineState)
                 encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
                 encoder.setFrontFacing(.clockwise)
                 encoder.setCullMode(.none)
                 encoder.setVertexBuffer(worldVertexBuffer, offset: 0, index: 0)
                 encoder.setVertexBytes(&worldUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
+                // Also bind WorldUniforms at fragment index 1. The sky
+                // fragment shader reads `constant WorldUniforms &uniforms
+                // [[buffer(1)]]` for cameraPos; without this bind, the
+                // read hits undefined memory and produces vertical
+                // smear bands across the sky.
+                encoder.setFragmentBytes(&worldUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
                 encoder.setFragmentSamplerState(worldSamplerState, index: 0)
 
                 if let worldDrawsPointer = Q3MetalRenderer_GetWorldDrawCommands(),
@@ -391,10 +524,72 @@ struct MetalView: UIViewRepresentable {
                     let worldDraws = UnsafeBufferPointer(start: worldDrawsPointer, count: Int(snapshot.worldCommandCount))
                     let timeSeconds = Float(CACurrentMediaTime() - frameTimeOrigin)
 
+                    let skyFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
+
                     // Ordered world passes:
                     // 0 = opaque, 1 = filter, 2 = alpha, 3 = additive.
+                    // Sky draws are handled in pass 0 through the sky pipeline
+                    // (view-direction spherical projection, no lightmap).
                     for worldPass in 0..<4 {
                     for draw in worldDraws where draw.indexCount > 0 {
+                        let isSky = (draw.flags & skyFlagBit) != 0
+                        if isSky {
+                            // Only emit sky during the opaque pass to avoid
+                            // duplicated draws across 4 pass iterations.
+                            guard worldPass == 0 else { continue }
+                            guard let skyPipelineState, let skyDepthStencilState else { continue }
+                            let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+                            guard stageCount > 0 else { continue }
+
+                            // One-shot diagnostic: log the sky draw's stage
+                            // layout so we can confirm killsky (stage0=base,
+                            // stage1=additive cloud overlay) is wired end-to-end.
+                            if !skyStagesLogged {
+                                skyStagesLogged = true
+                                print("[Metal] sky draw stageCount=\(stageCount) flags=0x\(String(draw.flags, radix: 16))")
+                                for i in 0..<stageCount {
+                                    let s = Self.worldStage(draw, i)
+                                    print("[Metal]   sky stage \(i): tex=\(s.textureHandle) blend=\(s.blendMode) tcMod=\(s.tcMod) tcModParams=(\(s.tcModParams.0),\(s.tcModParams.1),\(s.tcModParams.2),\(s.tcModParams.3))")
+                                }
+                            }
+
+                            // Render each sky stage in order. Stage 0 is the
+                            // base sky (opaque through the sky pipeline with
+                            // depth-write off). Subsequent stages are overlays
+                            // — killsky spec sheet stage 1 is GL_ONE/GL_ONE
+                            // additive. Use the stage's blendMode to decide.
+                            for stageIndex in 0..<stageCount {
+                                let stage = Self.worldStage(draw, stageIndex)
+                                guard let skyStageTexture = texture(for: stage.textureHandle, device: view.device) else {
+                                    continue
+                                }
+                                let isAdditive = (stageIndex > 0) && (Int(stage.blendMode) == 1)
+                                let pipeline = isAdditive ? (skyAdditivePipelineState ?? skyPipelineState) : skyPipelineState
+                                encoder.setRenderPipelineState(pipeline)
+                                encoder.setDepthStencilState(skyDepthStencilState)
+                                var skyDrawUniforms = WorldDrawUniforms(
+                                    tcGen: Float(stage.tcGen),
+                                    tcMod: Float(stage.tcMod),
+                                    rgbGen: Float(stage.rgbGen),
+                                    timeSeconds: timeSeconds,
+                                    tcModParams: Self.stageTcModParams(stage),
+                                    debugMode: 0,
+                                    forceWhiteVertColor: 0,
+                                    alphaTestThreshold: 0,
+                                    _pad0: 0
+                                )
+                                encoder.setFragmentTexture(skyStageTexture, index: 0)
+                                encoder.setFragmentBytes(&skyDrawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 0)
+                                encoder.drawIndexedPrimitives(
+                                    type: .triangle,
+                                    indexCount: Int(draw.indexCount),
+                                    indexType: .uint32,
+                                    indexBuffer: worldIndexBuffer,
+                                    indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride
+                                )
+                            }
+                            continue
+                        }
                         guard let lightmapTexture = texture(for: draw.lightmapTextureHandle, device: view.device) else {
                             continue
                         }
@@ -646,6 +841,42 @@ struct MetalView: UIViewRepresentable {
             } catch {
                 print("[Metal] Failed to create additive world pipeline: \\(error)")
             }
+
+            // Sky pipeline: view-direction spherical projection. No blending,
+            // no depth write (depth test still uses lessEqual so if anything
+            // draws over sky it occludes correctly — but sky vertex shader
+            // pushes z=w so sky is always at the far plane).
+            let skyPipelineDescriptor = MTLRenderPipelineDescriptor()
+            skyPipelineDescriptor.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            skyPipelineDescriptor.depthAttachmentPixelFormat = view.depthStencilPixelFormat
+            skyPipelineDescriptor.vertexFunction = library.makeFunction(name: "q3_sky_vertex")
+            skyPipelineDescriptor.fragmentFunction = library.makeFunction(name: "q3_sky_fragment")
+            do {
+                skyPipelineState = try device.makeRenderPipelineState(descriptor: skyPipelineDescriptor)
+            } catch {
+                print("[Metal] Failed to create sky pipeline: \\(error)")
+            }
+
+            // Additive sky pipeline for stage 1+ cloud layers (killsky_2
+            // over killsky_1). src=ONE, dst=ONE.
+            let skyAdditiveDescriptor = skyPipelineDescriptor.copy() as! MTLRenderPipelineDescriptor
+            skyAdditiveDescriptor.colorAttachments[0].isBlendingEnabled = true
+            skyAdditiveDescriptor.colorAttachments[0].rgbBlendOperation = .add
+            skyAdditiveDescriptor.colorAttachments[0].alphaBlendOperation = .add
+            skyAdditiveDescriptor.colorAttachments[0].sourceRGBBlendFactor = .one
+            skyAdditiveDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
+            skyAdditiveDescriptor.colorAttachments[0].destinationRGBBlendFactor = .one
+            skyAdditiveDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .one
+            do {
+                skyAdditivePipelineState = try device.makeRenderPipelineState(descriptor: skyAdditiveDescriptor)
+            } catch {
+                print("[Metal] Failed to create additive sky pipeline: \\(error)")
+            }
+
+            let skyDepthDescriptor = MTLDepthStencilDescriptor()
+            skyDepthDescriptor.depthCompareFunction = .lessEqual
+            skyDepthDescriptor.isDepthWriteEnabled = false
+            skyDepthStencilState = device.makeDepthStencilState(descriptor: skyDepthDescriptor)
 
             let entityPipelineDescriptor = MTLRenderPipelineDescriptor()
             entityPipelineDescriptor.colorAttachments[0].pixelFormat = view.colorPixelFormat

@@ -621,7 +621,7 @@ void Quake3_Init(const char *basePath) {
      * Call it explicitly here, after Com_Init so the cvar and command
      * subsystems are up. */
     IN_Init();
-    Cbuf_AddText("map q3dm1\n");
+    Cbuf_AddText("map q3dm7\n");
     engine_initialized = qtrue;
 
     Com_Printf("=== Quake3 iOS Engine Initialized ===\n");

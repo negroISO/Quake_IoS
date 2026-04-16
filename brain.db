@@ -1,0 +1,156 @@
+# Quake3-iOS brain.db
+
+Notes and deferred work items for the Metal renderer port.
+
+---
+
+## Deferred: Metal renderer work items (2026-04-16)
+
+### Status: parked — revisit after RE_AddPolyToScene is in.
+
+---
+
+### #2 — Batched RT_SPRITE into dynamic vertex buffer
+
+**Why parked:** no bottleneck yet. Current frame has ~26 draw cmds, GPU 2.7–3.5ms
+on A19 Pro. Optimize when we actually have a perf pin, not on speculation.
+
+**Goal:** replace per-sprite draw calls with a single batched draw. Visually identical;
+massive draw-call reduction.
+
+**Design:**
+
+```c
+#define MAX_SPRITE_VERTS   8192
+#define MAX_SPRITE_INDICES 12288
+
+static SpriteVertex s_spriteVerts[MAX_SPRITE_VERTS];
+static uint16_t     s_spriteIndices[MAX_SPRITE_INDICES];
+static int          s_spriteVertCount = 0;
+static int          s_spriteIndexCount = 0;
+```
+
+Per-sprite: build camera-facing quad from `origin`, `radius`, camera `right/up`
+vectors; append 4 verts + 6 indices (two triangles). Clear counts in `RE_ClearScene`.
+Single `drawIndexedPrimitives` at end-of-frame:
+
+```swift
+setVertexBuffer(spriteVerts)
+setIndexBuffer(spriteIndices)
+setBlendMode(ADDITIVE)       // src=ONE, dst=ONE
+depthWriteEnabled = false
+drawIndexedPrimitives(type: .triangle, indexCount: s_spriteIndexCount)
+```
+
+**Texture handling:**
+- Minimal: assume one texture (tracer/muzzle flash dominant case).
+- Better: group by texture, one draw per group.
+
+**Debug:** `Com_Printf("[DBG] spriteVerts=%d spriteIdx=%d\n", ...)`.
+
+**Expected gain:** same visuals, one draw call instead of N. Stable perf headroom
+for Vision Pro stereo later.
+
+---
+
+### #3 — Unified draw pipeline (models + sprites + polys)
+
+**Why parked:** no driving requirement yet. Today's world/entity/sky split is readable;
+stages are already unified through `Q3MetalWorldStage`. Doing this before polys/sprites
+exist means designing around hypothetical needs, and it's a renderer-wide break for days
+without a concrete win.
+
+**Revisit when:** shipping Vision Pro stereo (natural fit — replay one draw-cmd list
+per eye), or when draw-call count actually becomes a profiler issue.
+
+**Goal:** replace fragmented draw paths (models, sprites, polys) with a single
+submission + execution pipeline. Fewer calls, shared batching, cleaner shader +
+state handling. VR/stereo ready by construction.
+
+**Core struct:**
+
+```c
+typedef enum { DRAW_GEOMETRY, DRAW_SPRITE, DRAW_POLY } Q3DrawType;
+
+typedef struct {
+    Q3DrawType        type;
+    uint32_t          firstIndex;
+    uint32_t          indexCount;
+    uint32_t          textureHandle;
+    uint32_t          blendMode;
+    uint32_t          flags;         // depthHack, noCull, etc.
+    uint32_t          stageCount;
+    Q3MetalStage      stages[4];
+    vec3_t            origin;
+    vec3_t            axis[3];
+} Q3UnifiedDrawCmd;
+
+#define MAX_DRAW_CMDS 8192
+static Q3UnifiedDrawCmd s_drawCmds[MAX_DRAW_CMDS];
+static int              s_numDrawCmds = 0;
+```
+
+**Shared buffers:**
+
+```c
+#define MAX_VERTS   65536
+#define MAX_INDICES 131072
+static Vertex   s_vertices[MAX_VERTS];
+static uint16_t s_indices[MAX_INDICES];
+static int      s_vertCount  = 0;
+static int      s_indexCount = 0;
+```
+
+**Submission helpers** (one per draw type): `AddGeometryDraw`, `AddSpriteDraw`,
+`AddPolyDraw`. Each appends verts + indices to the shared buffers and pushes a
+`Q3UnifiedDrawCmd`.
+
+**Frame reset** (in `BeginFrame`): zero all counts.
+
+**Optional sort** (huge win): by `blendMode`, `textureHandle`, `shader`.
+
+**Render loop:**
+
+```swift
+for cmd in drawCmds {
+    setPipeline(cmd.blendMode, cmd.flags)
+    setTexture(cmd.textureHandle)
+    for stage in 0..<cmd.stageCount {
+        setStage(stage)
+        drawIndexed(cmd.firstIndex, cmd.indexCount)
+    }
+}
+```
+
+**VR/Vision Pro payoff:**
+
+```swift
+for eye in [left, right] {
+    setViewProjection(eye)
+    render(drawCmds)
+}
+```
+
+**Migration phases:**
+1. Build alongside existing pipelines (no removal yet).
+2. Route sprites → unified.
+3. Route polys → unified.
+4. Route MD3 + world → unified.
+5. Delete legacy paths.
+
+**Debug:** `Com_Printf("[DBG] drawCmds=%d verts=%d idx=%d\n", ...)`.
+
+---
+
+## Deferred: per-vertex normals attribute (entity pipeline)
+
+**Context:** entity vertices currently do NOT carry a per-vertex normal. CPU-side
+Lambert in `RE_RenderScene` decodes MD3 lat/long normals and bakes
+`(ambient + directed * NdotL) * entityColor` into `vertex.color`.
+
+**Why revisit:** if we later want per-pixel lighting (normal mapping, specular,
+env reflections), we'll need normals as a real vertex attribute, not pre-baked.
+
+**Design:** add `normal: float3` to `Q3MetalEntityVertex`, emit from MD3 build
+loop, pass through `q3_entity_vertex` to `q3_entity_fragment`. Drop the baked
+color Lambert in favor of per-pixel NdotL.
