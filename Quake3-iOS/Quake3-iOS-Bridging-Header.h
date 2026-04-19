@@ -11,4 +11,7 @@ void Q3Gamepad_SetState(float leftX, float leftY, float rightX, float rightY,
 /* Extended button state bitmask. Bit layout in code/ios/ios_local.h (Q3_PAD_*). */
 void Q3Gamepad_SetButtons(unsigned int buttonMask);
 
+/* Execute a Q3 console command from Swift (on-screen console overlay). */
+void Q3Exec_Command(const char *cmd);
+
 #endif

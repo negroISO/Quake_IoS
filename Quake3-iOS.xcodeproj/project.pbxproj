@@ -46,6 +46,7 @@
 		2E61945BBFA86209C838AEF0 /* envelope.c in Sources */ = {isa = PBXBuildFile; fileRef = AC08886BD27814B9C99A8144 /* envelope.c */; };
 		2F941A7564E1FA0DCC22C7E3 /* l_libvar.c in Sources */ = {isa = PBXBuildFile; fileRef = 36276A9523E4CEE0D37400F5 /* l_libvar.c */; };
 		2FCA20DA19A0C9809553CD7F /* md5.c in Sources */ = {isa = PBXBuildFile; fileRef = 487C2B0539A08F62C73C6D81 /* md5.c */; };
+		3171472F2F915C72004D3412 /* baseq3 in Resources */ = {isa = PBXBuildFile; fileRef = 3171472E2F915C72004D3412 /* baseq3 */; };
 		339B0DA7F41BDA7DB99FCC1D /* cg_servercmds.c in Sources */ = {isa = PBXBuildFile; fileRef = B4783F09E96EBCEF730A43B5 /* cg_servercmds.c */; settings = {COMPILER_FLAGS = "-DCGAME_NATIVE=1 -Wno-strict-prototypes -Wno-pointer-sign"; }; };
 		33F4AEDD16D354419E564840 /* md4.c in Sources */ = {isa = PBXBuildFile; fileRef = FDEFE89E236EDA943D78E2F5 /* md4.c */; };
 		35D79B56479E395B9433CE2C /* framing.c in Sources */ = {isa = PBXBuildFile; fileRef = EABAA152BE627C65DFEE6EB7 /* framing.c */; };
@@ -273,6 +274,7 @@
 		2FF077B854A1BFBBA4F03E0F /* jversion.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = jversion.h; sourceTree = "<group>"; };
 		302D1E63D77A078C03AAAB3A /* setup_11.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = setup_11.h; sourceTree = "<group>"; };
 		304A24F241F9EB6855915989 /* be_aas_entity.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = be_aas_entity.h; sourceTree = "<group>"; };
+		3171472E2F915C72004D3412 /* baseq3 */ = {isa = PBXFileReference; lastKnownFileType = text; path = baseq3; sourceTree = "<group>"; };
 		31AD9DD57B94DF07DF23C8C4 /* cl_input.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = cl_input.c; sourceTree = "<group>"; };
 		32E206EF24E8A7656C4C2E16 /* cg_predict.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = cg_predict.c; sourceTree = "<group>"; };
 		350C5378EAFA9D46AFD61317 /* jcmainct.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = jcmainct.c; sourceTree = "<group>"; };
@@ -299,7 +301,7 @@
 		45311376687BBBC1B284279A /* cm_patch.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = cm_patch.c; sourceTree = "<group>"; };
 		45A92960FE2D42C45BE88E48 /* bitrate.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = bitrate.h; sourceTree = "<group>"; };
 		45FCA2215445E4D69564A076 /* residue_44u.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = residue_44u.h; sourceTree = "<group>"; };
-		46730952512DD30A1113A24C /* Quake3-iOS.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = "Quake3-iOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		46730952512DD30A1113A24C /* Quake3-iOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Quake3-iOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		467F925E8F727F04638A9BF5 /* sv_game.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = sv_game.c; sourceTree = "<group>"; };
 		46F268AA29956562BCF97F9F /* psy.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = psy.h; sourceTree = "<group>"; };
 		472606AFE6CF6222F4A814DF /* qcommon.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = qcommon.h; sourceTree = "<group>"; };
@@ -1051,6 +1053,7 @@
 		FDC1DED2D65B4193CB6E9993 /* Quake3-iOS */ = {
 			isa = PBXGroup;
 			children = (
+				3171472E2F915C72004D3412 /* baseq3 */,
 				88E516AF1355E11FE7A7FD28 /* MetalView.swift */,
 				12703A83024DC702F9413C41 /* Quake3_iOSApp.swift */,
 				6AF21139679F9E7FC929A172 /* Quake3-iOS-Bridging-Header.h */,
@@ -1119,6 +1122,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				4DF2C23178D78E857E30EF88 /* libjpeg-changes.diff in Resources */,
+				3171472F2F915C72004D3412 /* baseq3 in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -1401,7 +1405,6 @@
 					"$(inherited)",
 					BOTLIB,
 					USE_ICON,
-					USE_VULKAN,
 					USE_VBO,
 					USE_CODEC_VORBIS,
 					HAVE_VM_COMPILED,
@@ -1520,7 +1523,6 @@
 					"$(inherited)",
 					BOTLIB,
 					USE_ICON,
-					USE_VULKAN,
 					USE_VBO,
 					USE_CODEC_VORBIS,
 					HAVE_VM_COMPILED,
