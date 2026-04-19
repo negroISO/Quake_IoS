@@ -3,6 +3,9 @@
 
 #include <stdint.h>
 
+#define Q3_METAL_WORLD_DRAWFLAG_SKY (1u << 5)
+#define Q3_METAL_WORLD_DRAWFLAG_PORTAL (1u << 6)
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -30,15 +33,17 @@ typedef struct {
     uint32_t firstVertex;
     uint32_t vertexCount;
     uint32_t textureHandle;
+    uint32_t blendMode;   /* 0=opaque/alpha (default UI), 3=filter (dst_color, zero) */
 } Q3MetalDrawCmd;
 
 typedef struct {
     uint32_t textureHandle;
-    uint32_t blendMode;   /* 0=opaque,1=add,2=alpha,3=filter */
+    uint32_t blendMode;   /* 0=opaque,1=add,2=alpha,3=filter,4=premult,5=skip */
     uint32_t tcGen;       /* 0=base,1=environment */
     uint32_t tcMod;       /* 0=none,1=scroll,2=turb,3=rotate,4=scale */
     float tcModParams[4];
-    uint32_t rgbGen;      /* 0=identity,1=vertex */
+    uint32_t rgbGen;      /* 0=identity, 1=vertex, 2=lightingDiffuse */
+    uint32_t alphaGen;    /* 0=identity, 1=vertex */
     uint32_t alphaFunc;   /* 0=none, 1=GT0, 2=GE128, 3=LT128 */
 } Q3MetalWorldStage;
 
@@ -48,9 +53,9 @@ typedef struct {
     uint32_t firstIndex;
     uint32_t indexCount;
     uint32_t lightmapTextureHandle;
-    uint32_t flags;
     uint32_t stageCount;
     Q3MetalWorldStage stages[Q3_METAL_MAX_STAGES];
+    uint32_t flags;
 } Q3MetalWorldDrawCmd;
 
 typedef struct {
@@ -65,8 +70,7 @@ enum {
     Q3_METAL_WORLD_DRAWFLAG_NOCULL = 1u << 1,
     Q3_METAL_WORLD_DRAWFLAG_LIGHTMAP_MULTIPLY = 1u << 2,
     Q3_METAL_WORLD_DRAWFLAG_ALPHA = 1u << 3,
-    Q3_METAL_WORLD_DRAWFLAG_FILTER = 1u << 4,
-    Q3_METAL_WORLD_DRAWFLAG_SKY = 1u << 5
+    Q3_METAL_WORLD_DRAWFLAG_FILTER = 1u << 4
 };
 
 enum {
@@ -74,7 +78,9 @@ enum {
     Q3_METAL_ENTITY_DRAWFLAG_NOCULL = 1u << 1,
     Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE = 1u << 2,
     Q3_METAL_ENTITY_DRAWFLAG_ALPHA = 1u << 3,
-    Q3_METAL_ENTITY_DRAWFLAG_FILTER = 1u << 4
+    Q3_METAL_ENTITY_DRAWFLAG_FILTER = 1u << 4,
+    Q3_METAL_ENTITY_DRAWFLAG_FIRST_PERSON = 1u << 5,
+    Q3_METAL_ENTITY_DRAWFLAG_PORTAL = 1u << 6
 };
 
 typedef struct {
@@ -108,6 +114,14 @@ typedef struct {
     float viewAxis[9];
 } Q3MetalSceneView;
 
+/* Portal camera captured from RT_PORTALSURFACE entities. Origin + axis
+ * only; fov inherits from the main scene. Returned via
+ * Q3MetalRenderer_GetPortalView() below. */
+typedef struct {
+    float origin[3];
+    float axis[9];
+} Q3MetalPortalView;
+
 void Q3MetalRenderer_UpdateDrawableSize(int width, int height);
 const Q3MetalFrameSnapshot *Q3MetalRenderer_GetFrameSnapshot(void);
 const Q3MetalVertex *Q3MetalRenderer_GetVertices(void);
@@ -120,6 +134,34 @@ const uint32_t *Q3MetalRenderer_GetEntityIndices(void);
 const Q3MetalEntityDrawCmd *Q3MetalRenderer_GetEntityDrawCommands(void);
 const Q3MetalSceneView *Q3MetalRenderer_GetSceneView(void);
 int Q3MetalRenderer_GetTextureInfo(uint32_t textureHandle, Q3MetalTextureInfo *outInfo);
+int Q3MetalRenderer_GetDebugRenderMode(void);
+int Q3MetalRenderer_GetDebugPasses(void);
+int Q3MetalRenderer_GetDrawWorld(void);
+int Q3MetalRenderer_GetDrawEntities(void);
+int Q3MetalRenderer_GetNoCull(void);
+int Q3MetalRenderer_GetNoPortals(void);
+int Q3MetalRenderer_GetPortalSmokeTest(void);
+
+/* Diagnostic cvar — when nonzero the Swift world draw loop zeroes out
+ * `WorldDrawUniforms.tcMod` on every draw, pinning UVs to their static
+ * BSP-baked values. If "flying texture" artifacts disappear when this
+ * is on, the root cause is in the tcMod parameter/uniform chain. If
+ * artifacts persist, look further down (vertex/index offsets, state
+ * leakage). */
+int Q3MetalRenderer_GetDisableTcMod(void);
+
+/* Returns nonzero if a RT_PORTALSURFACE was captured this frame and
+ * fills *out with its origin + axis. Returns 0 if no portal entity
+ * was seen (typical on maps without portals / mirrors). */
+int Q3MetalRenderer_GetPortalView(Q3MetalPortalView *out);
+
+/* Returns nonzero when the current map has portal BSP surfaces or the
+ * current frame has portal-shader entities. Swift uses this to skip the
+ * portal RTT pass on non-portal maps. Orthogonal to GetPortalView: a
+ * map with portal surfaces but no RT_PORTALSURFACE captured this frame
+ * still returns visible=true but GetPortalView returns 0. Caller should
+ * combine both (and r_portalSmokeTest) to decide whether to render. */
+int Q3MetalRenderer_HasVisiblePortal(void);
 
 #ifdef __cplusplus
 }
