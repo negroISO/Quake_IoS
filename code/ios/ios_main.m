@@ -469,6 +469,7 @@ void IN_Frame(void) {
         unsigned int cur = s_gamepadState.buttonMask;
         unsigned int changed = prev ^ cur;
         size_t bitIdx;
+        qboolean menuActive = (Key_GetCatcher() & KEYCATCH_UI) ? qtrue : qfalse;
         if (changed != 0) {
             for (bitIdx = 0; bitIdx < sizeof(s_gamepadBitMap)/sizeof(s_gamepadBitMap[0]); ++bitIdx) {
                 unsigned int bit = s_gamepadBitMap[bitIdx].bit;
@@ -482,7 +483,57 @@ void IN_Frame(void) {
                      * input pipeline. */
                     Com_Printf("IN: queued SE_KEY key=%d down=%d (mask prev=0x%X cur=0x%X)\n",
                                s_gamepadBitMap[bitIdx].key, (int)down, prev, cur);
+
+                    /* Menu navigation: when the UI keyCatcher is active,
+                     * also translate D-pad / A / B / Start into the
+                     * arrow / enter / escape keys the Q3 UI QVM listens
+                     * for. Emitted in ADDITION to the PAD0_* event above
+                     * so in-game bindings still work when a menu is not
+                     * up. A/B assignments match Xbox convention (A = OK,
+                     * B = back/cancel). Start also opens/closes menu. */
+                    if (menuActive) {
+                        int navKey = 0;
+                        if      (bit == Q3_PAD_DPAD_UP)    navKey = K_UPARROW;
+                        else if (bit == Q3_PAD_DPAD_DOWN)  navKey = K_DOWNARROW;
+                        else if (bit == Q3_PAD_DPAD_LEFT)  navKey = K_LEFTARROW;
+                        else if (bit == Q3_PAD_DPAD_RIGHT) navKey = K_RIGHTARROW;
+                        else if (bit == Q3_PAD_A)          navKey = K_ENTER;
+                        else if (bit == Q3_PAD_B)          navKey = K_ESCAPE;
+                        else if (bit == Q3_PAD_MENU)       navKey = K_ESCAPE;
+                        if (navKey != 0) {
+                            Sys_QueEvent(eventTime, SE_KEY, navKey, down, 0, NULL);
+                        }
+                    }
                 }
+            }
+        }
+
+        /* Left-stick menu navigation. The UI doesn't listen to joystick
+         * axes, so we synthesize arrow-key presses when the stick crosses
+         * a cardinal threshold. Edge-triggered: emit once on cross, emit
+         * release when stick returns to neutral. Diagonals are ignored
+         * to avoid double-firing. */
+        if (menuActive) {
+            static int s_prevStickKey = 0;
+            int nextKey = 0;
+            float lx = s_gamepadState.leftX;
+            float ly = s_gamepadState.leftY;
+            const float threshold = 0.5f;
+            if (fabsf(ly) > fabsf(lx)) {
+                if (ly >  threshold) nextKey = K_DOWNARROW;
+                if (ly < -threshold) nextKey = K_UPARROW;
+            } else {
+                if (lx >  threshold) nextKey = K_RIGHTARROW;
+                if (lx < -threshold) nextKey = K_LEFTARROW;
+            }
+            if (nextKey != s_prevStickKey) {
+                if (s_prevStickKey != 0) {
+                    Sys_QueEvent(eventTime, SE_KEY, s_prevStickKey, qfalse, 0, NULL);
+                }
+                if (nextKey != 0) {
+                    Sys_QueEvent(eventTime, SE_KEY, nextKey, qtrue, 0, NULL);
+                }
+                s_prevStickKey = nextKey;
             }
         }
     }
@@ -621,7 +672,7 @@ void Quake3_Init(const char *basePath) {
      * Call it explicitly here, after Com_Init so the cvar and command
      * subsystems are up. */
     IN_Init();
-    Cbuf_AddText("map q3dm7\n");
+    Cbuf_AddText("timedemo 1; demo four\n");
     engine_initialized = qtrue;
 
     Com_Printf("=== Quake3 iOS Engine Initialized ===\n");
@@ -631,4 +682,23 @@ void Quake3_Frame(void) {
     if (!engine_initialized) return;
     IN_Frame();
     Com_Frame(qfalse);
+}
+
+/* Execute an arbitrary Q3 command string from Swift. Used by the
+ * on-screen console overlay so the user can type cvars/commands when
+ * no physical keyboard is attached. Appends a trailing newline if the
+ * caller didn't include one, since Cbuf_AddText is line-delimited. */
+void Q3Exec_Command(const char *cmd) {
+    char buf[1024];
+    size_t len;
+    if (!engine_initialized || cmd == NULL || cmd[0] == '\0') return;
+    len = strlen(cmd);
+    if (len >= sizeof(buf) - 2) len = sizeof(buf) - 2;
+    memcpy(buf, cmd, len);
+    if (len == 0 || buf[len - 1] != '\n') {
+        buf[len++] = '\n';
+    }
+    buf[len] = '\0';
+    Cbuf_AddText(buf);
+    Cbuf_Execute();
 }

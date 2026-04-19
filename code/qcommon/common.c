@@ -3168,7 +3168,10 @@ void Com_ReadCDKey( const char *filename ) {
 
 	FS_SV_FOpenFileRead( fbuffer, &f );
 	if ( f == FS_INVALID_HANDLE ) {
-		Q_strncpyz( cl_cdkey, "                ", 17 );
+		/* iOS: no retail CD key distribution — default to 16 W's which
+		 * passes Com_CDKeyValidate's allowed-char check (W is in the
+		 * switch table) so the UI skips the "Enter CD Key" screen. */
+		Q_strncpyz( cl_cdkey, "WWWWWWWWWWWWWWWW", 17 );
 		return;
 	}
 
@@ -3180,7 +3183,7 @@ void Com_ReadCDKey( const char *filename ) {
 	if ( Com_CDKeyValidate(buffer, NULL) ) {
 		Q_strncpyz( cl_cdkey, buffer, 17 );
 	} else {
-		Q_strncpyz( cl_cdkey, "                ", 17 );
+		Q_strncpyz( cl_cdkey, "WWWWWWWWWWWWWWWW", 17 );
 	}
 }
 
@@ -3199,7 +3202,7 @@ void Com_AppendCDKey( const char *filename ) {
 
 	FS_SV_FOpenFileRead( fbuffer, &f );
 	if ( f == FS_INVALID_HANDLE ) {
-		Q_strncpyz( &cl_cdkey[16], "                ", 17 );
+		Q_strncpyz( &cl_cdkey[16], "WWWWWWWWWWWWWWWW", 17 );
 		return;
 	}
 
@@ -3211,7 +3214,7 @@ void Com_AppendCDKey( const char *filename ) {
 	if ( Com_CDKeyValidate(buffer, NULL)) {
 		strcat( &cl_cdkey[16], buffer );
 	} else {
-		Q_strncpyz( &cl_cdkey[16], "                ", 17 );
+		Q_strncpyz( &cl_cdkey[16], "WWWWWWWWWWWWWWWW", 17 );
 	}
 }
 
