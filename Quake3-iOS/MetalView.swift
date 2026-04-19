@@ -48,22 +48,33 @@ struct MetalView: UIViewRepresentable {
             var _pad: Float = 0            // pad to 16-byte alignment
         }
 
-        struct WorldDrawUniforms {
+        struct WorldDrawUniforms: Equatable {
             var tcGen: Float
             var tcMod: Float
-            var rgbGen: Float
+            var rgbGen: Float               // 0=identity, 1=vertex, 2=lightingDiffuse
             var timeSeconds: Float
             var tcModParams: SIMD4<Float>
             var debugMode: Float
             var forceWhiteVertColor: Float  // 1.0 for additive (skip BSP vertex color)
             var alphaTestThreshold: Float   // >0: discard if a<thresh; <0: discard if a>=|thresh|; 0: none
-            var _pad0: Float
+            var blendMode: Int32
+            var alphaGen: Float             // 0=identity, 1=vertex
+            var _pad0: Float = 0            // 16-byte alignment for the following float4
+            var _pad1: Float = 0
+            // Debug pass colorizer: when .a > 0.5 the fragment shader returns this
+            // flat color instead of sampling. Set per-pass from `metal_debug_passes`.
+            // 0=opaque (red), 1=filter (green), 2=alpha (blue), 3=additive (yellow).
+            var debugPassColor: SIMD4<Float> = SIMD4<Float>(0, 0, 0, 0)
         }
 
         // Render debug: 0 = normal, 1 = base only, 2 = lightmap only,
         // 3 = uv1 visualization, 4 = vertex color only. Flip to diagnose
         // lightmap / uv1 issues without touching the build pipeline.
         private static let worldDebugMode: Float = 0
+
+        // Flip to true to log world-pass stage/drawcall counts each frame.
+        // Reveals how effective run-length batching is. Flooding — leave off in production.
+        private static let worldBatchLogEnabled: Bool = false
 
         // One-shot: logs the first sky draw's stage layout once per launch.
         // Confirms killsky_1 + killsky_2 are both wired through as stages.
@@ -161,6 +172,7 @@ struct MetalView: UIViewRepresentable {
             float2 texCoord;
             float2 lightmapTexCoord;
             float4 color;
+            float3 worldPos;
         };
 
         struct WorldDrawUniforms {
@@ -172,7 +184,11 @@ struct MetalView: UIViewRepresentable {
             float debugMode;
             float forceWhiteVertColor;
             float alphaTestThreshold;
+            int blendMode;
+            float alphaGen;
             float _pad0;
+            float _pad1;
+            float4 debugPassColor;
         };
 
         struct EntityVertexIn {
@@ -200,101 +216,283 @@ struct MetalView: UIViewRepresentable {
             out.texCoord = inVertex.texCoord;
             out.lightmapTexCoord = inVertex.lightmapTexCoord;
             out.color = inVertex.color;
+            out.worldPos = inVertex.position;
             return out;
         }
 
-        fragment float4 q3_world_fragment(WorldVertexOut in [[stage_in]],
-                                          constant WorldDrawUniforms &drawUniforms [[buffer(0)]],
+        inline float2 ApplyTcMod(float2 uv, float3 worldPos, constant WorldDrawUniforms &u) {
+            int tcMod = int(u.tcMod + 0.5);
+            if (tcMod == 1) {
+                uv += u.tcModParams.xy * u.timeSeconds;
+            } else if (tcMod == 2) {
+                float s = sin(u.timeSeconds * u.tcModParams.w) * u.tcModParams.y;
+                uv += float2(s, s);
+            } else if (tcMod == 3) {
+                float a = u.tcModParams.x * u.timeSeconds;
+                float c = cos(a);
+                float s = sin(a);
+                float2 p = uv - 0.5;
+                uv = float2(p.x * c - p.y * s, p.x * s + p.y * c) + 0.5;
+            } else if (tcMod == 4) {
+                uv *= u.tcModParams.xy;
+            } else if (tcMod == 5) {
+                // tcMod turb — position-dependent sine UV warp using real
+                // world position (now that worldPos is interpolated to the
+                // fragment). Stock Q3 feeds tess.xyz into the turb sine
+                // table; we use a 1/128 spatial scale so adjacent lava/
+                // slime pool tiles ripple coherently without the chaotic
+                // high-frequency warp the UV-proxy version produced.
+                // params: (amp, freq, phase, unused)
+                float amp = u.tcModParams.x;
+                float freq = u.tcModParams.y;
+                float phase = u.tcModParams.z;
+                float t = (u.timeSeconds + phase) * freq * 2.0 * 3.14159265;
+                float2 wp = worldPos.xy * (1.0 / 128.0);
+                uv.x += sin(t + wp.y) * amp;
+                uv.y += sin(t + wp.x) * amp;
+            }
+            return uv;
+        }
+
+        inline float2 ComputeStageTexCoord(WorldVertexOut in,
+                                           constant WorldDrawUniforms &u,
+                                           float3 cameraPos) {
+            float2 uv;
+            int tcGen = int(u.tcGen + 0.5);
+            if (tcGen == 1) {
+                // tcGen environment — per-fragment facet normal from the
+                // screen-space derivatives of worldPos. Q3's BSP vertices
+                // don't carry per-vertex normals; the stock engine uses
+                // per-face normals from the surface plane. dfdx/dfdy on
+                // worldPos inside the fragment shader gives us the same
+                // (one flat normal per triangle). Matches the stock Q3
+                // envmap look on gothic pillar reliefs, armor trim, etc.
+                float3 dxPos = dfdx(in.worldPos);
+                float3 dyPos = dfdy(in.worldPos);
+                float3 N = normalize(cross(dxPos, dyPos));
+                float3 viewer = cameraPos - in.worldPos;
+                float rlen = rsqrt(max(dot(viewer, viewer), 1e-6));
+                viewer *= rlen;
+                float d = dot(N, viewer);
+                float3 R = N * (2.0 * d) - viewer;
+                // Stock Q3 RB_CalcEnvironmentTexCoords maps
+                //   st[0] = 0.5 + R.y * 0.5; st[1] = 0.5 - R.z * 0.5;
+                // i.e. horizontal axis is world Y, vertical axis is world Z
+                // (inverted so sky maps to the top of the envmap).
+                uv = float2(0.5 + R.y * 0.5, 0.5 - R.z * 0.5);
+            } else {
+                uv = in.texCoord;
+            }
+            return ApplyTcMod(uv, in.worldPos, u);
+        }
+
+        inline float4 SampleBase(texture2d<float> tex,
+                                 sampler s,
+                                 float2 uv,
+                                 constant WorldDrawUniforms &u) {
+            float4 texel = tex.sample(s, uv);
+            // Explicit alphaFunc (from the shader parser) only. Positive
+            // threshold = GT0/GE128 (discard below). Negative = LT128
+            // (discard above). Zero = no test.
+            //
+            // The previous implicit "if blendMode opaque/filter && alpha<0.5
+            // discard" fallback was removed 2026-04-17: it assumed every
+            // opaque wall had alpha=1, but RGBA textures loaded via
+            // fallback paths (or JPGs with accidental alpha<128) were
+            // getting their entire surface discarded — producing the
+            // "see-through walls" regression. Stock Q3 does not do an
+            // implicit alpha discard on opaque/filter stages.
+            float thresh = u.alphaTestThreshold;
+            if (thresh > 0.0) {
+                if (texel.a < thresh) discard_fragment();
+            } else if (thresh < 0.0) {
+                if (texel.a >= -thresh) discard_fragment();
+            }
+            return texel;
+        }
+
+        inline bool WorldDebugReplace(constant WorldDrawUniforms &u,
+                                      thread float4 &outColor) {
+            // Debug pass colorizer — solid replace when alpha >= 0.9.
+            if (u.debugPassColor.a >= 0.9) {
+                outColor = u.debugPassColor;
+                return true;
+            }
+            return false;
+        }
+
+        inline bool WorldDebugMode(WorldVertexOut in,
+                                   float4 texel,
+                                   float4 lightmap,
+                                   constant WorldDrawUniforms &u,
+                                   thread float4 &outColor) {
+            int mode = int(u.debugMode + 0.5);
+            if (mode == 1) {
+                outColor = float4(texel.rgb, 1.0);
+                return true;
+            }
+            if (mode == 2) {
+                outColor = float4(lightmap.rgb, 1.0);
+                return true;
+            }
+            if (mode == 3) {
+                outColor = float4(in.texCoord, 0.0, 1.0);
+                return true;
+            }
+            if (mode == 4) {
+                outColor = float4(in.lightmapTexCoord, 0.0, 1.0);
+                return true;
+            }
+            return false;
+        }
+
+        inline float4 ApplyWorldDebugTint(float4 outColor,
+                                          constant WorldDrawUniforms &u) {
+            // Tint (alpha < 0.9 but > 0) falls through to normal shading
+            // and gets mixed at the end so the texture stays visible.
+            if (u.debugPassColor.a > 0.01) {
+                outColor.rgb = mix(outColor.rgb, u.debugPassColor.rgb, u.debugPassColor.a);
+            }
+            return outColor;
+        }
+
+        // Apply rgbGen and alphaGen from the stage uniform to the computed
+        // fragment color. Safety rules (per advisor spec):
+        //  1. IDENTITY (code 0) is the default — DO NOTHING to color.
+        //  2. VERTEX / LIGHTING_DIFFUSE (1/2) multiplies color.rgb by
+        //     vertex.rgb ONLY if vertex color isn't near-zero. Guards
+        //     against BSP surfaces with (0,0,0) vertex colors that would
+        //     otherwise go black when the shader explicitly asked for
+        //     rgbGen vertex but q3map failed to bake vertex lighting.
+        //  3. alphaGen VERTEX (1) multiplies color.a by vertex.a.
+        // This function MUST NOT affect shaders that leave rgbGen/alphaGen
+        // unset — the majority of world BSP shaders.
+        inline float4 ApplyVertexColorGen(float4 color,
+                                          float4 vertexColor,
+                                          constant WorldDrawUniforms &u) {
+            int rgbGen = int(u.rgbGen + 0.5);
+            int alphaGen = int(u.alphaGen + 0.5);
+            if (rgbGen == 1 || rgbGen == 2) {
+                float3 vc = vertexColor.rgb;
+                // Safety: skip when vertex color is near-black so an
+                // uncompiled-lighting BSP surface doesn't disappear.
+                if (dot(vc, vc) > 0.0001) {
+                    color.rgb *= vc;
+                }
+            }
+            if (alphaGen == 1) {
+                color.a *= vertexColor.a;
+            }
+            return color;
+        }
+
+        fragment float4 q3_world_frag_opaque(WorldVertexOut in [[stage_in]],
+                                             constant WorldDrawUniforms &u [[buffer(0)]],
+                                             constant WorldUniforms &uniforms [[buffer(1)]],
+                                             texture2d<float> colorTexture [[texture(0)]],
+                                             texture2d<float> lightmapTexture [[texture(1)]],
+                                             sampler textureSampler [[sampler(0)]]) {
+            float4 outColor;
+            if (WorldDebugReplace(u, outColor)) {
+                return outColor;
+            }
+            float2 texCoord = ComputeStageTexCoord(in, u, uniforms.cameraPos);
+            float4 texel = SampleBase(colorTexture, textureSampler, texCoord, u);
+            float4 lightmap = lightmapTexture.sample(textureSampler, in.lightmapTexCoord);
+            if (WorldDebugMode(in, texel, lightmap, u, outColor)) {
+                return outColor;
+            }
+            outColor = float4(texel.rgb * lightmap.rgb, 1.0);
+            outColor = ApplyVertexColorGen(outColor, in.color, u);
+            return ApplyWorldDebugTint(outColor, u);
+        }
+
+        fragment float4 q3_world_frag_alpha(WorldVertexOut in [[stage_in]],
+                                            constant WorldDrawUniforms &u [[buffer(0)]],
+                                            constant WorldUniforms &uniforms [[buffer(1)]],
+                                            texture2d<float> colorTexture [[texture(0)]],
+                                            texture2d<float> lightmapTexture [[texture(1)]],
+                                            sampler textureSampler [[sampler(0)]]) {
+            float4 outColor;
+            if (WorldDebugReplace(u, outColor)) {
+                return outColor;
+            }
+            float2 texCoord = ComputeStageTexCoord(in, u, uniforms.cameraPos);
+            float4 texel = SampleBase(colorTexture, textureSampler, texCoord, u);
+            float4 lightmap = lightmapTexture.sample(textureSampler, in.lightmapTexCoord);
+            if (WorldDebugMode(in, texel, lightmap, u, outColor)) {
+                return outColor;
+            }
+            outColor = float4(texel.rgb, texel.a);
+            outColor = ApplyVertexColorGen(outColor, in.color, u);
+            return ApplyWorldDebugTint(outColor, u);
+        }
+
+        fragment float4 q3_world_frag_add(WorldVertexOut in [[stage_in]],
+                                          constant WorldDrawUniforms &u [[buffer(0)]],
+                                          constant WorldUniforms &uniforms [[buffer(1)]],
                                           texture2d<float> colorTexture [[texture(0)]],
                                           texture2d<float> lightmapTexture [[texture(1)]],
                                           sampler textureSampler [[sampler(0)]]) {
-            float2 texCoord = in.texCoord;
-            int tcMod = int(drawUniforms.tcMod + 0.5);
-            int rgbGen = int(drawUniforms.rgbGen + 0.5);
-            if (tcMod == 1) {
-                texCoord += drawUniforms.tcModParams.xy * drawUniforms.timeSeconds;
-            } else if (tcMod == 2) {
-                float s = sin(drawUniforms.timeSeconds * drawUniforms.tcModParams.w) * drawUniforms.tcModParams.y;
-                texCoord += float2(s, s);
-            } else if (tcMod == 3) {
-                float a = drawUniforms.tcModParams.x * drawUniforms.timeSeconds;
-                float c = cos(a);
-                float s = sin(a);
-                float2 p = texCoord - 0.5;
-                texCoord = float2(p.x * c - p.y * s, p.x * s + p.y * c) + 0.5;
-            } else if (tcMod == 4) {
-                texCoord *= drawUniforms.tcModParams.xy;
-            } else if (tcMod == 5) {
-                // tcMod turb — position-dependent sine UV warp, drives
-                // Q3 lava/water surfaces. Stock Q3 uses per-vertex world
-                // position; we don't have it in the world fragment, so
-                // we approximate using texCoord as a position proxy.
-                // Produces the molten-wobble look on lava.
-                // params: (amp, freq, phase, unused)
-                float amp = drawUniforms.tcModParams.x;
-                float freq = drawUniforms.tcModParams.y;
-                float phase = drawUniforms.tcModParams.z;
-                float t = (drawUniforms.timeSeconds + phase) * freq * 2.0 * 3.14159265;
-                texCoord.x += sin(t + texCoord.y * 4.0) * amp;
-                texCoord.y += sin(t + texCoord.x * 4.0) * amp;
+            float4 outColor;
+            if (WorldDebugReplace(u, outColor)) {
+                return outColor;
             }
-            float4 texel = colorTexture.sample(textureSampler, texCoord);
+            float2 texCoord = ComputeStageTexCoord(in, u, uniforms.cameraPos);
+            float4 texel = SampleBase(colorTexture, textureSampler, texCoord, u);
             float4 lightmap = lightmapTexture.sample(textureSampler, in.lightmapTexCoord);
-            int mode = int(drawUniforms.debugMode + 0.5);
-            if (mode == 1) {
-                return float4(texel.rgb, 1.0);
+            if (WorldDebugMode(in, texel, lightmap, u, outColor)) {
+                return outColor;
             }
-            if (mode == 2) {
-                return float4(lightmap.rgb, 1.0);
-            }
-            if (mode == 3) {
-                return float4(fract(in.lightmapTexCoord.x), fract(in.lightmapTexCoord.y), 0.0, 1.0);
-            }
-            if (mode == 4) {
-                return float4(in.color.rgb, 1.0);
-            }
-            // NOTE: No unconditional alpha-test discard here.
-            //
-            // ef21f24 introduced `if (result.a < 0.01) discard_fragment();` to
-            // emulate GL alphaFunc, but Q3 alpha-test is a PER-SHADER-STAGE opt-in
-            // (the `alphaFunc GT0|GE128|LT128` keyword on a stage), not a
-            // world-wide rule. Forcing it on every fragment made q3dm1's two
-            // ornamental arches go see-through whenever their stage0 texture
-            // failed to resolve (see HUD "falling back to white" errors) or when
-            // lightmap*vertexColor multiplied alpha below threshold.
-            //
-            // Until the per-stage shader driver is in place, world fragments must
-            // always write. Alpha-tested stages will be reintroduced through the
-            // Q3 shader parser, not as a global discard.
-            //
-            // Overbright: Q3 lightmaps are authored expecting a 2x boost (stock
-            // r_overBrightBits default = 1, i.e. multiply by 2^1). Without the
-            // boost the whole world renders at half brightness — user reported
-            // the game was 'awfully dark even with phone brightness all the way
-            // up'. saturate() clamps to [0,1] so bright spots don't wrap.
-            // Per-shader alphaFunc: GT0 / GE128 / LT128.
-            // Threshold >0 → discard if alpha < threshold (GT0=0.004, GE128=0.5)
-            // Threshold <0 → discard if alpha >= |threshold| (LT128=-0.5)
-            if (drawUniforms.alphaTestThreshold > 0.0) {
-                if (texel.a < drawUniforms.alphaTestThreshold) discard_fragment();
-            } else if (drawUniforms.alphaTestThreshold < 0.0) {
-                if (texel.a >= -drawUniforms.alphaTestThreshold) discard_fragment();
-            }
+            outColor = float4(texel.rgb * texel.a, texel.a);
+            outColor = ApplyVertexColorGen(outColor, in.color, u);
+            return ApplyWorldDebugTint(outColor, u);
+        }
 
-            // For additive surfaces (flames, glow), BSP vertex color is
-            // typically (0,0,0) because Q3 shaders use rgbGen identity.
-            // forceWhiteVertColor=1.0 substitutes white, preventing the
-            // multiply from zeroing out the fragment.
-            // Overbright 2x boost reverted (commit ed461eb). Now using the
-            // straightforward texel * lightmap * vertColor combine so the
-            // lighting baseline is unboosted — lets us see real lightmap
-            // output before entity lighting work. Bring the 2x back later
-            // as a tunable r_overBrightBits-style cvar if needed.
-            float3 vertexColor = (rgbGen == 1) ? in.color.rgb : float3(1.0);
-            float3 vc = mix(vertexColor, float3(1.0), drawUniforms.forceWhiteVertColor);
-            float  va = mix(in.color.a,   1.0,          drawUniforms.forceWhiteVertColor);
-            float3 lit = texel.rgb * lightmap.rgb * vc;
-            return float4(lit, texel.a * va);
+        fragment float4 q3_world_frag_filter(WorldVertexOut in [[stage_in]],
+                                             constant WorldDrawUniforms &u [[buffer(0)]],
+                                             constant WorldUniforms &uniforms [[buffer(1)]],
+                                             texture2d<float> colorTexture [[texture(0)]],
+                                             texture2d<float> lightmapTexture [[texture(1)]],
+                                             sampler textureSampler [[sampler(0)]]) {
+            float4 outColor;
+            if (WorldDebugReplace(u, outColor)) {
+                return outColor;
+            }
+            float2 texCoord = ComputeStageTexCoord(in, u, uniforms.cameraPos);
+            float4 texel = SampleBase(colorTexture, textureSampler, texCoord, u);
+            float4 lightmap = lightmapTexture.sample(textureSampler, in.lightmapTexCoord);
+            if (WorldDebugMode(in, texel, lightmap, u, outColor)) {
+                return outColor;
+            }
+            outColor = float4(texel.rgb * lightmap.rgb, 1.0);
+            outColor = ApplyVertexColorGen(outColor, in.color, u);
+            return ApplyWorldDebugTint(outColor, u);
+        }
+
+        // Phase-1 portal fragment: samples the RTT portalTexture with the
+        // BSP-baked stage UV. Stages are intentionally ignored by the
+        // caller — only one drawcall per portal surface and only texture
+        // slot 0 is bound. No lightmap, no tcMod, no stage blendMode —
+        // the portal "window" is whatever the RTT pass rendered.
+        fragment float4 q3_portal_fragment(WorldVertexOut in [[stage_in]],
+                                           texture2d<float> portalTex [[texture(0)]],
+                                           sampler textureSampler [[sampler(0)]]) {
+            return portalTex.sample(textureSampler, in.texCoord);
+        }
+
+        // Entity portal fragment: used when an MD3 entity's surface
+        // references a portal shader. MD3 UVs are model-space and would
+        // stretch the RTT across the model, so sample by screen position
+        // instead. screenSize is passed as drawable dimensions; Metal's
+        // [[position]] has top-left origin and portalTexture was rendered
+        // to the same convention, so no Y-flip is needed.
+        fragment float4 q3_entity_portal_fragment(EntityVertexOut in [[stage_in]],
+                                                  constant float2 &screenSize [[buffer(0)]],
+                                                  texture2d<float> portalTex [[texture(0)]],
+                                                  sampler textureSampler [[sampler(0)]]) {
+            float2 uv = in.position.xy / screenSize;
+            return portalTex.sample(textureSampler, uv);
         }
 
         vertex EntityVertexOut q3_entity_vertex(const device EntityVertexIn *vertices [[buffer(0)]],
@@ -309,10 +507,35 @@ struct MetalView: UIViewRepresentable {
         }
 
         fragment float4 q3_entity_fragment(EntityVertexOut in [[stage_in]],
+                                           constant float4 &debugPassColor [[buffer(0)]],
                                            texture2d<float> colorTexture [[texture(0)]],
                                            sampler textureSampler [[sampler(0)]]) {
+            if (debugPassColor.a >= 0.9) {
+                return debugPassColor;  // solid replace
+            }
             float4 texel = colorTexture.sample(textureSampler, in.texCoord);
-            return texel * in.color;
+            float4 outColor = texel * in.color;
+            if (debugPassColor.a > 0.01) {
+                outColor.rgb = mix(outColor.rgb, debugPassColor.rgb, debugPassColor.a);
+            }
+            return outColor;
+        }
+
+        fragment float4 q3_entity_additive_fragment(EntityVertexOut in [[stage_in]],
+                                                    constant float4 &debugPassColor [[buffer(0)]],
+                                                    texture2d<float> colorTexture [[texture(0)]],
+                                                    sampler textureSampler [[sampler(0)]]) {
+            if (debugPassColor.a >= 0.9) {
+                return debugPassColor;  // solid replace
+            }
+            float4 texel = colorTexture.sample(textureSampler, in.texCoord);
+            float alpha = texel.a * in.color.a;
+            float3 glow = texel.rgb * alpha * in.color.rgb * 0.35;
+            float4 outColor = float4(glow, alpha);
+            if (debugPassColor.a > 0.01) {
+                outColor.rgb = mix(outColor.rgb, debugPassColor.rgb, debugPassColor.a);
+            }
+            return outColor;
         }
 
         /* ================ Sky rendering ================
@@ -417,10 +640,22 @@ struct MetalView: UIViewRepresentable {
 
         private var commandQueue: MTLCommandQueue?
         private var uiPipelineState: MTLRenderPipelineState?
+        // Filter-mode UI pipeline (dst_color, zero). Specifically for
+        // `viewBloodBlend` and any other 2D overlay whose Q3 shader uses
+        // `blendFunc GL_DST_COLOR GL_*` — without this, they render through
+        // the default alpha pipeline as an opaque red overlay that blocks
+        // the view.
+        private var uiFilterPipelineState: MTLRenderPipelineState?
         private var worldPipelineState: MTLRenderPipelineState?
         private var worldFilterPipelineState: MTLRenderPipelineState?
         private var worldAlphaPipelineState: MTLRenderPipelineState?
         private var worldAdditivePipelineState: MTLRenderPipelineState?
+        // Premultiplied-alpha blend (src=ONE, dst=ONE_MINUS_SRC_ALPHA).
+        // For Q3 shaders with `blendFunc GL_ONE GL_ONE_MINUS_SRC_ALPHA` —
+        // their texels are pre-multiplied by alpha, so using the plain
+        // alpha pipeline (SRC_ALPHA / ONE_MINUS_SRC_ALPHA) darkens edges
+        // by multiplying src.rgb by src.a twice.
+        private var worldPremultPipelineState: MTLRenderPipelineState?
         private var skyPipelineState: MTLRenderPipelineState?
         private var skyAdditivePipelineState: MTLRenderPipelineState?
         private var skyDepthStencilState: MTLDepthStencilState?
@@ -435,6 +670,40 @@ struct MetalView: UIViewRepresentable {
         private var additiveDepthStencilState: MTLDepthStencilState?
         private var depthHackDepthStencilState: MTLDepthStencilState?
         private var fallbackDepthStencilState: MTLDepthStencilState?
+        var whiteTexture: MTLTexture!
+
+        // Phase-1 portal RTT targets. Created in configureRenderer and
+        // resized in mtkView(_:drawableSizeWillChange:). The portal pass
+        // renders the world+sky from a shifted camera into portalTexture,
+        // which the main pass then samples as the portal surface's fill.
+        private var portalTexture: MTLTexture?
+        private var portalDepthTexture: MTLTexture?
+        private var worldPortalPipelineState: MTLRenderPipelineState?
+        private var entityPortalPipelineState: MTLRenderPipelineState?
+
+        private func createPortalTargets(device: MTLDevice, size: CGSize, colorPixelFormat: MTLPixelFormat) {
+            let width = max(1, Int(size.width))
+            let height = max(1, Int(size.height))
+            let colorDesc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: colorPixelFormat,
+                width: width,
+                height: height,
+                mipmapped: false
+            )
+            colorDesc.usage = [.renderTarget, .shaderRead]
+            colorDesc.storageMode = .private
+            portalTexture = device.makeTexture(descriptor: colorDesc)
+
+            let depthDesc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .depth32Float,
+                width: width,
+                height: height,
+                mipmapped: false
+            )
+            depthDesc.usage = [.renderTarget]
+            depthDesc.storageMode = .private
+            portalDepthTexture = device.makeTexture(descriptor: depthDesc)
+        }
 
         private func ensuredDepthStencilState(_ preferred: MTLDepthStencilState?, device: MTLDevice?) -> MTLDepthStencilState? {
             if let preferred { return preferred }
@@ -466,25 +735,87 @@ struct MetalView: UIViewRepresentable {
         func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
             print("[Metal] Drawable size: \(size)")
             Q3MetalRenderer_UpdateDrawableSize(Int32(size.width), Int32(size.height))
+            if let device = view.device {
+                createPortalTargets(device: device, size: size, colorPixelFormat: view.colorPixelFormat)
+            }
         }
+        private var inFrame = false
 
         func draw(in view: MTKView) {
+
             if commandQueue == nil {
                 configureRenderer(for: view)
             }
 
-            Q3MetalRenderer_UpdateDrawableSize(Int32(view.drawableSize.width), Int32(view.drawableSize.height))
+            if inFrame {
+                print("[ERROR] draw() re-entered")
+                return
+            }
+            inFrame = true
+
+            let frameTime = CACurrentMediaTime()
+            let SKY_FLAG = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
+            let NOCULL_FLAG = UInt32(Q3_METAL_WORLD_DRAWFLAG_NOCULL)
+            let LIGHTMAP_MULTIPLY_FLAG = UInt32(Q3_METAL_WORLD_DRAWFLAG_LIGHTMAP_MULTIPLY)
+            let PORTAL_FLAG = UInt32(Q3_METAL_WORLD_DRAWFLAG_PORTAL)
+
+            // Debug pass colorizer (`metal_debug_passes`):
+            //   0 = off (normal rendering)
+            //   1 = solid replace: fragment returns a flat per-pass color
+            //   2 = tint: texture stays visible but gets mixed with the pass
+            //       color so you can still navigate the map.
+            // Per-pass RGB: 0=opaque (red), 1=filter (green), 2=alpha (blue),
+            // 3=additive (yellow). Alpha channel carries the mode marker —
+            // shaders test `a >= 0.9` for solid, `a > 0.01` (but < 0.9) for
+            // tint. a = 0 means off.
+            let debugPassesMode = Q3MetalRenderer_GetDebugPasses()
+            let debugAlpha: Float = (debugPassesMode == 2) ? 0.55 : ((debugPassesMode == 1) ? 1.0 : 0.0)
+            func debugColor(pass: Int) -> SIMD4<Float> {
+                guard debugAlpha > 0.0 else { return SIMD4<Float>(0, 0, 0, 0) }
+                switch pass {
+                case 0: return SIMD4<Float>(1, 0, 0, debugAlpha) // opaque
+                case 1: return SIMD4<Float>(0, 1, 0, debugAlpha) // filter
+                case 2: return SIMD4<Float>(0, 0, 1, debugAlpha) // alpha
+                case 3: return SIMD4<Float>(1, 1, 0, debugAlpha) // additive
+                default: return SIMD4<Float>(0, 0, 0, 0)
+                }
+            }
+            func worldPassIndex(blendMode: UInt32) -> Int {
+                switch blendMode {
+                case 1: return 3  // additive
+                case 2: return 2  // alpha
+                case 3: return 1  // filter
+                case 4: return 2  // premultiplied-alpha (reuse alpha debug color)
+                default: return 0 // opaque
+                }
+            }
+
+            // ---- 1. RUN ENGINE (LOGIC ONLY) ----
             Quake3_Frame()
 
-            guard let snapshot = Q3MetalRenderer_GetFrameSnapshot()?.pointee else { return }
+            // ---- 2. SNAPSHOT ----
+            guard let snapshotPtr = Q3MetalRenderer_GetFrameSnapshot() else {
+                print("[FRAME] no snapshot")
+                inFrame = false
+                return
+            }
+            let snapshot = snapshotPtr.pointee
+            let drawWorldEnabled = Q3MetalRenderer_GetDrawWorld() != 0
+            let drawEntitiesEnabled = Q3MetalRenderer_GetDrawEntities() != 0
+            let noCullEnabled = Q3MetalRenderer_GetNoCull() != 0
+            let noPortalsEnabled = Q3MetalRenderer_GetNoPortals() != 0
+
+            // ---- 3. ACQUIRE DRAWABLE ONCE ----
             guard let drawable = view.currentDrawable,
                   let descriptor = view.currentRenderPassDescriptor,
-                  let commandQueue,
-                  let uiSamplerState,
-                  let worldSamplerState,
+                  let commandQueue = commandQueue,
                   let commandBuffer = commandQueue.makeCommandBuffer()
-            else { return }
+            else {
+                inFrame = false
+                return
+            }
 
+            // ---- 4. SET CLEAR ----
             descriptor.colorAttachments[0].clearColor = MTLClearColor(
                 red: Double(snapshot.clearColor.0),
                 green: Double(snapshot.clearColor.1),
@@ -492,94 +823,416 @@ struct MetalView: UIViewRepresentable {
                 alpha: Double(snapshot.clearColor.3)
             )
 
-            guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
-                return
-            }
+            // ---- 4.5 PORTAL PASS (Phase 1 RTT) ----
+            // Renders the world from an alternate camera into portalTexture
+            // so the main pass can sample it on portal surfaces. Phase 1
+            // scope: opaque stage-0 draws only; sky and portal surfaces are
+            // skipped (no recursion). Runs before the main encoder so the
+            // portal texture is ready when the main pass samples it.
+            if let portalColor = portalTexture,
+               let portalDepth = portalDepthTexture,
+               snapshot.worldCommandCount > 0,
+               let worldDrawsPointerPortal = Q3MetalRenderer_GetWorldDrawCommands(),
+               let sceneViewPtr = Q3MetalRenderer_GetSceneView(),
+               let worldVB = uploadWorldBuffers(device: view.device, generation: snapshot.worldGeneration),
+               let worldIB = worldIndexBuffer,
+               let worldMainPipeline = worldPipelineState {
+                let mainSceneView = sceneViewPtr.pointee
+                var portalCam = Q3MetalPortalView()
+                let hasRealPortal = Q3MetalRenderer_GetPortalView(&portalCam) != 0
+                let smokeTestOn = Q3MetalRenderer_GetPortalSmokeTest() != 0
+                // Phase-2 visibility gate: skip the portal RTT pass entirely
+                // when the map has no portal surfaces and no portal entity is
+                // in the scene. This is ~99% of maps. Recovers the FPS lost
+                // to Phase-1's always-on portal pass.
+                let hasVisiblePortalSurface = Q3MetalRenderer_HasVisiblePortal() != 0
 
-            if snapshot.worldCommandCount > 0,
-               let worldPipelineState,
-               let sceneView = Q3MetalRenderer_GetSceneView()?.pointee,
-               let worldVertexBuffer = uploadWorldBuffers(device: view.device, generation: snapshot.worldGeneration),
-               let worldIndexBuffer {
-                let viewProjection = makeWorldViewProjection(sceneView)
-                let cameraPos = SIMD3<Float>(sceneView.viewOrigin.0, sceneView.viewOrigin.1, sceneView.viewOrigin.2)
-                var worldUniforms = WorldUniforms(viewProjection: viewProjection, cameraPos: cameraPos)
-                encoder.setRenderPipelineState(worldPipelineState)
-                encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
-                encoder.setFrontFacing(.clockwise)
-                encoder.setCullMode(.none)
-                encoder.setVertexBuffer(worldVertexBuffer, offset: 0, index: 0)
-                encoder.setVertexBytes(&worldUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
-                // Also bind WorldUniforms at fragment index 1. The sky
-                // fragment shader reads `constant WorldUniforms &uniforms
-                // [[buffer(1)]]` for cameraPos; without this bind, the
-                // read hits undefined memory and produces vertical
-                // smear bands across the sky.
-                encoder.setFragmentBytes(&worldUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
-                encoder.setFragmentSamplerState(worldSamplerState, index: 0)
+                // Rate-limited cull probe. Prints once per ~120 frames so
+                // non-portal maps get a steady "skipped" heartbeat and
+                // portal maps go quiet when the mirror is in view. Helps
+                // confirm the gate is actually firing at runtime.
+                if !hasVisiblePortalSurface, snapshot.frameNumber % 120 == 0 {
+                    print("[PORTAL] skipped frame=\(snapshot.frameNumber)")
+                }
 
-                if let worldDrawsPointer = Q3MetalRenderer_GetWorldDrawCommands(),
-                   let indicesPointer = Q3MetalRenderer_GetWorldIndices() {
-                    let _ = indicesPointer
-                    let worldDraws = UnsafeBufferPointer(start: worldDrawsPointer, count: Int(snapshot.worldCommandCount))
-                    let timeSeconds = Float(CACurrentMediaTime() - frameTimeOrigin)
+                if hasVisiblePortalSurface && (hasRealPortal || smokeTestOn) {
+                    var portalSceneView = mainSceneView
+                    if hasRealPortal {
+                        portalSceneView.viewOrigin = (portalCam.origin.0, portalCam.origin.1, portalCam.origin.2)
+                        portalSceneView.viewAxis = (
+                            portalCam.axis.0, portalCam.axis.1, portalCam.axis.2,
+                            portalCam.axis.3, portalCam.axis.4, portalCam.axis.5,
+                            portalCam.axis.6, portalCam.axis.7, portalCam.axis.8
+                        )
+                    } else {
+                        // Smoke test fallback: shift the main camera 50u up Z so
+                        // the RTT shows a visibly different view. Axis inherited.
+                        portalSceneView.viewOrigin = (
+                            mainSceneView.viewOrigin.0,
+                            mainSceneView.viewOrigin.1,
+                            mainSceneView.viewOrigin.2 + 50.0
+                        )
+                    }
 
-                    let skyFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
+                    let portalVP = makeWorldViewProjection(portalSceneView)
+                    let portalCamPos = SIMD3<Float>(
+                        portalSceneView.viewOrigin.0,
+                        portalSceneView.viewOrigin.1,
+                        portalSceneView.viewOrigin.2
+                    )
+                    var portalWorldUniforms = WorldUniforms(
+                        viewProjection: portalVP,
+                        cameraPos: portalCamPos
+                    )
 
-                    // Ordered world passes:
-                    // 0 = opaque, 1 = filter, 2 = alpha, 3 = additive.
-                    // Sky draws are handled in pass 0 through the sky pipeline
-                    // (view-direction spherical projection, no lightmap).
-                    for worldPass in 0..<4 {
-                    for draw in worldDraws where draw.indexCount > 0 {
-                        let isSky = (draw.flags & skyFlagBit) != 0
-                        if isSky {
-                            // Only emit sky during the opaque pass to avoid
-                            // duplicated draws across 4 pass iterations.
-                            guard worldPass == 0 else { continue }
-                            guard let skyPipelineState, let skyDepthStencilState else { continue }
+                    let portalPassDescriptor = MTLRenderPassDescriptor()
+                    portalPassDescriptor.colorAttachments[0].texture = portalColor
+                    portalPassDescriptor.colorAttachments[0].loadAction = .clear
+                    portalPassDescriptor.colorAttachments[0].storeAction = .store
+                    portalPassDescriptor.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+                    portalPassDescriptor.depthAttachment.texture = portalDepth
+                    portalPassDescriptor.depthAttachment.loadAction = .clear
+                    portalPassDescriptor.depthAttachment.storeAction = .dontCare
+                    portalPassDescriptor.depthAttachment.clearDepth = 1.0
+
+                    if let portalEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: portalPassDescriptor) {
+                        portalEncoder.setFrontFacing(.clockwise)
+                        portalEncoder.setVertexBuffer(worldVB, offset: 0, index: 0)
+                        portalEncoder.setVertexBytes(&portalWorldUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
+                        portalEncoder.setFragmentBytes(&portalWorldUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
+                        portalEncoder.setFragmentSamplerState(worldSamplerState, index: 0)
+
+                        let portalWorldDraws = UnsafeBufferPointer(
+                            start: worldDrawsPointerPortal,
+                            count: Int(snapshot.worldCommandCount)
+                        )
+                        let SKY_FLAG_PORTAL = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
+                        let NOCULL_FLAG_PORTAL = UInt32(Q3_METAL_WORLD_DRAWFLAG_NOCULL)
+                        let PORTAL_FLAG_PORTAL = UInt32(Q3_METAL_WORLD_DRAWFLAG_PORTAL)
+                        let portalTimeSeconds = Float(frameTime - frameTimeOrigin)
+
+                        // ---- SKY (in portal pass) ----
+                        // Mirror of the main-pass sky block. Renders into the
+                        // portal RTT so looking through a mirror at the sky
+                        // doesn't produce a black patch.
+                        if let skyPipelineState, let skyDepthStencilState {
+                            for draw in portalWorldDraws where draw.indexCount > 0 && (draw.flags & SKY_FLAG_PORTAL) != 0 {
+                                if (draw.flags & PORTAL_FLAG_PORTAL) != 0 { continue }
+                                let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+                                guard stageCount > 0 else { continue }
+                                for stageIndex in 0..<stageCount {
+                                    let stage = Self.worldStage(draw, stageIndex)
+                                    guard let skyTex = texture(for: stage.textureHandle, device: view.device) else { continue }
+                                    let useAdditiveSky = stage.blendMode == 1 && skyAdditivePipelineState != nil
+                                    portalEncoder.setRenderPipelineState(useAdditiveSky ? skyAdditivePipelineState! : skyPipelineState)
+                                    portalEncoder.setDepthStencilState(skyDepthStencilState)
+                                    portalEncoder.setCullMode(.none)
+                                    var skyDrawUniforms = WorldDrawUniforms(
+                                        tcGen: Float(stage.tcGen),
+                                        tcMod: Float(stage.tcMod),
+                                        rgbGen: Float(stage.rgbGen),
+                                        timeSeconds: portalTimeSeconds,
+                                        tcModParams: Self.stageTcModParams(stage),
+                                        debugMode: 0,
+                                        forceWhiteVertColor: 1,
+                                        alphaTestThreshold: 0,
+                                        blendMode: Int32(stage.blendMode),
+                                        alphaGen: Float(stage.alphaGen),
+                                        debugPassColor: SIMD4<Float>(0, 0, 0, 0)
+                                    )
+                                    portalEncoder.setFragmentTexture(skyTex, index: 0)
+                                    portalEncoder.setFragmentBytes(&skyDrawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 0)
+                                    portalEncoder.drawIndexedPrimitives(
+                                        type: .triangle,
+                                        indexCount: Int(draw.indexCount),
+                                        indexType: .uint32,
+                                        indexBuffer: worldIB,
+                                        indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride
+                                    )
+                                }
+                            }
+                            // Restore default world state before world loop.
+                            portalEncoder.setDepthStencilState(depthStencilState)
+                            portalEncoder.setCullMode(.back)
+                        }
+
+                        // ---- WORLD (in portal pass, full stage iteration) ----
+                        // Same shape as the main-pass world loop: opaquePhase
+                        // split, per-stage blend/pipeline/depth selection.
+                        // Portal surfaces skip (no recursion). Entities skipped
+                        // for Phase 2 — only world+sky renders into the RTT.
+                        for draw in portalWorldDraws where draw.indexCount > 0 && (draw.flags & SKY_FLAG_PORTAL) == 0 {
+                            if (draw.flags & PORTAL_FLAG_PORTAL) != 0 { continue }
                             let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
                             guard stageCount > 0 else { continue }
 
-                            // One-shot diagnostic: log the sky draw's stage
-                            // layout so we can confirm killsky (stage0=base,
-                            // stage1=additive cloud overlay) is wired end-to-end.
-                            if !skyStagesLogged {
-                                skyStagesLogged = true
-                                print("[Metal] sky draw stageCount=\(stageCount) flags=0x\(String(draw.flags, radix: 16))")
-                                for i in 0..<stageCount {
-                                    let s = Self.worldStage(draw, i)
-                                    print("[Metal]   sky stage \(i): tex=\(s.textureHandle) blend=\(s.blendMode) tcMod=\(s.tcMod) tcModParams=(\(s.tcModParams.0),\(s.tcModParams.1),\(s.tcModParams.2),\(s.tcModParams.3))")
+                            portalEncoder.setCullMode((draw.flags & NOCULL_FLAG_PORTAL) != 0 ? .none : .back)
+
+                            for opaquePhase in 0..<2 {
+                                for stageIndex in 0..<stageCount {
+                                    let stage = Self.worldStage(draw, stageIndex)
+                                    let mode = stage.blendMode
+                                    let isOpaqueStage = mode == 0
+                                    if opaquePhase == 0 {
+                                        guard isOpaqueStage else { continue }
+                                    } else {
+                                        guard !isOpaqueStage else { continue }
+                                    }
+
+                                    guard let stageTexture = texture(for: stage.textureHandle, device: view.device) else { continue }
+
+                                    switch mode {
+                                    case 1:
+                                        if let p = worldAdditivePipelineState { portalEncoder.setRenderPipelineState(p) }
+                                    case 2:
+                                        if let p = worldAlphaPipelineState { portalEncoder.setRenderPipelineState(p) }
+                                    case 3:
+                                        if let p = worldFilterPipelineState { portalEncoder.setRenderPipelineState(p) }
+                                    case 4:
+                                        if let p = worldPremultPipelineState { portalEncoder.setRenderPipelineState(p) }
+                                    default:
+                                        portalEncoder.setRenderPipelineState(worldMainPipeline)
+                                    }
+
+                                    if isOpaqueStage {
+                                        portalEncoder.setDepthStencilState(depthStencilState)
+                                    } else {
+                                        portalEncoder.setDepthStencilState(additiveDepthStencilState)
+                                    }
+
+                                    portalEncoder.setFragmentTexture(stageTexture, index: 0)
+                                    let usesLightmap = (mode == 0 || mode == 3)
+                                    if usesLightmap, let lightmap = texture(for: draw.lightmapTextureHandle, device: view.device) {
+                                        portalEncoder.setFragmentTexture(lightmap, index: 1)
+                                    } else {
+                                        portalEncoder.setFragmentTexture(whiteTexture, index: 1)
+                                    }
+
+                                    var drawUniforms = WorldDrawUniforms(
+                                        tcGen: Float(stage.tcGen),
+                                        tcMod: Float(stage.tcMod),
+                                        rgbGen: Float(stage.rgbGen),
+                                        timeSeconds: portalTimeSeconds,
+                                        tcModParams: Self.stageTcModParams(stage),
+                                        debugMode: 0,
+                                        forceWhiteVertColor: mode == 1 ? 1 : 0,
+                                        alphaTestThreshold: Self.alphaTestThreshold(for: stage.alphaFunc),
+                                        blendMode: Int32(mode),
+                                        alphaGen: Float(stage.alphaGen),
+                                        debugPassColor: SIMD4<Float>(0, 0, 0, 0)
+                                    )
+                                    portalEncoder.setFragmentBytes(&drawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 0)
+                                    portalEncoder.drawIndexedPrimitives(
+                                        type: .triangle,
+                                        indexCount: Int(draw.indexCount),
+                                        indexType: .uint32,
+                                        indexBuffer: worldIB,
+                                        indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride
+                                    )
                                 }
                             }
+                        }
+                        portalEncoder.endEncoding()
+                    }
+                }
+            }
 
-                            // Render each sky stage in order. Stage 0 is the
-                            // base sky (opaque through the sky pipeline with
-                            // depth-write off). Subsequent stages are overlays
-                            // — killsky spec sheet stage 1 is GL_ONE/GL_ONE
-                            // additive. Use the stage's blendMode to decide.
-                            for stageIndex in 0..<stageCount {
-                                let stage = Self.worldStage(draw, stageIndex)
-                                guard let skyStageTexture = texture(for: stage.textureHandle, device: view.device) else {
-                                    continue
-                                }
-                                let isAdditive = (stageIndex > 0) && (Int(stage.blendMode) == 1)
-                                let pipeline = isAdditive ? (skyAdditivePipelineState ?? skyPipelineState) : skyPipelineState
-                                encoder.setRenderPipelineState(pipeline)
-                                encoder.setDepthStencilState(skyDepthStencilState)
-                                var skyDrawUniforms = WorldDrawUniforms(
-                                    tcGen: Float(stage.tcGen),
-                                    tcMod: Float(stage.tcMod),
-                                    rgbGen: Float(stage.rgbGen),
-                                    timeSeconds: timeSeconds,
-                                    tcModParams: Self.stageTcModParams(stage),
-                                    debugMode: 0,
-                                    forceWhiteVertColor: 0,
-                                    alphaTestThreshold: 0,
-                                    _pad0: 0
-                                )
-                                encoder.setFragmentTexture(skyStageTexture, index: 0)
-                                encoder.setFragmentBytes(&skyDrawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 0)
+            guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
+                inFrame = false
+                return
+            }
+
+            // =========================================================
+            // 🔥 FULL RENDER PIPELINE STARTS HERE
+            // =========================================================
+
+            // ---- SKY ----
+            if drawWorldEnabled,
+               snapshot.worldCommandCount > 0,
+               let worldDrawsPointer = Q3MetalRenderer_GetWorldDrawCommands(),
+               let sceneView = Q3MetalRenderer_GetSceneView()?.pointee,
+               let worldVertexBuffer = uploadWorldBuffers(device: view.device, generation: snapshot.worldGeneration),
+               let worldIndexBuffer,
+               let skyPipelineState,
+               let skyDepthStencilState {
+
+                let worldDraws = Array(
+                    UnsafeBufferPointer(
+                        start: worldDrawsPointer,
+                        count: Int(snapshot.worldCommandCount)
+                    )
+                )
+
+                var worldUniforms = WorldUniforms(
+                    viewProjection: makeWorldViewProjection(sceneView),
+                    cameraPos: SIMD3<Float>(
+                        sceneView.viewOrigin.0,
+                        sceneView.viewOrigin.1,
+                        sceneView.viewOrigin.2
+                    )
+                )
+
+                encoder.setVertexBuffer(worldVertexBuffer, offset: 0, index: 0)
+                encoder.setVertexBytes(&worldUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
+
+                for draw in worldDraws where draw.indexCount > 0 && (draw.flags & SKY_FLAG) != 0 {
+                    if noPortalsEnabled && (draw.flags & PORTAL_FLAG) != 0 {
+                        continue
+                    }
+                    let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+                    guard stageCount > 0 else { continue }
+
+                    for stageIndex in 0..<stageCount {
+                        let stage = Self.worldStage(draw, stageIndex)
+                        guard let skyTexture = texture(for: stage.textureHandle, device: view.device) else {
+                            continue
+                        }
+
+                        let useAdditiveSky = stage.blendMode == 1 && skyAdditivePipelineState != nil
+                        encoder.setRenderPipelineState(useAdditiveSky ? skyAdditivePipelineState! : skyPipelineState)
+                        encoder.setDepthStencilState(skyDepthStencilState)
+                        encoder.setCullMode(.none)
+                        encoder.setFragmentSamplerState(worldSamplerState, index: 0)
+
+                        var drawUniforms = WorldDrawUniforms(
+                            tcGen: Float(stage.tcGen),
+                            tcMod: Float(stage.tcMod),
+                            rgbGen: Float(stage.rgbGen),
+                            timeSeconds: Float(frameTime - frameTimeOrigin),
+                            tcModParams: Self.stageTcModParams(stage),
+                            debugMode: Self.worldDebugMode,
+                            forceWhiteVertColor: 1,
+                            alphaTestThreshold: 0,
+                            blendMode: Int32(stage.blendMode),
+                            alphaGen: Float(stage.alphaGen),
+                            debugPassColor: debugColor(pass: worldPassIndex(blendMode: stage.blendMode))
+                        )
+
+                        encoder.setFragmentTexture(skyTexture, index: 0)
+                        encoder.setFragmentBytes(&drawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 0)
+                        encoder.setFragmentBytes(&worldUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
+
+                        encoder.drawIndexedPrimitives(
+                            type: .triangle,
+                            indexCount: Int(draw.indexCount),
+                            indexType: .uint32,
+                            indexBuffer: worldIndexBuffer,
+                            indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride
+                        )
+                    }
+                }
+
+                // Restore depth state for world/entities
+                encoder.setDepthStencilState(depthStencilState)
+                encoder.setCullMode(.back)
+            }
+            // ---- WORLD ----
+            if drawWorldEnabled,
+               snapshot.worldCommandCount > 0,
+               let worldDrawsPointer = Q3MetalRenderer_GetWorldDrawCommands(),
+               let sceneView = Q3MetalRenderer_GetSceneView()?.pointee,
+               let worldVertexBuffer = uploadWorldBuffers(device: view.device, generation: snapshot.worldGeneration),
+               let worldIndexBuffer {
+
+                let worldDraws = Array(
+                    UnsafeBufferPointer(
+                        start: worldDrawsPointer,
+                        count: Int(snapshot.worldCommandCount)
+                    )
+                )
+
+                let timeSeconds = Float(frameTime - frameTimeOrigin)
+                let debugRenderMode = Float(Q3MetalRenderer_GetDebugRenderMode())
+                // Diagnostic toggle: pin UVs to static BSP values by forcing
+                // tcMod to 0 on every stage. Used to isolate whether
+                // "flying texture" artifacts come from the tcMod parameter
+                // path. Toggle with `\r_disableTcMod 1`.
+                let disableTcMod = Q3MetalRenderer_GetDisableTcMod() != 0
+
+                // build uniforms
+                let viewProjection = makeWorldViewProjection(sceneView)
+                let cameraPos = SIMD3<Float>(
+                    sceneView.viewOrigin.0,
+                    sceneView.viewOrigin.1,
+                    sceneView.viewOrigin.2
+                )
+
+                var worldUniforms = WorldUniforms(
+                    viewProjection: viewProjection,
+                    cameraPos: cameraPos
+                )
+
+                encoder.setDepthStencilState(depthStencilState)
+                encoder.setVertexBuffer(worldVertexBuffer, offset: 0, index: 0)
+                encoder.setVertexBytes(&worldUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
+                encoder.setFragmentBytes(&worldUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
+
+                // ---- DRAW WORLD PASSES ----
+                // Batching strategy: hoist the opaque/non-opaque phase loop
+                // outside the per-draw iteration so adjacent same-state
+                // stages across draws emit contiguously, then coalesce runs
+                // of same-state stages with contiguous index ranges into a
+                // single drawIndexedPrimitives call. BSP loader emits each
+                // surface's indices directly after the previous one, so
+                // adjacent draws naturally have contiguous index ranges.
+                encoder.setFragmentSamplerState(worldSamplerState, index: 0)
+
+                // Per-phase batch state. These are reset at each phase
+                // boundary; a flush writes the current run and clears.
+                var lastPipeline: MTLRenderPipelineState? = nil
+                var lastDepth: MTLDepthStencilState? = nil
+                var lastCull: MTLCullMode = .back
+                var lastTex0: MTLTexture? = nil
+                var lastTex1: MTLTexture? = nil
+                var lastUniforms: WorldDrawUniforms? = nil
+                var runFirstIndex: UInt32 = 0
+                var runIndexCount: UInt32 = 0
+                var emittedDrawCalls: Int = 0
+                var stagesSeen: Int = 0
+
+                func flushRun() {
+                    if runIndexCount > 0 {
+                        encoder.drawIndexedPrimitives(
+                            type: .triangle,
+                            indexCount: Int(runIndexCount),
+                            indexType: .uint32,
+                            indexBuffer: worldIndexBuffer,
+                            indexBufferOffset: Int(runFirstIndex) * MemoryLayout<UInt32>.stride
+                        )
+                        emittedDrawCalls += 1
+                        runIndexCount = 0
+                    }
+                }
+
+                for opaquePhase in 0..<2 {
+                    // New phase → reset tracked state so first draw rebinds everything.
+                    flushRun()
+                    lastPipeline = nil
+                    lastDepth = nil
+                    lastCull = .back
+                    lastTex0 = nil
+                    lastTex1 = nil
+                    lastUniforms = nil
+
+                    for draw in worldDraws where draw.indexCount > 0 && (draw.flags & SKY_FLAG) == 0 {
+                        if noPortalsEnabled && (draw.flags & PORTAL_FLAG) != 0 {
+                            continue
+                        }
+
+                        // Phase-1 portal-surface override. Portals render once
+                        // during the opaque phase as a single drawcall sampling
+                        // portalTexture; skip entirely during the non-opaque
+                        // phase. State is completely distinct from normal world
+                        // rendering, so a portal always flushes the current run.
+                        if (draw.flags & PORTAL_FLAG) != 0 {
+                            if opaquePhase != 0 { continue }
+                            if let portalPipeline = worldPortalPipelineState,
+                               let portalTex = portalTexture {
+                                flushRun()
+                                encoder.setRenderPipelineState(portalPipeline)
+                                encoder.setDepthStencilState(additiveDepthStencilState)
+                                encoder.setCullMode(.none)
+                                encoder.setFragmentTexture(portalTex, index: 0)
                                 encoder.drawIndexedPrimitives(
                                     type: .triangle,
                                     indexCount: Int(draw.indexCount),
@@ -587,87 +1240,152 @@ struct MetalView: UIViewRepresentable {
                                     indexBuffer: worldIndexBuffer,
                                     indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride
                                 )
-                            }
-                            continue
-                        }
-                        guard let lightmapTexture = texture(for: draw.lightmapTextureHandle, device: view.device) else {
-                            continue
-                        }
-                        let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
-                        guard stageCount > 0 else { continue }
-                        for stageIndex in 0..<stageCount {
-                            let stage = Self.worldStage(draw, stageIndex)
-                            let blendMode = Int(stage.blendMode)
-                            let drawPass = (blendMode == 1) ? 3 : ((blendMode == 2) ? 2 : ((blendMode == 3) ? 1 : 0))
-                            guard drawPass == worldPass else { continue }
-                            guard let baseTexture = texture(for: stage.textureHandle, device: view.device) else {
+                                emittedDrawCalls += 1
+                                // Force rebind on next non-portal draw.
+                                lastPipeline = nil
+                                lastDepth = nil
+                                lastCull = .none
+                                lastTex0 = nil
+                                lastTex1 = nil
+                                lastUniforms = nil
                                 continue
                             }
-                            if drawPass == 3, let worldAdditivePipelineState {
-                                encoder.setRenderPipelineState(worldAdditivePipelineState)
-                                encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
-                            } else if drawPass == 2, let worldAlphaPipelineState {
-                                encoder.setRenderPipelineState(worldAlphaPipelineState)
-                                encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
-                            } else if drawPass == 1, let worldFilterPipelineState {
-                                encoder.setRenderPipelineState(worldFilterPipelineState)
-                                encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
-                            } else {
-                                encoder.setRenderPipelineState(worldPipelineState)
-                                encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
+                            // Portal pipeline not ready — fall through to
+                            // normal stage path so the surface still draws.
+                        }
+
+                        let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+                        guard stageCount > 0 else { continue }
+
+                        let targetCull: MTLCullMode =
+                            (noCullEnabled || (draw.flags & NOCULL_FLAG) != 0) ? .none : .back
+
+                        for stageIndex in 0..<stageCount {
+                            let stage = Self.worldStage(draw, stageIndex)
+                            let mode = stage.blendMode
+                            let isOpaqueStage = mode == 0
+                            if (opaquePhase == 0) != isOpaqueStage { continue }
+
+                            guard let stageTexture = texture(for: stage.textureHandle, device: view.device) else {
+                                continue
                             }
-                            let alphaTest = Self.alphaTestThreshold(for: stage.alphaFunc)
-                            var drawUniforms = WorldDrawUniforms(
+                            stagesSeen += 1
+
+                            let targetPipeline: MTLRenderPipelineState?
+                            switch mode {
+                            case 1: targetPipeline = worldAdditivePipelineState
+                            case 2: targetPipeline = worldAlphaPipelineState
+                            case 3: targetPipeline = worldFilterPipelineState
+                            case 4: targetPipeline = worldPremultPipelineState
+                            default: targetPipeline = worldPipelineState
+                            }
+                            guard let targetPipeline else { continue }
+
+                            let targetDepth: MTLDepthStencilState? =
+                                isOpaqueStage ? depthStencilState : additiveDepthStencilState
+
+                            let usesLightmap = (draw.flags & LIGHTMAP_MULTIPLY_FLAG) != 0 && (mode == 0 || mode == 3)
+                            let targetTex1: MTLTexture
+                            if usesLightmap,
+                               let lightmap = texture(for: draw.lightmapTextureHandle, device: view.device) {
+                                targetTex1 = lightmap
+                            } else {
+                                targetTex1 = whiteTexture
+                            }
+
+                            let targetUniforms = WorldDrawUniforms(
                                 tcGen: Float(stage.tcGen),
-                                tcMod: Float(stage.tcMod),
+                                tcMod: disableTcMod ? 0 : Float(stage.tcMod),
                                 rgbGen: Float(stage.rgbGen),
                                 timeSeconds: timeSeconds,
-                                tcModParams: Self.stageTcModParams(stage),
-                                debugMode: Coordinator.worldDebugMode,
-                                forceWhiteVertColor: (blendMode == 1) ? 1.0 : 0.0,
-                                alphaTestThreshold: alphaTest,
-                                _pad0: 0.0
+                                tcModParams: disableTcMod ? SIMD4<Float>(0, 0, 0, 0) : Self.stageTcModParams(stage),
+                                debugMode: debugRenderMode,
+                                forceWhiteVertColor: mode == 1 ? 1 : 0,
+                                alphaTestThreshold: Self.alphaTestThreshold(for: stage.alphaFunc),
+                                blendMode: Int32(stage.blendMode),
+                                alphaGen: Float(stage.alphaGen),
+                                debugPassColor: debugColor(pass: worldPassIndex(blendMode: stage.blendMode))
                             )
-                            encoder.setFragmentTexture(baseTexture, index: 0)
-                            encoder.setFragmentTexture(lightmapTexture, index: 1)
-                            encoder.setFragmentBytes(&drawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 0)
-                            encoder.drawIndexedPrimitives(
-                                type: .triangle,
-                                indexCount: Int(draw.indexCount),
-                                indexType: .uint32,
-                                indexBuffer: worldIndexBuffer,
-                                indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride
-                            )
+
+                            let stateMatches =
+                                lastPipeline === targetPipeline &&
+                                lastDepth === targetDepth &&
+                                lastCull == targetCull &&
+                                lastTex0 === stageTexture &&
+                                lastTex1 === targetTex1 &&
+                                lastUniforms == targetUniforms
+
+                            let contiguous =
+                                stateMatches &&
+                                runIndexCount > 0 &&
+                                draw.firstIndex == runFirstIndex + runIndexCount
+
+                            if contiguous {
+                                runIndexCount += draw.indexCount
+                                continue
+                            }
+
+                            // Either state differs or index range breaks —
+                            // flush the accumulated run, then rebind only
+                            // what changed, and start a new run.
+                            flushRun()
+
+                            if lastPipeline !== targetPipeline {
+                                encoder.setRenderPipelineState(targetPipeline)
+                                lastPipeline = targetPipeline
+                            }
+                            if lastDepth !== targetDepth {
+                                if let targetDepth { encoder.setDepthStencilState(targetDepth) }
+                                lastDepth = targetDepth
+                            }
+                            if lastCull != targetCull {
+                                encoder.setCullMode(targetCull)
+                                lastCull = targetCull
+                            }
+                            if lastTex0 !== stageTexture {
+                                encoder.setFragmentTexture(stageTexture, index: 0)
+                                lastTex0 = stageTexture
+                            }
+                            if lastTex1 !== targetTex1 {
+                                encoder.setFragmentTexture(targetTex1, index: 1)
+                                lastTex1 = targetTex1
+                            }
+                            if lastUniforms != targetUniforms {
+                                var u = targetUniforms
+                                encoder.setFragmentBytes(
+                                    &u,
+                                    length: MemoryLayout<WorldDrawUniforms>.stride,
+                                    index: 0
+                                )
+                                lastUniforms = targetUniforms
+                            }
+
+                            runFirstIndex = draw.firstIndex
+                            runIndexCount = draw.indexCount
                         }
                     }
-                    } // end worldPass loop
+
+                    flushRun()
                 }
 
-                debugFrameCounter &+= 1
-                if debugFrameCounter % 60 == 0 {
-                    let axis0 = SIMD3<Float>(sceneView.viewAxis.0, sceneView.viewAxis.1, sceneView.viewAxis.2)
-                    let axis1 = SIMD3<Float>(sceneView.viewAxis.3, sceneView.viewAxis.4, sceneView.viewAxis.5)
-                    let axis2 = SIMD3<Float>(sceneView.viewAxis.6, sceneView.viewAxis.7, sceneView.viewAxis.8)
-                    let fovX = String(format: "%.2f", sceneView.fovX)
-                    let fovY = String(format: "%.2f", sceneView.fovY)
-                    print(
-                        "[Metal] world frame \(debugFrameCounter) " +
-                        "vieworg=(\(sceneView.viewOrigin.0), \(sceneView.viewOrigin.1), \(sceneView.viewOrigin.2)) " +
-                        "axis0=\(formatVector(axis0)) axis1=\(formatVector(axis1)) axis2=\(formatVector(axis2)) " +
-                        "fov=(\(fovX), \(fovY)) " +
-                        "draws=\(snapshot.worldCommandCount) verts=\(snapshot.worldVertexCount) indices=\(snapshot.worldIndexCount)"
-                    )
-                    print("[Metal] world MVP \(formatMatrix(viewProjection))")
+                if Self.worldBatchLogEnabled {
+                    print("[batch] world stages=\(stagesSeen) drawCalls=\(emittedDrawCalls)")
                 }
             }
 
-            if snapshot.entityCommandCount > 0,
+            // ---- ENTITIES ----
+            if drawEntitiesEnabled,
+               snapshot.entityCommandCount > 0,
                let entityPipelineState,
                let sceneView = Q3MetalRenderer_GetSceneView()?.pointee,
                let entityVertexBuffer = uploadEntityBuffers(device: view.device),
-               let entityIndexBuffer {
+               let entityIndexBuffer,
+               let entityDrawsPointer = Q3MetalRenderer_GetEntityDrawCommands() {
+
                 let entityViewProjection = makeWorldViewProjection(sceneView)
+                let entityDepthHackViewProjection = makeDepthHackViewProjection(entityViewProjection)
                 var entityUniforms = EntityUniforms(viewProjection: entityViewProjection)
+                var entityDepthHackUniforms = EntityUniforms(viewProjection: entityDepthHackViewProjection)
                 encoder.setRenderPipelineState(entityPipelineState)
                 encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
                 encoder.setFrontFacing(.clockwise)
@@ -676,17 +1394,99 @@ struct MetalView: UIViewRepresentable {
                 encoder.setVertexBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
                 encoder.setFragmentSamplerState(worldSamplerState, index: 0)
 
-                if let entityDrawsPointer = Q3MetalRenderer_GetEntityDrawCommands() {
-                    let entityDraws = UnsafeBufferPointer(start: entityDrawsPointer, count: Int(snapshot.entityCommandCount))
-                    let depthHackBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_DEPTHHACK)
-                    let additiveBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE)
-                    let alphaBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ALPHA)
-                    let filterBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_FILTER)
+                let entityDraws = UnsafeBufferPointer(start: entityDrawsPointer, count: Int(snapshot.entityCommandCount))
+                let depthHackBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_DEPTHHACK)
+                let additiveBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE)
+                let alphaBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ALPHA)
+                let filterBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_FILTER)
+                let nocullBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_NOCULL)
+                let firstPersonBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_FIRST_PERSON)
+                let portalBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_PORTAL)
 
-                    // Ordered entity passes:
-                    // 0 = opaque, 1 = filter, 2 = alpha, 3 = additive.
-                    for entityPass in 0..<4 {
+                // FIRST_PERSON hard override: viewmodel bypasses the 4-pass
+                // system. Any blendMode on the weapon texture would otherwise
+                // flip wantsReadOnlyDepth on and lose the depth hack, causing
+                // the classic "ghost gun" transparency. Force opaque pipeline
+                // + depth-hack stencil + no cull, and skip these draws in the
+                // main loop below.
+                var firstPersonDebugColor = debugColor(pass: 0)
+                for draw in entityDraws where draw.indexCount > 0 {
+                    guard (draw.flags & firstPersonBit) != 0 else { continue }
+                    if noPortalsEnabled && (draw.flags & portalBit) != 0 {
+                        continue
+                    }
+                    guard let texture = texture(for: draw.textureHandle, device: view.device) else {
+                        continue
+                    }
+                    encoder.setRenderPipelineState(entityPipelineState)
+                    encoder.setDepthStencilState(ensuredDepthStencilState(depthHackDepthStencilState, device: view.device))
+                    encoder.setCullMode(.none)
+                    encoder.setVertexBytes(&entityDepthHackUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
+                    encoder.setFragmentBytes(&firstPersonDebugColor, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+                    encoder.setFragmentTexture(texture, index: 0)
+                    encoder.drawIndexedPrimitives(
+                        type: .triangle,
+                        indexCount: Int(draw.indexCount),
+                        indexType: .uint32,
+                        indexBuffer: entityIndexBuffer,
+                        indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride
+                    )
+                }
+
+                // Ordered entity passes:
+                // 0 = opaque, 1 = filter, 2 = alpha, 3 = additive.
+                for entityPass in 0..<4 {
+                    var passDebugColor = debugColor(pass: entityPass)
+                    encoder.setFragmentBytes(&passDebugColor, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
                     for draw in entityDraws where draw.indexCount > 0 {
+                        if (draw.flags & firstPersonBit) != 0 { continue }
+                        if noPortalsEnabled && (draw.flags & portalBit) != 0 {
+                            continue
+                        }
+
+                        // Phase-2 entity portal override: an entity whose
+                        // surface texture is a portal shader samples
+                        // portalTexture instead of its MD3 skin. Uses the
+                        // dedicated q3_entity_portal_fragment which samples
+                        // by screen position (in.position.xy / screenSize)
+                        // so the RTT image isn't stretched by arbitrary
+                        // MD3 UVs. Routed through the alpha pass only.
+                        if (draw.flags & portalBit) != 0,
+                           entityPass == 2,
+                           let portalTex = portalTexture,
+                           let entityPortalPipeline = entityPortalPipelineState {
+                            encoder.setRenderPipelineState(entityPortalPipeline)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveEntityDepthStencilState, device: view.device))
+                            encoder.setCullMode(.none)
+                            encoder.setVertexBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
+                            var screenSize = SIMD2<Float>(
+                                Float(max(snapshot.drawableWidth, 1)),
+                                Float(max(snapshot.drawableHeight, 1))
+                            )
+                            encoder.setFragmentBytes(&screenSize, length: MemoryLayout<SIMD2<Float>>.stride, index: 0)
+                            encoder.setFragmentTexture(portalTex, index: 0)
+                            encoder.drawIndexedPrimitives(
+                                type: .triangle,
+                                indexCount: Int(draw.indexCount),
+                                indexType: .uint32,
+                                indexBuffer: entityIndexBuffer,
+                                indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride
+                            )
+                            // Restore debugPassColor at fragment buffer 0 —
+                            // the portal override overwrote that slot with
+                            // an 8-byte screenSize, but the subsequent
+                            // non-portal q3_entity_fragment reads 16 bytes
+                            // as debugPassColor. Without this restore the
+                            // shader reads garbage upper bytes and triggers
+                            // solid-replace / tint on every entity drawn
+                            // after a portal entity in this pass.
+                            encoder.setFragmentBytes(&passDebugColor, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+                            continue
+                        }
+                        // Portal-flagged entities on non-alpha passes are
+                        // already handled above; skip in other passes.
+                        if (draw.flags & portalBit) != 0 { continue }
+
                         let isEntityAdditive = (draw.flags & additiveBit) != 0
                         let isEntityAlpha = (draw.flags & alphaBit) != 0
                         let isEntityFilter = (draw.flags & filterBit) != 0
@@ -695,21 +1495,31 @@ struct MetalView: UIViewRepresentable {
                         guard let texture = texture(for: draw.textureHandle, device: view.device) else {
                             continue
                         }
+
                         let wantsDepthHack = (draw.flags & depthHackBit) != 0
+                        let wantsNoCull = (draw.flags & nocullBit) != 0
+                        let wantsReadOnlyDepth = isEntityAdditive || isEntityAlpha || isEntityFilter
+                        encoder.setCullMode(noCullEnabled || wantsNoCull ? .none : .back)
+                        if wantsDepthHack {
+                            encoder.setVertexBytes(&entityDepthHackUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
+                        } else {
+                            encoder.setVertexBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
+                        }
+
                         if drawPass == 3, let entityAdditivePipelineState {
                             encoder.setRenderPipelineState(entityAdditivePipelineState)
-                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveEntityDepthStencilState, device: view.device))
                         } else if drawPass == 2, let entityAlphaPipelineState {
                             encoder.setRenderPipelineState(entityAlphaPipelineState)
-                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveEntityDepthStencilState, device: view.device))
                         } else if drawPass == 1, let entityFilterPipelineState {
                             encoder.setRenderPipelineState(entityFilterPipelineState)
-                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveEntityDepthStencilState, device: view.device))
                         } else {
                             encoder.setRenderPipelineState(entityPipelineState)
-                            let state = wantsDepthHack ? depthHackDepthStencilState : depthStencilState
-                            encoder.setDepthStencilState(ensuredDepthStencilState(state, device: view.device))
                         }
+                        let state = wantsReadOnlyDepth
+                            ? additiveEntityDepthStencilState
+                            : (wantsDepthHack ? depthHackDepthStencilState : depthStencilState)
+                        encoder.setDepthStencilState(ensuredDepthStencilState(state, device: view.device))
+
                         encoder.setFragmentTexture(texture, index: 0)
                         encoder.drawIndexedPrimitives(
                             type: .triangle,
@@ -719,28 +1529,39 @@ struct MetalView: UIViewRepresentable {
                             indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride
                         )
                     }
-                    } // end entityPass loop
                 }
             }
 
-            let vertexCount = Int(snapshot.vertexCount)
-            if vertexCount > 0, let verticesPointer = Q3MetalRenderer_GetVertices(),
-               let vertexBuffer = uploadVertices(UnsafeBufferPointer(start: verticesPointer, count: vertexCount), device: view.device) {
-                let vertices = UnsafeBufferPointer(start: verticesPointer, count: vertexCount)
+            // ---- UI ----
+            if snapshot.vertexCount > 0,
+               let verticesPointer = Q3MetalRenderer_GetVertices(),
+               let drawCommandsPointer = Q3MetalRenderer_GetDrawCommands() {
+
                 let projection = makeOrthoProjection(width: max(Float(snapshot.drawableWidth), 1.0), height: max(Float(snapshot.drawableHeight), 1.0))
                 var uniforms = Uniforms(projection: projection)
 
-                if let uiPipelineState {
-                    encoder.setRenderPipelineState(uiPipelineState)
-                }
                 encoder.setDepthStencilState(ensuredDepthStencilState(nil, device: view.device))
                 encoder.setFragmentSamplerState(uiSamplerState, index: 0)
-                encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
-                encoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
 
-                if let drawCommandsPointer = Q3MetalRenderer_GetDrawCommands() {
+                let vertexCount = Int(snapshot.vertexCount)
+                if let vertexBuffer = uploadVertices(UnsafeBufferPointer(start: verticesPointer, count: vertexCount), device: view.device) {
+                    encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+                    encoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
+
+                    var currentUIPipeline: MTLRenderPipelineState? = nil
                     let drawCommands = UnsafeBufferPointer(start: drawCommandsPointer, count: Int(snapshot.commandCount))
                     for draw in drawCommands {
+                        // Per-draw pipeline switch: blendMode==3 uses the
+                        // filter variant (for viewBloodBlend); everything
+                        // else uses the default alpha-blend UI pipeline.
+                        let targetPipeline: MTLRenderPipelineState? =
+                            (draw.blendMode == 3) ? uiFilterPipelineState : uiPipelineState
+                        if targetPipeline !== currentUIPipeline {
+                            if let p = targetPipeline {
+                                encoder.setRenderPipelineState(p)
+                                currentUIPipeline = p
+                            }
+                        }
                         if let texture = texture(for: draw.textureHandle, device: view.device) {
                             encoder.setFragmentTexture(texture, index: 0)
                             encoder.drawPrimitives(type: .triangle, vertexStart: Int(draw.firstVertex), vertexCount: Int(draw.vertexCount))
@@ -749,9 +1570,17 @@ struct MetalView: UIViewRepresentable {
                 }
             }
 
+            // =========================================================
+            // 🔥 END PIPELINE
+            // =========================================================
+
             encoder.endEncoding()
+
+            // ---- 5. PRESENT EXACTLY ONCE ----
             commandBuffer.present(drawable)
             commandBuffer.commit()
+
+            inFrame = false
         }
 
         @MainActor
@@ -759,6 +1588,20 @@ struct MetalView: UIViewRepresentable {
             guard let device = view.device else { return }
 
             commandQueue = device.makeCommandQueue()
+            let whitePixel: [UInt8] = [255, 255, 255, 255]
+            let desc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .rgba8Unorm,
+                width: 1,
+                height: 1,
+                mipmapped: false
+            )
+            whiteTexture = device.makeTexture(descriptor: desc)
+            whiteTexture.replace(
+                region: MTLRegionMake2D(0, 0, 1, 1),
+                mipmapLevel: 0,
+                withBytes: whitePixel,
+                bytesPerRow: 4
+            )
 
             let library: MTLLibrary
             do {
@@ -787,11 +1630,32 @@ struct MetalView: UIViewRepresentable {
                 print("[Metal] Failed to create UI pipeline: \\(error)")
             }
 
+            // Filter-mode UI pipeline: src=dst_color, dst=zero. Approximates
+            // Q3's GL_DST_COLOR/GL_SRC_ALPHA used by viewBloodBlend.
+            let uiFilterPipelineDescriptor = MTLRenderPipelineDescriptor()
+            uiFilterPipelineDescriptor.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            uiFilterPipelineDescriptor.depthAttachmentPixelFormat = view.depthStencilPixelFormat
+            uiFilterPipelineDescriptor.vertexFunction = library.makeFunction(name: "q3_ui_vertex")
+            uiFilterPipelineDescriptor.fragmentFunction = library.makeFunction(name: "q3_ui_fragment")
+            uiFilterPipelineDescriptor.colorAttachments[0].isBlendingEnabled = true
+            uiFilterPipelineDescriptor.colorAttachments[0].rgbBlendOperation = .add
+            uiFilterPipelineDescriptor.colorAttachments[0].alphaBlendOperation = .add
+            uiFilterPipelineDescriptor.colorAttachments[0].sourceRGBBlendFactor = .destinationColor
+            uiFilterPipelineDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .destinationAlpha
+            uiFilterPipelineDescriptor.colorAttachments[0].destinationRGBBlendFactor = .zero
+            uiFilterPipelineDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .zero
+
+            do {
+                uiFilterPipelineState = try device.makeRenderPipelineState(descriptor: uiFilterPipelineDescriptor)
+            } catch {
+                print("[Metal] Failed to create UI filter pipeline: \\(error)")
+            }
+
             let worldPipelineDescriptor = MTLRenderPipelineDescriptor()
             worldPipelineDescriptor.colorAttachments[0].pixelFormat = view.colorPixelFormat
             worldPipelineDescriptor.depthAttachmentPixelFormat = view.depthStencilPixelFormat
             worldPipelineDescriptor.vertexFunction = library.makeFunction(name: "q3_world_vertex")
-            worldPipelineDescriptor.fragmentFunction = library.makeFunction(name: "q3_world_fragment")
+            worldPipelineDescriptor.fragmentFunction = library.makeFunction(name: "q3_world_frag_opaque")
 
             do {
                 worldPipelineState = try device.makeRenderPipelineState(descriptor: worldPipelineDescriptor)
@@ -800,6 +1664,7 @@ struct MetalView: UIViewRepresentable {
             }
 
             let worldFilterPipelineDescriptor = worldPipelineDescriptor.copy() as! MTLRenderPipelineDescriptor
+            worldFilterPipelineDescriptor.fragmentFunction = library.makeFunction(name: "q3_world_frag_filter")
             worldFilterPipelineDescriptor.colorAttachments[0].isBlendingEnabled = true
             worldFilterPipelineDescriptor.colorAttachments[0].rgbBlendOperation = .add
             worldFilterPipelineDescriptor.colorAttachments[0].alphaBlendOperation = .add
@@ -814,6 +1679,7 @@ struct MetalView: UIViewRepresentable {
             }
 
             let worldAlphaPipelineDescriptor = worldPipelineDescriptor.copy() as! MTLRenderPipelineDescriptor
+            worldAlphaPipelineDescriptor.fragmentFunction = library.makeFunction(name: "q3_world_frag_alpha")
             worldAlphaPipelineDescriptor.colorAttachments[0].isBlendingEnabled = true
             worldAlphaPipelineDescriptor.colorAttachments[0].rgbBlendOperation = .add
             worldAlphaPipelineDescriptor.colorAttachments[0].alphaBlendOperation = .add
@@ -827,7 +1693,20 @@ struct MetalView: UIViewRepresentable {
                 print("[Metal] Failed to create alpha world pipeline: \\(error)")
             }
 
+            // Portal pipeline: clone of the alpha pipeline with the portal
+            // fragment substituted. Same src-alpha/one-minus blend so the
+            // portal surface can be composited over whatever geometry lies
+            // behind it if the shader author drew it translucently.
+            let worldPortalPipelineDescriptor = worldAlphaPipelineDescriptor.copy() as! MTLRenderPipelineDescriptor
+            worldPortalPipelineDescriptor.fragmentFunction = library.makeFunction(name: "q3_portal_fragment")
+            do {
+                worldPortalPipelineState = try device.makeRenderPipelineState(descriptor: worldPortalPipelineDescriptor)
+            } catch {
+                print("[Metal] Failed to create portal pipeline: \\(error)")
+            }
+
             let worldAdditivePipelineDescriptor = worldPipelineDescriptor.copy() as! MTLRenderPipelineDescriptor
+            worldAdditivePipelineDescriptor.fragmentFunction = library.makeFunction(name: "q3_world_frag_add")
             worldAdditivePipelineDescriptor.colorAttachments[0].isBlendingEnabled = true
             worldAdditivePipelineDescriptor.colorAttachments[0].rgbBlendOperation = .add
             worldAdditivePipelineDescriptor.colorAttachments[0].alphaBlendOperation = .add
@@ -840,6 +1719,23 @@ struct MetalView: UIViewRepresentable {
                 worldAdditivePipelineState = try device.makeRenderPipelineState(descriptor: worldAdditivePipelineDescriptor)
             } catch {
                 print("[Metal] Failed to create additive world pipeline: \\(error)")
+            }
+
+            // Premultiplied-alpha pipeline. Shares the alpha fragment
+            // (which already emits straight texel.rgb — correct for
+            // premultiplied sources) but blend factors are (ONE,
+            // ONE_MINUS_SRC_ALPHA) so the src.rgb isn't multiplied by
+            // src.a a second time during the blend.
+            let worldPremultPipelineDescriptor = worldAlphaPipelineDescriptor.copy() as! MTLRenderPipelineDescriptor
+            worldPremultPipelineDescriptor.colorAttachments[0].sourceRGBBlendFactor = .one
+            worldPremultPipelineDescriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+            worldPremultPipelineDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
+            worldPremultPipelineDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+
+            do {
+                worldPremultPipelineState = try device.makeRenderPipelineState(descriptor: worldPremultPipelineDescriptor)
+            } catch {
+                print("[Metal] Failed to create premult world pipeline: \\(error)")
             }
 
             // Sky pipeline: view-direction spherical projection. No blending,
@@ -900,7 +1796,7 @@ struct MetalView: UIViewRepresentable {
             entityAdditiveDesc.colorAttachments[0].destinationAlphaBlendFactor = .one
             entityAdditiveDesc.depthAttachmentPixelFormat = view.depthStencilPixelFormat
             entityAdditiveDesc.vertexFunction = library.makeFunction(name: "q3_entity_vertex")
-            entityAdditiveDesc.fragmentFunction = library.makeFunction(name: "q3_entity_fragment")
+            entityAdditiveDesc.fragmentFunction = library.makeFunction(name: "q3_entity_additive_fragment")
             do {
                 entityAdditivePipelineState = try device.makeRenderPipelineState(descriptor: entityAdditiveDesc)
             } catch {
@@ -921,6 +1817,18 @@ struct MetalView: UIViewRepresentable {
                 entityAlphaPipelineState = try device.makeRenderPipelineState(descriptor: entityAlphaDesc)
             } catch {
                 print("[Metal] Failed to create alpha entity pipeline: \\(error)")
+            }
+
+            // Entity portal pipeline — clone of entity alpha with the
+            // dedicated screen-UV fragment. Used when an MD3 surface
+            // references a portal shader so the RTT samples by screen
+            // position instead of stretching across model UVs.
+            let entityPortalDesc = entityAlphaDesc.copy() as! MTLRenderPipelineDescriptor
+            entityPortalDesc.fragmentFunction = library.makeFunction(name: "q3_entity_portal_fragment")
+            do {
+                entityPortalPipelineState = try device.makeRenderPipelineState(descriptor: entityPortalDesc)
+            } catch {
+                print("[Metal] Failed to create entity portal pipeline: \\(error)")
             }
 
             let entityFilterDesc = MTLRenderPipelineDescriptor()
@@ -969,13 +1877,20 @@ struct MetalView: UIViewRepresentable {
             additiveDepthDescriptor.depthCompareFunction = .lessEqual
             additiveDepthStencilState = device.makeDepthStencilState(descriptor: additiveDepthDescriptor)
 
-            // Depth-hack state for first-person viewmodel: always pass depth
-            // test so the gun is never occluded by world geometry, while
-            // still writing depth so model self-occlusion stays correct.
+            // Depth-hack state for first-person viewmodel. Stock Q3 does not
+            // bypass depth testing; it compresses the draw into a reduced
+            // depth range near the camera. The special projection below does
+            // the range squeeze, so the stencil state stays on normal
+            // lessEqual testing with writes enabled.
             let depthHackDescriptor = MTLDepthStencilDescriptor()
             depthHackDescriptor.isDepthWriteEnabled = true
-            depthHackDescriptor.depthCompareFunction = .always
+            depthHackDescriptor.depthCompareFunction = .lessEqual
             depthHackDepthStencilState = device.makeDepthStencilState(descriptor: depthHackDescriptor)
+
+            // Portal RTT targets — created at the current drawable size so
+            // the first frame has valid textures even if drawableSizeWillChange
+            // hasn't fired yet. Resize handler above reallocates on change.
+            createPortalTargets(device: device, size: view.drawableSize, colorPixelFormat: view.colorPixelFormat)
         }
 
         private func uploadVertices(_ vertices: UnsafeBufferPointer<Q3MetalVertex>, device: MTLDevice?) -> MTLBuffer? {
@@ -1203,6 +2118,16 @@ struct MetalView: UIViewRepresentable {
             ))
 
             return openGLToMetalClip * quakeProjection * flip * viewer
+        }
+
+        private func makeDepthHackViewProjection(_ matrix: simd_float4x4,
+                                                 depthScale: Float = 0.3) -> simd_float4x4 {
+            var hacked = matrix
+            hacked.columns.0.z *= depthScale
+            hacked.columns.1.z *= depthScale
+            hacked.columns.2.z *= depthScale
+            hacked.columns.3.z *= depthScale
+            return hacked
         }
 
         private func formatVector(_ vector: SIMD3<Float>) -> String {
