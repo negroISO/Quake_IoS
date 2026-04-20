@@ -591,24 +591,50 @@ static qhandle_t RegisterTexture(const char *name) {
          * multi-stage + animated shaders also resolve. */
         const metalShaderMap_t *entry = ShaderMap_LookupEntry(name);
         qboolean resolved = qfalse;
+        qboolean diag = (!Q_stricmp(name, "textures/sfx/border11c") ||
+                         !Q_stricmp(name, "textures/sfx/xmetalfloor_wall_5b") ||
+                         !Q_stricmp(name, "textures/gothic_block/killblock_i4b"));
+        if (diag) {
+            ri.Printf(PRINT_ALL,
+                "[TEX-DBG] resolving '%s' entry=%s stageCount=%d entry.mapPath='%s'\n",
+                name,
+                entry ? "FOUND" : "NULL",
+                entry ? entry->stageCount : 0,
+                entry ? (entry->mapPath[0] ? entry->mapPath : "(empty)") : "n/a");
+        }
         if (entry != NULL) {
             if (entry->animFrameCount > 0 && entry->animFrames[0][0] != '\0') {
                 if (TryLoadImageRGBA(entry->animFrames[0], &rgba, &width, &height, resolvedName, sizeof(resolvedName))) {
                     resolved = qtrue;
+                    if (diag) ri.Printf(PRINT_ALL, "[TEX-DBG]   via animFrames[0] '%s' → '%s'\n", entry->animFrames[0], resolvedName);
+                } else if (diag) {
+                    ri.Printf(PRINT_ALL, "[TEX-DBG]   animFrames[0]='%s' load FAILED\n", entry->animFrames[0]);
                 }
             }
             if (!resolved && entry->mapPath[0] != '\0') {
                 if (TryLoadImageRGBA(entry->mapPath, &rgba, &width, &height, resolvedName, sizeof(resolvedName))) {
                     resolved = qtrue;
+                    if (diag) ri.Printf(PRINT_ALL, "[TEX-DBG]   via entry.mapPath '%s' → '%s'\n", entry->mapPath, resolvedName);
+                } else if (diag) {
+                    ri.Printf(PRINT_ALL, "[TEX-DBG]   entry.mapPath='%s' load FAILED\n", entry->mapPath);
                 }
             }
             if (!resolved) {
                 int si;
                 for (si = 0; si < entry->stageCount && !resolved; ++si) {
-                    if (entry->stages[si].useLightmap) continue;
-                    if (entry->stages[si].mapPath[0] == '\0') continue;
+                    if (entry->stages[si].useLightmap) {
+                        if (diag) ri.Printf(PRINT_ALL, "[TEX-DBG]   stage[%d] skipped (lightmap)\n", si);
+                        continue;
+                    }
+                    if (entry->stages[si].mapPath[0] == '\0') {
+                        if (diag) ri.Printf(PRINT_ALL, "[TEX-DBG]   stage[%d] skipped (empty mapPath)\n", si);
+                        continue;
+                    }
                     if (TryLoadImageRGBA(entry->stages[si].mapPath, &rgba, &width, &height, resolvedName, sizeof(resolvedName))) {
                         resolved = qtrue;
+                        if (diag) ri.Printf(PRINT_ALL, "[TEX-DBG]   via stages[%d].mapPath '%s' → '%s'\n", si, entry->stages[si].mapPath, resolvedName);
+                    } else if (diag) {
+                        ri.Printf(PRINT_ALL, "[TEX-DBG]   stages[%d].mapPath='%s' load FAILED\n", si, entry->stages[si].mapPath);
                     }
                 }
             }
@@ -2265,7 +2291,10 @@ static void ParseShaderText(const char *text) {
             }
             if (token[0] == '}' && token[1] == '\0') {
                 depth -= 1;
-                if (depth <= 1) {
+                /* Only append on stage-close (depth 2→1). The outer
+                 * shader-close (depth 1→0) previously also hit this and
+                 * appended a stale cur as a duplicate/bogus stage. */
+                if (depth == 1) {
                     inStage = qfalse;
                     if (cur.useLightmap && cur.blendMode == 0) {
                         cur.blendMode = 3;
@@ -2502,6 +2531,31 @@ static void ParseShaderText(const char *text) {
                 last->stageCount = stagesCount;
                 last->cullMode = cullMode;
                 last->isPortal = gotPortal;
+
+                /* Diagnostic: dump full parse state for shaders we know
+                 * are falling back to white. Lets us see if the issue is
+                 * (a) the shader never reached here, (b) stageCount==0,
+                 * (c) stages[0].mapPath is empty, or (d) stages[0].mapPath
+                 * is correct and the miss lives in RegisterTexture. */
+                if (!Q_stricmp(shaderName, "textures/sfx/border11c") ||
+                    !Q_stricmp(shaderName, "textures/sfx/xmetalfloor_wall_5b") ||
+                    !Q_stricmp(shaderName, "textures/gothic_block/killblock_i4b")) {
+                    int ds;
+                    ri.Printf(PRINT_ALL,
+                        "[SHADER-DBG] registered '%s' stageCount=%d mapPath='%s' cull=%d portal=%d\n",
+                        shaderName, stagesCount,
+                        (last->mapPath[0] != '\0') ? last->mapPath : "(empty)",
+                        cullMode, gotPortal ? 1 : 0);
+                    for (ds = 0; ds < stagesCount; ++ds) {
+                        ri.Printf(PRINT_ALL,
+                            "[SHADER-DBG]   stage[%d] mapPath='%s' useLightmap=%d blend=%d alphaFunc=%d rgbGen=%d tcMods=%d\n",
+                            ds,
+                            (stages[ds].mapPath[0] != '\0') ? stages[ds].mapPath : "(empty)",
+                            stages[ds].useLightmap, stages[ds].blendMode,
+                            stages[ds].alphaFunc, stages[ds].rgbGen,
+                            stages[ds].tcModCount);
+                    }
+                }
                 if (gotSkyParms) {
                     Q_strncpyz(last->skyBoxBase, skyBoxBase, sizeof(last->skyBoxBase));
                 }
