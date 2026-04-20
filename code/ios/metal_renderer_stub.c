@@ -2608,12 +2608,22 @@ static void LoadAllShaders(void) {
         char path[MAX_QPATH];
         char *buf;
         int len;
+        int j;
 
         Com_sprintf(path, sizeof(path), "scripts/%s", fileList[i]);
         len = ri.FS_ReadFile(path, (void **)&buf);
         if (len <= 0 || buf == NULL) {
             if (buf) ri.FS_FreeFile(buf);
             continue;
+        }
+        /* Normalize CRLF → LF in place. The original id shader files ship
+         * with Windows line endings (\r\n); COM_ParseExt leaves the \r
+         * attached to the preceding token, so shader names parsed from
+         * CRLF files are stored as 'textures/sfx/border11c\r' and fail
+         * every subsequent lookup. Replacing \r with space also avoids
+         * confusing the parser with an extra empty line. */
+        for (j = 0; j < len; ++j) {
+            if (buf[j] == '\r') buf[j] = ' ';
         }
         ParseShaderText(buf);
         ri.FS_FreeFile(buf);
