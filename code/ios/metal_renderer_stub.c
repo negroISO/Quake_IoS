@@ -2869,6 +2869,36 @@ static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime
         return;
     }
 
+    /* Defensive origin/axis validation. Scoreboard/intermission scenes
+     * (rdflags=0x1) intermittently submit refEntity_t instances with
+     * astronomical origin values (Y ≈ 8e25, etc). If accepted, the
+     * MD3 rasterizes triangles that span the entire viewport — with the
+     * skin texture falling back to white, the whole frame blanks to
+     * solid white. Reject non-finite or out-of-range coords up front.
+     * 1e6 is well past any legitimate Q3 world coordinate (maps are
+     * ~8192 units across) so the threshold has ample headroom. */
+    {
+        int c;
+        qboolean badOrigin = qfalse;
+        qboolean badAxis = qfalse;
+        for (c = 0; c < 3 && !badOrigin; ++c) {
+            float v = re->origin[c];
+            if (!isfinite(v) || fabsf(v) > 1.0e6f) badOrigin = qtrue;
+        }
+        for (c = 0; c < 3 && !badAxis; ++c) {
+            float v = re->axis[0][c];
+            if (!isfinite(v)) badAxis = qtrue;
+            v = re->axis[1][c]; if (!isfinite(v)) badAxis = qtrue;
+            v = re->axis[2][c]; if (!isfinite(v)) badAxis = qtrue;
+        }
+        if (badOrigin || badAxis) {
+            s_entityRejectedModelThisFrame += 1;
+            AuditOnce(badOrigin ? "ENTITY:rejected-implausible-origin"
+                                 : "ENTITY:rejected-non-finite-axis");
+            return;
+        }
+    }
+
     s_sceneEntities[s_sceneEntityCount].entity = *re;
     CrossProduct(re->axis[0], re->axis[1], cross);
     s_sceneEntities[s_sceneEntityCount].mirrored = (DotProduct(re->axis[2], cross) < 0.0f);
