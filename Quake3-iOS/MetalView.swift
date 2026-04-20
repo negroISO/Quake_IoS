@@ -46,14 +46,22 @@ struct MetalView: UIViewRepresentable {
             var viewProjection: simd_float4x4
             var cameraPos: SIMD3<Float>    // for sky sphere-mapping
             var _pad: Float = 0            // pad to 16-byte alignment
+            // Inline BSP movers reuse the world pipelines/shaders, so the
+            // model matrix lives in the shared world uniform instead of
+            // introducing a second "brush entity" pipeline.
+            var modelMatrix: simd_float4x4 = matrix_identity_float4x4
         }
 
         struct WorldDrawUniforms: Equatable {
             var tcGen: Float
-            var tcMod: Float
+            var tcModCount: Int32           // 0-4 tcMod entries in the chain
             var rgbGen: Float               // 0=identity, 1=vertex, 2=lightingDiffuse
             var timeSeconds: Float
-            var tcModParams: SIMD4<Float>
+            var tcModType: SIMD4<Float>     // type per chain entry (1=scroll, 2=wave, 3=rotate, 4=scale, 5=turb)
+            var tcModParams0: SIMD4<Float>  // chain[0] params
+            var tcModParams1: SIMD4<Float>  // chain[1] params
+            var tcModParams2: SIMD4<Float>  // chain[2] params
+            var tcModParams3: SIMD4<Float>  // chain[3] params
             var debugMode: Float
             var forceWhiteVertColor: Float  // 1.0 for additive (skip BSP vertex color)
             var alphaTestThreshold: Float   // >0: discard if a<thresh; <0: discard if a>=|thresh|; 0: none
@@ -101,9 +109,51 @@ struct MetalView: UIViewRepresentable {
             }
         }
 
-        private static func stageTcModParams(_ stage: Q3MetalWorldStage) -> SIMD4<Float> {
-            SIMD4<Float>(stage.tcModParams.0, stage.tcModParams.1, stage.tcModParams.2, stage.tcModParams.3)
+        /// Full tcMod chain pack — matches the `WorldDrawUniforms`
+        /// `tcModCount` + `tcModType` + `tcModParams0..3` layout. MSL
+        /// iterates all active entries via `ApplyTcMod`.
+        typealias TcModChainPack = (types: SIMD4<Float>,
+                                    p0: SIMD4<Float>, p1: SIMD4<Float>,
+                                    p2: SIMD4<Float>, p3: SIMD4<Float>,
+                                    count: Int32)
+
+        /// Flatten the parsed `Q3MetalStage.tcMods[Q3_MAX_TCMODS]` chain
+        /// into the six uniform fields (types + four params + count).
+        /// Declaration order preserved; up to 4 entries.
+        private static func fillTcMods(_ stage: Q3MetalWorldStage) -> TcModChainPack {
+            var types = SIMD4<Float>(0, 0, 0, 0)
+            var p0 = SIMD4<Float>(0, 0, 0, 0)
+            var p1 = SIMD4<Float>(0, 0, 0, 0)
+            var p2 = SIMD4<Float>(0, 0, 0, 0)
+            var p3 = SIMD4<Float>(0, 0, 0, 0)
+            let n = Int(min(stage.tcModCount, 4))
+            // Q3TcMod tcMods[] is a fixed-size C array (tuple in Swift).
+            let chain = [stage.tcMods.0, stage.tcMods.1, stage.tcMods.2, stage.tcMods.3]
+            for i in 0..<n {
+                let m = chain[i]
+                types[i] = Float(m.type)
+                let pp = m.params
+                let v = SIMD4<Float>(pp.0, pp.1, pp.2, pp.3)
+                switch i {
+                case 0: p0 = v
+                case 1: p1 = v
+                case 2: p2 = v
+                case 3: p3 = v
+                default: break
+                }
+            }
+            return (types, p0, p1, p2, p3, Int32(n))
         }
+
+        /// Zero pack used by `disableTcMod` call sites.
+        private static let kZeroTcModPack: TcModChainPack = (
+            SIMD4<Float>(0, 0, 0, 0),
+            SIMD4<Float>(0, 0, 0, 0),
+            SIMD4<Float>(0, 0, 0, 0),
+            SIMD4<Float>(0, 0, 0, 0),
+            SIMD4<Float>(0, 0, 0, 0),
+            0
+        )
 
         struct GPUEntityVertex {
             var position: SIMD3<Float>
@@ -165,6 +215,7 @@ struct MetalView: UIViewRepresentable {
             float4x4 viewProjection;
             packed_float3 cameraPos;
             float _pad;
+            float4x4 modelMatrix;
         };
 
         struct WorldVertexOut {
@@ -177,10 +228,14 @@ struct MetalView: UIViewRepresentable {
 
         struct WorldDrawUniforms {
             float tcGen;
-            float tcMod;
+            int   tcModCount;
             float rgbGen;
             float timeSeconds;
-            float4 tcModParams;
+            float4 tcModType;
+            float4 tcModParams0;
+            float4 tcModParams1;
+            float4 tcModParams2;
+            float4 tcModParams3;
             float debugMode;
             float forceWhiteVertColor;
             float alphaTestThreshold;
@@ -212,44 +267,59 @@ struct MetalView: UIViewRepresentable {
                                               uint vertexID [[vertex_id]]) {
             WorldVertexOut out;
             WorldVertexIn inVertex = vertices[vertexID];
-            out.position = uniforms.viewProjection * float4(inVertex.position, 1.0);
+            float4 worldPosition = uniforms.modelMatrix * float4(inVertex.position, 1.0);
+            out.position = uniforms.viewProjection * worldPosition;
             out.texCoord = inVertex.texCoord;
             out.lightmapTexCoord = inVertex.lightmapTexCoord;
             out.color = inVertex.color;
-            out.worldPos = inVertex.position;
+            // tcMod turb / tcGen environment must see the moved brush in
+            // real world space, not the submodel's local BSP coordinates.
+            out.worldPos = worldPosition.xyz;
             return out;
         }
 
         inline float2 ApplyTcMod(float2 uv, float3 worldPos, constant WorldDrawUniforms &u) {
-            int tcMod = int(u.tcMod + 0.5);
-            if (tcMod == 1) {
-                uv += u.tcModParams.xy * u.timeSeconds;
-            } else if (tcMod == 2) {
-                float s = sin(u.timeSeconds * u.tcModParams.w) * u.tcModParams.y;
-                uv += float2(s, s);
-            } else if (tcMod == 3) {
-                float a = u.tcModParams.x * u.timeSeconds;
-                float c = cos(a);
-                float s = sin(a);
-                float2 p = uv - 0.5;
-                uv = float2(p.x * c - p.y * s, p.x * s + p.y * c) + 0.5;
-            } else if (tcMod == 4) {
-                uv *= u.tcModParams.xy;
-            } else if (tcMod == 5) {
-                // tcMod turb — position-dependent sine UV warp using real
-                // world position (now that worldPos is interpolated to the
-                // fragment). Stock Q3 feeds tess.xyz into the turb sine
-                // table; we use a 1/128 spatial scale so adjacent lava/
-                // slime pool tiles ripple coherently without the chaotic
-                // high-frequency warp the UV-proxy version produced.
-                // params: (amp, freq, phase, unused)
-                float amp = u.tcModParams.x;
-                float freq = u.tcModParams.y;
-                float phase = u.tcModParams.z;
-                float t = (u.timeSeconds + phase) * freq * 2.0 * 3.14159265;
-                float2 wp = worldPos.xy * (1.0 / 128.0);
-                uv.x += sin(t + wp.y) * amp;
-                uv.y += sin(t + wp.x) * amp;
+            // Iterate the full tcMod chain in declaration order. Up to four
+            // entries; types[]/params0..3 are populated by Swift-side
+            // fillTcMods(). chain[i] params selection is a ladder because
+            // Metal constant buffers don't support dynamic indexing into
+            // disjoint float4 fields.
+            for (int i = 0; i < u.tcModCount; ++i) {
+                int t = int(u.tcModType[i] + 0.5);
+                float4 p = (i == 0) ? u.tcModParams0
+                         : (i == 1) ? u.tcModParams1
+                         : (i == 2) ? u.tcModParams2
+                                    : u.tcModParams3;
+                if (t == 1) {
+                    // scroll
+                    uv += p.xy * u.timeSeconds;
+                } else if (t == 2) {
+                    // wave — params.y=amp, params.w=speed
+                    float s = sin(u.timeSeconds * p.w) * p.y;
+                    uv += float2(s, s);
+                } else if (t == 3) {
+                    // rotate — params.x=deg/sec
+                    float a = p.x * u.timeSeconds;
+                    float c = cos(a);
+                    float s = sin(a);
+                    float2 q = uv - 0.5;
+                    uv = float2(q.x * c - q.y * s, q.x * s + q.y * c) + 0.5;
+                } else if (t == 4) {
+                    // scale
+                    uv *= p.xy;
+                } else if (t == 5) {
+                    // turb — params.x=amp, .y=freq, .z=phase. Stock Q3
+                    // feeds tess.xyz into the turb sine table; we use a
+                    // 1/128 spatial scale so adjacent lava/slime tiles
+                    // ripple coherently.
+                    float amp = p.x;
+                    float freq = p.y;
+                    float phase = p.z;
+                    float tt = (u.timeSeconds + phase) * freq * 2.0 * 3.14159265;
+                    float2 wp = worldPos.xy * (1.0 / 128.0);
+                    uv.x += sin(tt + wp.y) * amp;
+                    uv.y += sin(tt + wp.x) * amp;
+                }
             }
             return uv;
         }
@@ -561,10 +631,11 @@ struct MetalView: UIViewRepresentable {
                                           uint vertexID [[vertex_id]]) {
             SkyVertexOut out;
             WorldVertexIn inVertex = vertices[vertexID];
-            out.position = uniforms.viewProjection * float4(inVertex.position, 1.0);
+            float4 worldPosition = uniforms.modelMatrix * float4(inVertex.position, 1.0);
+            out.position = uniforms.viewProjection * worldPosition;
             // Push to max depth so sky always renders behind everything
             out.position.z = out.position.w;
-            out.worldPos = inVertex.position;
+            out.worldPos = worldPosition.xyz;
             out.scrollTex = inVertex.texCoord;
             return out;
         }
@@ -617,16 +688,25 @@ struct MetalView: UIViewRepresentable {
             // slot: if tcMod==1 use .xy as scroll; if tcMod==4 use
             // .xy as scale; otherwise no-op. Applied to all three
             // projections identically so motion stays coherent.
-            int tcMod = int(drawUniforms.tcMod + 0.5);
-            if (tcMod == 1) {
-                float2 scroll = drawUniforms.tcModParams.xy * drawUniforms.timeSeconds;
-                uvX += scroll;
-                uvY += scroll;
-                uvZ += scroll;
-            } else if (tcMod == 4) {
-                uvX *= drawUniforms.tcModParams.xy;
-                uvY *= drawUniforms.tcModParams.xy;
-                uvZ *= drawUniforms.tcModParams.xy;
+            // Walk the tcMod chain; sky only applies scroll/scale slots
+            // (turb/wave/rotate on sky surfaces are rare and the cube
+            // projection would distort the UV anyway).
+            for (int _i = 0; _i < drawUniforms.tcModCount; ++_i) {
+                int tcMod = int(drawUniforms.tcModType[_i] + 0.5);
+                float4 _p = (_i == 0) ? drawUniforms.tcModParams0
+                          : (_i == 1) ? drawUniforms.tcModParams1
+                          : (_i == 2) ? drawUniforms.tcModParams2
+                                      : drawUniforms.tcModParams3;
+                if (tcMod == 1) {
+                    float2 scroll = _p.xy * drawUniforms.timeSeconds;
+                    uvX += scroll;
+                    uvY += scroll;
+                    uvZ += scroll;
+                } else if (tcMod == 4) {
+                    uvX *= _p.xy;
+                    uvY *= _p.xy;
+                    uvZ *= _p.xy;
+                }
             }
 
             float4 sX = skyTexture.sample(textureSampler, uvX);
@@ -758,6 +838,12 @@ struct MetalView: UIViewRepresentable {
             let NOCULL_FLAG = UInt32(Q3_METAL_WORLD_DRAWFLAG_NOCULL)
             let LIGHTMAP_MULTIPLY_FLAG = UInt32(Q3_METAL_WORLD_DRAWFLAG_LIGHTMAP_MULTIPLY)
             let PORTAL_FLAG = UInt32(Q3_METAL_WORLD_DRAWFLAG_PORTAL)
+            // Q3 `cull front` inverts winding — we render back faces.
+            let CULL_FRONT_FLAG = UInt32(Q3_METAL_WORLD_DRAWFLAG_CULL_FRONT)
+            // Inline bmodel draw — owning entity's model matrix is live in
+            // WorldDrawUniforms.modelMatrix and must break batching so the
+            // per-entity uniform set is emitted separately from static world.
+            let BMODEL_FLAG = UInt32(Q3_METAL_WORLD_DRAWFLAG_BMODEL)
 
             // Debug pass colorizer (`metal_debug_passes`):
             //   0 = off (normal rendering)
@@ -895,7 +981,15 @@ struct MetalView: UIViewRepresentable {
                     portalPassDescriptor.depthAttachment.storeAction = .dontCare
                     portalPassDescriptor.depthAttachment.clearDepth = 1.0
 
-                    if let portalEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: portalPassDescriptor) {
+                    // Portal pass runs on its OWN command buffer, committed
+                    // BEFORE the main pass encoder starts. This keeps the
+                    // drawable's texture out of the portal pass's command
+                    // buffer entirely (prevents CAMetalLayer retention
+                    // warnings from draining into the portal work).
+                    guard let portalCommandBuffer = commandQueue.makeCommandBuffer() else {
+                        return
+                    }
+                    if let portalEncoder = portalCommandBuffer.makeRenderCommandEncoder(descriptor: portalPassDescriptor) {
                         portalEncoder.setFrontFacing(.clockwise)
                         portalEncoder.setVertexBuffer(worldVB, offset: 0, index: 0)
                         portalEncoder.setVertexBytes(&portalWorldUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
@@ -929,10 +1023,14 @@ struct MetalView: UIViewRepresentable {
                                     portalEncoder.setCullMode(.none)
                                     var skyDrawUniforms = WorldDrawUniforms(
                                         tcGen: Float(stage.tcGen),
-                                        tcMod: Float(stage.tcMod),
+                                        tcModCount: Self.fillTcMods(stage).count,
                                         rgbGen: Float(stage.rgbGen),
                                         timeSeconds: portalTimeSeconds,
-                                        tcModParams: Self.stageTcModParams(stage),
+                                        tcModType: Self.fillTcMods(stage).types,
+                                        tcModParams0: Self.fillTcMods(stage).p0,
+                                        tcModParams1: Self.fillTcMods(stage).p1,
+                                        tcModParams2: Self.fillTcMods(stage).p2,
+                                        tcModParams3: Self.fillTcMods(stage).p3,
                                         debugMode: 0,
                                         forceWhiteVertColor: 1,
                                         alphaTestThreshold: 0,
@@ -1001,7 +1099,7 @@ struct MetalView: UIViewRepresentable {
                                     }
 
                                     portalEncoder.setFragmentTexture(stageTexture, index: 0)
-                                    let usesLightmap = (mode == 0 || mode == 3)
+                                    let usesLightmap = stage.useLightmap != 0
                                     if usesLightmap, let lightmap = texture(for: draw.lightmapTextureHandle, device: view.device) {
                                         portalEncoder.setFragmentTexture(lightmap, index: 1)
                                     } else {
@@ -1010,10 +1108,14 @@ struct MetalView: UIViewRepresentable {
 
                                     var drawUniforms = WorldDrawUniforms(
                                         tcGen: Float(stage.tcGen),
-                                        tcMod: Float(stage.tcMod),
+                                        tcModCount: Self.fillTcMods(stage).count,
                                         rgbGen: Float(stage.rgbGen),
                                         timeSeconds: portalTimeSeconds,
-                                        tcModParams: Self.stageTcModParams(stage),
+                                        tcModType: Self.fillTcMods(stage).types,
+                                        tcModParams0: Self.fillTcMods(stage).p0,
+                                        tcModParams1: Self.fillTcMods(stage).p1,
+                                        tcModParams2: Self.fillTcMods(stage).p2,
+                                        tcModParams3: Self.fillTcMods(stage).p3,
                                         debugMode: 0,
                                         forceWhiteVertColor: mode == 1 ? 1 : 0,
                                         alphaTestThreshold: Self.alphaTestThreshold(for: stage.alphaFunc),
@@ -1032,8 +1134,114 @@ struct MetalView: UIViewRepresentable {
                                 }
                             }
                         }
+
+                        // Inline BSP movers reuse the same world buffers and
+                        // stage metadata; only the model matrix changes per
+                        // entity instance, so render them here with the
+                        // portal camera before the main pass samples the RTT.
+                        if snapshot.inlineModelCommandCount > 0,
+                           let inlineInstancesPointer = Q3MetalRenderer_GetInlineModelInstances() {
+                            let inlineInstances = UnsafeBufferPointer(
+                                start: inlineInstancesPointer,
+                                count: Int(snapshot.inlineModelCommandCount)
+                            )
+                            let maxDrawIndex = inlineInstances.reduce(Int(snapshot.worldCommandCount)) {
+                                max($0, Int($1.firstDraw + $1.drawCount))
+                            }
+                            let portalAllWorldDraws = UnsafeBufferPointer(
+                                start: worldDrawsPointerPortal,
+                                count: maxDrawIndex
+                            )
+
+                            for instance in inlineInstances where instance.drawCount > 0 {
+                                var inlineUniforms = WorldUniforms(
+                                    viewProjection: portalVP,
+                                    cameraPos: portalCamPos,
+                                    modelMatrix: makeInlineModelMatrix(instance)
+                                )
+                                portalEncoder.setVertexBytes(&inlineUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
+                                portalEncoder.setFragmentBytes(&inlineUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
+
+                                let drawStart = Int(instance.firstDraw)
+                                let drawEnd = drawStart + Int(instance.drawCount)
+                                for opaquePhase in 0..<2 {
+                                    for drawIndex in drawStart..<drawEnd {
+                                        let draw = portalAllWorldDraws[drawIndex]
+                                        if draw.indexCount == 0 || (draw.flags & SKY_FLAG_PORTAL) != 0 || (draw.flags & PORTAL_FLAG_PORTAL) != 0 {
+                                            continue
+                                        }
+
+                                        let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+                                        guard stageCount > 0 else { continue }
+
+                                        portalEncoder.setCullMode((draw.flags & NOCULL_FLAG_PORTAL) != 0 ? .none : .back)
+
+                                        for stageIndex in 0..<stageCount {
+                                            let stage = Self.worldStage(draw, stageIndex)
+                                            let mode = stage.blendMode
+                                            let isOpaqueStage = mode == 0
+                                            if (opaquePhase == 0) != isOpaqueStage { continue }
+                                            guard let stageTexture = texture(for: stage.textureHandle, device: view.device) else { continue }
+
+                                            switch mode {
+                                            case 1:
+                                                if let p = worldAdditivePipelineState { portalEncoder.setRenderPipelineState(p) }
+                                            case 2:
+                                                if let p = worldAlphaPipelineState { portalEncoder.setRenderPipelineState(p) }
+                                            case 3:
+                                                if let p = worldFilterPipelineState { portalEncoder.setRenderPipelineState(p) }
+                                            case 4:
+                                                if let p = worldPremultPipelineState { portalEncoder.setRenderPipelineState(p) }
+                                            default:
+                                                portalEncoder.setRenderPipelineState(worldMainPipeline)
+                                            }
+
+                                            portalEncoder.setDepthStencilState(isOpaqueStage ? depthStencilState : additiveDepthStencilState)
+                                            portalEncoder.setFragmentTexture(stageTexture, index: 0)
+                                            let usesLightmap = stage.useLightmap != 0
+                                            if usesLightmap, let lightmap = texture(for: draw.lightmapTextureHandle, device: view.device) {
+                                                portalEncoder.setFragmentTexture(lightmap, index: 1)
+                                            } else {
+                                                portalEncoder.setFragmentTexture(whiteTexture, index: 1)
+                                            }
+
+                                            let _tc = Self.fillTcMods(stage)
+                                            var drawUniforms = WorldDrawUniforms(
+                                                tcGen: Float(stage.tcGen),
+                                                tcModCount: _tc.count,
+                                                rgbGen: Float(stage.rgbGen),
+                                                timeSeconds: portalTimeSeconds,
+                                                tcModType: _tc.types,
+                                                tcModParams0: _tc.p0,
+                                                tcModParams1: _tc.p1,
+                                                tcModParams2: _tc.p2,
+                                                tcModParams3: _tc.p3,
+                                                debugMode: 0,
+                                                forceWhiteVertColor: mode == 1 ? 1 : 0,
+                                                alphaTestThreshold: Self.alphaTestThreshold(for: stage.alphaFunc),
+                                                blendMode: Int32(mode),
+                                                alphaGen: Float(stage.alphaGen),
+                                                debugPassColor: SIMD4<Float>(0, 0, 0, 0)
+                                            )
+                                            portalEncoder.setFragmentBytes(&drawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 0)
+                                            portalEncoder.drawIndexedPrimitives(
+                                                type: .triangle,
+                                                indexCount: Int(draw.indexCount),
+                                                indexType: .uint32,
+                                                indexBuffer: worldIB,
+                                                indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         portalEncoder.endEncoding()
                     }
+                    // Commit portal pass before the main pass starts so
+                    // the RTT target is ready when the main encoder
+                    // samples it via the portal fragment shader.
+                    portalCommandBuffer.commit()
                 }
             }
 
@@ -1041,6 +1249,7 @@ struct MetalView: UIViewRepresentable {
                 inFrame = false
                 return
             }
+            encoder.setFrontFacing(.clockwise)
 
             // =========================================================
             // 🔥 FULL RENDER PIPELINE STARTS HERE
@@ -1094,12 +1303,17 @@ struct MetalView: UIViewRepresentable {
                         encoder.setCullMode(.none)
                         encoder.setFragmentSamplerState(worldSamplerState, index: 0)
 
+                        let _tc = Self.fillTcMods(stage)
                         var drawUniforms = WorldDrawUniforms(
                             tcGen: Float(stage.tcGen),
-                            tcMod: Float(stage.tcMod),
+                            tcModCount: _tc.count,
                             rgbGen: Float(stage.rgbGen),
                             timeSeconds: Float(frameTime - frameTimeOrigin),
-                            tcModParams: Self.stageTcModParams(stage),
+                            tcModType: _tc.types,
+                            tcModParams0: _tc.p0,
+                            tcModParams1: _tc.p1,
+                            tcModParams2: _tc.p2,
+                            tcModParams3: _tc.p3,
                             debugMode: Self.worldDebugMode,
                             forceWhiteVertColor: 1,
                             alphaTestThreshold: 0,
@@ -1257,8 +1471,19 @@ struct MetalView: UIViewRepresentable {
                         let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
                         guard stageCount > 0 else { continue }
 
-                        let targetCull: MTLCullMode =
-                            (noCullEnabled || (draw.flags & NOCULL_FLAG) != 0) ? .none : .back
+                        // Per-stage cullMode (parsed from shader `cull`
+                        // directive). 0=BACK, 1=NONE (disable/twosided),
+                        // 2=FRONT (inverted). noCullEnabled cvar still
+                        // forces .none globally for debugging.
+                        let stage0CullMode = Self.worldStage(draw, 0).cullMode
+                        let targetCull: MTLCullMode = {
+                            if noCullEnabled { return .none }
+                            switch stage0CullMode {
+                            case 1: return .none
+                            case 2: return .front
+                            default: return .back
+                            }
+                        }()
 
                         for stageIndex in 0..<stageCount {
                             let stage = Self.worldStage(draw, stageIndex)
@@ -1284,7 +1509,7 @@ struct MetalView: UIViewRepresentable {
                             let targetDepth: MTLDepthStencilState? =
                                 isOpaqueStage ? depthStencilState : additiveDepthStencilState
 
-                            let usesLightmap = (draw.flags & LIGHTMAP_MULTIPLY_FLAG) != 0 && (mode == 0 || mode == 3)
+                            let usesLightmap = stage.useLightmap != 0
                             let targetTex1: MTLTexture
                             if usesLightmap,
                                let lightmap = texture(for: draw.lightmapTextureHandle, device: view.device) {
@@ -1293,19 +1518,48 @@ struct MetalView: UIViewRepresentable {
                                 targetTex1 = whiteTexture
                             }
 
+                            // DIAGNOSTIC: log chain for multi-tcMod stages.
+                            // `stage.tcMods` is a Swift tuple (C fixed-size
+                            // array) — materialize into an Array to index by Int.
+                            if stage.tcModCount > 1 {
+                                let typeNames = ["NONE", "SCROLL", "WAVE", "ROTATE", "SCALE", "TURB"]
+                                let chain = [stage.tcMods.0, stage.tcMods.1, stage.tcMods.2, stage.tcMods.3]
+                                var typeStr = ""
+                                for i in 0..<Int(stage.tcModCount) {
+                                    let ti = Int(chain[i].type)
+                                    let name = (ti >= 0 && ti < typeNames.count) ? typeNames[ti] : "UNKNOWN"
+                                    if i > 0 { typeStr += "," }
+                                    typeStr += name
+                                }
+                                let shaderKey = String(format: "tex=0x%x", stage.textureHandle)
+                                print("[DRAW] \(shaderKey) tcModCount=\(stage.tcModCount) types=\(typeStr)")
+                            }
+                            let _tc: TcModChainPack = disableTcMod ? Self.kZeroTcModPack : Self.fillTcMods(stage)
                             let targetUniforms = WorldDrawUniforms(
                                 tcGen: Float(stage.tcGen),
-                                tcMod: disableTcMod ? 0 : Float(stage.tcMod),
+                                tcModCount: _tc.count,
                                 rgbGen: Float(stage.rgbGen),
                                 timeSeconds: timeSeconds,
-                                tcModParams: disableTcMod ? SIMD4<Float>(0, 0, 0, 0) : Self.stageTcModParams(stage),
+                                tcModType: _tc.types,
+                                tcModParams0: _tc.p0,
+                                tcModParams1: _tc.p1,
+                                tcModParams2: _tc.p2,
+                                tcModParams3: _tc.p3,
                                 debugMode: debugRenderMode,
-                                forceWhiteVertColor: mode == 1 ? 1 : 0,
+                                forceWhiteVertColor: (mode == 1 || stage.rgbGen == 0) ? 1 : 0,
                                 alphaTestThreshold: Self.alphaTestThreshold(for: stage.alphaFunc),
                                 blendMode: Int32(stage.blendMode),
                                 alphaGen: Float(stage.alphaGen),
                                 debugPassColor: debugColor(pass: worldPassIndex(blendMode: stage.blendMode))
                             )
+                            // DIAGNOSTIC: verify uniform carries the full chain.
+                            if targetUniforms.tcModCount > 1 {
+                                print("[UNIFORM] tcModCount=\(targetUniforms.tcModCount) " +
+                                      "types=(\(targetUniforms.tcModType.x),\(targetUniforms.tcModType.y)," +
+                                      "\(targetUniforms.tcModType.z),\(targetUniforms.tcModType.w)) " +
+                                      "p0=(\(targetUniforms.tcModParams0.x),\(targetUniforms.tcModParams0.y)) " +
+                                      "p1=(\(targetUniforms.tcModParams1.x),\(targetUniforms.tcModParams1.y))")
+                            }
 
                             let stateMatches =
                                 lastPipeline === targetPipeline &&
@@ -1370,6 +1624,158 @@ struct MetalView: UIViewRepresentable {
 
                 if Self.worldBatchLogEnabled {
                     print("[batch] world stages=\(stagesSeen) drawCalls=\(emittedDrawCalls)")
+                }
+            }
+
+            // ---- INLINE BSP MODELS ----
+            if drawWorldEnabled,
+               snapshot.inlineModelCommandCount > 0,
+               let inlineInstancesPointer = Q3MetalRenderer_GetInlineModelInstances(),
+               let worldDrawsPointer = Q3MetalRenderer_GetWorldDrawCommands(),
+               let sceneView = Q3MetalRenderer_GetSceneView()?.pointee,
+               let worldVertexBuffer = uploadWorldBuffers(device: view.device, generation: snapshot.worldGeneration),
+               let worldIndexBuffer {
+
+                let inlineInstances = UnsafeBufferPointer(
+                    start: inlineInstancesPointer,
+                    count: Int(snapshot.inlineModelCommandCount)
+                )
+                let maxDrawIndex = inlineInstances.reduce(Int(snapshot.worldCommandCount)) {
+                    max($0, Int($1.firstDraw + $1.drawCount))
+                }
+                let worldAllDraws = UnsafeBufferPointer(
+                    start: worldDrawsPointer,
+                    count: maxDrawIndex
+                )
+                let timeSeconds = Float(frameTime - frameTimeOrigin)
+                let debugRenderMode = Float(Q3MetalRenderer_GetDebugRenderMode())
+                let disableTcMod = Q3MetalRenderer_GetDisableTcMod() != 0
+                let viewProjection = makeWorldViewProjection(sceneView)
+                let cameraPos = SIMD3<Float>(
+                    sceneView.viewOrigin.0,
+                    sceneView.viewOrigin.1,
+                    sceneView.viewOrigin.2
+                )
+
+                encoder.setVertexBuffer(worldVertexBuffer, offset: 0, index: 0)
+                encoder.setFragmentSamplerState(worldSamplerState, index: 0)
+
+                for instance in inlineInstances where instance.drawCount > 0 {
+                    var inlineUniforms = WorldUniforms(
+                        viewProjection: viewProjection,
+                        cameraPos: cameraPos,
+                        modelMatrix: makeInlineModelMatrix(instance)
+                    )
+                    encoder.setVertexBytes(&inlineUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
+                    encoder.setFragmentBytes(&inlineUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
+
+                    let drawStart = Int(instance.firstDraw)
+                    let drawEnd = drawStart + Int(instance.drawCount)
+                    for opaquePhase in 0..<2 {
+                        for drawIndex in drawStart..<drawEnd {
+                            let draw = worldAllDraws[drawIndex]
+                            if draw.indexCount == 0 || (draw.flags & SKY_FLAG) != 0 {
+                                continue
+                            }
+                            if noPortalsEnabled && (draw.flags & PORTAL_FLAG) != 0 {
+                                continue
+                            }
+
+                            if (draw.flags & PORTAL_FLAG) != 0 {
+                                if opaquePhase != 0 { continue }
+                                if let portalPipeline = worldPortalPipelineState,
+                                   let portalTex = portalTexture {
+                                    encoder.setRenderPipelineState(portalPipeline)
+                                    encoder.setDepthStencilState(additiveDepthStencilState)
+                                    encoder.setCullMode(.none)
+                                    encoder.setFragmentTexture(portalTex, index: 0)
+                                    encoder.drawIndexedPrimitives(
+                                        type: .triangle,
+                                        indexCount: Int(draw.indexCount),
+                                        indexType: .uint32,
+                                        indexBuffer: worldIndexBuffer,
+                                        indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride
+                                    )
+                                    continue
+                                }
+                            }
+
+                            let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+                            guard stageCount > 0 else { continue }
+                            // Per-stage cullMode (parsed from shader `cull`
+                            // directive). Mirrors the static-world branch.
+                            let stage0CullMode = Self.worldStage(draw, 0).cullMode
+                            let targetCull: MTLCullMode = {
+                                if noCullEnabled { return .none }
+                                switch stage0CullMode {
+                                case 1: return .none
+                                case 2: return .front
+                                default: return .back
+                                }
+                            }()
+                            encoder.setCullMode(targetCull)
+
+                            for stageIndex in 0..<stageCount {
+                                let stage = Self.worldStage(draw, stageIndex)
+                                let mode = stage.blendMode
+                                let isOpaqueStage = mode == 0
+                                if (opaquePhase == 0) != isOpaqueStage { continue }
+                                guard let stageTexture = texture(for: stage.textureHandle, device: view.device) else {
+                                    continue
+                                }
+
+                                switch mode {
+                                case 1:
+                                    if let p = worldAdditivePipelineState { encoder.setRenderPipelineState(p) }
+                                case 2:
+                                    if let p = worldAlphaPipelineState { encoder.setRenderPipelineState(p) }
+                                case 3:
+                                    if let p = worldFilterPipelineState { encoder.setRenderPipelineState(p) }
+                                case 4:
+                                    if let p = worldPremultPipelineState { encoder.setRenderPipelineState(p) }
+                                default:
+                                    if let p = worldPipelineState { encoder.setRenderPipelineState(p) }
+                                }
+
+                                encoder.setDepthStencilState(isOpaqueStage ? depthStencilState : additiveDepthStencilState)
+                                encoder.setFragmentTexture(stageTexture, index: 0)
+                                let usesLightmap = stage.useLightmap != 0
+                                if usesLightmap,
+                                   let lightmap = texture(for: draw.lightmapTextureHandle, device: view.device) {
+                                    encoder.setFragmentTexture(lightmap, index: 1)
+                                } else {
+                                    encoder.setFragmentTexture(whiteTexture, index: 1)
+                                }
+
+                                let _tc: TcModChainPack = disableTcMod ? Self.kZeroTcModPack : Self.fillTcMods(stage)
+                                var drawUniforms = WorldDrawUniforms(
+                                    tcGen: Float(stage.tcGen),
+                                    tcModCount: _tc.count,
+                                    rgbGen: Float(stage.rgbGen),
+                                    timeSeconds: timeSeconds,
+                                    tcModType: _tc.types,
+                                    tcModParams0: _tc.p0,
+                                    tcModParams1: _tc.p1,
+                                    tcModParams2: _tc.p2,
+                                    tcModParams3: _tc.p3,
+                                    debugMode: debugRenderMode,
+                                    forceWhiteVertColor: (mode == 1 || stage.rgbGen == 0) ? 1 : 0,
+                                    alphaTestThreshold: Self.alphaTestThreshold(for: stage.alphaFunc),
+                                    blendMode: Int32(stage.blendMode),
+                                    alphaGen: Float(stage.alphaGen),
+                                    debugPassColor: debugColor(pass: worldPassIndex(blendMode: stage.blendMode))
+                                )
+                                encoder.setFragmentBytes(&drawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 0)
+                                encoder.drawIndexedPrimitives(
+                                    type: .triangle,
+                                    indexCount: Int(draw.indexCount),
+                                    indexType: .uint32,
+                                    indexBuffer: worldIndexBuffer,
+                                    indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride
+                                )
+                            }
+                        }
+                    }
                 }
             }
 
@@ -2065,6 +2471,15 @@ struct MetalView: UIViewRepresentable {
 
             textureCache[handle] = (generation: info.generation, texture: texture)
             return texture
+        }
+
+        private func makeInlineModelMatrix(_ instance: Q3MetalInlineModelInstance) -> simd_float4x4 {
+            simd_float4x4(columns: (
+                SIMD4<Float>(instance.axis.0, instance.axis.1, instance.axis.2, 0),
+                SIMD4<Float>(instance.axis.3, instance.axis.4, instance.axis.5, 0),
+                SIMD4<Float>(instance.axis.6, instance.axis.7, instance.axis.8, 0),
+                SIMD4<Float>(instance.origin.0, instance.origin.1, instance.origin.2, 1)
+            ))
         }
 
         private func makeOrthoProjection(width: Float, height: Float) -> simd_float4x4 {

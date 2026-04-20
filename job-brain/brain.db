@@ -1,0 +1,77 @@
+Session Resume Notes (Quake iOS Metal renderer)
+Date: 2026-04-16
+
+Completed this session
+
+1) Sky/world flags + sampler crash
+- Sky flag path is active end-to-end.
+- Fixed sky-pass crash by binding sampler in sky pass:
+  - Quake3-iOS/MetalView.swift: added
+    encoder.setFragmentSamplerState(worldSamplerState, index: 0)
+
+2) World lightmap binding hardening
+- World pass now always binds texture(1) using draw.lightmapTextureHandle.
+- If missing, binds whiteTexture fallback to texture(1).
+- File: Quake3-iOS/MetalView.swift
+
+3) Debug render mode wired from cvar
+- Added C API:
+  int Q3MetalRenderer_GetDebugRenderMode(void)
+- Reads cvar:
+  r_debugRenderMode (default 0)
+- Files:
+  - code/ios/metal_renderer_stub.c
+  - code/ios/metal_renderer_shared.h
+
+4) Shader debug modes updated
+- q3_world_fragment modes:
+  0: base * lightmap
+  1: base only
+  2: lightmap only
+  3: uv0 (in.texCoord)
+  4: uv1 (in.lightmapTexCoord)
+- File: Quake3-iOS/MetalView.swift
+
+5) First-person crash triage guard
+- Temporarily skips RF_FIRST_PERSON entities in RE_AddRefEntityToScene.
+- File: code/ios/metal_renderer_stub.c
+- Audit log emitted once: ENTITY:RF_FIRST_PERSON skipped
+
+Important known state
+- metal_renderer_shared.h currently should NOT include tr_local.h (removed due Swift bridging/OpenGL include failure).
+- Q3_METAL_WORLD_DRAWFLAG_SKY is set to non-conflicting bit (1u << 5).
+
+How to validate quickly next session
+
+Console cvars:
+- \r_debugRenderMode 1   (base only)
+- \r_debugRenderMode 2   (lightmap only)
+- \r_debugRenderMode 3   (uv0)
+- \r_debugRenderMode 4   (uv1)
+- \r_debugRenderMode 0   (normal)
+
+Expected:
+- Mode 1: textured/fullbright look
+- Mode 2: grayscale lighting atlas effect
+- Mode 3: regular UV layout
+- Mode 4: lightmap UV atlas layout
+
+Immediate next task (do first)
+- Verify screenshots for modes 1 and 2.
+- If mode 2 is black/wrong:
+  - inspect draw.lightmapTextureHandle population in C world draw setup
+  - verify lightmap texture upload/generation path
+
+After that
+1) tcMod stabilization (use absolute time, no cumulative UV drift)
+2) Blend/alpha stage correctness (fire black squares)
+3) RT_MODEL re-enable/work (after world stable)
+
+Quick grep anchors
+- Quake3-iOS/MetalView.swift:
+  - q3_world_fragment
+  - draw.lightmapTextureHandle
+  - Q3MetalRenderer_GetDebugRenderMode
+- code/ios/metal_renderer_stub.c:
+  - Q3MetalRenderer_GetDebugRenderMode
+  - RF_FIRST_PERSON skipped

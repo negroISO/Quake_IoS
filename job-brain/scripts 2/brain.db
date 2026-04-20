@@ -1,0 +1,49 @@
+Plan I’d Execute
+
+1. Lock Baseline + Repro
+- Capture one known-bad screenshot and one short log sample.
+- Add a single debug cvar for render debug mode toggles (base-only / lightmap-only / UV debug) if not already present.
+- Goal: every change can be visually verified in seconds.
+
+2. World Lightmap Multiply (Highest Priority)
+- Verify world pass always binds:
+  - base texture at texture(0)
+  - lightmap (or white fallback) at texture(1)
+- Verify fragment path uses uv0 for base and uv1 for lightmap.
+- Force lightmap-only output briefly to validate data path.
+- Exit criteria: scene gains proper shading depth; no fullbright look.
+
+3. UV / tcMod Stabilization
+- Temporarily disable tcMod and confirm floor stops “swimming.”
+- Re-enable tcMod in strict order:
+  - scroll
+  - scale
+  - turb (then rotate if used)
+- Ensure tcMod is computed from immutable base UV + time (not accumulated each frame).
+- Exit criteria: animated surfaces move correctly, static surfaces stay stable.
+
+4. Blend/Alpha Stage Correctness (Fire/Black Squares)
+- Verify stage flags from C (blendMode, alphaFunc, stage count) are reaching Swift.
+- Use correct Metal blend pipeline for:
+  - additive (ONE, ONE)
+  - alpha (SRC_ALPHA, ONE_MINUS_SRC_ALPHA)
+  - filter/multiply as needed
+- Ensure alpha-test threshold path is active where expected.
+- Exit criteria: fire/glow textures lose black boxes and composite correctly.
+
+5. Pass State Hygiene
+- Confirm each pass explicitly sets required state (pipeline, depth, sampler, textures, uniforms), no reliance on carry-over.
+- Keep sky/world/UI separation strict.
+- Exit criteria: no random regressions when pass order changes.
+
+6. RT_MODEL Bring-up (After World Is Solid)
+- Start with non-first-person models only.
+- Validate model transforms and texture binding with minimal shading first.
+- Reintroduce first-person path after stable third-person/world models.
+- Exit criteria: pickups/player models visible and stable without crashes.
+
+How I’d proceed immediately
+1. Do Task 2 end-to-end first.
+2. Then Task 3.
+3. Then Task 4.
+4. Re-test and only then start Task 6.

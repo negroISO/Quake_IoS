@@ -7,62 +7,6 @@
 #include "../renderercommon/tr_public.h"
 #include "../renderer/tr_common.h"
 #include "metal_renderer_shared.h"
-#include <ctype.h>
-
-typedef struct metalShaderMap_s metalShaderMap_t;
-
-#define MAX_SHADER_MAP_ENTRIES 4096
-#define METAL_ANIMMAP_MAX_FRAMES 16
-#define Q3_MAX_STAGES 4
-
-/* Unified per-stage data captured by ParseShaderText. One Q3MetalStage
- * per `{ ... }` block inside a shader. Replaces the old stage1/stage2
- * special-case flat fields on metalShaderMap_t. World rendering iterates
- * metalShaderMap_t.stages[0..stageCount-1] and emits one AddWorldDrawStage
- * call per entry, in declaration order. */
-typedef struct {
-    char mapPath[MAX_QPATH];
-    int blendMode;
-    int rgbGen;
-    int alphaGen;
-    int alphaFunc;
-    int tcGen;            /* 0=base UV, 1=environment */
-    Q3TcMod tcMods[Q3_MAX_TCMODS];
-    int tcModCount;
-    int rgbWaveFunc;
-    float rgbWaveBase;
-    float rgbWaveAmp;
-    float rgbWavePhase;
-    float rgbWaveFreq;
-    int alphaWaveFunc;
-    float alphaWaveBase;
-    float alphaWaveAmp;
-    float alphaWavePhase;
-    float alphaWaveFreq;
-    int useLightmap;      /* 1 if stage's map is `$lightmap` */
-} Q3MetalStage;
-
-struct metalShaderMap_s {
-    char shaderName[128];
-    /* Mirror of stages[0].mapPath (or first non-$lightmap stage's mapPath
-     * when stage 0 IS $lightmap). RegisterTexture's shader-map-first
-     * lookup chain reads this field — kept for backward compatibility. */
-    char mapPath[MAX_QPATH];
-    qboolean tcGenEnv;       /* any stage uses tcGen environment */
-    int cullMode;            /* top-level cull (Q3 cull is per-shader, not per-stage) */
-    int animFrameCount;
-    float animFps;
-    char animFrames[METAL_ANIMMAP_MAX_FRAMES][MAX_QPATH];
-    qhandle_t animTextures[METAL_ANIMMAP_MAX_FRAMES];
-    char skyBoxBase[MAX_QPATH];
-    qhandle_t skyFaceTextures[6];
-    qboolean isPortal;
-    /* Authoritative per-stage data captured by ParseShaderText. Stage
-     * order matches declaration order in the .shader file. World
-     * rendering iterates stages[0..stageCount-1]. */
-    Q3MetalStage stages[Q3_MAX_STAGES];
-    int stageCount;
-};
 
 #define LL(x) x=LittleLong(x)
 
@@ -71,28 +15,6 @@ struct metalShaderMap_s {
 #define Q3_METAL_MAX_TEXTURES 1024
 #define Q3_METAL_MAX_MODELS 1024
 #define Q3_METAL_MAX_REFENTITIES 1024
-
-/* Sentinel returned by BlendModeFromTokens for stages whose blendFunc is a
- * Q3 no-op placeholder (e.g. GL_ZERO GL_ZERO — used as a depth prepass /
- * conditional stage marker; writes nothing to the framebuffer). World draws
- * discard these stages entirely. Distinct from 0 (OPAQUE) so we never
- * confuse "unknown blend → opaque fallback" with "intentional no-op". */
-#define Q3_BLEND_SKIP 5
-
-/* Inline BSP model handles live outside the MD3 registry so the normal
- * mesh lookup path can't mistake `*N` movers for MD3 assets. */
-#define METAL_INLINE_MODEL_HANDLE_BASE 0x30000000
-
-/* Requested shader cull subset only. Q3's `cull disable` and
- * `cull twosided` both collapse to "no cull" in Metal; everything else
- * stays on the normal back-face path so batching/state stays unchanged. */
-enum {
-    METAL_SHADER_CULL_BACK = 0,
-    METAL_SHADER_CULL_DISABLE = 1,
-    /* Q3 `cull front` — inverts winding (render back faces only).
-     * Used by skybox interior hulls and a handful of portal shaders. */
-    METAL_SHADER_CULL_FRONT = 2
-};
 
 typedef struct {
     qboolean inUse;
@@ -107,28 +29,10 @@ typedef struct {
     int blendMode; /* 0=opaque, 1=additive, 2=alpha, 3=filter; propagated
                     * from the shader-map entry that resolved this texture. */
     int alphaFunc; /* 0=none, 1=GT0, 2=GE128, 3=LT128 */
-    int cullMode;  /* METAL_SHADER_CULL_* parsed from top-level `cull`. */
-    qboolean isAdditive;
-    qboolean isScroll;
-    float scrollSpeedU;
-    float scrollSpeedV;
-    int animFrames;
-    float animSpeed;
-    qhandle_t animBaseHandle;
 } metalTexture_t;
 
 refimport_t ri;
-static void ShaderMap_GetTcModChain(const char *name,
-                                    Q3TcMod *outChain,
-                                    int *outCount);
 
-static int ShaderMap_GetRgbWave(const char *name,
-                                int *outFunc, float *outBase, float *outAmp,
-                                float *outPhase, float *outFreq);
-
-static int ShaderMap_GetAlphaWave(const char *name,
-                                  int *outFunc, float *outBase, float *outAmp,
-                                  float *outPhase, float *outFreq);
 static glconfig_t s_glConfig;
 static Q3MetalFrameSnapshot s_frameSnapshot;
 static Q3MetalSceneView s_sceneView;
@@ -141,7 +45,6 @@ static float s_currentColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
 static metalTexture_t s_textures[Q3_METAL_MAX_TEXTURES];
 static qhandle_t s_nextTextureHandle = 1;
 static qhandle_t s_whiteTextureHandle;
-static qhandle_t s_transparentTextureHandle;
 static qhandle_t s_skyTextureHandle;
 static qhandle_t s_timHellBaseTextureHandle;
 static qhandle_t s_timHellAddTextureHandle;
@@ -162,24 +65,14 @@ typedef struct {
 } metalSceneEntity_t;
 
 typedef struct {
-    vec3_t mins;
-    vec3_t maxs;
-    uint32_t firstDraw;
-    uint32_t drawCount;
-} metalInlineModel_t;
-
-typedef struct {
     qboolean loaded;
     uint32_t generation;
     uint32_t vertexCount;
     uint32_t indexCount;
     uint32_t drawCount;
-    uint32_t staticWorldDrawCount;
     Q3MetalWorldVertex *vertices;
     uint32_t *indices;
     Q3MetalWorldDrawCmd *draws;
-    metalInlineModel_t *inlineModels;
-    uint32_t inlineModelCount;
     /* Parallel table of animated shader slot per draw index.
      * Slot == -1 means static; >= 0 indexes s_shaderMap for per-frame
      * retargeting (fire/lava/teleport on world geometry). */
@@ -226,41 +119,6 @@ static void AuditOnce(const char *msg) {
 static Q3MetalEntityVertex *s_entityVertices;
 static uint32_t *s_entityIndices;
 static Q3MetalEntityDrawCmd *s_entityDraws;
-static Q3MetalInlineModelInstance s_inlineModelInstances[Q3_METAL_MAX_REFENTITIES];
-static uint32_t s_inlineModelInstanceCount;
-
-/* Portal-visibility flags used by the Swift-side portal-pass culling gate
- * (Q3MetalRenderer_HasVisiblePortal). `s_worldHasPortalSurface` latches
- * at LoadWorldMapData time — any BSP draw carrying the PORTAL flag means
- * the map CAN show a portal, so keep the flag until the next map load.
- * `s_hasVisiblePortalEntity` resets per-frame in RE_BeginFrame and is set
- * when an MD3 entity surface lands on a portal-classified shader this
- * frame. Declared early so LoadWorldMapData (which runs before
- * RE_AddRefEntityToScene's declaration block) can reference them. */
-static qboolean s_worldHasPortalSurface = qfalse;
-static qboolean s_hasVisiblePortalEntity = qfalse;
-
-/* Scene-accumulated polygon storage. cgame submits polys (marks, smoke,
- * rail trails, gibs, plasma spans) via RE_AddPolyToScene BEFORE
- * RE_RenderScene runs. We stash them here and triangulate/emit into the
- * entity vertex/index buffers inside RE_RenderScene so they share the
- * existing entity pipeline (alpha/additive depending on texture blendMode).
- *
- * Reset per-scene in RE_ClearScene. Each logical poly keeps its shader
- * handle + first-vert offset + vertex count so RE_RenderScene can
- * triangle-fan-triangulate it at emit time. */
-#define METAL_MAX_SCENE_POLYS 1024
-#define METAL_MAX_SCENE_POLY_VERTS (METAL_MAX_SCENE_POLYS * 8)
-typedef struct {
-    qhandle_t shader;
-    uint32_t firstVert;
-    uint32_t vertCount;
-} metalScenePoly_t;
-static polyVert_t s_scenePolyVerts[METAL_MAX_SCENE_POLY_VERTS];
-static metalScenePoly_t s_scenePolys[METAL_MAX_SCENE_POLYS];
-static uint32_t s_scenePolyCount;
-static uint32_t s_scenePolyVertCount;
-
 static uint32_t s_entityVertexCount;
 static uint32_t s_entityIndexCount;
 static uint32_t s_entityDrawCount;
@@ -346,18 +204,6 @@ static metalModel_t *AllocModelSlot(void) {
     return NULL;
 }
 
-static int InlineModelIndexForHandle(qhandle_t handle) {
-    int index;
-    if ((handle & 0xF0000000) != METAL_INLINE_MODEL_HANDLE_BASE) {
-        return -1;
-    }
-    index = (int)(handle - METAL_INLINE_MODEL_HANDLE_BASE);
-    if (index < 0 || (uint32_t)index >= s_world.inlineModelCount) {
-        return -1;
-    }
-    return index;
-}
-
 static qhandle_t EnsureWhiteTexture(void) {
     metalTexture_t *texture;
     byte *rgba;
@@ -384,166 +230,6 @@ static qhandle_t EnsureWhiteTexture(void) {
     Q_strncpyz(texture->name, "*white", sizeof(texture->name));
     s_whiteTextureHandle = texture->handle;
     return s_whiteTextureHandle;
-}
-
-static qhandle_t EnsureTransparentTexture(void) {
-    metalTexture_t *texture;
-    byte *rgba;
-
-    if (s_transparentTextureHandle != 0) {
-        return s_transparentTextureHandle;
-    }
-
-    texture = AllocTextureSlot();
-    if (texture == NULL) {
-        return EnsureWhiteTexture();
-    }
-
-    rgba = ri.Malloc(4);
-    rgba[0] = 0;
-    rgba[1] = 0;
-    rgba[2] = 0;
-    rgba[3] = 0;
-
-    texture->width = 1;
-    texture->height = 1;
-    texture->rgbaBytes = rgba;
-    /* Use alpha blend semantics when this fallback is selected. */
-    texture->blendMode = 2;
-    Q_strncpyz(texture->name, "*clear", sizeof(texture->name));
-    s_transparentTextureHandle = texture->handle;
-    return s_transparentTextureHandle;
-}
-
-static qboolean NameContainsCaseInsensitive(const char *name, const char *needle) {
-    size_t i, j;
-    size_t needleLen;
-
-    if (name == NULL || needle == NULL) {
-        return qfalse;
-    }
-    needleLen = strlen(needle);
-    if (needleLen == 0) {
-        return qfalse;
-    }
-
-    for (i = 0; name[i] != '\0'; ++i) {
-        for (j = 0; j < needleLen; ++j) {
-            char a = name[i + j];
-            char b = needle[j];
-            if (a == '\0') {
-                return qfalse;
-            }
-            if (tolower((unsigned char)a) != tolower((unsigned char)b)) {
-                break;
-            }
-        }
-        if (j == needleLen) {
-            return qtrue;
-        }
-    }
-    return qfalse;
-}
-
-/* Name-pattern "effect" classifier — DISABLED. The shader parser now
- * drives all blendMode / tcMod / cull decisions. Kept as a stub so the
- * forward declaration and any legacy call site compile; always returns
- * false so RegisterTexture never takes the effect fallback branch. */
-static qboolean IsLikelyEffectTextureName(const char *name) {
-    (void)name;
-    return qfalse;
-}
-
-static qboolean ShaderMap_IsPortal(const char *name);
-
-/* Stock-Q3 fogparms aliasing — DISABLED. The previous `fog` → kc_fogcloud3
- * alias was a name-based guess; Metal must consume real shader data. */
-static const char *ResolveMissingEffectTextureAlias(const char *name) {
-    (void)name;
-    return NULL;
-}
-
-static qboolean TryLoadImageRGBA(const char *name, byte **rgba, int *width, int *height, char *resolvedName, size_t resolvedNameSize);
-
-static qhandle_t ResolveFakeAnimatedTextureHandle(qhandle_t textureHandle) {
-    const metalTexture_t *texture = FindTextureByHandle(textureHandle);
-    qhandle_t baseHandle;
-    int frame;
-    if (texture == NULL || texture->animFrames <= 1 || texture->animSpeed <= 0.0f) return textureHandle;
-    baseHandle = texture->animBaseHandle != 0 ? texture->animBaseHandle : texture->handle;
-    frame = (int)((float)cls.realtime * 0.001f * texture->animSpeed) % texture->animFrames;
-    if (frame <= 0 || FindTextureByHandle(baseHandle + frame) == NULL) return baseHandle;
-    return baseHandle + frame;
-}
-
-static qboolean BuildFakeAnimTextureName(const char *name, int frameIndex, char *outName, size_t outNameSize) {
-    char base[MAX_QPATH];
-    char extWithDot[16];
-    int end, start;
-    if (name == NULL || outName == NULL || frameIndex <= 0) return qfalse;
-    Q_strncpyz(base, name, sizeof(base));
-    extWithDot[0] = '\0';
-    if (COM_GetExtension(base)[0] != '\0') {
-        Com_sprintf(extWithDot, sizeof(extWithDot), ".%s", COM_GetExtension(base));
-        COM_StripExtension(base, base, sizeof(base));
-    }
-    end = (int)strlen(base);
-    start = end;
-    while (start > 0 && isdigit((unsigned char)base[start - 1])) start--;
-    if (start == end) return qfalse;
-    Com_sprintf(outName, outNameSize, "%.*s%d%s", start, base, atoi(base + start) + frameIndex, extWithDot);
-    return qtrue;
-}
-
-static void PreloadFakeAnimFrames(metalTexture_t *texture, const char *name) {
-    int frameIndex, loadedCount = 1;
-    if (texture == NULL || texture->animFrames <= 1) return;
-    for (frameIndex = 1; frameIndex < texture->animFrames; ++frameIndex) {
-        char frameName[MAX_QPATH], resolvedName[MAX_QPATH];
-        byte *rgba = NULL;
-        int width = 0, height = 0;
-        metalTexture_t *frameTexture;
-        if (!BuildFakeAnimTextureName(name, frameIndex, frameName, sizeof(frameName))) break;
-        if (!TryLoadImageRGBA(frameName, &rgba, &width, &height, resolvedName, sizeof(resolvedName))) break;
-        frameTexture = FindTextureByName(frameName);
-        if (frameTexture == NULL) frameTexture = AllocTextureSlot();
-        if (frameTexture == NULL) {
-            ri.Free(rgba);
-            break;
-        }
-        frameTexture->width = width;
-        frameTexture->height = height;
-        frameTexture->rgbaBytes = rgba;
-        frameTexture->blendMode = texture->blendMode;
-        frameTexture->alphaFunc = texture->alphaFunc;
-        frameTexture->isAdditive = texture->isAdditive;
-        frameTexture->isScroll = texture->isScroll;
-        frameTexture->scrollSpeedU = texture->scrollSpeedU;
-        frameTexture->scrollSpeedV = texture->scrollSpeedV;
-        frameTexture->animFrames = texture->animFrames;
-        frameTexture->animSpeed = texture->animSpeed;
-        frameTexture->animBaseHandle = texture->handle;
-        Q_strncpyz(frameTexture->name, frameName, sizeof(frameTexture->name));
-        loadedCount++;
-    }
-    for (frameIndex = 0; frameIndex < loadedCount; ++frameIndex) {
-        metalTexture_t *frameTexture = FindTextureByHandle(texture->handle + frameIndex);
-        if (frameTexture != NULL) {
-            frameTexture->animFrames = loadedCount;
-            frameTexture->animSpeed = texture->animSpeed;
-            frameTexture->animBaseHandle = texture->handle;
-        }
-    }
-}
-
-/* Name-based shader-flag stamping — DISABLED. All blendMode / isAdditive /
- * isScroll / animFrames decisions now come from ParseShaderText reading the
- * actual .shader file. This function is retained only so that legacy call
- * sites still compile; it intentionally does nothing. Metal consumes
- * parsed shader data; it does not guess from texture names. */
-static void ApplyFakeShaderFlags(metalTexture_t *texture, const char *name) {
-    (void)texture;
-    (void)name;
 }
 
 static qhandle_t RegisterRawTexture(const char *name, byte *rgba, int width, int height) {
@@ -663,84 +349,28 @@ static void AddWorldDrawStage(Q3MetalWorldDrawCmd *draw,
                               qhandle_t textureHandle,
                               int blendMode,
                               int tcGenEnv,
-                              const Q3TcMod *tcMods,
-                              int tcModCount,
+                              int tcModType,
+                              float tcModP0,
+                              float tcModP1,
+                              float tcModP2,
+                              float tcModP3,
                               int rgbGen,
-                              int alphaGen,
-                              int alphaFunc,
-                              int cullMode,
-                              int useLightmap,
-                              int rgbWaveFunc,
-                              float rgbWaveBase,
-                              float rgbWaveAmp,
-                              float rgbWavePhase,
-                              float rgbWaveFreq,
-                              int alphaWaveFunc,
-                              float alphaWaveBase,
-                              float alphaWaveAmp,
-                              float alphaWavePhase,
-                              float alphaWaveFreq) {
+                              int alphaFunc) {
     Q3MetalWorldStage *stage;
-    int i;
-    int clampedTcModCount;
     if (draw == NULL || draw->stageCount >= Q3_METAL_MAX_STAGES) {
         return;
     }
-    /* Q3_BLEND_SKIP — stage has `blendFunc GL_ZERO GL_ZERO` or equivalent
-     * no-op. Do not store; do not rebind pipeline; do not waste a draw. */
-    if (blendMode == Q3_BLEND_SKIP) {
-        return;
-    }
-    /* animMap-style animated frame resolution is parser-sourced data
-     * (shader file's own `animmap <fps> <f1> <f2> ...`), not a heuristic. */
-    textureHandle = ResolveFakeAnimatedTextureHandle(textureHandle);
-    /* All fields below are sourced from the parsed shader stage:
-     *   textureHandle   ← first-valid-stage `map` / `animmap` / `$whiteimage`
-     *   blendMode       ← first-valid-stage `blendFunc`
-     *   tcGenEnv        ← first-valid-stage `tcGen environment`
-     *   tcMods[]        ← first-valid-stage `tcMod …` chain (ORDER preserved)
-     *   rgbGen/alpha    ← first-valid-stage `rgbGen / alphaGen`
-     *   rgb/alphaWave*  ← first-valid-stage `rgbGen wave / alphaGen wave` params
-     *   alphaFunc       ← first-valid-stage `alphaFunc GT0/GE128/LT128`
-     *   cullMode        ← top-level `cull back|disable|twosided|front`
-     * No name-based overrides, no FX-name promotion, no portal
-     * reclassification. Metal consumes whatever the parser produced. */
     stage = &draw->stages[draw->stageCount++];
     stage->textureHandle = (uint32_t)textureHandle;
     stage->blendMode = (uint32_t)blendMode;
     stage->tcGen = (uint32_t)((tcGenEnv != 0) ? 1 : 0);
-
-    clampedTcModCount = tcModCount;
-    if (clampedTcModCount < 0) clampedTcModCount = 0;
-    if (clampedTcModCount > Q3_MAX_TCMODS) clampedTcModCount = Q3_MAX_TCMODS;
-    for (i = 0; i < Q3_MAX_TCMODS; ++i) {
-        if (i < clampedTcModCount && tcMods != NULL) {
-            stage->tcMods[i] = tcMods[i];
-        } else {
-            stage->tcMods[i].type = 0;
-            stage->tcMods[i].params[0] = 0.0f;
-            stage->tcMods[i].params[1] = 0.0f;
-            stage->tcMods[i].params[2] = 0.0f;
-            stage->tcMods[i].params[3] = 0.0f;
-        }
-    }
-    stage->tcModCount = (uint32_t)clampedTcModCount;
-
+    stage->tcMod = (uint32_t)tcModType;
+    stage->tcModParams[0] = tcModP0;
+    stage->tcModParams[1] = tcModP1;
+    stage->tcModParams[2] = tcModP2;
+    stage->tcModParams[3] = tcModP3;
     stage->rgbGen = (uint32_t)rgbGen;
-    stage->alphaGen = (uint32_t)alphaGen;
     stage->alphaFunc = (uint32_t)alphaFunc;
-    stage->cullMode = (uint32_t)cullMode;
-    stage->useLightmap = (uint32_t)((useLightmap != 0) ? 1 : 0);
-    stage->rgbWaveFunc = (uint32_t)rgbWaveFunc;
-    stage->rgbWaveBase = rgbWaveBase;
-    stage->rgbWaveAmp = rgbWaveAmp;
-    stage->rgbWavePhase = rgbWavePhase;
-    stage->rgbWaveFreq = rgbWaveFreq;
-    stage->alphaWaveFunc = (uint32_t)alphaWaveFunc;
-    stage->alphaWaveBase = alphaWaveBase;
-    stage->alphaWaveAmp = alphaWaveAmp;
-    stage->alphaWavePhase = alphaWavePhase;
-    stage->alphaWaveFreq = alphaWaveFreq;
 }
 
 static qboolean TryLoadImageRGBA(const char *name, byte **rgba, int *width, int *height, char *resolvedName, size_t resolvedNameSize) {
@@ -753,35 +383,6 @@ static qboolean TryLoadImageRGBA(const char *name, byte **rgba, int *width, int 
     *width = 0;
     *height = 0;
 
-    /* (1) Try the exact incoming path AS IS first. Covers `.TGA`/`.JPG`
-     * uppercase variants and any extension routed through an explicit
-     * loader via Q_stricmp dispatch. Q3's FS is case-insensitive inside
-     * pk3 archives, so lowercase candidates match uppercase archive
-     * entries — but hitting the exact incoming name first is zero cost
-     * and surfaces any on-disk name the iterator wouldn't generate. */
-    ext = COM_GetExtension(name);
-    if (ext[0] != '\0') {
-        if (!Q_stricmp(ext, "tga")) {
-            R_LoadTGA(name, rgba, width, height);
-        } else if (!Q_stricmp(ext, "jpg") || !Q_stricmp(ext, "jpeg")) {
-            R_LoadJPG(name, rgba, width, height);
-        }
-        if (*rgba != NULL && *width > 0 && *height > 0) {
-            Q_strncpyz(resolvedName, name, resolvedNameSize);
-            return qtrue;
-        }
-        /* Belt-and-suspenders: ensure state is clean before fallback. */
-        if (*rgba != NULL) {
-            ri.Free(*rgba);
-            *rgba = NULL;
-        }
-        *width = 0;
-        *height = 0;
-    }
-
-    /* (2) Strip any extension and iterate `.tga → .jpg → .jpeg`. Quake 3
-     * shader scripts frequently declare `map foo.tga` for a texture that
-     * ships as `foo.jpg` (or vice versa); stock Q3 tries all three. */
     Q_strncpyz(base, name, sizeof(base));
     ext = COM_GetExtension(base);
     if (ext[0] != '\0') {
@@ -807,7 +408,6 @@ static qboolean TryLoadImageRGBA(const char *name, byte **rgba, int *width, int 
 }
 
 static const char *ShaderMap_Lookup(const char *name);
-const metalShaderMap_t *ShaderMap_LookupEntry(const char *name);
 static qhandle_t ShaderMap_ResolveCurrentFrame(const char *name);
 static int ShaderMap_FindAnimatedSlot(const char *name);
 static qhandle_t ShaderMap_AnimatedSlotCurrentHandle(int slot);
@@ -816,9 +416,6 @@ static void ShaderMap_GetScale(const char *name, float *outS, float *outT);
 static qboolean ShaderMap_GetTurb(const char *name, float *outAmp, float *outPhase, float *outFreq);
 static int ShaderMap_GetBlendMode(const char *name);
 static int ShaderMap_GetAlphaFunc(const char *name);
-static int ShaderMap_GetCullMode(const char *name);
-static int ShaderMap_GetRgbGen(const char *name);
-static int ShaderMap_GetAlphaGen(const char *name);
 static int ShaderMap_GetTcGenEnv(const char *name);
 static qboolean ShaderMap_GetSecondStage(const char *name,
                                          char *outMap, size_t outMapSize,
@@ -829,6 +426,8 @@ static qboolean ShaderMap_GetSecondStage(const char *name,
 static int s_pendingAnimSlot;
 static float s_pendingScrollS;
 static float s_pendingScrollT;
+static int s_pendingBlendMode;
+static int s_pendingAlphaFunc;
 
 static qhandle_t RegisterTexture(const char *name) {
     metalTexture_t *existing;
@@ -839,15 +438,6 @@ static qhandle_t RegisterTexture(const char *name) {
     char resolvedName[MAX_QPATH];
 
     if (name == NULL || name[0] == '\0' || !Q_stricmp(name, "white")) {
-        return EnsureWhiteTexture();
-    }
-    /* Honour the `$whiteimage` engine sentinel up-front. FX shader stages
-     * (railCore, smokePuff, rocketExplosion, …) use `map $whiteimage` and
-     * derive color/alpha from rgbGen wave + alphaGen wave on top of pure
-     * white. Per-stage emission passes "$whiteimage" verbatim as the
-     * stage texture name; without this short-circuit it falls through to
-     * disk load → fails → spammy "no shader mapPath / disk image" warning. */
-    if (name[0] == '$' && !Q_stricmp(name, "$whiteimage")) {
         return EnsureWhiteTexture();
     }
 
@@ -889,94 +479,20 @@ static qhandle_t RegisterTexture(const char *name) {
                     int parentAF = ShaderMap_GetAlphaFunc(name);
                     if (parentAF != 0) animTex->alphaFunc = parentAF;
                 }
-                if (animTex->cullMode == METAL_SHADER_CULL_BACK) {
-                    int parentCull = ShaderMap_GetCullMode(name);
-                    if (parentCull == METAL_SHADER_CULL_DISABLE) {
-                        animTex->cullMode = parentCull;
-                    }
-                }
             }
             return animHandle;
         }
     }
 
-    {
-        /* Shader-map FIRST: shader names rarely match on-disk image paths.
-         * Consult ShaderMap_LookupEntry before attempting any direct load
-         * by `name`. */
-        const metalShaderMap_t *entry = ShaderMap_LookupEntry(name);
-        qboolean loaded = qfalse;
-        qboolean isWhiteImage = qfalse;
-        if (entry != NULL) {
-            if (entry->mapPath[0] != '\0' && entry->mapPath[0] != '$') {
-                if (TryLoadImageRGBA(entry->mapPath, &rgba, &width, &height,
-                                     resolvedName, sizeof(resolvedName))) {
-                    ri.Printf(PRINT_DEVELOPER,
-                              "Metal shader: '%s' -> mapPath '%s'\n",
-                              name, entry->mapPath);
-                    loaded = qtrue;
-                }
-            } else if (entry->mapPath[0] == '$' &&
-                       !Q_stricmp(entry->mapPath, "$whiteimage")) {
-                /* $whiteimage sentinel — FX shaders (smokePuff, railCore,
-                 * rocketExplosion, etc.) derive color from rgbGen wave +
-                 * alphaGen wave on top of pure white. Allocate a PER-SHADER
-                 * 1×1 white slot (not the shared EnsureWhiteTexture handle)
-                 * so the shader's blendMode / alphaFunc / cullMode from
-                 * metalShaderMap_t propagates onto metalTexture_t at the
-                 * AllocTextureSlot block below — otherwise every
-                 * $whiteimage shader collapses onto the single shared white
-                 * texture and loses its per-shader blend classification. */
-                rgba = ri.Malloc(4);
-                if (rgba == NULL) {
-                    return EnsureWhiteTexture();
-                }
-                rgba[0] = 255;
-                rgba[1] = 255;
-                rgba[2] = 255;
-                rgba[3] = 255;
-                width = 1;
-                height = 1;
-                Q_strncpyz(resolvedName, "$whiteimage", sizeof(resolvedName));
-                isWhiteImage = qtrue;
-                loaded = qtrue;
-            }
+    if (!TryLoadImageRGBA(name, &rgba, &width, &height, resolvedName, sizeof(resolvedName))) {
+        const char *mapped = ShaderMap_Lookup(name);
+        if (mapped != NULL
+            && TryLoadImageRGBA(mapped, &rgba, &width, &height, resolvedName, sizeof(resolvedName))) {
+            ri.Printf(PRINT_DEVELOPER, "Metal shader: resolved '%s' -> '%s'\n", name, mapped);
+        } else {
+            ri.Printf(PRINT_WARNING, "Metal stub: failed to load UI texture '%s', falling back to white\n", name);
+            return EnsureWhiteTexture();
         }
-        if (!loaded) {
-            /* No shader entry, or entry mapPath did not load — try a
-             * direct disk load by the original name. Quake 3 has TWO
-             * legal resolution classes: (1) shader names declared in
-             * scripts .shader files; (2) raw texture paths that have
-             * NO shader (models tga / textures without a script entry).
-             * A missing shader entry is NOT an error — it just means
-             * this is a raw texture. */
-            if (!TryLoadImageRGBA(name, &rgba, &width, &height,
-                                  resolvedName, sizeof(resolvedName))) {
-                /* Only log an ERROR when a shader entry existed and
-                 * pointed at a real mapPath that failed to load from
-                 * disk — that's a genuine asset-resolution failure.
-                 * Other cases (no entry = raw texture missing on disk;
-                 * entry with empty mapPath = sky/portal-only shader)
-                 * are demoted to PRINT_DEVELOPER so `\developer 1`
-                 * still surfaces them but normal runs are silent. */
-                if (entry != NULL && entry->mapPath[0] != '\0' &&
-                    entry->mapPath[0] != '$') {
-                    ri.Printf(PRINT_ERROR,
-                              "Metal SHADER-RESOLVE FAIL '%s' — entry mapPath '%s' failed to load from disk; falling back to white\n",
-                              name, entry->mapPath);
-                } else if (entry == NULL) {
-                    ri.Printf(PRINT_DEVELOPER,
-                              "Metal raw-texture miss: '%s' (no shader, no disk file); white fallback\n",
-                              name);
-                } else {
-                    ri.Printf(PRINT_DEVELOPER,
-                              "Metal shader mapPath-empty: '%s' (sky/portal-only or sentinel-only shader); white fallback\n",
-                              name);
-                }
-                return EnsureWhiteTexture();
-            }
-        }
-        (void)isWhiteImage; /* flag kept for future per-stage wiring */
     }
 
     texture = AllocTextureSlot();
@@ -989,13 +505,11 @@ static qhandle_t RegisterTexture(const char *name) {
     texture->width = width;
     texture->height = height;
     texture->rgbaBytes = rgba;
-    texture->animBaseHandle = texture->handle;
     Q_strncpyz(texture->name, name, sizeof(texture->name));
-    /* Blend / alphaFunc / cull come straight from the shader-map entry
-     * that resolved this texture — parser-sourced, no name heuristics. */
+    /* Propagate blend mode from the shader-map entry that resolved
+     * this texture. Used by entity draw to decide additive pipeline. */
     texture->blendMode = ShaderMap_GetBlendMode(name);
     texture->alphaFunc = ShaderMap_GetAlphaFunc(name);
-    texture->cullMode = ShaderMap_GetCullMode(name);
     if (Q_stricmp(name, resolvedName)) {
         ri.Printf(PRINT_ALL, "Metal stub: loaded '%s' from '%s' (%dx%d)\n", name, resolvedName, width, height);
     }
@@ -1039,9 +553,6 @@ static void FreeWorldMapData(void) {
     }
     if (s_world.draws != NULL) {
         ri.Free(s_world.draws);
-    }
-    if (s_world.inlineModels != NULL) {
-        ri.Free(s_world.inlineModels);
     }
     if (s_world.animShaderSlots != NULL) {
         ri.Free(s_world.animShaderSlots);
@@ -1747,21 +1258,6 @@ static void SetupEntityLighting(const refEntity_t *ent,
     }
 }
 
-static int WorldModelIndexForSurface(const dmodel_t *models, int modelCount, int surfaceIndex) {
-    int modelIndex;
-    if (models == NULL || modelCount <= 0 || surfaceIndex < 0) {
-        return 0;
-    }
-    for (modelIndex = 0; modelIndex < modelCount; ++modelIndex) {
-        int firstSurface = LittleLong(models[modelIndex].firstSurface);
-        int numSurfaces = LittleLong(models[modelIndex].numSurfaces);
-        if (surfaceIndex >= firstSurface && surfaceIndex < firstSurface + numSurfaces) {
-            return modelIndex;
-        }
-    }
-    return 0;
-}
-
 static qboolean LoadWorldMapData(const char *name) {
     void *fileBuffer = NULL;
     dheader_t *header;
@@ -1769,12 +1265,10 @@ static qboolean LoadWorldMapData(const char *name) {
     drawVert_t *drawVerts;
     int *drawIndexes;
     dsurface_t *surfaces;
-    const dmodel_t *models;
     int shaderCount;
     int drawVertCount;
     int drawIndexCount;
     int surfaceCount;
-    int modelCount;
     int i;
     uint32_t totalVertices = 0;
     uint32_t totalIndices = 0;
@@ -1788,11 +1282,7 @@ static qboolean LoadWorldMapData(const char *name) {
     uint32_t triSoupDraws = 0;
     uint32_t skippedNoDrawSurfaces = 0;
 
-    static const uint32_t defaultWorldFlags = 0;
-
-    /* Reset map-level portal latch. Set below when any draw is tagged
-     * Q3_METAL_WORLD_DRAWFLAG_PORTAL. */
-    s_worldHasPortalSurface = qfalse;
+    static const uint32_t defaultWorldFlags = Q3_METAL_WORLD_DRAWFLAG_NOCULL;
 
     if (ri.FS_ReadFile(name, &fileBuffer) <= 0 || fileBuffer == NULL) {
         ri.Printf(PRINT_WARNING, "Metal world: failed to read BSP '%s'\n", name);
@@ -1810,13 +1300,11 @@ static qboolean LoadWorldMapData(const char *name) {
     drawIndexes = (int *)((byte *)fileBuffer + LittleLong(header->lumps[LUMP_DRAWINDEXES].fileofs));
     surfaces = (dsurface_t *)((byte *)fileBuffer + LittleLong(header->lumps[LUMP_SURFACES].fileofs));
     shaders = (dshader_t *)((byte *)fileBuffer + LittleLong(header->lumps[LUMP_SHADERS].fileofs));
-    models = (const dmodel_t *)((const byte *)fileBuffer + LittleLong(header->lumps[LUMP_MODELS].fileofs));
 
     shaderCount = LittleLong(header->lumps[LUMP_SHADERS].filelen) / (int)sizeof(dshader_t);
     drawVertCount = LittleLong(header->lumps[LUMP_DRAWVERTS].filelen) / (int)sizeof(drawVert_t);
     drawIndexCount = LittleLong(header->lumps[LUMP_DRAWINDEXES].filelen) / (int)sizeof(int);
     surfaceCount = LittleLong(header->lumps[LUMP_SURFACES].filelen) / (int)sizeof(dsurface_t);
-    modelCount = LittleLong(header->lumps[LUMP_MODELS].filelen) / (int)sizeof(dmodel_t);
 
     for (i = 0; i < surfaceCount; ++i) {
         const dsurface_t *surface = &surfaces[i];
@@ -1887,26 +1375,6 @@ static qboolean LoadWorldMapData(const char *name) {
         }
     }
 
-    if (modelCount > 0) {
-        s_world.inlineModels = ri.Malloc(modelCount * sizeof(*s_world.inlineModels));
-        if (s_world.inlineModels == NULL) {
-            ri.Printf(PRINT_WARNING, "Metal world: inline-model allocation failed for '%s'\n", name);
-            FreeWorldMapData();
-            ri.FS_FreeFile(fileBuffer);
-            return qfalse;
-        }
-        s_world.inlineModelCount = (uint32_t)modelCount;
-        for (i = 0; i < modelCount; ++i) {
-            int axis;
-            for (axis = 0; axis < 3; ++axis) {
-                s_world.inlineModels[i].mins[axis] = LittleFloat(models[i].mins[axis]);
-                s_world.inlineModels[i].maxs[axis] = LittleFloat(models[i].maxs[axis]);
-            }
-            s_world.inlineModels[i].firstDraw = UINT32_MAX;
-            s_world.inlineModels[i].drawCount = 0;
-        }
-    }
-
     s_world.vertices = ri.Malloc(totalVertices * sizeof(*s_world.vertices));
     s_world.indices = ri.Malloc(totalIndices * sizeof(*s_world.indices));
     s_world.draws = ri.Malloc(totalDraws * sizeof(*s_world.draws));
@@ -1936,10 +1404,18 @@ static qboolean LoadWorldMapData(const char *name) {
         uint32_t baseVertex;
         qhandle_t textureHandle;
         qhandle_t lightmapHandle;
-        qhandle_t skyOverrideTexture; /* sky cubemap face / cloud-dome override for stage 0 */
+        qhandle_t stage2TextureHandle;
+        int stage0BlendMode;
+        int stage0AlphaFunc;
+        int stage0TcGenEnv;
+        int stage0TcModType;
+        float stage0TcModParams[4];
+        char skyStage2Map[MAX_QPATH];
+        int skyStage2BlendMode;
+        int skyStage2TcModType;
+        float skyStage2TcModParams[4];
+        qboolean hasSkyStage2;
         int lightmapNum;
-        int ownerModelIndex;
-        int shaderCullMode;
         qboolean hasLightmap;
         uint32_t worldFlags;
         int j;
@@ -1954,9 +1430,24 @@ static qboolean LoadWorldMapData(const char *name) {
         numIndexes = LittleLong(surface->numIndexes);
         shaderNum = LittleLong(surface->shaderNum);
         lightmapNum = LittleLong(surface->lightmapNum);
-        ownerModelIndex = WorldModelIndexForSurface(models, modelCount, i);
         hasLightmap = qfalse;
-        skyOverrideTexture = 0;
+        stage2TextureHandle = 0;
+        stage0BlendMode = 0;
+        stage0AlphaFunc = 0;
+        stage0TcGenEnv = 0;
+        stage0TcModType = 0;
+        stage0TcModParams[0] = 0.0f;
+        stage0TcModParams[1] = 0.0f;
+        stage0TcModParams[2] = 0.0f;
+        stage0TcModParams[3] = 0.0f;
+        skyStage2Map[0] = '\0';
+        skyStage2BlendMode = 0;
+        skyStage2TcModType = 0;
+        skyStage2TcModParams[0] = 0.0f;
+        skyStage2TcModParams[1] = 0.0f;
+        skyStage2TcModParams[2] = 0.0f;
+        skyStage2TcModParams[3] = 0.0f;
+        hasSkyStage2 = qfalse;
 
         if (shaderNum < 0 || shaderNum >= shaderCount) {
             continue;
@@ -1996,73 +1487,132 @@ static qboolean LoadWorldMapData(const char *name) {
                 }
                 skyFace = GetSkyFaceTextureForSurface(shaders[shaderNum].shader, nx, ny, nz);
             }
-            /* Sky cube override: override stage 0 texture only. Cloud-dome
-             * sky uses entry->stages[0].mapPath (killsky_1) via the unified
-             * loop, so no override is set in that case. */
             if (skyFace != 0) {
-                skyOverrideTexture = skyFace;
                 textureHandle = skyFace;
             } else {
-                textureHandle = 0;
+                /* No farbox cubemap — use parsed cloud texture. */
+                textureHandle = RegisterTexture(shaders[shaderNum].shader);
+                if (textureHandle == 0) {
+                    textureHandle = EnsureSkyTexture();
+                }
             }
             skyDraws += 1;
         } else {
-            textureHandle = 0;
+            textureHandle = RegisterTexture(shaders[shaderNum].shader);
         }
 
+        /* Record animated-shader slot for this surface so RE_RenderScene
+         * can re-resolve the textureHandle each frame. Without this,
+         * world fire/lava/teleport surfaces cache frame-0 forever.
+         * Patch surfaces emit multiple draws, so we stash the slot and
+         * apply after each SetupWorldDraw below. */
         s_pendingAnimSlot = ShaderMap_FindAnimatedSlot(shaders[shaderNum].shader);
-        shaderCullMode = ShaderMap_GetCullMode(shaders[shaderNum].shader);
+        /* Per-shader tcMod scroll (s,t) for lava-flow, scrolling fog,
+         * etc. MSL applies `uv + scroll * timeSeconds` each frame. */
+        ShaderMap_GetScroll(shaders[shaderNum].shader, &s_pendingScrollS, &s_pendingScrollT);
+        stage0AlphaFunc = ShaderMap_GetAlphaFunc(shaders[shaderNum].shader);
+        stage0BlendMode = ShaderMap_GetBlendMode(shaders[shaderNum].shader);
+        stage0TcGenEnv = ShaderMap_GetTcGenEnv(shaders[shaderNum].shader);
+
+        /* Resolve tcMod for NON-sky surfaces (lava, scrolling fog, etc.).
+         * Sky branch below overrides this with its own sky-aware logic.
+         * Preference turb > scroll > scale because turb is the most
+         * visually distinctive — lava without turb looks dead. Only one
+         * tcMod slot per stage in the current draw-uniform layout, so
+         * we pick the most impactful. */
+        if (!IsSkyShaderName(shaders[shaderNum].shader)) {
+            float turbAmp = 0.0f, turbPhase = 0.0f, turbFreq = 0.0f;
+            qboolean nsHasTurb = ShaderMap_GetTurb(shaders[shaderNum].shader, &turbAmp, &turbPhase, &turbFreq);
+            qboolean nsHasScroll = (fabsf(s_pendingScrollS) > 0.00001f || fabsf(s_pendingScrollT) > 0.00001f);
+            float nsScaleS = 1.0f, nsScaleT = 1.0f;
+            ShaderMap_GetScale(shaders[shaderNum].shader, &nsScaleS, &nsScaleT);
+            qboolean nsHasScale = (fabsf(nsScaleS - 1.0f) > 0.00001f || fabsf(nsScaleT - 1.0f) > 0.00001f);
+            if (nsHasTurb) {
+                stage0TcModType = 5;
+                stage0TcModParams[0] = turbAmp;
+                stage0TcModParams[1] = turbFreq;
+                stage0TcModParams[2] = turbPhase;
+                stage0TcModParams[3] = 0.0f;
+            } else if (nsHasScroll) {
+                stage0TcModType = 1;
+                stage0TcModParams[0] = s_pendingScrollS;
+                stage0TcModParams[1] = s_pendingScrollT;
+            } else if (nsHasScale) {
+                stage0TcModType = 4;
+                stage0TcModParams[0] = nsScaleS;
+                stage0TcModParams[1] = nsScaleT;
+            }
+        }
+        if (IsSkyShaderName(shaders[shaderNum].shader)) {
+            float scaleS = 1.0f;
+            float scaleT = 1.0f;
+            qboolean stage0HasScroll = (fabsf(s_pendingScrollS) > 0.00001f || fabsf(s_pendingScrollT) > 0.00001f);
+            ShaderMap_GetScale(shaders[shaderNum].shader, &scaleS, &scaleT);
+            qboolean stage0HasScale = (fabsf(scaleS - 1.0f) > 0.00001f || fabsf(scaleT - 1.0f) > 0.00001f);
+            /* Scroll wins over scale — Q3 killsky has both but scroll
+             * is the animation; scale is a one-time tile. The old
+             * logic unconditionally overrode scroll→scale whenever
+             * the scale wasn't 1.0, which is exactly the "if anything
+             * interesting happens, ruin it" bug. */
+            if (stage0HasScroll) {
+                stage0TcModType = 1;
+                stage0TcModParams[0] = s_pendingScrollS;
+                stage0TcModParams[1] = s_pendingScrollT;
+            } else if (stage0HasScale) {
+                stage0TcModType = 4;
+                stage0TcModParams[0] = scaleS;
+                stage0TcModParams[1] = scaleT;
+            } else {
+                stage0TcModType = 0;
+                stage0TcModParams[0] = 0.0f;
+                stage0TcModParams[1] = 0.0f;
+            }
+            hasSkyStage2 = ShaderMap_GetSecondStage(
+                shaders[shaderNum].shader,
+                skyStage2Map, sizeof(skyStage2Map),
+                &skyStage2BlendMode,
+                &skyStage2TcModParams[0], &skyStage2TcModParams[1],
+                &skyStage2TcModParams[2], &skyStage2TcModParams[3]);
+            if (hasSkyStage2) {
+                qboolean stage2HasScroll = (fabsf(skyStage2TcModParams[2]) > 0.00001f || fabsf(skyStage2TcModParams[3]) > 0.00001f);
+                qboolean stage2HasScale = (fabsf(skyStage2TcModParams[0] - 1.0f) > 0.00001f || fabsf(skyStage2TcModParams[1] - 1.0f) > 0.00001f);
+                /* Preserve raw values for diagnostic BEFORE branches mutate params[0][1]. */
+                float rawScaleS = skyStage2TcModParams[0];
+                float rawScaleT = skyStage2TcModParams[1];
+                float rawScrollS = skyStage2TcModParams[2];
+                float rawScrollT = skyStage2TcModParams[3];
+                stage2TextureHandle = RegisterTexture(skyStage2Map);
+                if (stage2HasScroll) {
+                    skyStage2TcModType = 1;
+                    skyStage2TcModParams[0] = skyStage2TcModParams[2];
+                    skyStage2TcModParams[1] = skyStage2TcModParams[3];
+                } else if (stage2HasScale) {
+                    skyStage2TcModType = 4;
+                    /* params[0][1] already hold scale; nothing to do. */
+                } else {
+                    skyStage2TcModType = 0;
+                    skyStage2TcModParams[0] = 0.0f;
+                    skyStage2TcModParams[1] = 0.0f;
+                }
+                ri.Printf(PRINT_DEVELOPER,
+                          "Metal sky tcMod: '%s' stage1 raw_scale=(%.3f,%.3f) raw_scroll=(%.3f,%.3f) resolved=type=%d,(%.3f,%.3f)\n",
+                          shaders[shaderNum].shader,
+                          rawScaleS, rawScaleT, rawScrollS, rawScrollT,
+                          skyStage2TcModType, skyStage2TcModParams[0], skyStage2TcModParams[1]);
+            }
+        }
         lightmapHandle = EnsureWhiteTexture();
         worldFlags = defaultWorldFlags;
-        if (shaderCullMode == METAL_SHADER_CULL_DISABLE) {
-            worldFlags |= Q3_METAL_WORLD_DRAWFLAG_NOCULL;
-        } else if (shaderCullMode == METAL_SHADER_CULL_FRONT) {
-            /* `cull front` inverts winding; Swift picks MTLCullMode.front. */
-            worldFlags |= Q3_METAL_WORLD_DRAWFLAG_CULL_FRONT;
-        }
-        /* Lightmap binding gated on PER-STAGE useLightmap (`map $lightmap`)
-         * detection. If no parsed stage references $lightmap, do not bind
-         * a lightmap even if the surface has a valid BSP lightmapNum.
-         * Falls back to "any non-sky surface with valid lightmapNum" when
-         * the shader has no stages parsed at all (BSP-only texture path
-         * without a .shader script entry — stock Q3 lightmaps these). */
         if (!IsSkyShaderName(shaders[shaderNum].shader) && lightmapNum >= 0 && lightmapNum < s_worldLightmapCount) {
-            const metalShaderMap_t *_le = ShaderMap_LookupEntry(shaders[shaderNum].shader);
-            qboolean wantLightmap = qfalse;
-            if (_le == NULL || _le->stageCount == 0) {
-                wantLightmap = qtrue; /* no shader script — BSP texture default */
-            } else {
-                int _ls;
-                for (_ls = 0; _ls < _le->stageCount; ++_ls) {
-                    if (_le->stages[_ls].useLightmap) { wantLightmap = qtrue; break; }
-                }
-            }
-            if (wantLightmap) {
-                lightmapHandle = s_worldLightmapHandles[lightmapNum];
-                hasLightmap = qtrue;
-                worldFlags |= Q3_METAL_WORLD_DRAWFLAG_LIGHTMAP_MULTIPLY;
-            }
+            lightmapHandle = s_worldLightmapHandles[lightmapNum];
+            hasLightmap = qtrue;
+            worldFlags |= Q3_METAL_WORLD_DRAWFLAG_LIGHTMAP_MULTIPLY;
         }
         if (IsSkyShaderName(shaders[shaderNum].shader)) {
             /* Flag sky draws so the Swift side can route them through the
              * sky pipeline (view-direction projection, no depth write).
              * Must be set after LIGHTMAP_MULTIPLY gate above. */
             worldFlags |= Q3_METAL_WORLD_DRAWFLAG_SKY;
-        }
-        if (ShaderMap_IsPortal(shaders[shaderNum].shader)) {
-            worldFlags |= Q3_METAL_WORLD_DRAWFLAG_PORTAL;
-            /* Latch: this map has at least one portal surface, so the
-             * Swift-side portal pass is worth running. Cleared at the
-             * top of the next LoadWorldMapData (see s_world reset). */
-            s_worldHasPortalSurface = qtrue;
-        }
-        {
-            if (GetSkyFaceTextureForSurface(shaders[shaderNum].shader, 1.0f, 0.0f, 0.0f) != 0) {
-                worldFlags |= Q3_METAL_WORLD_DRAWFLAG_SKY;
-            }
-            if (strstr(shaders[shaderNum].shader, "sky") != NULL) {
-                worldFlags |= Q3_METAL_WORLD_DRAWFLAG_SKY;
-            }
         }
 
         if (surfaceType == MST_PATCH) {
@@ -2128,76 +1678,38 @@ static qboolean LoadWorldMapData(const char *name) {
                         uint32_t firstIndexForDraw = s_world.draws[drawCursor].firstIndex;
                         uint32_t indexCountForDraw = indexCursor - firstIndexForDraw;
                         uint32_t _dstIdx = drawCursor;
-                        Q3MetalWorldDrawCmd *draw = &s_world.draws[_dstIdx];
-                        draw->flags = 0;
-                        SetupWorldDraw(draw,
+                        SetupWorldDraw(&s_world.draws[drawCursor++],
                                        firstIndexForDraw,
                                        indexCountForDraw,
                                        hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
                                        worldFlags);
-                        drawCursor++;
-                        if (s_world.inlineModels != NULL &&
-                            ownerModelIndex >= 0 &&
-                            ownerModelIndex < modelCount) {
-                            if (s_world.inlineModels[ownerModelIndex].firstDraw == UINT32_MAX) {
-                                s_world.inlineModels[ownerModelIndex].firstDraw = _dstIdx;
-                            }
-                            s_world.inlineModels[ownerModelIndex].drawCount += 1;
-                        }
+                        AddWorldDrawStage(&s_world.draws[_dstIdx],
+                                          textureHandle,
+                                          stage0BlendMode,
+                                          stage0TcGenEnv,
+                                          stage0TcModType,
+                                          stage0TcModParams[0],
+                                          stage0TcModParams[1],
+                                          stage0TcModParams[2],
+                                          stage0TcModParams[3],
+                                          0,
+                                          stage0AlphaFunc);
                         if (s_world.animShaderSlots && s_pendingAnimSlot >= 0) {
                             s_world.animShaderSlots[_dstIdx] = s_pendingAnimSlot;
                             s_world.animatedDrawCount += 1;
                         }
-                        /* UNIFIED per-stage emission. Iterates the parsed
-                         * stages[] array straight onto AddWorldDrawStage.
-                         * Sky cube override applies to stage 0 only. Plain
-                         * BSP textures (no .shader entry) fall back to a
-                         * single default stage with RegisterTexture(name). */
-                        {
-                            const metalShaderMap_t *_e = ShaderMap_LookupEntry(shaders[shaderNum].shader);
-                            int _s;
-                            int _emitted = 0;
-                            if (_e != NULL && _e->stageCount > 0) {
-                                for (_s = 0; _s < _e->stageCount; ++_s) {
-                                    const Q3MetalStage *_st = &_e->stages[_s];
-                                    qhandle_t _tex;
-                                    if (_st->useLightmap) {
-                                        _tex = lightmapHandle;
-                                    } else if (_s == 0 && skyOverrideTexture != 0) {
-                                        _tex = skyOverrideTexture;
-                                    } else {
-                                        _tex = (_st->mapPath[0] != '\0' ? RegisterTexture(_st->mapPath) : 0);
-                                    }
-                                    if (_tex == 0) continue;
-                                    AddWorldDrawStage(draw, _tex, _st->blendMode, _st->tcGen,
-                                                      (Q3TcMod *)_st->tcMods, _st->tcModCount,
-                                                      _st->rgbGen, _st->alphaGen, _st->alphaFunc,
-                                                      shaderCullMode, _st->useLightmap,
-                                                      _st->rgbWaveFunc, _st->rgbWaveBase, _st->rgbWaveAmp,
-                                                      _st->rgbWavePhase, _st->rgbWaveFreq,
-                                                      _st->alphaWaveFunc, _st->alphaWaveBase, _st->alphaWaveAmp,
-                                                      _st->alphaWavePhase, _st->alphaWaveFreq);
-                                    _emitted += 1;
-                                }
-                            }
-                            if (_e == NULL || _e->stageCount == 0) {
-                                /* No parsed stages OR all stages dropped:
-                                 * emit single default stage. Sky cube
-                                 * override texture wins; otherwise plain
-                                 * RegisterTexture(name). */
-                                static Q3TcMod _zeroMods[Q3_MAX_TCMODS] = {{0,{0,0,0,0}}};
-                                qhandle_t _tex = skyOverrideTexture != 0
-                                                 ? skyOverrideTexture
-                                                 : RegisterTexture(shaders[shaderNum].shader);
-                                if (_tex != 0) {
-                                    AddWorldDrawStage(draw, _tex, 0, 0,
-                                                      _zeroMods, 0,
-                                                      0, 0, 0,
-                                                      shaderCullMode, 0,
-                                                      0, 0.0f, 0.0f, 0.0f, 0.0f,
-                                                      0, 0.0f, 0.0f, 0.0f, 0.0f);
-                                }
-                            }
+                        if (hasSkyStage2 && stage2TextureHandle != 0) {
+                            AddWorldDrawStage(&s_world.draws[_dstIdx],
+                                              stage2TextureHandle,
+                                              skyStage2BlendMode,
+                                              0,
+                                              skyStage2TcModType,
+                                              skyStage2TcModParams[0],
+                                              skyStage2TcModParams[1],
+                                              skyStage2TcModParams[2],
+                                              skyStage2TcModParams[3],
+                                              0,
+                                              0);
                         }
                     }
                 }
@@ -2229,68 +1741,38 @@ static qboolean LoadWorldMapData(const char *name) {
             uint32_t firstIndexForDraw = s_world.draws[drawCursor].firstIndex;
             uint32_t indexCountForDraw = indexCursor - firstIndexForDraw;
             uint32_t _dstIdx = drawCursor;
-            Q3MetalWorldDrawCmd *draw = &s_world.draws[_dstIdx];
-            draw->flags = 0;
-            SetupWorldDraw(draw,
+            SetupWorldDraw(&s_world.draws[drawCursor++],
                            firstIndexForDraw,
                            indexCountForDraw,
                            hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
                            worldFlags);
-            drawCursor++;
-            if (s_world.inlineModels != NULL &&
-                ownerModelIndex >= 0 &&
-                ownerModelIndex < modelCount) {
-                if (s_world.inlineModels[ownerModelIndex].firstDraw == UINT32_MAX) {
-                    s_world.inlineModels[ownerModelIndex].firstDraw = _dstIdx;
-                }
-                s_world.inlineModels[ownerModelIndex].drawCount += 1;
-            }
+            AddWorldDrawStage(&s_world.draws[_dstIdx],
+                              textureHandle,
+                              stage0BlendMode,
+                              stage0TcGenEnv,
+                              stage0TcModType,
+                              stage0TcModParams[0],
+                              stage0TcModParams[1],
+                              stage0TcModParams[2],
+                              stage0TcModParams[3],
+                              0,
+                              stage0AlphaFunc);
             if (s_world.animShaderSlots && s_pendingAnimSlot >= 0) {
                 s_world.animShaderSlots[_dstIdx] = s_pendingAnimSlot;
                 s_world.animatedDrawCount += 1;
             }
-            /* UNIFIED per-stage emission. */
-            {
-                const metalShaderMap_t *_e = ShaderMap_LookupEntry(shaders[shaderNum].shader);
-                int _s;
-                int _emitted = 0;
-                if (_e != NULL && _e->stageCount > 0) {
-                    for (_s = 0; _s < _e->stageCount; ++_s) {
-                        const Q3MetalStage *_st = &_e->stages[_s];
-                        qhandle_t _tex;
-                        if (_st->useLightmap) {
-                            _tex = lightmapHandle;
-                        } else if (_s == 0 && skyOverrideTexture != 0) {
-                            _tex = skyOverrideTexture;
-                        } else {
-                            _tex = (_st->mapPath[0] != '\0' ? RegisterTexture(_st->mapPath) : 0);
-                        }
-                        if (_tex == 0) continue;
-                        AddWorldDrawStage(draw, _tex, _st->blendMode, _st->tcGen,
-                                          (Q3TcMod *)_st->tcMods, _st->tcModCount,
-                                          _st->rgbGen, _st->alphaGen, _st->alphaFunc,
-                                          shaderCullMode, _st->useLightmap,
-                                          _st->rgbWaveFunc, _st->rgbWaveBase, _st->rgbWaveAmp,
-                                          _st->rgbWavePhase, _st->rgbWaveFreq,
-                                          _st->alphaWaveFunc, _st->alphaWaveBase, _st->alphaWaveAmp,
-                                          _st->alphaWavePhase, _st->alphaWaveFreq);
-                        _emitted += 1;
-                    }
-                }
-                if (_e == NULL || _e->stageCount == 0) {
-                    static Q3TcMod _zeroMods[Q3_MAX_TCMODS] = {{0,{0,0,0,0}}};
-                    qhandle_t _tex = skyOverrideTexture != 0
-                                     ? skyOverrideTexture
-                                     : RegisterTexture(shaders[shaderNum].shader);
-                    if (_tex != 0) {
-                        AddWorldDrawStage(draw, _tex, 0, 0,
-                                          _zeroMods, 0,
-                                          0, 0, 0,
-                                          shaderCullMode, 0,
-                                          0, 0.0f, 0.0f, 0.0f, 0.0f,
-                                          0, 0.0f, 0.0f, 0.0f, 0.0f);
-                    }
-                }
+            if (hasSkyStage2 && stage2TextureHandle != 0) {
+                AddWorldDrawStage(&s_world.draws[_dstIdx],
+                                  stage2TextureHandle,
+                                  skyStage2BlendMode,
+                                  0,
+                                  skyStage2TcModType,
+                                  skyStage2TcModParams[0],
+                                  skyStage2TcModParams[1],
+                                  skyStage2TcModParams[2],
+                                  skyStage2TcModParams[3],
+                                  0,
+                                  0);
             }
         }
     }
@@ -2300,18 +1782,11 @@ static qboolean LoadWorldMapData(const char *name) {
     s_world.vertexCount = vertexCursor;
     s_world.indexCount = indexCursor;
     s_world.drawCount = drawCursor;
-    ri.Printf(PRINT_ALL, "WORLD DRAWS: %u\n", s_world.drawCount);
-    s_world.staticWorldDrawCount = (s_world.inlineModels != NULL &&
-                                    s_world.inlineModelCount > 0 &&
-                                    s_world.inlineModels[0].firstDraw == 0)
-        ? s_world.inlineModels[0].drawCount
-        : drawCursor;
     Q_strncpyz(s_world.name, name, sizeof(s_world.name));
 
     ri.Printf(PRINT_ALL,
-              "Metal world: loaded '%s' with %u verts, %u indices, %u draws (%u static, %u planar, %u patch, %u trisoup, %u sky)\n",
+              "Metal world: loaded '%s' with %u verts, %u indices, %u draws (%u planar, %u patch, %u trisoup, %u sky)\n",
               name, s_world.vertexCount, s_world.indexCount, s_world.drawCount,
-              s_world.staticWorldDrawCount,
               planarDraws, patchDraws, triSoupDraws, skyDraws);
     if (skippedNoDrawSurfaces > 0) {
         ri.Printf(PRINT_ALL, "Metal world: skipped %u nodraw surfaces in '%s'\n", skippedNoDrawSurfaces, name);
@@ -2338,10 +1813,61 @@ static void RE_Shutdown(refShutdownCode_t code) {
  * the first stage's first map directive, and hash shader_name -> texture_path.
  * RegisterTexture consults this table as a fallback when direct path load fails.
  *
- * Started as a "find one plausible texture" fallback; now also captures the
- * first stage's blend/tcMod data plus top-level sky/portal/cull state so the
- * Metal side can stay on the stock Q3 material path without new pipelines.
+ * Ignored: tcGen environment, animMap frame sequencing, blendFunc, tcMod — bind
+ * at least one plausible texture so the geometry is visible instead of white.
  */
+#define MAX_SHADER_MAP_ENTRIES 4096
+#define METAL_ANIMMAP_MAX_FRAMES 16
+
+typedef struct {
+    char shaderName[128];
+    char mapPath[MAX_QPATH];
+    qboolean tcGenEnv;   /* any stage uses tcGen environment */
+    /* First stage's `tcMod scroll sx sy` values. Zero when absent.
+     * The Q3MetalWorldDrawUniforms shader already multiplies
+     * texCoordScroll by timeSeconds, so these flow directly into the
+     * per-draw uniform with no further math needed. */
+    float tcModScrollS;
+    float tcModScrollT;
+    float tcModScaleS;
+    float tcModScaleT;
+    /* tcMod turb (turbulence) — `tcMod turb <base> <amp> <phase> <freq>`.
+     * Q3 lava / water surfaces use it for the wobbly warp. Stored
+     * separately from scroll; stage1 resolution picks turb > scroll >
+     * scale as the visible tcMod type since turb produces the most
+     * recognizable "molten" look. Base is unused in our impl (stock
+     * Q3 folds it into the wave-table lookup offset). */
+    qboolean hasTurb;
+    float tcModTurbAmp;
+    float tcModTurbPhase;
+    float tcModTurbFreq;
+    /* blendFunc from first stage. 0=opaque, 1=additive (GL_ONE GL_ONE),
+     * 2=alpha-blend (GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA or 'blend'),
+     * 3=filter (GL_DST_COLOR GL_ZERO or 'filter'). */
+    int blendMode;
+    /* alphaFunc from first stage. 0=none, 1=GT0, 2=GE128, 3=LT128. */
+    int alphaFunc;
+    /* animMap support. framePaths[0] == mapPath. 0 frames = not animated. */
+    int animFrameCount;
+    float animFps;
+    char animFrames[METAL_ANIMMAP_MAX_FRAMES][MAX_QPATH];
+    qhandle_t animTextures[METAL_ANIMMAP_MAX_FRAMES]; /* lazy resolve */
+    /* skyparms support. `skyparms <basename> <cloudHeight> <nearbox>`
+     * declares a 6-sided skybox. We load six face textures from
+     *   <basename>_up|dn|ft|bk|lf|rt.(tga|jpg)
+     * and pick the right face per world sky surface based on the
+     * surface's dominant vertex normal direction. Empty skyBoxBase =
+     * not a skyparms shader (normal map). */
+    char skyBoxBase[MAX_QPATH];
+    qhandle_t skyFaceTextures[6]; /* up, dn, ft, bk, lf, rt (lazy) */
+    char stage2MapPath[MAX_QPATH];
+    int stage2BlendMode;
+    float stage2TcModScrollS;
+    float stage2TcModScrollT;
+    float stage2TcModScaleS;
+    float stage2TcModScaleT;
+} metalShaderMap_t;
+
 /* Sky face enumeration. Order matches Q3 convention. */
 #define METAL_SKY_FACE_UP 0
 #define METAL_SKY_FACE_DN 1
@@ -2352,37 +1878,6 @@ static void RE_Shutdown(refShutdownCode_t code) {
 static metalShaderMap_t s_shaderMap[MAX_SHADER_MAP_ENTRIES];
 static int s_shaderMapCount = 0;
 static qboolean s_shaderMapLoaded = qfalse;
-
-/* Canonicalize a shader name: lowercase + strip trailing extension.
- * Applied at BOTH ShaderMap_Register (store) and ShaderMap_LookupEntry
- * (lookup) sites so keys are directly comparable without per-site
- * Q_stricmp / StripImageExt fallbacks. Case-insensitive / extension-
- * agnostic matching still works via the existing fallbacks, but the
- * canonical form is the fast path. */
-static void Q3_NormalizeShaderName(const char *in, char *out, size_t outSize) {
-    char tmp[MAX_QPATH];
-    char *dot;
-    if (out == NULL || outSize == 0) return;
-    out[0] = '\0';
-    if (in == NULL) return;
-    Q_strncpyz(tmp, in, sizeof(tmp));
-    Q_strlwr(tmp);
-    dot = strrchr(tmp, '.');
-    if (dot != NULL && strlen(dot) <= 5) {
-        /* Only strip extensions that look like image extensions — keep
-         * parity with StripImageExt's intent (don't strip arbitrary
-         * trailing dots from paths). */
-        static const char *exts[] = { ".tga", ".jpg", ".jpeg", ".png", ".pcx", NULL };
-        int i;
-        for (i = 0; exts[i]; ++i) {
-            if (!Q_stricmp(dot, exts[i])) {
-                *dot = '\0';
-                break;
-            }
-        }
-    }
-    Q_strncpyz(out, tmp, outSize);
-}
 
 /* Strip a trailing image extension (.tga/.jpg/.jpeg/.png/.pcx). Caller
  * supplies out buffer. Returns qtrue if an extension was stripped. */
@@ -2410,24 +1905,18 @@ static qboolean StripImageExt(const char *name, char *out, size_t outSize) {
     return qfalse;
 }
 
-const metalShaderMap_t *ShaderMap_LookupEntry(const char *name) {
+static const metalShaderMap_t *ShaderMap_LookupEntry(const char *name) {
     int i;
-    char normName[MAX_QPATH];
     char stripped[MAX_QPATH];
     if (name == NULL || name[0] == '\0') return NULL;
-    /* Fast path: normalize the lookup name to the same canonical form
-     * (lowercase + image-extension stripped) used at ShaderMap_Register
-     * time. Stored shaderName fields are already normalized, so a plain
-     * Q_stricmp match here is the common case. */
-    Q3_NormalizeShaderName(name, normName, sizeof(normName));
     for (i = 0; i < s_shaderMapCount; ++i) {
-        if (!Q_stricmp(s_shaderMap[i].shaderName, normName)) {
+        if (!Q_stricmp(s_shaderMap[i].shaderName, name)) {
             return &s_shaderMap[i];
         }
     }
-    /* Belt-and-suspenders: historical fallback. If an entry was stored
-     * before normalization was introduced (stale cache, hot-reload, etc.)
-     * the extension-stripped retry still catches MD3-embedded names. */
+    /* Fall back: MD3s often embed shader names with an image extension
+     * (models/.../red_sphere.tga) while .shader scripts define the same
+     * material without one. Retry with the extension stripped. */
     if (StripImageExt(name, stripped, sizeof(stripped))) {
         for (i = 0; i < s_shaderMapCount; ++i) {
             if (!Q_stricmp(s_shaderMap[i].shaderName, stripped)) {
@@ -2441,13 +1930,6 @@ const metalShaderMap_t *ShaderMap_LookupEntry(const char *name) {
 static const char *ShaderMap_Lookup(const char *name) {
     const metalShaderMap_t *e = ShaderMap_LookupEntry(name);
     return e ? e->mapPath : NULL;
-}
-
-static qboolean ShaderMap_IsPortal(const char *name) {
-    const metalShaderMap_t *e;
-    if (name == NULL || name[0] == '\0') return qfalse;
-    e = ShaderMap_LookupEntry(name);
-    return (e != NULL && e->isPortal) ? qtrue : qfalse;
 }
 
 /* If the shader referenced by `name` is animated, return the current frame's
@@ -2554,77 +2036,30 @@ static qhandle_t GetSkyFaceTextureForSurface(const char *shaderName,
 static int ShaderMap_GetBlendMode(const char *name) {
     const metalShaderMap_t *entry;
     if (name == NULL || name[0] == '\0') return 0;
+    /* Use ShaderMap_LookupEntry which handles extension-stripped
+     * fallback (e.g. 'yellow.tga' → 'yellow'). A plain stricmp
+     * loop missed entity textures registered with their file
+     * extension while shader definitions omit it. */
     entry = ShaderMap_LookupEntry(name);
-    return (entry && entry->stageCount > 0) ? entry->stages[0].blendMode : 0;
+    return entry ? entry->blendMode : 0;
 }
 
 static int BlendModeFromTokens(const char *src, const char *dst) {
     if (src == NULL || src[0] == '\0') return 0;
-
-    /* Shorthand keywords. */
-    if (!Q_stricmp(src, "add")) return 1;        /* additive */
-    if (!Q_stricmp(src, "blend")) return 2;      /* alpha */
-    if (!Q_stricmp(src, "filter")) return 3;     /* multiply */
-
-    /* Explicit GL factor pairs. dst may be NULL only for shorthand above. */
-    if (dst == NULL || dst[0] == '\0') return 0;
-
-    /* NO-OP stages: `blendFunc GL_ZERO GL_ZERO` writes nothing to the
-     * framebuffer and is used in Q3 shaders as a depth-only prepass or a
-     * conditional placeholder stage. Return SKIP so AddWorldDrawStage
-     * drops the stage entirely instead of spending a draw + pipeline
-     * rebind on a no-op. Handled before the unknown-pair warning so it
-     * doesn't spam PRINT_WARNING. */
-    if (!Q_stricmp(src, "GL_ZERO") && !Q_stricmp(dst, "GL_ZERO")) return Q3_BLEND_SKIP;
-
-    /* ADDITIVE family (glows, flames, plasma, rails): anything that adds
-     * source into the framebuffer without attenuating the existing image. */
-    if (!Q_stricmp(src, "GL_ONE") && !Q_stricmp(dst, "GL_ONE")) return 1;
-    if (!Q_stricmp(src, "GL_SRC_ALPHA") && !Q_stricmp(dst, "GL_ONE")) return 1;
-    if (!Q_stricmp(src, "GL_ONE") && !Q_stricmp(dst, "GL_SRC_ALPHA")) return 1;
-
-    /* ALPHA family (translucent, smoke, portals): standard over-composite. */
-    if (!Q_stricmp(src, "GL_SRC_ALPHA") && !Q_stricmp(dst, "GL_ONE_MINUS_SRC_ALPHA")) return 2;
-    if (!Q_stricmp(src, "GL_ONE_MINUS_SRC_ALPHA") && !Q_stricmp(dst, "GL_SRC_ALPHA")) return 2;
-
-    /* PREMULTIPLIED-ALPHA (blendMode 4). Source texel is expected to already
-     * have RGB pre-multiplied by its own alpha — the correct blend factors
-     * are (ONE, ONE_MINUS_SRC_ALPHA). Routing this through the standard
-     * alpha pipeline (SRC_ALPHA / ONE_MINUS_SRC_ALPHA) double-multiplies
-     * src.rgb by src.a, darkening the edges of smoke/flame/particle
-     * textures that were authored premultiplied. */
-    if (!Q_stricmp(src, "GL_ONE") && !Q_stricmp(dst, "GL_ONE_MINUS_SRC_ALPHA")) return 4;
-
-    /* FILTER family (lightmaps, dirt overlays, damage screen tint):
-     * framebuffer is modulated by source. `viewBloodBlend`'s exact
-     * GL_DST_COLOR GL_SRC_ALPHA pair produces a screen tint in stock Q3;
-     * routing to filter is a close visual match (we lose the SRC_ALPHA
-     * attenuation term but the screen stays legible — critical, since
-     * the alternative is the overlay rendering as fully-opaque red). */
-    if (!Q_stricmp(src, "GL_DST_COLOR") && !Q_stricmp(dst, "GL_ZERO")) return 3;
-    if (!Q_stricmp(src, "GL_ZERO") && !Q_stricmp(dst, "GL_SRC_COLOR")) return 3;
-    if (!Q_stricmp(src, "GL_DST_COLOR") && !Q_stricmp(dst, "GL_SRC_COLOR")) return 3;  /* 2x modulate */
-    if (!Q_stricmp(src, "GL_ZERO") && !Q_stricmp(dst, "GL_ONE_MINUS_SRC_COLOR")) return 3;
-    if (!Q_stricmp(src, "GL_DST_COLOR") && !Q_stricmp(dst, "GL_SRC_ALPHA")) return 3;  /* viewBloodBlend */
-
-    /* Generic no-op: any `blendFunc X X` where src and dst are the same
-     * factor. All of these collapse to either a direct overwrite of the
-     * framebuffer with itself (identity) or a write-of-zero — Q3 shaders
-     * use the idiom as a depth-prepass / conditional-stage marker. The
-     * specific `GL_ZERO GL_ZERO` case is caught above for clarity and
-     * documentation; this generic rule covers `GL_SRC_ALPHA GL_SRC_ALPHA`,
-     * `GL_ONE_MINUS_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA`,
-     * `GL_SRC_COLOR GL_SRC_COLOR`, etc. — kills the long tail of
-     * "unknown blendFunc" warnings for no-op stages without emitting any
-     * additional draws. Known-real same-factor pair (`GL_ONE GL_ONE`,
-     * additive) is matched by the ADDITIVE branch above and returns
-     * before reaching here. */
-    if (!Q_stricmp(src, dst)) return Q3_BLEND_SKIP;
-
-    /* Unrecognised pair — surface as opaque, log at WARNING so the miss
-     * shows up without `\developer 1`. Add the pair above when spotted. */
-    ri.Printf(PRINT_WARNING,
-              "[Q3-STAGE] unknown blendFunc '%s %s' → OPAQUE\n", src, dst);
+    if (!Q_stricmp(src, "add") ||
+        (!Q_stricmp(src, "GL_ONE") && dst != NULL && !Q_stricmp(dst, "GL_ONE"))) {
+        return 1;
+    }
+    if (!Q_stricmp(src, "blend") ||
+        (!Q_stricmp(src, "GL_SRC_ALPHA") && dst != NULL &&
+         !Q_stricmp(dst, "GL_ONE_MINUS_SRC_ALPHA"))) {
+        return 2;
+    }
+    if (!Q_stricmp(src, "filter") ||
+        (!Q_stricmp(src, "GL_DST_COLOR") && dst != NULL &&
+         !Q_stricmp(dst, "GL_ZERO"))) {
+        return 3;
+    }
     return 0;
 }
 
@@ -2632,28 +2067,7 @@ static int ShaderMap_GetAlphaFunc(const char *name) {
     const metalShaderMap_t *entry;
     if (name == NULL || name[0] == '\0') return 0;
     entry = ShaderMap_LookupEntry(name);
-    return (entry && entry->stageCount > 0) ? entry->stages[0].alphaFunc : 0;
-}
-
-static int ShaderMap_GetCullMode(const char *name) {
-    const metalShaderMap_t *entry;
-    if (name == NULL || name[0] == '\0') return METAL_SHADER_CULL_BACK;
-    entry = ShaderMap_LookupEntry(name);
-    return entry ? entry->cullMode : METAL_SHADER_CULL_BACK;
-}
-
-static int ShaderMap_GetRgbGen(const char *name) {
-    const metalShaderMap_t *entry;
-    if (name == NULL || name[0] == '\0') return 0;
-    entry = ShaderMap_LookupEntry(name);
-    return (entry && entry->stageCount > 0) ? entry->stages[0].rgbGen : 0;
-}
-
-static int ShaderMap_GetAlphaGen(const char *name) {
-    const metalShaderMap_t *entry;
-    if (name == NULL || name[0] == '\0') return 0;
-    entry = ShaderMap_LookupEntry(name);
-    return (entry && entry->stageCount > 0) ? entry->stages[0].alphaGen : 0;
+    return entry ? entry->alphaFunc : 0;
 }
 
 static int ShaderMap_GetTcGenEnv(const char *name) {
@@ -2664,17 +2078,14 @@ static int ShaderMap_GetTcGenEnv(const char *name) {
 }
 
 static void ShaderMap_GetScroll(const char *name, float *outS, float *outT) {
-    const metalShaderMap_t *entry;
     int i;
     if (outS) *outS = 0.0f;
     if (outT) *outT = 0.0f;
     if (name == NULL || name[0] == '\0') return;
-    entry = ShaderMap_LookupEntry(name);
-    if (entry == NULL || entry->stageCount == 0) return;
-    for (i = 0; i < entry->stages[0].tcModCount; ++i) {
-        if (entry->stages[0].tcMods[i].type == 1) {
-            if (outS) *outS = entry->stages[0].tcMods[i].params[0];
-            if (outT) *outT = entry->stages[0].tcMods[i].params[1];
+    for (i = 0; i < s_shaderMapCount; ++i) {
+        if (!Q_stricmp(s_shaderMap[i].shaderName, name)) {
+            if (outS) *outS = s_shaderMap[i].tcModScrollS;
+            if (outT) *outT = s_shaderMap[i].tcModScrollT;
             return;
         }
     }
@@ -2682,116 +2093,27 @@ static void ShaderMap_GetScroll(const char *name, float *outS, float *outT) {
 
 static void ShaderMap_GetScale(const char *name, float *outS, float *outT) {
     const metalShaderMap_t *entry;
-    int i;
     if (outS) *outS = 1.0f;
     if (outT) *outT = 1.0f;
     if (name == NULL || name[0] == '\0') return;
     entry = ShaderMap_LookupEntry(name);
-    if (entry == NULL || entry->stageCount == 0) return;
-    for (i = 0; i < entry->stages[0].tcModCount; ++i) {
-        if (entry->stages[0].tcMods[i].type == 4) {
-            if (outS) *outS = entry->stages[0].tcMods[i].params[0];
-            if (outT) *outT = entry->stages[0].tcMods[i].params[1];
-            return;
-        }
-    }
-}
-
-/* Returns the parsed first-stage tcMod chain (preserves declaration order)
- * for the named shader. Output array must hold at least Q3_MAX_TCMODS slots.
- * outCount is set to 0 if the shader is not in the map or has no tcMods. */
-static void ShaderMap_GetTcModChain(const char *name,
-                                    Q3TcMod *outChain,
-                                    int *outCount) {
-    const metalShaderMap_t *entry;
-    int i, n;
-    if (outCount) *outCount = 0;
-    if (outChain) {
-        for (i = 0; i < Q3_MAX_TCMODS; ++i) {
-            outChain[i].type = 0;
-            outChain[i].params[0] = 0.0f;
-            outChain[i].params[1] = 0.0f;
-            outChain[i].params[2] = 0.0f;
-            outChain[i].params[3] = 0.0f;
-        }
-    }
-    if (name == NULL || name[0] == '\0') return;
-    entry = ShaderMap_LookupEntry(name);
     if (entry == NULL) return;
-    if (entry->stageCount == 0) return;
-    n = entry->stages[0].tcModCount;
-    if (n < 0) n = 0;
-    if (n > Q3_MAX_TCMODS) n = Q3_MAX_TCMODS;
-    if (outChain) {
-        for (i = 0; i < n; ++i) {
-            outChain[i] = entry->stages[0].tcMods[i];
-        }
-    }
-    if (outCount) *outCount = n;
-}
-
-/* Returns nonzero if the shader has a parsed `rgbGen wave` directive on
- * its first stage, and fills *outFunc/Base/Amp/Phase/Freq with the params.
- * Zero return ⇒ no wave (caller should leave wave fields zeroed). */
-static int ShaderMap_GetRgbWave(const char *name,
-                                int *outFunc, float *outBase, float *outAmp,
-                                float *outPhase, float *outFreq) {
-    const metalShaderMap_t *entry;
-    if (outFunc) *outFunc = 0;
-    if (outBase) *outBase = 0.0f;
-    if (outAmp) *outAmp = 0.0f;
-    if (outPhase) *outPhase = 0.0f;
-    if (outFreq) *outFreq = 0.0f;
-    if (name == NULL || name[0] == '\0') return 0;
-    entry = ShaderMap_LookupEntry(name);
-    if (entry == NULL || entry->stageCount == 0 || entry->stages[0].rgbWaveFunc == 0) return 0;
-    if (outFunc) *outFunc = entry->stages[0].rgbWaveFunc;
-    if (outBase) *outBase = entry->stages[0].rgbWaveBase;
-    if (outAmp) *outAmp = entry->stages[0].rgbWaveAmp;
-    if (outPhase) *outPhase = entry->stages[0].rgbWavePhase;
-    if (outFreq) *outFreq = entry->stages[0].rgbWaveFreq;
-    return 1;
-}
-
-/* Same as ShaderMap_GetRgbWave but for `alphaGen wave`. */
-static int ShaderMap_GetAlphaWave(const char *name,
-                                  int *outFunc, float *outBase, float *outAmp,
-                                  float *outPhase, float *outFreq) {
-    const metalShaderMap_t *entry;
-    if (outFunc) *outFunc = 0;
-    if (outBase) *outBase = 0.0f;
-    if (outAmp) *outAmp = 0.0f;
-    if (outPhase) *outPhase = 0.0f;
-    if (outFreq) *outFreq = 0.0f;
-    if (name == NULL || name[0] == '\0') return 0;
-    entry = ShaderMap_LookupEntry(name);
-    if (entry == NULL || entry->stageCount == 0 || entry->stages[0].alphaWaveFunc == 0) return 0;
-    if (outFunc) *outFunc = entry->stages[0].alphaWaveFunc;
-    if (outBase) *outBase = entry->stages[0].alphaWaveBase;
-    if (outAmp) *outAmp = entry->stages[0].alphaWaveAmp;
-    if (outPhase) *outPhase = entry->stages[0].alphaWavePhase;
-    if (outFreq) *outFreq = entry->stages[0].alphaWaveFreq;
-    return 1;
+    if (outS) *outS = entry->tcModScaleS;
+    if (outT) *outT = entry->tcModScaleT;
 }
 
 static qboolean ShaderMap_GetTurb(const char *name, float *outAmp, float *outPhase, float *outFreq) {
     const metalShaderMap_t *entry;
-    int i;
     if (outAmp) *outAmp = 0.0f;
     if (outPhase) *outPhase = 0.0f;
     if (outFreq) *outFreq = 0.0f;
     if (name == NULL || name[0] == '\0') return qfalse;
     entry = ShaderMap_LookupEntry(name);
-    if (entry == NULL || entry->stageCount == 0) return qfalse;
-    for (i = 0; i < entry->stages[0].tcModCount; ++i) {
-        if (entry->stages[0].tcMods[i].type == 5) {
-            if (outAmp) *outAmp = entry->stages[0].tcMods[i].params[0];
-            if (outFreq) *outFreq = entry->stages[0].tcMods[i].params[1];
-            if (outPhase) *outPhase = entry->stages[0].tcMods[i].params[2];
-            return qtrue;
-        }
-    }
-    return qfalse;
+    if (entry == NULL || !entry->hasTurb) return qfalse;
+    if (outAmp) *outAmp = entry->tcModTurbAmp;
+    if (outPhase) *outPhase = entry->tcModTurbPhase;
+    if (outFreq) *outFreq = entry->tcModTurbFreq;
+    return qtrue;
 }
 
 static qboolean ShaderMap_GetSecondStage(const char *name,
@@ -2800,27 +2122,21 @@ static qboolean ShaderMap_GetSecondStage(const char *name,
                                          float *outScaleS, float *outScaleT,
                                          float *outScrollS, float *outScrollT) {
     const metalShaderMap_t *entry = ShaderMap_LookupEntry(name);
-    int i;
     if (outMap && outMapSize > 0) outMap[0] = '\0';
     if (outBlendMode) *outBlendMode = 0;
     if (outScaleS) *outScaleS = 1.0f;
     if (outScaleT) *outScaleT = 1.0f;
     if (outScrollS) *outScrollS = 0.0f;
     if (outScrollT) *outScrollT = 0.0f;
-    if (entry == NULL || entry->stageCount < 2 || entry->stages[1].mapPath[0] == '\0') return qfalse;
+    if (entry == NULL || entry->stage2MapPath[0] == '\0') return qfalse;
     if (outMap && outMapSize > 0) {
-        Q_strncpyz(outMap, entry->stages[1].mapPath, outMapSize);
+        Q_strncpyz(outMap, entry->stage2MapPath, outMapSize);
     }
-    if (outBlendMode) *outBlendMode = entry->stages[1].blendMode;
-    for (i = 0; i < entry->stages[1].tcModCount; ++i) {
-        if (entry->stages[1].tcMods[i].type == 1) {
-            if (outScrollS) *outScrollS = entry->stages[1].tcMods[i].params[0];
-            if (outScrollT) *outScrollT = entry->stages[1].tcMods[i].params[1];
-        } else if (entry->stages[1].tcMods[i].type == 4) {
-            if (outScaleS) *outScaleS = entry->stages[1].tcMods[i].params[0];
-            if (outScaleT) *outScaleT = entry->stages[1].tcMods[i].params[1];
-        }
-    }
+    if (outBlendMode) *outBlendMode = entry->stage2BlendMode;
+    if (outScaleS) *outScaleS = entry->stage2TcModScaleS;
+    if (outScaleT) *outScaleT = entry->stage2TcModScaleT;
+    if (outScrollS) *outScrollS = entry->stage2TcModScrollS;
+    if (outScrollT) *outScrollT = entry->stage2TcModScrollT;
     return qtrue;
 }
 
@@ -2844,17 +2160,17 @@ static qhandle_t ShaderMap_AnimatedSlotCurrentHandle(int slot) {
 }
 
 static void ShaderMap_Register(const char *name, const char *path, qboolean tcGenEnv) {
-    char normName[MAX_QPATH];
     if (s_shaderMapCount >= MAX_SHADER_MAP_ENTRIES) return;
     if (ShaderMap_Lookup(name) != NULL) return; /* first wins */
-    Q3_NormalizeShaderName(name, normName, sizeof(normName));
-    Q_strncpyz(s_shaderMap[s_shaderMapCount].shaderName, normName,
+    Q_strncpyz(s_shaderMap[s_shaderMapCount].shaderName, name,
         sizeof(s_shaderMap[0].shaderName));
     Q_strncpyz(s_shaderMap[s_shaderMapCount].mapPath, path,
         sizeof(s_shaderMap[0].mapPath));
     s_shaderMap[s_shaderMapCount].tcGenEnv = tcGenEnv;
-    s_shaderMap[s_shaderMapCount].cullMode = METAL_SHADER_CULL_BACK;
-    s_shaderMap[s_shaderMapCount].stageCount = 0;
+    s_shaderMap[s_shaderMapCount].tcModScaleS = 1.0f;
+    s_shaderMap[s_shaderMapCount].tcModScaleT = 1.0f;
+    s_shaderMap[s_shaderMapCount].stage2TcModScaleS = 1.0f;
+    s_shaderMap[s_shaderMapCount].stage2TcModScaleT = 1.0f;
     s_shaderMap[s_shaderMapCount].animFrameCount = 0;
     s_shaderMap[s_shaderMapCount].animFps = 0.0f;
     s_shaderMapCount += 1;
@@ -2870,18 +2186,18 @@ static void ShaderMap_RegisterAnimated(const char *name,
                                        qboolean tcGenEnv) {
     int i;
     int maxFrames = frameCount < METAL_ANIMMAP_MAX_FRAMES ? frameCount : METAL_ANIMMAP_MAX_FRAMES;
-    char normName[MAX_QPATH];
     if (s_shaderMapCount >= MAX_SHADER_MAP_ENTRIES) return;
     if (ShaderMap_Lookup(name) != NULL) return;
     if (maxFrames <= 0) return;
-    Q3_NormalizeShaderName(name, normName, sizeof(normName));
-    Q_strncpyz(s_shaderMap[s_shaderMapCount].shaderName, normName,
+    Q_strncpyz(s_shaderMap[s_shaderMapCount].shaderName, name,
         sizeof(s_shaderMap[0].shaderName));
     Q_strncpyz(s_shaderMap[s_shaderMapCount].mapPath, frames[0],
         sizeof(s_shaderMap[0].mapPath));
     s_shaderMap[s_shaderMapCount].tcGenEnv = tcGenEnv;
-    s_shaderMap[s_shaderMapCount].cullMode = METAL_SHADER_CULL_BACK;
-    s_shaderMap[s_shaderMapCount].stageCount = 0;
+    s_shaderMap[s_shaderMapCount].tcModScaleS = 1.0f;
+    s_shaderMap[s_shaderMapCount].tcModScaleT = 1.0f;
+    s_shaderMap[s_shaderMapCount].stage2TcModScaleS = 1.0f;
+    s_shaderMap[s_shaderMapCount].stage2TcModScaleT = 1.0f;
     s_shaderMap[s_shaderMapCount].animFrameCount = maxFrames;
     s_shaderMap[s_shaderMapCount].animFps = (fps > 0.0f) ? fps : 8.0f;
     for (i = 0; i < maxFrames; ++i) {
@@ -2898,22 +2214,37 @@ static void ParseShaderText(const char *text) {
 
     while (1) {
         char shaderName[128];
+        char firstMap[MAX_QPATH];
         char animFrames[METAL_ANIMMAP_MAX_FRAMES][MAX_QPATH];
         int animFrameCount;
         float animFps;
+        float tcScrollS;
+        float tcScrollT;
+        float tcScaleS;
+        float tcScaleT;
+        float tcTurbAmp;
+        float tcTurbPhase;
+        float tcTurbFreq;
+        qboolean gotTcScroll;
+        qboolean gotTcScale;
+        qboolean gotTcTurb;
+        char stage2Map[MAX_QPATH];
+        qboolean gotStage2Map;
+        float stage2ScrollS;
+        float stage2ScrollT;
+        float stage2ScaleS;
+        float stage2ScaleT;
+        qboolean gotStage2Scroll;
+        qboolean gotStage2Scale;
+        int stage2BlendMode;
         int depth;
         qboolean inStage;
+        int stageIndex;
+        qboolean gotMap;
         qboolean gotAnim;
-        qboolean tcGenEnv;       /* any-stage env marker, top-level */
-        int cullMode;
+        qboolean tcGenEnv;
         char skyBoxBase[MAX_QPATH];
         qboolean gotSkyParms;
-        qboolean gotPortal;
-        /* Per-stage in-flight capture + accumulated stages. Each `{ ... }`
-         * block resets cur on `{` and appends to stages[] on matching `}`. */
-        Q3MetalStage cur;
-        Q3MetalStage stages[Q3_MAX_STAGES];
-        int stagesCount;
 
         token = COM_ParseExt(&p, qtrue);
         if (!token[0]) break;
@@ -2922,19 +2253,39 @@ static void ParseShaderText(const char *text) {
         token = COM_ParseExt(&p, qtrue);
         if (token[0] != '{') continue;
 
+        firstMap[0] = '\0';
         animFrameCount = 0;
         animFps = 0.0f;
+        tcScrollS = 0.0f;
+        tcScrollT = 0.0f;
+        tcScaleS = 1.0f;
+        tcScaleT = 1.0f;
+        tcTurbAmp = 0.0f;
+        tcTurbPhase = 0.0f;
+        tcTurbFreq = 0.0f;
+        gotTcScroll = qfalse;
+        gotTcScale = qfalse;
+        gotTcTurb = qfalse;
+        stage2Map[0] = '\0';
+        gotStage2Map = qfalse;
+        stage2ScrollS = 0.0f;
+        stage2ScrollT = 0.0f;
+        stage2ScaleS = 1.0f;
+        stage2ScaleT = 1.0f;
+        gotStage2Scroll = qfalse;
+        gotStage2Scale = qfalse;
+        stage2BlendMode = 0;
         depth = 1;
         inStage = qfalse;
+        stageIndex = 0;
+        gotMap = qfalse;
         gotAnim = qfalse;
         tcGenEnv = qfalse;
-        cullMode = METAL_SHADER_CULL_BACK;
         skyBoxBase[0] = '\0';
         gotSkyParms = qfalse;
-        gotPortal = qfalse;
-        Com_Memset(&cur, 0, sizeof(cur));
-        Com_Memset(stages, 0, sizeof(stages));
-        stagesCount = 0;
+        s_pendingBlendMode = 0;
+        s_pendingAlphaFunc = 0;
+
         while (depth > 0) {
             token = COM_ParseExt(&p, qtrue);
             if (!token[0]) break;
@@ -2942,8 +2293,8 @@ static void ParseShaderText(const char *text) {
             if (token[0] == '{' && token[1] == '\0') {
                 depth += 1;
                 if (depth == 2) {
+                    stageIndex += 1;
                     inStage = qtrue;
-                    Com_Memset(&cur, 0, sizeof(cur));
                 }
                 continue;
             }
@@ -2951,279 +2302,221 @@ static void ParseShaderText(const char *text) {
                 depth -= 1;
                 if (depth <= 1) {
                     inStage = qfalse;
-                    /* Stage close: UNCONDITIONALLY append cur to stages[].
-                     * Every `{ ... }` block is ONE stage — no validity
-                     * heuristics, no "stageHasData" filtering. Excess
-                     * stages beyond Q3_MAX_STAGES are dropped. The
-                     * `$lightmap → blendMode=3` default still applies so
-                     * lightmap stages without explicit blendFunc render
-                     * via the filter pipeline. */
-                    if (cur.useLightmap && cur.blendMode == 0) {
-                        cur.blendMode = 3; /* FILTER (GL_DST_COLOR/GL_ZERO) */
-                    }
-                    if (stagesCount < Q3_MAX_STAGES) {
-                        stages[stagesCount++] = cur;
-                    }
                 }
                 continue;
             }
 
-            /* Top-level directives (outside any stage block). */
+            /* Top-level directives (outside any stage block). `skyparms`
+             * is the most important one for us — declares the 6-face
+             * skybox basename that the world rendering will use per
+             * sky surface. */
             if (!inStage) {
                 if (!gotSkyParms && !Q_stricmp(token, "skyparms")) {
+                    /* skyparms <farbox> <cloudHeight> <nearbox>
+                     * `-` means "no farbox / nearbox"; take it as empty. */
                     token = COM_ParseExt(&p, qfalse);
                     if (token[0] && Q_stricmp(token, "-") != 0) {
                         Q_strncpyz(skyBoxBase, token, sizeof(skyBoxBase));
                         gotSkyParms = qtrue;
                     }
-                } else if (!gotPortal && !Q_stricmp(token, "portal")) {
-                    gotPortal = qtrue;
-                } else if (!Q_stricmp(token, "cull")) {
-                    token = COM_ParseExt(&p, qfalse);
-                    if (token[0] &&
-                        (!Q_stricmp(token, "disable") ||
-                         !Q_stricmp(token, "twosided") ||
-                         !Q_stricmp(token, "none"))) {
-                        cullMode = METAL_SHADER_CULL_DISABLE;
-                    } else if (token[0] && !Q_stricmp(token, "front")) {
-                        cullMode = METAL_SHADER_CULL_FRONT;
-                    } else {
-                        cullMode = METAL_SHADER_CULL_BACK;
-                    }
-                } else if (!gotAnim && !Q_stricmp(token, "animMap")) {
-                    /* Top-level animMap is rare but stock Q3 sometimes uses
-                     * it before stage blocks. Most use is inside a stage;
-                     * the in-stage handler below is the primary site. */
+                    /* Ignore the remaining two args. */
                 }
                 continue;
             }
 
-            /* In-stage directives. ALL stages handled identically — no
-             * stageIndex == 1 || == 2 gating. Each directive writes
-             * into the in-flight `cur` Q3MetalStage. */
-            {
-                if (!Q_stricmp(token, "map") || !Q_stricmp(token, "clampmap")) {
+            if (inStage) {
+                if (!gotMap && !gotAnim && (!Q_stricmp(token, "map") || !Q_stricmp(token, "clampmap"))) {
                     token = COM_ParseExt(&p, qfalse);
-                    ri.Printf(PRINT_ALL,
-                              "DEBUG: map token value = '%s'\n", token);
-                    if (token[0]) {
-                        if (!Q_stricmp(token, "$lightmap")) {
-                            cur.useLightmap = 1;
-                        } else if (cur.mapPath[0] == '\0') {
-                            /* First `map` in this stage wins — do not
-                             * overwrite if a prior map already set it. */
-                            Q_strncpyz(cur.mapPath, token, sizeof(cur.mapPath));
-                        }
-                        ri.Printf(PRINT_DEVELOPER,
-                                  "STAGE MAP %s -> %s\n",
-                                  shaderName, token);
+                    if (token[0] && token[0] != '$') {
+                        Q_strncpyz(firstMap, token, sizeof(firstMap));
+                        gotMap = qtrue;
                     }
-                } else if (!Q_stricmp(token, "animMap") || !Q_stricmp(token, "animmap")) {
+                } else if (stageIndex == 2 && !gotStage2Map &&
+                           (!Q_stricmp(token, "map") || !Q_stricmp(token, "clampmap"))) {
+                    token = COM_ParseExt(&p, qfalse);
+                    if (token[0] && token[0] != '$') {
+                        Q_strncpyz(stage2Map, token, sizeof(stage2Map));
+                        gotStage2Map = qtrue;
+                    }
+                } else if (!gotMap && !gotAnim && !Q_stricmp(token, "animmap")) {
+                    /* animMap <fps> <frame1> <frame2> ... up to end of line. */
                     token = COM_ParseExt(&p, qfalse);
                     animFps = (float)atof(token);
                     while (1) {
                         token = COM_ParseExt(&p, qfalse);
-                        if (!token[0]) break;
+                        if (!token[0]) break; /* end of line */
                         if (token[0] == '$') continue;
                         if (animFrameCount >= METAL_ANIMMAP_MAX_FRAMES) continue;
                         Q_strncpyz(animFrames[animFrameCount], token, MAX_QPATH);
                         animFrameCount += 1;
                     }
                     if (animFrameCount > 0) {
-                        Q_strncpyz(cur.mapPath, animFrames[0], sizeof(cur.mapPath));
+                        Q_strncpyz(firstMap, animFrames[0], sizeof(firstMap));
                         gotAnim = qtrue;
                     }
                 } else if (!Q_stricmp(token, "tcGen") || !Q_stricmp(token, "tcgen")) {
                     token = COM_ParseExt(&p, qfalse);
                     if (token[0] && (!Q_stricmp(token, "environment") ||
                                      !Q_stricmp(token, "env"))) {
-                        cur.tcGen = 1;
                         tcGenEnv = qtrue;
                     }
-                } else if (!Q_stricmp(token, "blendFunc") || !Q_stricmp(token, "blendfunc")) {
+                } else if (stageIndex == 1 && (!Q_stricmp(token, "blendFunc") || !Q_stricmp(token, "blendfunc"))) {
+                    /* Capture the first stage's blendFunc. Common combos:
+                     *   GL_ONE GL_ONE          → additive (flames, glow)
+                     *   GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA → alpha blend
+                     *   GL_DST_COLOR GL_ZERO   → filter (lightmap multiply)
+                     *   add / blend / filter    → shorthand names
+                     * We only store a coarse category (additive vs alpha
+                     * vs filter vs opaque) and skip uncommon combos. */
                     const char *src = COM_ParseExt(&p, qfalse);
                     const char *dst = COM_ParseExt(&p, qfalse);
                     if (src[0]) {
-                        cur.blendMode = BlendModeFromTokens(src, dst);
+                        s_pendingBlendMode = BlendModeFromTokens(src, dst);
                     }
-                } else if (!Q_stricmp(token, "alphaFunc") || !Q_stricmp(token, "alphafunc")) {
-                    token = COM_ParseExt(&p, qfalse);
-                    if (!Q_stricmp(token, "GT0")) cur.alphaFunc = 1;
-                    else if (!Q_stricmp(token, "GE128")) cur.alphaFunc = 2;
-                    else if (!Q_stricmp(token, "LT128")) cur.alphaFunc = 3;
-                } else if (!Q_stricmp(token, "rgbGen") || !Q_stricmp(token, "rgbgen")) {
-                    token = COM_ParseExt(&p, qfalse);
-                    if (!Q_stricmp(token, "vertex")) cur.rgbGen = 1;
-                    else if (!Q_stricmp(token, "lightingDiffuse") ||
-                             !Q_stricmp(token, "lightingdiffuse")) cur.rgbGen = 2;
-                    else if (!Q_stricmp(token, "wave")) cur.rgbGen = 3;
-                    else cur.rgbGen = 0;
-                    if (!Q_stricmp(token, "wave")) {
-                        const char *funcTok = COM_ParseExt(&p, qfalse);
-                        const char *baseTok = COM_ParseExt(&p, qfalse);
-                        const char *ampTok = COM_ParseExt(&p, qfalse);
-                        const char *phaseTok = COM_ParseExt(&p, qfalse);
-                        const char *freqTok = COM_ParseExt(&p, qfalse);
-                        if (funcTok[0]) {
-                            if (!Q_stricmp(funcTok, "sin")) cur.rgbWaveFunc = 1;
-                            else if (!Q_stricmp(funcTok, "triangle")) cur.rgbWaveFunc = 2;
-                            else if (!Q_stricmp(funcTok, "square")) cur.rgbWaveFunc = 3;
-                            else if (!Q_stricmp(funcTok, "sawtooth")) cur.rgbWaveFunc = 4;
-                            else if (!Q_stricmp(funcTok, "inversesawtooth") ||
-                                     !Q_stricmp(funcTok, "inverseSawtooth")) cur.rgbWaveFunc = 5;
-                            else if (!Q_stricmp(funcTok, "noise")) cur.rgbWaveFunc = 6;
-                            else cur.rgbWaveFunc = 1;
-                        }
-                        if (baseTok[0]) cur.rgbWaveBase = (float)atof(baseTok);
-                        if (ampTok[0]) cur.rgbWaveAmp = (float)atof(ampTok);
-                        if (phaseTok[0]) cur.rgbWavePhase = (float)atof(phaseTok);
-                        if (freqTok[0]) cur.rgbWaveFreq = (float)atof(freqTok);
-                    } else if (!Q_stricmp(token, "const") ||
-                               !Q_stricmp(token, "exactVertex") ||
-                               !Q_stricmp(token, "exactvertex")) {
-                        (void)COM_ParseExt(&p, qfalse); /* ( */
-                        (void)COM_ParseExt(&p, qfalse); /* r */
-                        (void)COM_ParseExt(&p, qfalse); /* g */
-                        (void)COM_ParseExt(&p, qfalse); /* b */
-                        (void)COM_ParseExt(&p, qfalse); /* ) */
+                } else if (stageIndex == 2 && (!Q_stricmp(token, "blendFunc") || !Q_stricmp(token, "blendfunc"))) {
+                    const char *src = COM_ParseExt(&p, qfalse);
+                    const char *dst = COM_ParseExt(&p, qfalse);
+                    if (src[0]) {
+                        stage2BlendMode = BlendModeFromTokens(src, dst);
                     }
-                } else if (!Q_stricmp(token, "alphaGen") || !Q_stricmp(token, "alphagen")) {
+                } else if (stageIndex == 1 && (!Q_stricmp(token, "alphaFunc") || !Q_stricmp(token, "alphafunc"))) {
                     token = COM_ParseExt(&p, qfalse);
-                    if (!Q_stricmp(token, "vertex")) cur.alphaGen = 1;
-                    else if (!Q_stricmp(token, "wave")) cur.alphaGen = 3;
-                    else cur.alphaGen = 0;
-                    if (!Q_stricmp(token, "wave")) {
-                        const char *funcTok = COM_ParseExt(&p, qfalse);
-                        const char *baseTok = COM_ParseExt(&p, qfalse);
-                        const char *ampTok = COM_ParseExt(&p, qfalse);
-                        const char *phaseTok = COM_ParseExt(&p, qfalse);
-                        const char *freqTok = COM_ParseExt(&p, qfalse);
-                        if (funcTok[0]) {
-                            if (!Q_stricmp(funcTok, "sin")) cur.alphaWaveFunc = 1;
-                            else if (!Q_stricmp(funcTok, "triangle")) cur.alphaWaveFunc = 2;
-                            else if (!Q_stricmp(funcTok, "square")) cur.alphaWaveFunc = 3;
-                            else if (!Q_stricmp(funcTok, "sawtooth")) cur.alphaWaveFunc = 4;
-                            else if (!Q_stricmp(funcTok, "inversesawtooth") ||
-                                     !Q_stricmp(funcTok, "inverseSawtooth")) cur.alphaWaveFunc = 5;
-                            else if (!Q_stricmp(funcTok, "noise")) cur.alphaWaveFunc = 6;
-                            else cur.alphaWaveFunc = 1;
-                        }
-                        if (baseTok[0]) cur.alphaWaveBase = (float)atof(baseTok);
-                        if (ampTok[0]) cur.alphaWaveAmp = (float)atof(ampTok);
-                        if (phaseTok[0]) cur.alphaWavePhase = (float)atof(phaseTok);
-                        if (freqTok[0]) cur.alphaWaveFreq = (float)atof(freqTok);
-                    } else if (!Q_stricmp(token, "const")) {
-                        (void)COM_ParseExt(&p, qfalse); /* value */
-                    } else if (!Q_stricmp(token, "portal")) {
-                        (void)COM_ParseExt(&p, qfalse); /* range */
+                    if (!Q_stricmp(token, "GT0")) {
+                        s_pendingAlphaFunc = 1;
+                    } else if (!Q_stricmp(token, "GE128")) {
+                        s_pendingAlphaFunc = 2;
+                    } else if (!Q_stricmp(token, "LT128")) {
+                        s_pendingAlphaFunc = 3;
                     }
-                } else if (!Q_stricmp(token, "tcMod") || !Q_stricmp(token, "tcmod")) {
+                } else if (stageIndex == 1 && (!Q_stricmp(token, "tcMod") || !Q_stricmp(token, "tcmod"))) {
+                    /* Capture first-stage tcMod directives. Q3 stages
+                     * frequently stack multiple tcMods (e.g. lava has
+                     * both `tcMod turb …` AND `tcMod scroll …` on the
+                     * same stage). All three are captured independently;
+                     * the draw-setup site later picks a visible mod in
+                     * preference order turb > scroll > scale. Unhandled
+                     * variants (rotate, stretch, transform) must still
+                     * consume their params so the outer parse loop
+                     * doesn't then treat float tokens as keywords. */
                     token = COM_ParseExt(&p, qfalse);
                     if (token[0] && !Q_stricmp(token, "scroll")) {
                         const char *sTok = COM_ParseExt(&p, qfalse);
                         const char *tTok = COM_ParseExt(&p, qfalse);
-                        if (sTok[0] && tTok[0] && cur.tcModCount < Q3_MAX_TCMODS) {
-                            cur.tcMods[cur.tcModCount].type = 1;
-                            cur.tcMods[cur.tcModCount].params[0] = (float)atof(sTok);
-                            cur.tcMods[cur.tcModCount].params[1] = (float)atof(tTok);
-                            cur.tcMods[cur.tcModCount].params[2] = 0.0f;
-                            cur.tcMods[cur.tcModCount].params[3] = 0.0f;
-                            cur.tcModCount += 1;
+                        if (sTok[0] && tTok[0]) {
+                            tcScrollS = (float)atof(sTok);
+                            tcScrollT = (float)atof(tTok);
+                            gotTcScroll = qtrue;
                         }
                     } else if (token[0] && !Q_stricmp(token, "scale")) {
                         const char *sTok = COM_ParseExt(&p, qfalse);
                         const char *tTok = COM_ParseExt(&p, qfalse);
-                        if (sTok[0] && tTok[0] && cur.tcModCount < Q3_MAX_TCMODS) {
-                            cur.tcMods[cur.tcModCount].type = 4;
-                            cur.tcMods[cur.tcModCount].params[0] = (float)atof(sTok);
-                            cur.tcMods[cur.tcModCount].params[1] = (float)atof(tTok);
-                            cur.tcMods[cur.tcModCount].params[2] = 0.0f;
-                            cur.tcMods[cur.tcModCount].params[3] = 0.0f;
-                            cur.tcModCount += 1;
+                        if (sTok[0] && tTok[0]) {
+                            tcScaleS = (float)atof(sTok);
+                            tcScaleT = (float)atof(tTok);
+                            gotTcScale = qtrue;
                         }
                     } else if (token[0] && !Q_stricmp(token, "turb")) {
+                        /* Stock Q3: `tcMod turb <base> <amp> <phase> <freq>`.
+                         * <base> is an unused legacy offset into the
+                         * sin-wave table. We consume but ignore it. */
                         const char *baseTok = COM_ParseExt(&p, qfalse);
                         const char *ampTok = COM_ParseExt(&p, qfalse);
                         const char *phaseTok = COM_ParseExt(&p, qfalse);
                         const char *freqTok = COM_ParseExt(&p, qfalse);
                         (void)baseTok;
-                        if (ampTok[0] && phaseTok[0] && freqTok[0] && cur.tcModCount < Q3_MAX_TCMODS) {
-                            cur.tcMods[cur.tcModCount].type = 5;
-                            cur.tcMods[cur.tcModCount].params[0] = (float)atof(ampTok);
-                            cur.tcMods[cur.tcModCount].params[1] = (float)atof(freqTok);
-                            cur.tcMods[cur.tcModCount].params[2] = (float)atof(phaseTok);
-                            cur.tcMods[cur.tcModCount].params[3] = 0.0f;
-                            cur.tcModCount += 1;
+                        if (ampTok[0] && phaseTok[0] && freqTok[0]) {
+                            tcTurbAmp = (float)atof(ampTok);
+                            tcTurbPhase = (float)atof(phaseTok);
+                            tcTurbFreq = (float)atof(freqTok);
+                            gotTcTurb = qtrue;
                         }
                     } else if (token[0] && !Q_stricmp(token, "rotate")) {
-                        const char *speedTok = COM_ParseExt(&p, qfalse);
-                        if (speedTok[0] && cur.tcModCount < Q3_MAX_TCMODS) {
-                            cur.tcMods[cur.tcModCount].type = 3;
-                            cur.tcMods[cur.tcModCount].params[0] = (float)atof(speedTok);
-                            cur.tcMods[cur.tcModCount].params[1] = 0.0f;
-                            cur.tcMods[cur.tcModCount].params[2] = 0.0f;
-                            cur.tcMods[cur.tcModCount].params[3] = 0.0f;
-                            cur.tcModCount += 1;
-                        }
+                        COM_ParseExt(&p, qfalse); /* swallow 1 param */
                     } else if (token[0] && !Q_stricmp(token, "stretch")) {
-                        COM_ParseExt(&p, qfalse);
+                        COM_ParseExt(&p, qfalse); /* swallow 4 params */
                         COM_ParseExt(&p, qfalse);
                         COM_ParseExt(&p, qfalse);
                         COM_ParseExt(&p, qfalse);
                     } else if (token[0] && !Q_stricmp(token, "transform")) {
-                        COM_ParseExt(&p, qfalse);
+                        COM_ParseExt(&p, qfalse); /* 6 params */
                         COM_ParseExt(&p, qfalse);
                         COM_ParseExt(&p, qfalse);
                         COM_ParseExt(&p, qfalse);
                         COM_ParseExt(&p, qfalse);
                         COM_ParseExt(&p, qfalse);
                     }
+                } else if (stageIndex == 2 && (!Q_stricmp(token, "tcMod") || !Q_stricmp(token, "tcmod"))) {
+                    token = COM_ParseExt(&p, qfalse);
+                    if (token[0] && !Q_stricmp(token, "scroll")) {
+                        const char *sTok = COM_ParseExt(&p, qfalse);
+                        const char *tTok = COM_ParseExt(&p, qfalse);
+                        if (sTok[0] && tTok[0]) {
+                            stage2ScrollS = (float)atof(sTok);
+                            stage2ScrollT = (float)atof(tTok);
+                            gotStage2Scroll = qtrue;
+                        }
+                    } else if (token[0] && !Q_stricmp(token, "scale")) {
+                        const char *sTok = COM_ParseExt(&p, qfalse);
+                        const char *tTok = COM_ParseExt(&p, qfalse);
+                        if (sTok[0] && tTok[0]) {
+                            stage2ScaleS = (float)atof(sTok);
+                            stage2ScaleT = (float)atof(tTok);
+                            gotStage2Scale = qtrue;
+                        }
+                    }
                 }
-                /* unknown in-stage tokens silently consumed */
             }
         }
 
-        ri.Printf(PRINT_DEVELOPER, "PARSED: %s\n", shaderName);
-        /* Pick the shader-level mapPath used by RegisterTexture's
-         * shader-map-first lookup chain. Prefer the first stage with a
-         * non-$lightmap map; if none, prefer animMap frame 0; else "". */
-        {
-            char shaderMapPath[MAX_QPATH];
-            int s;
-            shaderMapPath[0] = '\0';
-            for (s = 0; s < stagesCount; ++s) {
-                if (stages[s].mapPath[0] != '\0' && !stages[s].useLightmap) {
-                    Q_strncpyz(shaderMapPath, stages[s].mapPath, sizeof(shaderMapPath));
-                    break;
-                }
-            }
-            if (gotAnim && animFrameCount > 0) {
-                ShaderMap_RegisterAnimated(shaderName, animFrames, animFrameCount, animFps, tcGenEnv);
-            } else {
-                ShaderMap_Register(shaderName, shaderMapPath, tcGenEnv);
-            }
+        if (gotAnim) {
+            ShaderMap_RegisterAnimated(shaderName, animFrames, animFrameCount, animFps, tcGenEnv);
+        } else if (gotMap) {
+            ShaderMap_Register(shaderName, firstMap, tcGenEnv);
+        } else if (gotSkyParms) {
+            /* Sky-only shader (no renderable map stage). Register a
+             * placeholder so the lookup succeeds and the skyparms
+             * back-patch below has a slot to attach to. */
+            ShaderMap_Register(shaderName, "", qfalse);
         }
-        /* Direct copy of parsed stages[] + cullMode + skyparms + portal
-         * onto the just-registered entry. NO back-patching of legacy
-         * flat fields — those were removed. */
-        if (s_shaderMapCount > 0) {
+        /* Back-patch tcMod scroll and skyparms onto the just-registered
+         * entry. Deferred so the Register call chooses the slot. */
+        if ((gotAnim || gotMap || gotSkyParms) && s_shaderMapCount > 0) {
             metalShaderMap_t *last = &s_shaderMap[s_shaderMapCount - 1];
             if (!Q_stricmp(last->shaderName, shaderName)) {
-                int s;
-                for (s = 0; s < Q3_MAX_STAGES; ++s) {
-                    last->stages[s] = stages[s];
+                if (gotTcScroll) {
+                    last->tcModScrollS = tcScrollS;
+                    last->tcModScrollT = tcScrollT;
                 }
-                last->stageCount = stagesCount;
-                last->cullMode = cullMode;
-                last->tcGenEnv = tcGenEnv;
-                ri.Printf(PRINT_DEVELOPER, "STAGES %s = %d\n",
-                          last->shaderName, last->stageCount);
+                if (gotTcScale) {
+                    last->tcModScaleS = tcScaleS;
+                    last->tcModScaleT = tcScaleT;
+                }
+                if (gotTcTurb) {
+                    last->hasTurb = qtrue;
+                    last->tcModTurbAmp = tcTurbAmp;
+                    last->tcModTurbPhase = tcTurbPhase;
+                    last->tcModTurbFreq = tcTurbFreq;
+                }
+                if (s_pendingBlendMode != 0) {
+                    last->blendMode = s_pendingBlendMode;
+                }
+                if (s_pendingAlphaFunc != 0) {
+                    last->alphaFunc = s_pendingAlphaFunc;
+                }
                 if (gotSkyParms) {
                     Q_strncpyz(last->skyBoxBase, skyBoxBase, sizeof(last->skyBoxBase));
                 }
-                if (gotPortal) {
-                    last->isPortal = qtrue;
-                    ri.Printf(PRINT_ALL, "[PORTAL] %s\n", last->shaderName);
+                if (gotStage2Map) {
+                    Q_strncpyz(last->stage2MapPath, stage2Map, sizeof(last->stage2MapPath));
+                    last->stage2BlendMode = stage2BlendMode;
+                    if (gotStage2Scroll) {
+                        last->stage2TcModScrollS = stage2ScrollS;
+                        last->stage2TcModScrollT = stage2ScrollT;
+                    }
+                    if (gotStage2Scale) {
+                        last->stage2TcModScaleS = stage2ScaleS;
+                        last->stage2TcModScaleT = stage2ScaleT;
+                    }
                 }
             }
         }
@@ -3433,23 +2726,6 @@ static qhandle_t RE_RegisterModel(const char *name) {
     if (name == NULL || name[0] == '\0') {
         return 0;
     }
-    /* Q3 BSP inline submodels: cgame registers "*1", "*2", ... for doors,
-     * lifts, buttons, platforms. Model 0 is the world itself. Keep the
-     * handle outside the MD3 registry so the normal mesh path won't try
-     * to decode BSP brush geometry as an MD3. */
-    if (name[0] == '*') {
-        int index = atoi(name + 1);
-        if (index >= 0 && index < 4096) {
-            static int s_inlineRegLogged = 0;
-            if (s_inlineRegLogged < 8) {
-                ri.Printf(PRINT_ALL, "Metal inline model: registered '%s' → handle 0x%x\n",
-                          name, METAL_INLINE_MODEL_HANDLE_BASE + index);
-                s_inlineRegLogged += 1;
-            }
-            return (qhandle_t)(METAL_INLINE_MODEL_HANDLE_BASE + index);
-        }
-        return 0;
-    }
     return ResolveAndRegisterModel(name);
 }
 
@@ -3536,8 +2812,6 @@ static void RE_ClearScene(void) {
      * draw buffer here, the world scene's draws would be lost before the
      * HUD scenes' RE_RenderScene runs — which is exactly when Swift reads
      * s_frameSnapshot. Resets happen in RE_RenderScene (gated on world). */
-    s_scenePolyCount = 0;
-    s_scenePolyVertCount = 0;
     s_entityAcceptedThisFrame = 0;
     s_entityRejectedNullThisFrame = 0;
     s_entityRejectedTypeThisFrame = 0;
@@ -3545,13 +2819,6 @@ static void RE_ClearScene(void) {
 }
 
 static uint32_t s_rawEntryCount;  /* unconditional counter for debug */
-
-/* Portal-pass Phase 1 state. `s_hasPortal` is reset in RE_BeginFrame and
- * set when RE_AddRefEntityToScene sees a RT_PORTALSURFACE. The captured
- * `s_portalView` carries the destination camera origin + axis — fov is
- * inherited from the main scene on the Swift side. */
-static qboolean s_hasPortal = qfalse;
-static Q3MetalPortalView s_portalView;
 
 static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime) {
     vec3_t cross;
@@ -3561,12 +2828,14 @@ static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime
         s_entityRejectedNullThisFrame += 1;
         return;
     }
-    /* Allow RF_FIRST_PERSON entities through. The native cgame submits the
-     * real viewmodel this way (often with RF_DEPTHHACK), and skipping them
-     * removes first-person weapon meshes and related effects. */
-    /* Procedural effect entities that need view-dependent quads/strips get
-     * emitted later in RE_RenderScene once the current camera axes exist. */
-    if (re->reType == RT_SPRITE || re->reType == RT_RAIL_CORE) {
+    /* RT_SPRITE: billboard quad (plasma bolts, rail core, muzzle flashes,
+     * smoke puffs). We accept sprites into the scene-entity list and emit
+     * their geometry at RE_RenderScene time (camera-facing math requires
+     * the view axes, which aren't known here). All other reTypes
+     * (RT_BEAM, RT_RAIL_CORE, etc.) are still rejected for now and emit
+     * an audit entry so we can see what else the map submits. */
+    if (re->reType == RT_SPRITE) {
+        AuditOnce("ENTITY:RT_SPRITE");
         s_sceneEntities[s_sceneEntityCount].entity = *re;
         s_sceneEntities[s_sceneEntityCount].mirrored = qfalse;
         s_sceneEntityCount += 1;
@@ -3574,75 +2843,18 @@ static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime
         return;
     }
     if (re->reType != RT_MODEL) {
-        if (re->reType == RT_PORTALSURFACE) {
-            /* Phase 1 portal capture: stash destination camera for the
-             * Swift-side RTT pass. Stock Q3 uses re->oldorigin as the
-             * through-portal camera origin and re->axis (after axial
-             * inversion) as the destination camera frame. We keep the
-             * axis as-delivered here; Swift combines it with the main
-             * scene fov to build the portal view-projection. */
-            s_hasPortal = qtrue;
-            s_portalView.origin[0] = re->oldorigin[0];
-            s_portalView.origin[1] = re->oldorigin[1];
-            s_portalView.origin[2] = re->oldorigin[2];
-            s_portalView.axis[0] = re->axis[0][0];
-            s_portalView.axis[1] = re->axis[0][1];
-            s_portalView.axis[2] = re->axis[0][2];
-            s_portalView.axis[3] = re->axis[1][0];
-            s_portalView.axis[4] = re->axis[1][1];
-            s_portalView.axis[5] = re->axis[1][2];
-            s_portalView.axis[6] = re->axis[2][0];
-            s_portalView.axis[7] = re->axis[2][1];
-            s_portalView.axis[8] = re->axis[2][2];
-            return;
-        }
         if (re->reType == RT_BEAM) AuditOnce("ENTITY:RT_BEAM");
+        else if (re->reType == RT_RAIL_CORE) AuditOnce("ENTITY:RT_RAIL_CORE");
         else if (re->reType == RT_RAIL_RINGS) AuditOnce("ENTITY:RT_RAIL_RINGS");
         else if (re->reType == RT_LIGHTNING) AuditOnce("ENTITY:RT_LIGHTNING");
+        else if (re->reType == RT_PORTALSURFACE) AuditOnce("ENTITY:RT_PORTALSURFACE");
         else AuditOnce("ENTITY:reType unknown");
         s_entityRejectedTypeThisFrame += 1;
         return;
     }
-    if (re->hModel == 0 ||
-        (FindModelByHandle(re->hModel) == NULL && InlineModelIndexForHandle(re->hModel) < 0)) {
+    if (re->hModel == 0 || FindModelByHandle(re->hModel) == NULL) {
         s_entityRejectedModelThisFrame += 1;
         return;
-    }
-
-    /* Sanity-reject entities with garbage origin. Stock Q3 maps live inside
-     * ±65536 world units; any |origin| > 1e10 is a reinterpreted-memory or
-     * NaN-equivalent bit pattern. Happens occasionally on RF_FIRST_PERSON
-     * body parts from native cgame — root cause unresolved (possibly a
-     * stale refEntity_t field or a union mis-write across cg/engine). The
-     * entity would otherwise be frustum-clipped and waste a draw; drop it
-     * here. Log the first few occurrences so frequency is visible. */
-    {
-        static int s_badOriginLoggedCount = 0;
-        const float kOriginLimit = 1.0e10f;
-        int isBad = 0;
-        int axis;
-        for (axis = 0; axis < 3; axis += 1) {
-            float v = re->origin[axis];
-            if (v != v || v > kOriginLimit || v < -kOriginLimit) {
-                isBad = 1;
-                break;
-            }
-        }
-        if (isBad) {
-            if (s_badOriginLoggedCount < 8) {
-                const char *name = "";
-                metalModel_t *mdl = FindModelByHandle(re->hModel);
-                if (mdl) name = mdl->name;
-                ri.Printf(PRINT_WARNING,
-                    "Metal refEnt rejected: bad origin=(%.3g %.3g %.3g) "
-                    "rfx=0x%x reType=%d hMdl=%d model='%s'\n",
-                    re->origin[0], re->origin[1], re->origin[2],
-                    re->renderfx, re->reType, re->hModel, name);
-                s_badOriginLoggedCount += 1;
-            }
-            s_entityRejectedTypeThisFrame += 1;
-            return;
-        }
     }
 
     s_sceneEntities[s_sceneEntityCount].entity = *re;
@@ -3651,29 +2863,9 @@ static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime
     s_sceneEntityCount += 1;
     s_entityAcceptedThisFrame += 1;
 }
-static void RE_AddPolyToScene(qhandle_t hShader, int numVerts, const polyVert_t *verts, int numPolys) {
-    /* cgame calls this for rocket smoke trails, rail slug trails, bullet
-     * sparks, blood marks, plasma spans, gib chunks — anything built from
-     * arbitrary triangle sets sharing one shader. A single call can
-     * provide `numPolys` sequential polygons of `numVerts` each (same
-     * shader), packed contiguously in `verts`. Stash them all in the
-     * scene-accumulated buffers; RE_RenderScene fan-triangulates each
-     * into the entity vertex/index stream. */
-    int p;
-    if (hShader == 0 || numVerts < 3 || verts == NULL) return;
-    if (numPolys <= 0) numPolys = 1;
+static void RE_AddPolyToScene(qhandle_t hShader, int numVerts, const polyVert_t *verts, int num) {
     AuditOnce("POLY:RE_AddPolyToScene");
-    for (p = 0; p < numPolys; ++p) {
-        const polyVert_t *polyStart = verts + p * numVerts;
-        if (s_scenePolyCount >= METAL_MAX_SCENE_POLYS) break;
-        if (s_scenePolyVertCount + (uint32_t)numVerts > METAL_MAX_SCENE_POLY_VERTS) break;
-        s_scenePolys[s_scenePolyCount].shader = hShader;
-        s_scenePolys[s_scenePolyCount].firstVert = s_scenePolyVertCount;
-        s_scenePolys[s_scenePolyCount].vertCount = (uint32_t)numVerts;
-        memcpy(&s_scenePolyVerts[s_scenePolyVertCount], polyStart, sizeof(polyVert_t) * (size_t)numVerts);
-        s_scenePolyVertCount += (uint32_t)numVerts;
-        s_scenePolyCount += 1;
-    }
+    (void)hShader; (void)numVerts; (void)verts; (void)num;
 }
 static int R_LightForPoint(vec3_t point, vec3_t ambientLight, vec3_t directedLight, vec3_t lightDir) { return 0; }
 static void RE_AddLightToScene(const vec3_t org, float intensity, float r, float g, float b) {}
@@ -3786,7 +2978,7 @@ static void SynthesizeViewmodelEntity(const vec3_t vieworg,
     e = &slot->entity;
     e->reType = RT_MODEL;
     e->hModel = hModel;
-    e->renderfx = RF_DEPTHHACK | RF_FIRST_PERSON;
+    e->renderfx = RF_DEPTHHACK;
     e->shader.rgba[0] = 255;
     e->shader.rgba[1] = 255;
     e->shader.rgba[2] = 255;
@@ -3828,7 +3020,6 @@ static void RE_RenderScene(const refdef_t *fd) {
     vec3_t axis2;
     float fovX;
     float fovY;
-    float fakeShaderTime;
 
     if (fd == NULL) {
         return;
@@ -3843,18 +3034,11 @@ static void RE_RenderScene(const refdef_t *fd) {
         s_world.animShaderSlots != NULL && s_world.draws != NULL) {
         uint32_t i;
         for (i = 0; i < s_world.drawCount; ++i) {
-            uint32_t stageIndex;
             int slot = s_world.animShaderSlots[i];
             if (slot >= 0) {
                 qhandle_t h = ShaderMap_AnimatedSlotCurrentHandle(slot);
                 if (h != 0 && s_world.draws[i].stageCount > 0) {
                     s_world.draws[i].stages[0].textureHandle = (uint32_t)h;
-                }
-            }
-            for (stageIndex = 0; stageIndex < s_world.draws[i].stageCount; ++stageIndex) {
-                qhandle_t h = ResolveFakeAnimatedTextureHandle((qhandle_t)s_world.draws[i].stages[stageIndex].textureHandle);
-                if (h != 0) {
-                    s_world.draws[i].stages[stageIndex].textureHandle = (uint32_t)h;
                 }
             }
         }
@@ -3866,7 +3050,6 @@ static void RE_RenderScene(const refdef_t *fd) {
     VectorCopy(fd->viewaxis[2], axis2);
     fovX = fd->fov_x;
     fovY = fd->fov_y;
-    fakeShaderTime = (float)fd->time * 0.001f;
 
     /* Refdef fallback camera — gated behind cvar now that native cgame
      * writes a valid refdef. With cgame.qvm's broken ABI the refdef
@@ -4041,7 +3224,7 @@ static void RE_RenderScene(const refdef_t *fd) {
     if (s_world.loaded && !(fd->rdflags & RDF_NOWORLDMODEL)) {
         s_frameSnapshot.worldVertexCount = s_world.vertexCount;
         s_frameSnapshot.worldIndexCount = s_world.indexCount;
-        s_frameSnapshot.worldCommandCount = s_world.staticWorldDrawCount;
+        s_frameSnapshot.worldCommandCount = s_world.drawCount;
         s_frameSnapshot.worldGeneration = s_world.generation;
     }
 
@@ -4053,8 +3236,6 @@ static void RE_RenderScene(const refdef_t *fd) {
         s_entityVertexCount = 0;
         s_entityIndexCount = 0;
         s_entityDrawCount = 0;
-        s_inlineModelInstanceCount = 0;
-        s_frameSnapshot.inlineModelCommandCount = 0;
     }
 
     if (fd->rdflags == 0 && s_sceneEntityCount > 0) {
@@ -4065,58 +3246,16 @@ static void RE_RenderScene(const refdef_t *fd) {
 
         for (entityIndex = 0; entityIndex < s_sceneEntityCount; ++entityIndex) {
             const metalSceneEntity_t *sceneEntity = &s_sceneEntities[entityIndex];
-            int inlineIndex;
-            Q3MetalInlineModelInstance *instance;
-
-            if (sceneEntity->entity.reType != RT_MODEL) {
-                continue;
-            }
-            if (sceneEntity->entity.renderfx & RF_THIRD_PERSON) {
-                continue;
-            }
-
-            inlineIndex = InlineModelIndexForHandle(sceneEntity->entity.hModel);
-            if (inlineIndex <= 0 ||
-                s_world.inlineModels == NULL ||
-                (uint32_t)inlineIndex >= s_world.inlineModelCount) {
-                continue;
-            }
-            if (s_world.inlineModels[inlineIndex].drawCount == 0 ||
-                s_inlineModelInstanceCount >= Q3_METAL_MAX_REFENTITIES) {
-                continue;
-            }
-
-            instance = &s_inlineModelInstances[s_inlineModelInstanceCount++];
-            instance->firstDraw = s_world.inlineModels[inlineIndex].firstDraw;
-            instance->drawCount = s_world.inlineModels[inlineIndex].drawCount;
-            instance->origin[0] = sceneEntity->entity.origin[0];
-            instance->origin[1] = sceneEntity->entity.origin[1];
-            instance->origin[2] = sceneEntity->entity.origin[2];
-            instance->axis[0] = sceneEntity->entity.axis[0][0];
-            instance->axis[1] = sceneEntity->entity.axis[0][1];
-            instance->axis[2] = sceneEntity->entity.axis[0][2];
-            instance->axis[3] = sceneEntity->entity.axis[1][0];
-            instance->axis[4] = sceneEntity->entity.axis[1][1];
-            instance->axis[5] = sceneEntity->entity.axis[1][2];
-            instance->axis[6] = sceneEntity->entity.axis[2][0];
-            instance->axis[7] = sceneEntity->entity.axis[2][1];
-            instance->axis[8] = sceneEntity->entity.axis[2][2];
-        }
-        s_frameSnapshot.inlineModelCommandCount = s_inlineModelInstanceCount;
-
-        for (entityIndex = 0; entityIndex < s_sceneEntityCount; ++entityIndex) {
-            const metalSceneEntity_t *sceneEntity = &s_sceneEntities[entityIndex];
             const metalModel_t *model;
             const md3Header_t *header;
             const md3Surface_t *surface;
             int surfaceIndex;
 
-            /* Procedural sprite/beam entities reserve a single quad. */
-            if (sceneEntity->entity.reType == RT_SPRITE ||
-                sceneEntity->entity.reType == RT_RAIL_CORE) {
+            /* Sprites reserve a single quad: 4 verts, 6 indices, 1 draw. */
+            if (sceneEntity->entity.reType == RT_SPRITE) {
                 totalEntityVerts += 4;
                 totalEntityIndices += 6;
-                totalEntityDraws += 2;
+                totalEntityDraws += 1;
                 continue;
             }
 
@@ -4130,7 +3269,7 @@ static void RE_RenderScene(const refdef_t *fd) {
             for (surfaceIndex = 0; surfaceIndex < header->numSurfaces; ++surfaceIndex) {
                 totalEntityVerts += (uint32_t)surface->numVerts;
                 totalEntityIndices += (uint32_t)(surface->numTriangles * 3);
-                totalEntityDraws += 2;
+                totalEntityDraws += 1;
                 surface = (const md3Surface_t *)((const byte *)surface + surface->ofsEnd);
             }
         }
@@ -4155,127 +3294,59 @@ static void RE_RenderScene(const refdef_t *fd) {
                 vec4_t entityColor;
                 int surfaceIndex;
 
-                /* Procedural effect entities: RT_SPRITE uses a camera-facing
-                 * billboard, RT_RAIL_CORE uses a camera-facing beam quad. */
-                if (sceneEntity->entity.reType == RT_SPRITE ||
-                    sceneEntity->entity.reType == RT_RAIL_CORE) {
+                /* RT_SPRITE: billboard quad facing the camera. Q3 view
+                 * axis convention: axis[0]=forward, axis[1]=left,
+                 * axis[2]=up — so right_world = -axis1, up_world = axis2.
+                 * Uses additive blend (flags bit) + the additive entity
+                 * pipeline which already runs depth-read-only (no write)
+                 * via additiveEntityDepthStencilState. Covers plasma
+                 * bolts, rail core, muzzle flashes, smoke puffs. */
+                if (sceneEntity->entity.reType == RT_SPRITE) {
                     uint32_t baseVertex = entityVertexCursor;
                     uint32_t firstIndex = entityIndexCursor;
-                    qhandle_t textureHandle = sceneEntity->entity.customShader != 0
-                        ? sceneEntity->entity.customShader
-                        : EnsureWhiteTexture();
-                    textureHandle = ResolveFakeAnimatedTextureHandle(textureHandle);
-                    const metalTexture_t *tex = FindTextureByHandle(textureHandle);
-                    uint32_t drawFlags = Q3_METAL_ENTITY_DRAWFLAG_NOCULL;
                     float radius = sceneEntity->entity.radius;
                     vec3_t right, up;
                     vec3_t v0, v1, v2, v3;
-                    float scrollU = 0.0f;
-                    float scrollV = 0.0f;
-                    float uMax = 1.0f;
                     float r, g, b, a;
                     int i;
-                    if (radius < 0.5f) {
-                        radius = (sceneEntity->entity.reType == RT_RAIL_CORE) ? 6.0f : 8.0f;
-                    }
-                    if ((sceneEntity->entity.renderfx & RF_DEPTHHACK) ||
-                        (sceneEntity->entity.renderfx & RF_FIRST_PERSON)) {
-                        drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_DEPTHHACK;
-                    }
-                    if (sceneEntity->entity.renderfx & RF_FIRST_PERSON) {
-                        drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_FIRST_PERSON;
-                    }
-                    if (tex != NULL) {
-                        /* Blend classification comes from the parsed shader
-                         * blendFunc only. No name-based / portal / isAdditive
-                         * override; if the .shader says additive, we render
-                         * additive. `portal`-keyword shaders keep the
-                         * visibility-gate latch so the portal RTT pass still
-                         * knows a portal shader is in-frame, but we do NOT
-                         * rewrite the draw's blendMode. */
-                        if (ShaderMap_IsPortal(tex->name)) {
-                            drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_PORTAL;
-                            s_hasVisiblePortalEntity = qtrue;
-                        }
-                        if (tex->blendMode == 2) {
-                            drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_ALPHA;
-                        } else if (tex->blendMode == 3) {
-                            drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_FILTER;
-                        } else if (tex->blendMode == 1) {
-                            drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
-                        }
-                    }
-                    if (sceneEntity->entity.reType == RT_SPRITE) {
-                        VectorScale(axis1, -radius, right);
-                        VectorScale(axis2,  radius, up);
-                        /* Four billboard corners. CCW order with UV
-                         * origin at top-left (Q3 tex convention). */
-                        VectorSubtract(sceneEntity->entity.origin, right, v0);
-                        VectorSubtract(v0, up, v0);
-                        VectorAdd(sceneEntity->entity.origin, right, v1);
-                        VectorSubtract(v1, up, v1);
-                        VectorAdd(sceneEntity->entity.origin, right, v2);
-                        VectorAdd(v2, up, v2);
-                        VectorSubtract(sceneEntity->entity.origin, right, v3);
-                        VectorAdd(v3, up, v3);
-                    } else {
-                        vec3_t start, end, beamDir, viewToStart, viewToEnd;
-                        float beamLength;
-                        VectorCopy(sceneEntity->entity.origin, start);
-                        VectorCopy(sceneEntity->entity.oldorigin, end);
-                        VectorSubtract(end, start, beamDir);
-                        beamLength = VectorNormalize(beamDir);
-                        if (beamLength <= 0.01f) {
-                            continue;
-                        }
-                        uMax = beamLength / 256.0f;
-                        VectorSubtract(start, vieworg, viewToStart);
-                        VectorSubtract(end, vieworg, viewToEnd);
-                        if (VectorNormalize(viewToStart) <= 0.0f ||
-                            VectorNormalize(viewToEnd) <= 0.0f) {
-                            continue;
-                        }
-                        CrossProduct(viewToStart, viewToEnd, right);
-                        if (VectorNormalize(right) <= 0.0f) {
-                            CrossProduct(beamDir, axis2, right);
-                            if (VectorNormalize(right) <= 0.0f) {
-                                CrossProduct(beamDir, axis1, right);
-                                if (VectorNormalize(right) <= 0.0f) {
-                                    continue;
-                                }
-                            }
-                        }
-                        VectorMA(start,  radius, right, v0);
-                        VectorMA(start, -radius, right, v1);
-                        VectorMA(end,   -radius, right, v2);
-                        VectorMA(end,    radius, right, v3);
-                    }
+                    if (radius < 0.5f) radius = 8.0f;  /* sensible default */
+                    VectorScale(axis1, -radius, right);
+                    VectorScale(axis2,  radius, up);
+                    /* Four billboard corners. CCW order with UV
+                     * origin at top-left (Q3 tex convention). */
+                    VectorSubtract(sceneEntity->entity.origin, right, v0);
+                    VectorSubtract(v0, up, v0);
+                    VectorAdd(sceneEntity->entity.origin, right, v1);
+                    VectorSubtract(v1, up, v1);
+                    VectorAdd(sceneEntity->entity.origin, right, v2);
+                    VectorAdd(v2, up, v2);
+                    VectorSubtract(sceneEntity->entity.origin, right, v3);
+                    VectorAdd(v3, up, v3);
                     r = (float)sceneEntity->entity.shader.rgba[0] / 255.0f;
                     g = (float)sceneEntity->entity.shader.rgba[1] / 255.0f;
                     b = (float)sceneEntity->entity.shader.rgba[2] / 255.0f;
                     a = (float)sceneEntity->entity.shader.rgba[3] / 255.0f;
-                    /* Emit 4 verts: start-left/start-right/end-right/end-left
-                     * for beams, BL/BR/TR/TL for sprites. */
+                    /* Emit 4 verts: BL, BR, TR, TL */
                     s_entityVertices[baseVertex + 0].position[0] = v0[0];
                     s_entityVertices[baseVertex + 0].position[1] = v0[1];
                     s_entityVertices[baseVertex + 0].position[2] = v0[2];
-                    s_entityVertices[baseVertex + 0].texCoord[0] = 0.0f + scrollU;
-                    s_entityVertices[baseVertex + 0].texCoord[1] = (sceneEntity->entity.reType == RT_RAIL_CORE ? 0.0f : 1.0f) + scrollV;
+                    s_entityVertices[baseVertex + 0].texCoord[0] = 0.0f;
+                    s_entityVertices[baseVertex + 0].texCoord[1] = 1.0f;
                     s_entityVertices[baseVertex + 1].position[0] = v1[0];
                     s_entityVertices[baseVertex + 1].position[1] = v1[1];
                     s_entityVertices[baseVertex + 1].position[2] = v1[2];
-                    s_entityVertices[baseVertex + 1].texCoord[0] = (sceneEntity->entity.reType == RT_RAIL_CORE ? 0.0f : 1.0f) + scrollU;
-                    s_entityVertices[baseVertex + 1].texCoord[1] = 1.0f + scrollV;
+                    s_entityVertices[baseVertex + 1].texCoord[0] = 1.0f;
+                    s_entityVertices[baseVertex + 1].texCoord[1] = 1.0f;
                     s_entityVertices[baseVertex + 2].position[0] = v2[0];
                     s_entityVertices[baseVertex + 2].position[1] = v2[1];
                     s_entityVertices[baseVertex + 2].position[2] = v2[2];
-                    s_entityVertices[baseVertex + 2].texCoord[0] = uMax + scrollU;
-                    s_entityVertices[baseVertex + 2].texCoord[1] = (sceneEntity->entity.reType == RT_RAIL_CORE ? 1.0f : 0.0f) + scrollV;
+                    s_entityVertices[baseVertex + 2].texCoord[0] = 1.0f;
+                    s_entityVertices[baseVertex + 2].texCoord[1] = 0.0f;
                     s_entityVertices[baseVertex + 3].position[0] = v3[0];
                     s_entityVertices[baseVertex + 3].position[1] = v3[1];
                     s_entityVertices[baseVertex + 3].position[2] = v3[2];
-                    s_entityVertices[baseVertex + 3].texCoord[0] = (sceneEntity->entity.reType == RT_RAIL_CORE ? uMax : 0.0f) + scrollU;
-                    s_entityVertices[baseVertex + 3].texCoord[1] = 0.0f + scrollV;
+                    s_entityVertices[baseVertex + 3].texCoord[0] = 0.0f;
+                    s_entityVertices[baseVertex + 3].texCoord[1] = 0.0f;
                     for (i = 0; i < 4; ++i) {
                         s_entityVertices[baseVertex + i].color[0] = r;
                         s_entityVertices[baseVertex + i].color[1] = g;
@@ -4293,17 +3364,9 @@ static void RE_RenderScene(const refdef_t *fd) {
                     entityIndexCursor += 6;
                     s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
                     s_entityDraws[entityDrawCursor].indexCount = 6;
-                    s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)textureHandle;
-                    s_entityDraws[entityDrawCursor].flags = drawFlags;
+                    s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)sceneEntity->entity.customShader;
+                    s_entityDraws[entityDrawCursor].flags = Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE | Q3_METAL_ENTITY_DRAWFLAG_NOCULL;
                     entityDrawCursor += 1;
-                    if (tex != NULL && ShaderMap_IsPortal(tex->name) && entityDrawCursor < s_entityDrawCapacity) {
-                        s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
-                        s_entityDraws[entityDrawCursor].indexCount = 6;
-                        s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)textureHandle;
-                        s_entityDraws[entityDrawCursor].flags = (drawFlags & ~(Q3_METAL_ENTITY_DRAWFLAG_ALPHA | Q3_METAL_ENTITY_DRAWFLAG_FILTER))
-                            | Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
-                        entityDrawCursor += 1;
-                    }
                     continue;
                 }
 
@@ -4445,13 +3508,10 @@ static void RE_RenderScene(const refdef_t *fd) {
                     const md3St_t *st = (const md3St_t *)((const byte *)surface + surface->ofsSt);
                     const md3XyzNormal_t *currentFrameVerts = (const md3XyzNormal_t *)((const byte *)surface + surface->ofsXyzNormals) + frameIndex * surface->numVerts;
                     const md3XyzNormal_t *oldFrameVerts = (const md3XyzNormal_t *)((const byte *)surface + surface->ofsXyzNormals) + oldFrameIndex * surface->numVerts;
-                    const metalTexture_t *tex;
                     qhandle_t textureHandle = EnsureWhiteTexture();
-                    uint32_t drawFlags = 0;
+                    uint32_t drawFlags = Q3_METAL_ENTITY_DRAWFLAG_NOCULL;
                     uint32_t baseVertex = entityVertexCursor;
                     uint32_t firstIndex = entityIndexCursor;
-                    float scrollU = 0.0f;
-                    float scrollV = 0.0f;
                     int vertexIndex;
                     int triangleIndex;
 
@@ -4479,39 +3539,23 @@ static void RE_RenderScene(const refdef_t *fd) {
                         }
                         textureHandle = RegisterTexture(shader[shaderSlot].name);
                     }
-                    textureHandle = ResolveFakeAnimatedTextureHandle(textureHandle);
 
-                    if ((sceneEntity->entity.renderfx & RF_DEPTHHACK) ||
-                        (sceneEntity->entity.renderfx & RF_FIRST_PERSON)) {
+                    if (sceneEntity->entity.renderfx & RF_DEPTHHACK) {
                         drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_DEPTHHACK;
-                    }
-                    if (sceneEntity->entity.renderfx & RF_FIRST_PERSON) {
-                        drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_FIRST_PERSON;
                     }
                     /* Check entity's shader for additive blending (e.g.
                      * health orbs, glow effects, flame pickups). The
                      * texture's blendMode was propagated from the shader-
                      * map entry at RegisterTexture time. */
-                    tex = FindTextureByHandle(textureHandle);
                     {
+                        const metalTexture_t *tex = FindTextureByHandle(textureHandle);
                         if (tex != NULL) {
-                            if (tex->cullMode == METAL_SHADER_CULL_DISABLE) {
-                                drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_NOCULL;
-                            }
-                            if (ShaderMap_IsPortal(tex->name)) {
-                                drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_PORTAL;
-                                s_hasVisiblePortalEntity = qtrue;
-                            }
-                            if (tex->blendMode == 2) {
+                            if (tex->blendMode == 1) {
+                                drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                            } else if (tex->blendMode == 2) {
                                 drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_ALPHA;
                             } else if (tex->blendMode == 3) {
                                 drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_FILTER;
-                            } else if (tex->blendMode == 1 || tex->isAdditive) {
-                                drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
-                            }
-                            if (tex->isScroll) {
-                                scrollU = tex->scrollSpeedU * fakeShaderTime;
-                                scrollV = tex->scrollSpeedV * fakeShaderTime;
                             }
                         }
                         /* Diagnostic: first 5 per frame */
@@ -4552,8 +3596,8 @@ static void RE_RenderScene(const refdef_t *fd) {
                         outVertex->position[0] = worldPosition[0];
                         outVertex->position[1] = worldPosition[1];
                         outVertex->position[2] = worldPosition[2];
-                        outVertex->texCoord[0] = st[vertexIndex].st[0] + scrollU;
-                        outVertex->texCoord[1] = st[vertexIndex].st[1] + scrollV;
+                        outVertex->texCoord[0] = st[vertexIndex].st[0];
+                        outVertex->texCoord[1] = st[vertexIndex].st[1];
 
                         /* Per-vertex Lambert diffuse from BSP lightgrid.
                          * 1. Decode MD3 lat/long normal (2 bytes packed).
@@ -4631,14 +3675,6 @@ static void RE_RenderScene(const refdef_t *fd) {
                     s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)textureHandle;
                     s_entityDraws[entityDrawCursor].flags = drawFlags;
                     entityDrawCursor += 1;
-                    if (tex != NULL && ShaderMap_IsPortal(tex->name) && entityDrawCursor < s_entityDrawCapacity) {
-                        s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
-                        s_entityDraws[entityDrawCursor].indexCount = entityIndexCursor - firstIndex;
-                        s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)textureHandle;
-                        s_entityDraws[entityDrawCursor].flags = (drawFlags & ~(Q3_METAL_ENTITY_DRAWFLAG_ALPHA | Q3_METAL_ENTITY_DRAWFLAG_FILTER))
-                            | Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
-                        entityDrawCursor += 1;
-                    }
 
                     surface = (const md3Surface_t *)((const byte *)surface + surface->ofsEnd);
                 }
@@ -4648,73 +3684,6 @@ static void RE_RenderScene(const refdef_t *fd) {
             s_entityIndexCount = entityIndexCursor;
             s_entityDrawCount = entityDrawCursor;
         }
-    }
-
-    /* Emit accumulated scene polys (RE_AddPolyToScene) into the entity
-     * vertex/index buffers. Each stashed poly becomes one entity draw
-     * using the standard entity pipeline. Fan-triangulates n-gons. The
-     * texture's parsed blendMode routes the draw to opaque/alpha/
-     * additive/filter as appropriate. Covers rocket smoke trails, rail
-     * slug trails, blood marks, bullet sparks, plasma spans, gib polys. */
-    if (fd->rdflags == 0 && s_scenePolyCount > 0) {
-        uint32_t p;
-        uint32_t entityVertexCursor = s_entityVertexCount;
-        uint32_t entityIndexCursor = s_entityIndexCount;
-        uint32_t entityDrawCursor = s_entityDrawCount;
-        for (p = 0; p < s_scenePolyCount; ++p) {
-            const metalScenePoly_t *poly = &s_scenePolys[p];
-            const polyVert_t *polyVerts;
-            uint32_t pv;
-            uint32_t pt;
-            uint32_t baseVert;
-            uint32_t firstIdx;
-            metalTexture_t *tex;
-            uint32_t drawFlags = Q3_METAL_ENTITY_DRAWFLAG_NOCULL;
-
-            if (poly->vertCount < 3) continue;
-            if (entityVertexCursor + poly->vertCount >= s_entityVertexCapacity) break;
-            if (entityIndexCursor + (poly->vertCount - 2) * 3 >= s_entityIndexCapacity) break;
-            if (entityDrawCursor >= s_entityDrawCapacity) break;
-
-            polyVerts = &s_scenePolyVerts[poly->firstVert];
-            baseVert = entityVertexCursor;
-            for (pv = 0; pv < poly->vertCount; ++pv) {
-                s_entityVertices[entityVertexCursor].position[0] = polyVerts[pv].xyz[0];
-                s_entityVertices[entityVertexCursor].position[1] = polyVerts[pv].xyz[1];
-                s_entityVertices[entityVertexCursor].position[2] = polyVerts[pv].xyz[2];
-                s_entityVertices[entityVertexCursor].texCoord[0] = polyVerts[pv].st[0];
-                s_entityVertices[entityVertexCursor].texCoord[1] = polyVerts[pv].st[1];
-                s_entityVertices[entityVertexCursor].color[0] = polyVerts[pv].modulate.rgba[0] / 255.0f;
-                s_entityVertices[entityVertexCursor].color[1] = polyVerts[pv].modulate.rgba[1] / 255.0f;
-                s_entityVertices[entityVertexCursor].color[2] = polyVerts[pv].modulate.rgba[2] / 255.0f;
-                s_entityVertices[entityVertexCursor].color[3] = polyVerts[pv].modulate.rgba[3] / 255.0f;
-                entityVertexCursor += 1;
-            }
-            firstIdx = entityIndexCursor;
-            /* Fan triangulation around vertex 0 — Q3 polys are convex so
-             * this is correct for all standard uses. */
-            for (pt = 1; pt + 1 < poly->vertCount; ++pt) {
-                s_entityIndices[entityIndexCursor++] = baseVert;
-                s_entityIndices[entityIndexCursor++] = baseVert + pt;
-                s_entityIndices[entityIndexCursor++] = baseVert + pt + 1;
-            }
-
-            tex = FindTextureByHandle(poly->shader);
-            if (tex != NULL) {
-                if (tex->blendMode == 1)      drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
-                else if (tex->blendMode == 2) drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_ALPHA;
-                else if (tex->blendMode == 3) drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_FILTER;
-            }
-
-            s_entityDraws[entityDrawCursor].firstIndex = firstIdx;
-            s_entityDraws[entityDrawCursor].indexCount = entityIndexCursor - firstIdx;
-            s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)poly->shader;
-            s_entityDraws[entityDrawCursor].flags = drawFlags;
-            entityDrawCursor += 1;
-        }
-        s_entityVertexCount = entityVertexCursor;
-        s_entityIndexCount = entityIndexCursor;
-        s_entityDrawCount = entityDrawCursor;
     }
 
     s_frameSnapshot.entityVertexCount = s_entityVertexCount;
@@ -4744,29 +3713,15 @@ static void RE_SetColor(const float *rgba) {
 static void RE_StretchPic(float x, float y, float w, float h, float s1, float t1, float s2, float t2, qhandle_t hShader) {
     Q3MetalDrawCmd *draw;
     qhandle_t textureHandle = hShader > 0 ? hShader : EnsureWhiteTexture();
-    metalTexture_t *tex;
-    uint32_t drawBlendMode = 0;
 
     if (s_drawCount >= Q3_METAL_MAX_DRAWS || s_vertexCount + 6 > Q3_METAL_MAX_VERTICES) {
         return;
-    }
-
-    /* Plumb the shader's blendMode to the UI draw so the Swift side can
-     * pick a matching pipeline. Filter-mode (blendMode==3) is the one
-     * that actually matters here — Q3's `viewBloodBlend` uses
-     * `blendFunc GL_DST_COLOR GL_SRC_ALPHA`, which we map to filter in
-     * BlendModeFromTokens. Without a filter UI pipeline the screen
-     * tint renders as an opaque red overlay and obscures gameplay. */
-    tex = FindTextureByHandle(textureHandle);
-    if (tex != NULL && tex->blendMode == 3) {
-        drawBlendMode = 3;
     }
 
     draw = &s_draws[s_drawCount++];
     draw->firstVertex = s_vertexCount;
     draw->vertexCount = 6;
     draw->textureHandle = (uint32_t)textureHandle;
-    draw->blendMode = drawBlendMode;
 
     PushStretchPicVertex(x, y, s1, t1, s_currentColor);
     PushStretchPicVertex(x + w, y, s2, t1, s_currentColor);
@@ -4780,13 +3735,6 @@ static void RE_StretchRaw(int x, int y, int w, int h, int cols, int rows, byte *
 static void RE_UploadCinematic(int w, int h, int cols, int rows, byte *data, int client, qboolean dirty) {}
 
 static void RE_BeginFrame(stereoFrame_t stereoFrame) {
-    /* Portal capture is per-frame. RE_BeginFrame fires once per frame,
-     * unlike RE_ClearScene which fires per scene (world + HUDs). This
-     * is the correct reset site. */
-    s_hasPortal = qfalse;
-    s_hasVisiblePortalEntity = qfalse;
-    /* NOTE: s_worldHasPortalSurface is NOT reset here — it latches at
-     * LoadWorldMapData and persists for the map's lifetime. */
     s_vertexCount = 0;
     s_drawCount = 0;
     s_frameSnapshot.vertexCount = 0;
@@ -4795,11 +3743,9 @@ static void RE_BeginFrame(stereoFrame_t stereoFrame) {
     s_frameSnapshot.worldIndexCount = 0;
     s_frameSnapshot.worldCommandCount = 0;
     s_frameSnapshot.worldGeneration = s_world.generation;
-    s_frameSnapshot.inlineModelCommandCount = 0;
     s_frameSnapshot.entityVertexCount = 0;
     s_frameSnapshot.entityIndexCount = 0;
     s_frameSnapshot.entityCommandCount = 0;
-    s_inlineModelInstanceCount = 0;
 }
 
 static void RE_EndFrame(int *frontEndMsec, int *backEndMsec) {
@@ -4868,36 +3814,7 @@ static int R_LerpTag(orientation_t *tag, qhandle_t handle, int startFrame, int e
 
     return 0;
 }
-static void R_ModelBounds(qhandle_t model, vec3_t mins, vec3_t maxs) {
-    int inlineIndex;
-    metalModel_t *mdl;
-
-    if (mins == NULL || maxs == NULL) {
-        return;
-    }
-
-    VectorClear(mins);
-    VectorClear(maxs);
-
-    inlineIndex = InlineModelIndexForHandle(model);
-    if (inlineIndex >= 0 && s_world.inlineModels != NULL) {
-        VectorCopy(s_world.inlineModels[inlineIndex].mins, mins);
-        VectorCopy(s_world.inlineModels[inlineIndex].maxs, maxs);
-        return;
-    }
-
-    mdl = FindModelByHandle(model);
-    if (mdl == NULL || mdl->md3 == NULL) {
-        return;
-    }
-
-    {
-        const md3Header_t *hdr = mdl->md3;
-        const md3Frame_t *frame = (const md3Frame_t *)((const byte *)hdr + hdr->ofsFrames);
-        VectorCopy(frame->bounds[0], mins);
-        VectorCopy(frame->bounds[1], maxs);
-    }
-}
+static void R_ModelBounds(qhandle_t model, vec3_t mins, vec3_t maxs) {}
 
 static void RE_RemapShader(const char *oldShader, const char *newShader, const char *offsetTime) {}
 static qboolean RE_GetEntityToken(char *buffer, int size) { return qfalse; }
@@ -4948,10 +3865,6 @@ const Q3MetalWorldDrawCmd *Q3MetalRenderer_GetWorldDrawCommands(void) {
     return s_world.draws;
 }
 
-const Q3MetalInlineModelInstance *Q3MetalRenderer_GetInlineModelInstances(void) {
-    return s_inlineModelInstances;
-}
-
 const Q3MetalEntityVertex *Q3MetalRenderer_GetEntityVertices(void) {
     return s_entityVertices;
 }
@@ -4980,97 +3893,6 @@ int Q3MetalRenderer_GetTextureInfo(uint32_t textureHandle, Q3MetalTextureInfo *o
     outInfo->generation = texture->generation;
     outInfo->rgbaBytes = texture->rgbaBytes;
     return 1;
-}
-
-int Q3MetalRenderer_GetDebugRenderMode(void) {
-    static cvar_t *s_cvarDebugRenderMode = NULL;
-    if (s_cvarDebugRenderMode == NULL) {
-        s_cvarDebugRenderMode = ri.Cvar_Get("r_debugRenderMode", "0", CVAR_ARCHIVE);
-    }
-    return s_cvarDebugRenderMode ? s_cvarDebugRenderMode->integer : 0;
-}
-
-int Q3MetalRenderer_GetDebugPasses(void) {
-    static cvar_t *s_cvarDebugPasses = NULL;
-    if (s_cvarDebugPasses == NULL) {
-        s_cvarDebugPasses = ri.Cvar_Get("metal_debug_passes", "0", CVAR_ARCHIVE);
-        /* Classification is now trusted. Force-set to "0" once this run to
-         * overwrite the persisted "2" left in q3config.cfg by the previous
-         * diagnostic build. After this run the saved cfg will read "0" and
-         * the force-set can be safely removed. Modes: 0=off, 1=solid, 2=tint. */
-        ri.Cvar_Set("metal_debug_passes", "0");
-    }
-    return s_cvarDebugPasses ? s_cvarDebugPasses->integer : 0;
-}
-
-int Q3MetalRenderer_GetDrawWorld(void) {
-    static cvar_t *s_cvarDrawWorld = NULL;
-    if (s_cvarDrawWorld == NULL) {
-        s_cvarDrawWorld = ri.Cvar_Get("r_drawworld", "1", CVAR_CHEAT);
-    }
-    return s_cvarDrawWorld ? s_cvarDrawWorld->integer : 1;
-}
-
-int Q3MetalRenderer_GetDrawEntities(void) {
-    static cvar_t *s_cvarDrawEntities = NULL;
-    if (s_cvarDrawEntities == NULL) {
-        s_cvarDrawEntities = ri.Cvar_Get("r_drawentities", "1", CVAR_CHEAT);
-    }
-    return s_cvarDrawEntities ? s_cvarDrawEntities->integer : 1;
-}
-
-int Q3MetalRenderer_GetNoCull(void) {
-    static cvar_t *s_cvarNoCull = NULL;
-    if (s_cvarNoCull == NULL) {
-        s_cvarNoCull = ri.Cvar_Get("r_nocull", "0", CVAR_CHEAT);
-    }
-    return s_cvarNoCull ? s_cvarNoCull->integer : 0;
-}
-
-int Q3MetalRenderer_GetNoPortals(void) {
-    static cvar_t *s_cvarNoPortals = NULL;
-    if (s_cvarNoPortals == NULL) {
-        s_cvarNoPortals = ri.Cvar_Get("r_noportals", "0", CVAR_CHEAT);
-    }
-    return s_cvarNoPortals ? s_cvarNoPortals->integer : 0;
-}
-
-int Q3MetalRenderer_GetPortalSmokeTest(void) {
-    static cvar_t *s_cvarSmokeTest = NULL;
-    if (s_cvarSmokeTest == NULL) {
-        /* Phase 1 default ON: when no RT_PORTALSURFACE is captured, the
-         * Swift side still runs the portal pass against a camera offset
-         * from the main view so RTT wiring can be verified on any map. */
-        s_cvarSmokeTest = ri.Cvar_Get("r_portalSmokeTest", "1", CVAR_ARCHIVE);
-    }
-    return s_cvarSmokeTest ? s_cvarSmokeTest->integer : 1;
-}
-
-int Q3MetalRenderer_GetDisableTcMod(void) {
-    static cvar_t *s_cvarDisableTcMod = NULL;
-    if (s_cvarDisableTcMod == NULL) {
-        /* Default OFF. Toggle with `r_disableTcMod 1` to pin all world
-         * UVs to their BSP-baked static values, isolating whether
-         * texture motion artifacts come from the tcMod uniform path.
-         * NOT CVAR_CHEAT — needs to be settable on non-cheat servers
-         * for diagnostic use from the on-screen console. */
-        s_cvarDisableTcMod = ri.Cvar_Get("r_disableTcMod", "0", 0);
-    }
-    return s_cvarDisableTcMod ? s_cvarDisableTcMod->integer : 0;
-}
-
-int Q3MetalRenderer_GetPortalView(Q3MetalPortalView *out) {
-    if (out == NULL || !s_hasPortal) return 0;
-    *out = s_portalView;
-    return 1;
-}
-
-int Q3MetalRenderer_HasVisiblePortal(void) {
-    /* Returns nonzero only when the map has at least one portal-tagged
-     * BSP surface OR an entity with the portal shader was submitted this
-     * frame. Swift gates the portal RTT pass on this to skip the cost on
-     * non-portal maps (the vast majority). */
-    return (s_worldHasPortalSurface || s_hasVisiblePortalEntity) ? 1 : 0;
 }
 
 refexport_t *GetRefAPI(int apiVersion, refimport_t *rimp) {

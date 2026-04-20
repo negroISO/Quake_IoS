@@ -1,0 +1,187 @@
+Session Resume Notes (Quake iOS Metal renderer)
+Date: 2026-04-17
+
+Completed this session (2026-04-17)
+
+1) P0 — FIRST_PERSON viewmodel "ghost gun" fix
+- Added Q3_METAL_ENTITY_DRAWFLAG_FIRST_PERSON = 1u << 5
+  - code/ios/metal_renderer_shared.h
+- C stub: sets flag when renderfx & RF_FIRST_PERSON (sprite + MD3 paths + synthetic)
+- Swift: dedicated PRE-pass before 4-pass entity loop in MetalView.swift
+  - Forces entityPipelineState + depthHackDepthStencilState (.always, depth write ON) + cullMode=.none
+  - 4-pass loop `continue`s on firstPersonBit
+- Root cause: wantsReadOnlyDepth from additive/alpha/filter classification was overriding
+  wantsDepthHack for non-opaque viewmodel surfaces.
+
+2) P1 — Portal/teleporter alpha reclassification
+- IsPortalLikeTextureName() added; forces Q3_METAL_ENTITY_DRAWFLAG_ALPHA on entity
+  classification sites (sprite + MD3) BEFORE blendMode chain.
+- AddWorldDrawStage applies the override in TWO places:
+  a) first-stage: forces blendMode=2 after FX-name fallback, before tcMod
+  b) second-stage: dedicated additive overlay branch (unchanged)
+- Removed `/sfx/` folder heuristic (isSfxLike) — was blanket-promoting opaque
+  bouncepads/pent floors/computer panels to additive.
+- Removed isJumpPadLike from additive chain.
+- Added glow/spark to FX additive keyword list.
+
+3) Debug pass colorizer (metal_debug_passes cvar, CVAR_ARCHIVE)
+- Q3MetalRenderer_GetDebugPasses() in metal_renderer_stub.c
+- WorldDrawUniforms.debugPassColor: SIMD4<Float> (Swift + MSL)
+- Three modes via alpha encoding:
+  a=0   off (normal render)
+  a=1.0 (mode 1) solid replace — fragment early-returns color
+  a=0.55 (mode 2) tint — mix(outColor.rgb, debugPassColor.rgb, 0.55) at end
+- Entity fragments take constant float4 &debugPassColor [[buffer(0)]] — MUST always bind
+  (pass zero SIMD4 when off).
+- Swift debugColor(pass:) maps pass→color (opaque=red, filter=green, alpha=blue, additive=yellow).
+- DEFAULT FLIPPED OFF (was "2" during debug): Cvar_Get("metal_debug_passes", "0") + one-shot
+  Cvar_Set("metal_debug_passes", "0") to clear stale "2" from q3config.cfg.
+  Remove the one-shot after first launch cleans cfg.
+
+4) BlendModeFromTokens expanded
+- Shorthand: add/blend/filter (handled without dst token)
+- Additive family: GL_ONE GL_ONE, GL_SRC_ALPHA GL_ONE, GL_ONE GL_SRC_ALPHA
+- Alpha family: GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA, GL_ONE GL_ONE_MINUS_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA GL_SRC_ALPHA
+- Filter family: GL_DST_COLOR GL_ZERO, GL_ZERO GL_SRC_COLOR, GL_DST_COLOR GL_SRC_COLOR, GL_ZERO GL_ONE_MINUS_SRC_COLOR
+- Unknown pairs emit PRINT_DEVELOPER warning "[Q3-STAGE] unknown blendFunc '...' → OPAQUE".
+
+5) tcMod turb "100mph scrolling" fix
+- MSL q3_world_fragment tcMod==5 spatial coefficient 4.0 → 0.5
+  texCoord.x += sin(t + texCoord.y * 0.5) * amp;
+  texCoord.y += sin(t + texCoord.x * 0.5) * amp;
+- Was producing ~64 interfering bands on 16-tile pool; now ~0.5 cycle per UV tile.
+- Known limitation: uses texCoord as worldPos proxy (Q3 uses worldPos/1024).
+  Full fidelity requires piping worldPos from q3_world_vertex to q3_world_fragment
+  (already done for sky; not yet for world).
+
+6) AuditOnce STAGE logging
+- AddWorldDrawStage emits `[Q3-AUDIT] STAGE:<texName> bm=<n>` via AuditOnce.
+- Kept as production diagnostic; remove once classification is confirmed 100% stable.
+
+Validation
+- Pre-fix vs post-fix log diff: bm=0/1/2 counts went 101/14/0 → 106/4/5
+  (more opaque, fewer mis-additive, some now alpha — matches expectation).
+- Red/yellow/blue/green pass tints confirmed correct via screenshots.
+- Viewmodel no longer "ghosts" through walls.
+
+Pending / P-ranked backlog
+
+P1 (next)
+- Goat-skull wall relief near staircase scrolling — need STAGE log line for the
+  specific texture to diagnose. Likely tcGen environment (not implemented) or
+  stale tcMod leak. NOT the pillar gargoyles.
+- Pipe worldPos into q3_world_fragment (like sky) for correct tcMod turb if
+  * 0.5 still looks wrong after user inspection.
+
+P2
+- rgbGen wave — needed for pulsing flame brightness.
+- deformVertexes wave — needed for flame/water surface wobble.
+- RE_AddPolyToScene body (currently audit-only stub) — cgame particle system
+  needs this for sparks, smoke puffs, muzzle flash particles, blood.
+
+P3
+- tcGen environment UV generation (envmap). Flag captured in shader map; UVs
+  still wrong. Goat-skull relief likely needs this.
+- tcMod rotate MSL implementation (currently type parsed but not rendered? verify).
+
+P4
+- Portal/teleporter render-to-texture for proper "mirror" look (currently
+  semi-transparent alpha is correct classification but not the Q3 visual).
+
+Known state
+- Native cgame is live (commit 5977485); renderfx bits are correct.
+- metal_synth_viewmodel = 0, metal_hide_nearby = 0, metal_fallback_camera = 0
+  (all OFF; retained as cvars for regression fallback).
+- RF_THIRD_PERSON filter is active in RE_RenderScene (skip via continue).
+- Four-pass order: 0=opaque, 1=filter, 2=alpha, 3=additive (ours — NOT advisor's numbering).
+- metal_debug_passes cvar default "0"; remove Cvar_Set one-shot after first launch.
+
+Grep anchors (new this session)
+- Q3_METAL_ENTITY_DRAWFLAG_FIRST_PERSON
+- IsPortalLikeTextureName
+- Q3MetalRenderer_GetDebugPasses
+- debugPassColor
+- BlendModeFromTokens
+- AuditOnce
+- [Q3-AUDIT] STAGE:
+- tcMod==5 (turb)
+
+---
+
+Session Resume Notes (Quake iOS Metal renderer)
+Date: 2026-04-16
+
+Completed this session
+
+1) Sky/world flags + sampler crash
+- Sky flag path is active end-to-end.
+- Fixed sky-pass crash by binding sampler in sky pass:
+  - Quake3-iOS/MetalView.swift: added
+    encoder.setFragmentSamplerState(worldSamplerState, index: 0)
+
+2) World lightmap binding hardening
+- World pass now always binds texture(1) using draw.lightmapTextureHandle.
+- If missing, binds whiteTexture fallback to texture(1).
+- File: Quake3-iOS/MetalView.swift
+
+3) Debug render mode wired from cvar
+- Added C API:
+  int Q3MetalRenderer_GetDebugRenderMode(void)
+- Reads cvar:
+  r_debugRenderMode (default 0)
+- Files:
+  - code/ios/metal_renderer_stub.c
+  - code/ios/metal_renderer_shared.h
+
+4) Shader debug modes updated
+- q3_world_fragment modes:
+  0: base * lightmap
+  1: base only
+  2: lightmap only
+  3: uv0 (in.texCoord)
+  4: uv1 (in.lightmapTexCoord)
+- File: Quake3-iOS/MetalView.swift
+
+5) First-person crash triage guard
+- Temporarily skips RF_FIRST_PERSON entities in RE_AddRefEntityToScene.
+- File: code/ios/metal_renderer_stub.c
+- Audit log emitted once: ENTITY:RF_FIRST_PERSON skipped
+
+Important known state
+- metal_renderer_shared.h currently should NOT include tr_local.h (removed due Swift bridging/OpenGL include failure).
+- Q3_METAL_WORLD_DRAWFLAG_SKY is set to non-conflicting bit (1u << 5).
+
+How to validate quickly next session
+
+Console cvars:
+- \r_debugRenderMode 1   (base only)
+- \r_debugRenderMode 2   (lightmap only)
+- \r_debugRenderMode 3   (uv0)
+- \r_debugRenderMode 4   (uv1)
+- \r_debugRenderMode 0   (normal)
+
+Expected:
+- Mode 1: textured/fullbright look
+- Mode 2: grayscale lighting atlas effect
+- Mode 3: regular UV layout
+- Mode 4: lightmap UV atlas layout
+
+Immediate next task (do first)
+- Verify screenshots for modes 1 and 2.
+- If mode 2 is black/wrong:
+  - inspect draw.lightmapTextureHandle population in C world draw setup
+  - verify lightmap texture upload/generation path
+
+After that
+1) tcMod stabilization (use absolute time, no cumulative UV drift)
+2) Blend/alpha stage correctness (fire black squares)
+3) RT_MODEL re-enable/work (after world stable)
+
+Quick grep anchors
+- Quake3-iOS/MetalView.swift:
+  - q3_world_fragment
+  - draw.lightmapTextureHandle
+  - Q3MetalRenderer_GetDebugRenderMode
+- code/ios/metal_renderer_stub.c:
+  - Q3MetalRenderer_GetDebugRenderMode
+  - RF_FIRST_PERSON skipped

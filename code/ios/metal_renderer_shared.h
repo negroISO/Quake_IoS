@@ -36,15 +36,41 @@ typedef struct {
     uint32_t blendMode;   /* 0=opaque/alpha (default UI), 3=filter (dst_color, zero) */
 } Q3MetalDrawCmd;
 
+#define Q3_MAX_TCMODS 4
+
+typedef struct {
+    uint32_t type;        /* 0=none,1=scroll,2=wave-sin,3=rotate,4=scale,5=turb */
+    float params[4];
+} Q3TcMod;
+
 typedef struct {
     uint32_t textureHandle;
     uint32_t blendMode;   /* 0=opaque,1=add,2=alpha,3=filter,4=premult,5=skip */
     uint32_t tcGen;       /* 0=base,1=environment */
-    uint32_t tcMod;       /* 0=none,1=scroll,2=turb,3=rotate,4=scale */
-    float tcModParams[4];
-    uint32_t rgbGen;      /* 0=identity, 1=vertex, 2=lightingDiffuse */
-    uint32_t alphaGen;    /* 0=identity, 1=vertex */
+    /* Multi-tcMod chain (preserves ORDER from the .shader file).
+     * Q3 stages frequently stack `tcMod turb` + `tcMod scroll` etc.
+     * Chain is consumed left-to-right by the renderer; an unused
+     * slot has type==0. */
+    Q3TcMod tcMods[Q3_MAX_TCMODS];
+    uint32_t tcModCount;
+    uint32_t rgbGen;      /* 0=identity, 1=vertex, 2=lightingDiffuse, 3=wave */
+    uint32_t alphaGen;    /* 0=identity, 1=vertex, 3=wave */
     uint32_t alphaFunc;   /* 0=none, 1=GT0, 2=GE128, 3=LT128 */
+    uint32_t cullMode;    /* 0=CULL_BACK, 1=CULL_NONE (disable/twosided), 2=CULL_FRONT */
+    uint32_t useLightmap; /* 1 if this stage sourced its map from `$lightmap` */
+    /* `rgbGen wave <func> <base> <amp> <phase> <freq>` parameters.
+     * func: 0=none,1=sin,2=triangle,3=square,4=sawtooth,5=inverseSawtooth,6=noise. */
+    uint32_t rgbWaveFunc;
+    float rgbWaveBase;
+    float rgbWaveAmp;
+    float rgbWavePhase;
+    float rgbWaveFreq;
+    /* `alphaGen wave …` parameters. Same func enumeration as rgbWaveFunc. */
+    uint32_t alphaWaveFunc;
+    float alphaWaveBase;
+    float alphaWaveAmp;
+    float alphaWavePhase;
+    float alphaWaveFreq;
 } Q3MetalWorldStage;
 
 #define Q3_METAL_MAX_STAGES 4
@@ -65,12 +91,25 @@ typedef struct {
     uint32_t flags;
 } Q3MetalEntityDrawCmd;
 
+typedef struct {
+    uint32_t firstDraw;
+    uint32_t drawCount;
+    float origin[3];
+    float axis[9];
+} Q3MetalInlineModelInstance;
+
 enum {
     Q3_METAL_WORLD_DRAWFLAG_ADDITIVE = 1u << 0,
     Q3_METAL_WORLD_DRAWFLAG_NOCULL = 1u << 1,
     Q3_METAL_WORLD_DRAWFLAG_LIGHTMAP_MULTIPLY = 1u << 2,
     Q3_METAL_WORLD_DRAWFLAG_ALPHA = 1u << 3,
-    Q3_METAL_WORLD_DRAWFLAG_FILTER = 1u << 4
+    Q3_METAL_WORLD_DRAWFLAG_FILTER = 1u << 4,
+    /* Shader explicitly declared `cull front` — render back faces (inverted).
+     * Mutually exclusive with NOCULL; Swift picks .front cull when set. */
+    Q3_METAL_WORLD_DRAWFLAG_CULL_FRONT = 1u << 7,
+    /* Inline bmodel draw — WorldDrawUniforms.modelMatrix is non-identity and
+     * driven by the owning scene entity's origin/axis each frame. */
+    Q3_METAL_WORLD_DRAWFLAG_BMODEL = 1u << 8
 };
 
 enum {
@@ -93,6 +132,7 @@ typedef struct {
     uint32_t worldIndexCount;
     uint32_t worldCommandCount;
     uint32_t worldGeneration;
+    uint32_t inlineModelCommandCount;
     uint32_t entityVertexCount;
     uint32_t entityIndexCount;
     uint32_t entityCommandCount;
@@ -129,6 +169,7 @@ const Q3MetalDrawCmd *Q3MetalRenderer_GetDrawCommands(void);
 const Q3MetalWorldVertex *Q3MetalRenderer_GetWorldVertices(void);
 const uint32_t *Q3MetalRenderer_GetWorldIndices(void);
 const Q3MetalWorldDrawCmd *Q3MetalRenderer_GetWorldDrawCommands(void);
+const Q3MetalInlineModelInstance *Q3MetalRenderer_GetInlineModelInstances(void);
 const Q3MetalEntityVertex *Q3MetalRenderer_GetEntityVertices(void);
 const uint32_t *Q3MetalRenderer_GetEntityIndices(void);
 const Q3MetalEntityDrawCmd *Q3MetalRenderer_GetEntityDrawCommands(void);

@@ -1,0 +1,225 @@
++attack	start attacking (shooting, punching)
++back	start moving backwards
++button0	start firing same as mouse button 1 (fires weapon)
++button1	start displaying chat bubble
++button2	start using items (same as enter)
++button3	start player taunt animation
++button4	fixed +button4 not causing footsteps "John Carmack"
++button5	used for MODS also used by Team Arena Mission Pack
++button6	used for MODS also used by Team Arena Mission Pack
++button7	start hand signal, player model looks like it's motioning to team "move forward" (Team Arena Models Only)
++button8	start hand signal, player model looks like it's motioning to team "come here" (Team Arena Models Only)
++button9	stop hand signal, player model looks like it's motioning to team "come to my left side" (Team Arena Models Only)
++button10	start hand signal, player model looks like it's motioning to team "come to my right side" (Team Arena Models Only)
++button11	
++button12	
++button13	
++button14	
++forward	start moving forward
++info	start displaying server information (sv_hostname, map, rules, g_gametype, fraglimit)
++left	start turning left
++lookdown	start looking down
++lookup	start looking up
++mlook	start using mouse movements to control head movement
++movedown	start moving down (crouch, climb down, swim down)
++moveleft	start strafing to the left
++moveright	start strafing to the right
++moveup	start moving up (jump, climb up, swim up)
++right	start turning right
++scores	start displaying current scores
++speed	speed toggle bound to shift key by default toggles run/walk
++strafe	start changing directional movement into strafing movement
++zoom	zoom in to fov specified by the zoomfov variable
+addbot	add one bot <botlib> name of the bot library <name> name of the bot <skin> skin of the bot <charfile> file with the bot character <charname> name of the character - "Mr. Elusive" bots can be given a fractional skill when adding them from the console. for instance use "/addbot grunt 4.6 blue" to add a 4.5 skill Grunt to team blue.
+arena	load arena and bots "name" from arena.txt (arena <name>)
+-attack	stop attacking (shooting, punching)
+-back	stop moving backwards
+banClient	ban a client by slot number used in conjunction with serverstatus you can ban players by their slot number regardless of player name (from server console only) part of the client banning system which depends on a master banned list on the master server at id software
+banUser	ban a client by their player name. once the name is entered the players name, IP, and CD-Key are sent to the master server where the player will be band for a length of time determined by id software. lamers take heed this system will ban you from all servers instantly.
+bind	assign a key to command(s). (bind <key> "<command>")
+bindlist	list all currently bound keys and what command they are bound to
+-button0	stop firing same as mouse button 1 (fires weapon)
+-button1	stop displaying chat bubble
+-button2	stop using items (same as releasing enter)
+-button3	stop player taunt animation
+-button4	fixed +button4 not causing footsteps "John Carmack"
+-button5	used for MODS also used by Team Arena Mission Pack
+-button6	used for MODS also used by Team Arena Mission Pack
+-button7	stop hand signal, player model looks like it's motioning to team "move forward" (Team Arena Models Only)
+-button8	stop hand signal, player model looks like it's motioning to team "come here" (Team Arena Models Only)
+-button9	start hand signal, player model looks like it's motioning to team "come to my left side" (Team Arena Models Only)
+-button10	stop hand signal, player model looks like it's motioning to team "come to my right side" (Team Arena Models Only)
+-button11	
+-button12	
+-button13	
+-button14	
+callteamvote	allows a team to vote for a captain or team leader
+callvote	callvote <command> vote <y/n> Caller automatically votes yes vote has a 30 second timeout each client can only call 3 votes a level vote is displayed on screen with totals "John Carmack" vote commands are: map_restart, nextmap, map , g_gametype and kick .
+centerview	quickly move current view to the center of screen
+changeVectors	change to vector defined by FIND_NEW_CHANGE_VECTORS as in vector graphics - with vector graphics it is possible to change any element of the picture at any time since each part is stored as an independent object whereas once something in a bitmap has been overwritten it cannot in general be retrieved. could also be for 3D rendering vectors?
+cinematic	play the q3a movie RoQ files (cinematic intro.RoQ)
+clear	clear all text from console
+clientinfo	display name, rate, number of snaps, player model, rail color, and handicap (state number?)
+clientkick	kick a client by slot number used in conjunction with serverstatus you can kick players by their slot number regardless of player name (from server console only)
+cmd	send a command to server remote console
+cmdlist	list all available console commands
+condump	condump "x" write the console text to a file where "x" is the name of that file
+configstrings	list the current config strings in effect
+connect	connect to server (connect 204.52.135.50) or (connect serverURL.com)
+crash	causes Q3TEST.EXE to perform an illegal operation in Windows
+cvar_restart	reset all variables back to factory defaults (could be handy)
+cvarlist	list all available console variables and their values
+demo	play demo (demo q3demo001.dm3)
+devmap	load maps in development mode? (loads map with cheats enabled)
+dir	display directory if syntax is correct ex. (dir \) or (dir ..\) or (dir ..\baseq3)
+disconnect	disconnects you from server (local included)
+dumpuser	display user info (handicap, model/color, rail color, more…)(dumpuser "<name>")
+echo	echo a string to the message display to your console only
+error	execute an error routine to protect the server
+exec	execute a config file or script
+fdir	allows the user to search his game directory for the presence of file types. a common use for this might be to search out the file names of maps that are often buried inside pak files with different names. syntax: fdir <filter>example: fdir *q3dm?.bsp - In this example, the user is searching all subdirectories (the "*" stands in for the path name) for game maps (the .bsp file extension) that have the letters "q3dm" in their name AND that are followed by a single character (indicated by the "?").one or more metacharacters may be used in the filter.* match any string of zero or more characters? match any single character[abc...] match any of the enclosed characters; a hyphen can be used to specify a range (e.g. a-z, A-Z, 0-9)
+follow	switch to follow mode (follow "<name>" or follow1 for 1 ST place follow2 for 2 ND etc…)
+-forward	stop moving forward
+freeze	freeze game and all animation for specified time (freeze 5) (5 seconds)
+gfxinfo	returns extensive information about video settings
+fs_openedList	display the file name of open pak files (pk3)
+Fs_pureList	this command basically displays the contents of the sv_referencedPaks variable
+Fs_referencedList	this variable basically displays the contents of the sv_referencedPakNames variable
+give	cheat - give player item (give railgun)
+globalservers	list public servers on the internet
+god	cheat - give player invulnerability
+heartbeat	send a manual heartbeat to the master servers
+hunk_stats	returns value of some registers how many bits high/low and total meminfo command replaces hunk_stats and z_stats "John Carmack"
+imagelist	list currently open images/textures used by the current map. also displays the amount of texture memory the map is using which is the last number displayed - Jax_Gator
+in_restart	restarts all the input drivers, dinput, joystick, etc
+-info	stop displaying server information (sv_hostname, map, rules, g_gametype, fraglimit)
+joy_advancedupdate	removed Graeme says joy support still broken
+kick	kick the player with the given name off the server. if nobody uses the name "all" and "all" is specified as player name then everyone is kicked. if there are no bots with the name "allbots" and "allbots" is specified as player name then all the bots are kicked. (from server console only…kick "<name>")
+kill	kills your player (suicide but can get you unstuck some times)
+killserver	stops server from running and broadcasting heartbeat??
+-left	stop turning left
+levelshot	display the image used at the end of a level
+loaddefered	load models and skins that have not yet been loaded
+loaddeferred	load models and skins that have not yet been loaded (corrected spelling)
+localservers	list servers on LAN or local sub net only
+-lookdown	stop looking down
+-lookup	stop looking up
+map	loads specified map (map q3dm7)
+map_restart	resets the game on the same map (also plays fight! sound file and displays FIGHT!)
+meminfo	meminfo command replaces hunk_stats and z_stats "John Carmack"
+messagemode	send a message to everyone
+messagemode2	send a message to teammates
+messagemode3	send a message to tourney opponents?
+messagemode4	send a message to attacker? (does not work)
+midiinfo	display information about MIDI music system
+-mlook	stop using mouse look
+model	display the name of current player model if no parameters are given (see also model variable)
+modelist	list of accessible screen resolutions
+modellist	list of currently open player models
+-movedown	stop moving down (crouch, climb down, swim down)
+-moveleft	stop strafing to the left
+-moveright	stop strafing to the right
+-moveup	stop moving up (jump, climb up, swim up)
+music	plays specified music file (music music.wav)
+net_restart	reset all the network related variables like rate etc...
+nextframe	"nextframe", "prevframe", "nextskin", and "prevskin" commands will change the frame or skin of the testmodel. These are bound to F5, F6, F7, and F8 in q3default.cfg.
+nextskin	"nextframe", "prevframe", "nextskin", and "prevskin" commands will change the frame or skin of the testmodel. These are bound to F5, F6, F7, and F8 in q3default.cfg.
+noclip	no clipping objects (nothing will be solid)
+notarget	BOTS will not fight/see you (good for getting cool screenshots)
+path	display all current game paths
+ping	manually ping a server (ping "<sv_hostname>" or by the IP address)
+play	play a sound file (play sound.wav)
+prevframe	"nextframe", "prevframe", "nextskin", and "prevskin" commands will change the frame or skin of the testmodel. These are bound to F5, F6, F7, and F8 in q3default.cfg.
+prevskin	"nextframe", "prevframe", "nextskin", and "prevskin" commands will change the frame or skin of the testmodel. These are bound to F5, F6, F7, and F8 in q3default.cfg.
+quit	quit arena and quit Quake 3 Arena and return to your OS…Thanx for flying
+rcon	start a remote console to a server.
+reconnect	re-initialize the connection to the last server you were connected to
+record	records a demo (record mydemo.dm3) (g_syncronousClients must be a 1 to start)
+reset	reset specified variable (reset model) single variable as opposed to cvar_restart…(c:
+restart	restart the game on the current map (server only)
+-right	stop turning right
+s_info	display information about sound system (replaced soundinfo command)
+s_list	display paths and filenames of all sound files as they are played. (replaced soundlist command)
+s_stop	stop whatever sound that is currently playing from playing. (Replaced stopsound command)
+s_disable_a3d	disable support for Aureal 3D sound system
+s_enable_a3d	enable support for Aureal 3D sound system
+say	say something to everyone on the server.
+say_team	say something to your team only.
+scanservers	scan the local area network for servers (only works for same subnet)
+-scores	stop displaying current scores
+screenshot	save current viewport to a TARGA image file (usually named sequentially shot0001.tga)
+screenshotJPEG	save current viewport to a JPEG image file (usually named sequentially shot0001.jpg)
+sectorlist	lists sectors and number of entities in each on the currently loaded map
+serverinfo	gives information about local server from the console of that server
+serverstatus	display the current status of the connected server as well as connected users and their slot number. if you specify an IP address it will display the status of a remote server
+serverrecord	records a serverside demo (serverrecord srvrdemo.dm3)
+serverstop	stops the recording of a serverside demo
+set	set a variable (set <variable name> <commands;separate by;semi;colon>)
+seta	sets the variable with the archive flag will save the last setting to q3config.cfg and reload that setting every time you run the game. Any changes to variables with an A for the class ID are automatically stored in q3config.cfg - LOKi
+setenv	sets environment variables
+sets	sets the variable with the serverinfo flag, so it will be transmitted from a server to connecting clients - LOKi
+setu	sets the variable with the userinfo flag, so it will be transmitted from a client to a server while connecting - LOKi
+setviewpos	sets the VR coordinates of the players view screen
+shaderlist	list of currently open shaders (light effects).
+showip	display your current TCP/IP address
+sizedown	makes viewport one size smaller
+sizeup	makes viewport one size larger
+skinlist	list of currently open skins
+snd_restart	reinitialize sound
+soundinfo	information about sound system
+soundlist	list of currently open sound files
+spdevmap	load a devmap with bots spawned in. (cheats enabled)
+-speed	speed toggle bound to shift key by default toggles run/walk
+spmap	load a map with bots spawned in. (cheats disabled)
+startOrbit	start the 3rd person display of your player model and orbit in a circle around it
+stats	
+status	status of currently connected server
+stoprecord	stop recording a demo
+stopdemo	stop recording demo
+stopsound	stop whatever sound that is currently playing from playing.
+-strafe	stop changing directional movement into strafing movement
+systeminfo	returns values for: g_syncronousclients, sv_serverid, and timescale.
+tcmd	display the current target command or displays some type of code address
+team	set player status. p=player s=spectator red, blue, or free (team free joins smallest/loosing team)also in tourney play team follow1 2 etc.(follow players by lead position) team scoreboard your player becomes a scoreboard
+teamtask	display the current task you have been assigned 1 - offense 2 - defense 3 - point/patroll 4 - following 5 - retrieving 6 - escort(gaurding flag carrier) 7 - camping
+teamvote	allows user to cast a vote on a called team vote yes or no callteamvote <playername> vote <y/n> Caller automatically votes yes vote has a 30 second timeout each client can only call 3 votes a level vote is displayed on screen with totals
+tell	say something to an individual on the server tell <playername> "go get the flag"
+tell_attacker	possibly to pass a complement to your last known attacker..he he more like insult
+tell_target	possibly to pass a complement back…ha ha more like "Die Llama"
+testfog	removed may have been used for development of fog emulation
+testgun	weapon model dissapears cg_gun 1 does not bring it back. will cause the model to follow the player around and suppress the real view weapon model. The default frame 0 of most guns is completely off screen, so you will probably have to cycle a couple frames to see it. "nextframe", "prevframe", "nextskin", and "prevskin" commands will change the frame or skin of the testmodel. These are bound to F5, F6, F7, and F8 in q3default.cfg.
+testmodel	testmodel <path\model.md3> will create a fake entity 100 units in front of the current view position, directly facing the viewer. It will remain immobile, so you can move around it to view it from different angles "nextframe", "prevframe", "nextskin", and "prevskin" commands will change the frame or skin of the testmodel. These are bound to F5, F6, F7, and F8 in q3default.cfg. (useful tool for model and skin artists)
+testshader	covers all brushes and entities with the selected texture, and lights the map using the effect of that texture as well. entering testshader without a parameter will restore all textures set by the map. -hacker (removed possibly because cheat potential)
+toggle	toggle "X", where X is the variable you give, to a 1 if it is 0 and 0 if it is 1 (toggle cg_autoswitch) "The 'toggle' command can toggle write protected cvars." Graeme
+toggleconsole	usually bound to ~ the tilde key brings the console up and down
+touchFile	make the file a zero byte file (not a good idea I did not test this one)
+unbind	unbinds a key
+unbindall	unbinds all keys (be careful)
+userinfo	list user information like (possibly replaced by clientinfo)
+vid_restart	reinitialize video
+viewpos	returns player coordinates on the map in x y z form
+vminfo	display information about virtual machine interpreter on the local machine
+vmprofile	possibly more of the virtual machine John's talking about, profile…hmm?
+vmtest	probably a developer test which returns levels of success, returns >display "C: test 1234"
+vosay	use a predefined voice message and play everyone
+vosay_team	use a predefined voice message and play to your team
+vote	allows user to cast a vote on a called vote usually bound to F1 (yes) and F2 (no)...(c: callvote <command> vote <y/n> Caller automatically votes yes vote has a 30 second timeout each client can only call 3 votes a level vote is displayed on screen with totals "John Carmack"
+votell	use a predefined voice message and play to a <playername> you specify
+vsay	use a predefined voice message and play to everyone
+vsay_team	use a predefined voice message and play to your team
+vstr	identifies the attached command as a variable sting (bind a vstr "myvariable")
+vtaunt	play a random voice taunt wav file to everyone
+vtell	possibly to play a random voice taunt to a <playername> you specify
+vtell_attacker	possibly to play a random voice taunt to your last known attacker
+vtell_target	possibly to play a random voice taunt at player you last hit
+wait	stop execution and wait one game tick (no alias support will be added in Q3A per J.C.)
+weapnext	switch to the next higher numbered weapon
+weapon	select a weapon by it's number (weapon "5")
+weapprev	switch to the next lower numbered weapon
+writeconfig	saves current configuration to a cfg file…this is cool! (c:
+z_stats	display the memory statistics for the Z-buffer in the game "lists all blocks >= given size" John Carmack meminfo command replaces hunk_stats and z_stats "John Carmack"
+-zoom	zoom out to fov specified by the fov variable
+Red Font	Removed or replaced in current version
+Green Font	Added by current version
+	**note any +commands do not activate from the console until the console is toggled**
+	**note any commands since version 1.09 must be preceded by a slash character**
