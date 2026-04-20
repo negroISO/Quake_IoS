@@ -2186,7 +2186,8 @@ static void ShaderMap_Register(const char *name, const char *path, qboolean tcGe
     if (s_shaderMapCount >= MAX_SHADER_MAP_ENTRIES) return;
     if (ShaderMap_Lookup(name) != NULL) return; /* first wins */
     if (name && (strstr(name, "border11c") || strstr(name, "killblock_i4b") ||
-                 strstr(name, "xmetalfloor_wall_5b"))) {
+                 strstr(name, "xmetalfloor_wall_5b") ||
+                 strncmp(name, "textures/sfx/", 13) == 0)) {
         size_t nlen = strlen(name);
         ri.Printf(PRINT_ALL, "[SHADER-REG] name=[%s] len=%zu last3bytes=%02x,%02x,%02x path=[%s]\n",
             name, nlen,
@@ -2634,7 +2635,14 @@ static void LoadAllShaders(void) {
         for (j = 0; j < len; ++j) {
             if (buf[j] == '\r') buf[j] = ' ';
         }
-        ParseShaderText(buf);
+        {
+            int before = s_shaderMapCount;
+            ri.Printf(PRINT_ALL, "[PARSER-DBG] begin file=%s size=%d mapCount=%d\n",
+                fileList[i], len, s_shaderMapCount);
+            ParseShaderText(buf);
+            ri.Printf(PRINT_ALL, "[PARSER-DBG] end   file=%s registered=%d (total=%d)\n",
+                fileList[i], s_shaderMapCount - before, s_shaderMapCount);
+        }
         ri.FS_FreeFile(buf);
     }
 
