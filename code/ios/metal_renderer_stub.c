@@ -2004,21 +2004,58 @@ static int ShaderMap_GetBlendMode(const char *name) {
     return entry ? entry->blendMode : 0;
 }
 
+/* blendMode enum used throughout the stub and the Q3MetalWorldStage:
+ *   0 = opaque (no blend)
+ *   1 = additive (GL_ONE/GL_ONE, GL_SRC_ALPHA/GL_ONE)
+ *   2 = alpha   (GL_SRC_ALPHA/GL_ONE_MINUS_SRC_ALPHA)
+ *   3 = filter  (GL_DST_COLOR/GL_ZERO and commutative form GL_ZERO/GL_SRC_COLOR)
+ * If Q3 supports the blendFunc combo, we must map it. Unrecognized combos
+ * fall through to opaque AND log once so missing cases surface without
+ * re-introducing stage0/stage2 heuristics. */
 static int BlendModeFromTokens(const char *src, const char *dst) {
     if (src == NULL || src[0] == '\0') return 0;
-    if (!Q_stricmp(src, "add") ||
-        (!Q_stricmp(src, "GL_ONE") && dst != NULL && !Q_stricmp(dst, "GL_ONE"))) {
-        return 1;
-    }
-    if (!Q_stricmp(src, "blend") ||
-        (!Q_stricmp(src, "GL_SRC_ALPHA") && dst != NULL &&
-         !Q_stricmp(dst, "GL_ONE_MINUS_SRC_ALPHA"))) {
-        return 2;
-    }
-    if (!Q_stricmp(src, "filter") ||
-        (!Q_stricmp(src, "GL_DST_COLOR") && dst != NULL &&
-         !Q_stricmp(dst, "GL_ZERO"))) {
-        return 3;
+
+    /* Short Q3 aliases — these are dst-independent. */
+    if (!Q_stricmp(src, "add"))    return 1;
+    if (!Q_stricmp(src, "blend"))  return 2;
+    if (!Q_stricmp(src, "filter")) return 3;
+
+    if (dst == NULL || dst[0] == '\0') return 0;
+
+    /* Canonical additive. */
+    if (!Q_stricmp(src, "GL_ONE") && !Q_stricmp(dst, "GL_ONE")) return 1;
+    /* Premultiplied additive (flame, glow). */
+    if (!Q_stricmp(src, "GL_SRC_ALPHA") && !Q_stricmp(dst, "GL_ONE")) return 1;
+    /* Alpha blend (transparent decals, glass). */
+    if (!Q_stricmp(src, "GL_SRC_ALPHA") && !Q_stricmp(dst, "GL_ONE_MINUS_SRC_ALPHA")) return 2;
+    /* Filter / modulate (lightmap pass, dark overlay). */
+    if (!Q_stricmp(src, "GL_DST_COLOR") && !Q_stricmp(dst, "GL_ZERO")) return 3;
+    /* Filter (commutative factor ordering — some shaders author this form). */
+    if (!Q_stricmp(src, "GL_ZERO") && !Q_stricmp(dst, "GL_SRC_COLOR")) return 3;
+    /* Opaque explicit (no-op blend). */
+    if (!Q_stricmp(src, "GL_ONE") && !Q_stricmp(dst, "GL_ZERO")) return 0;
+    /* Skip stage — GL_ZERO/GL_ZERO writes black. We render opaque-black
+     * rather than dropping so the stage still consumes its slot; if a
+     * shader relies on this being a no-op, promote to a dedicated drop
+     * path later. */
+    if (!Q_stricmp(src, "GL_ZERO") && !Q_stricmp(dst, "GL_ZERO")) return 0;
+
+    /* Unknown combo: warn once. Adding here is cheaper than bisecting
+     * visuals weeks later. */
+    {
+        static char s_unknownSeen[64][64];
+        static int s_unknownCount = 0;
+        char combo[64];
+        int u;
+        qboolean seen = qfalse;
+        Com_sprintf(combo, sizeof(combo), "%s|%s", src, dst);
+        for (u = 0; u < s_unknownCount; ++u) {
+            if (!Q_stricmp(s_unknownSeen[u], combo)) { seen = qtrue; break; }
+        }
+        if (!seen && s_unknownCount < (int)(sizeof(s_unknownSeen) / sizeof(s_unknownSeen[0]))) {
+            Q_strncpyz(s_unknownSeen[s_unknownCount++], combo, sizeof(s_unknownSeen[0]));
+            ri.Printf(PRINT_WARNING, "Metal shader: unrecognized blendFunc '%s %s' → opaque\n", src, dst);
+        }
     }
     return 0;
 }
