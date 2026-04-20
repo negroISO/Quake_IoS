@@ -1,0 +1,970 @@
+17:             var tcGen: Float
+18:-            var tcModCount: Int32           // 0-4 tcMod entries in the chain
+20:+            var tcMod: Float
+23:-            var tcModType: SIMD4<Float>     // type per chain entry (1=scroll, 2=wave, 3=rotate, 4=scale, 5=turb)
+24:-            var tcModParams0: SIMD4<Float>  // chain[0] params
+25:-            var tcModParams1: SIMD4<Float>  // chain[1] params
+26:-            var tcModParams2: SIMD4<Float>  // chain[2] params
+27:-            var tcModParams3: SIMD4<Float>  // chain[3] params
+28:+            var tcModParams: SIMD4<Float>
+31:             var alphaTestThreshold: Float   // >0: discard if a<thresh; <0: discard if a>=|thresh|; 0: none
+32:-            var blendMode: Int32
+33:-            var alphaGen: Float             // 0=identity, 1=vertex
+38:-            // 0=opaque (red), 1=filter (green), 2=alpha (blue), 3=additive (yellow).
+48:-        // Flip to true to log world-pass stage/drawcall counts each frame.
+52:         // One-shot: logs the first sky draw's stage layout once per launch.
+53:         // Confirms killsky_1 + killsky_2 are both wired through as stages.
+59:-        /// Full tcMod chain pack — matches the `WorldDrawUniforms`
+60:-        /// `tcModCount` + `tcModType` + `tcModParams0..3` layout. MSL
+67:-        /// Flatten the parsed `Q3MetalStage.tcMods[Q3_MAX_TCMODS]` chain
+70:-        private static func fillTcMods(_ stage: Q3MetalWorldStage) -> TcModChainPack {
+76:-            let n = Int(min(stage.tcModCount, 4))
+77:-            // Q3TcMod tcMods[] is a fixed-size C array (tuple in Swift).
+78:-            let chain = [stage.tcMods.0, stage.tcMods.1, stage.tcMods.2, stage.tcMods.3]
+93:+        private static func stageTcModParams(_ stage: Q3MetalWorldStage) -> SIMD4<Float> {
+94:+            SIMD4<Float>(stage.tcModParams.0, stage.tcModParams.1, stage.tcModParams.2, stage.tcModParams.3)
+126:             float tcGen;
+127:-            int   tcModCount;
+128:+            float tcMod;
+131:-            float4 tcModType;
+132:-            float4 tcModParams0;
+133:-            float4 tcModParams1;
+134:-            float4 tcModParams2;
+135:-            float4 tcModParams3;
+136:+            float4 tcModParams;
+139:             float alphaTestThreshold;
+140:-            int blendMode;
+141:-            float alphaGen;
+158:-            // tcMod turb / tcGen environment must see the moved brush in
+165:-            // Iterate the full tcMod chain in declaration order. Up to four
+170:-            for (int i = 0; i < u.tcModCount; ++i) {
+171:-                int t = int(u.tcModType[i] + 0.5);
+172:-                float4 p = (i == 0) ? u.tcModParams0
+173:-                         : (i == 1) ? u.tcModParams1
+174:-                         : (i == 2) ? u.tcModParams2
+175:-                                    : u.tcModParams3;
+214:-            int tcGen = int(u.tcGen + 0.5);
+215:-            if (tcGen == 1) {
+216:-                // tcGen environment — per-fragment facet normal from the
+247:-            // Explicit alphaFunc (from the shader parser) only. Positive
+251:-            // The previous implicit "if blendMode opaque/filter && alpha<0.5
+253:-            // opaque wall had alpha=1, but RGBA textures loaded via
+254:-            // fallback paths (or JPGs with accidental alpha<128) were
+257:-            // implicit alpha discard on opaque/filter stages.
+258:-            float thresh = u.alphaTestThreshold;
+269:-            // Debug pass colorizer — solid replace when alpha >= 0.9.
+283:+        fragment float4 q3_world_fragment(WorldVertexOut in [[stage_in]],
+289:+            int tcMod = int(drawUniforms.tcMod + 0.5);
+291:+            if (tcMod == 1) {
+292:+                texCoord += drawUniforms.tcModParams.xy * drawUniforms.timeSeconds;
+293:+            } else if (tcMod == 2) {
+294:+                float s = sin(drawUniforms.timeSeconds * drawUniforms.tcModParams.w) * drawUniforms.tcModParams.y;
+296:+            } else if (tcMod == 3) {
+297:+                float a = drawUniforms.tcModParams.x * drawUniforms.timeSeconds;
+302:+            } else if (tcMod == 4) {
+303:+                texCoord *= drawUniforms.tcModParams.xy;
+304:+            } else if (tcMod == 5) {
+305:+                // tcMod turb — position-dependent sine UV warp, drives
+311:+                float amp = drawUniforms.tcModParams.x;
+312:+                float freq = drawUniforms.tcModParams.y;
+313:+                float phase = drawUniforms.tcModParams.z;
+345:-            // Tint (alpha < 0.9 but > 0) falls through to normal shading
+353:-        // Apply rgbGen and alphaGen from the stage uniform to the computed
+361:-        //  3. alphaGen VERTEX (1) multiplies color.a by vertex.a.
+362:-        // This function MUST NOT affect shaders that leave rgbGen/alphaGen
+368:-            int alphaGen = int(u.alphaGen + 0.5);
+377:-            if (alphaGen == 1) {
+383:-        fragment float4 q3_world_frag_opaque(WorldVertexOut in [[stage_in]],
+404:-        fragment float4 q3_world_frag_alpha(WorldVertexOut in [[stage_in]],
+426:-        fragment float4 q3_world_frag_add(WorldVertexOut in [[stage_in]],
+447:-        fragment float4 q3_world_frag_filter(WorldVertexOut in [[stage_in]],
+469:-        // BSP-baked stage UV. Stages are intentionally ignored by the
+471:-        // slot 0 is bound. No lightmap, no tcMod, no stage blendMode —
+473:-        fragment float4 q3_portal_fragment(WorldVertexOut in [[stage_in]],
+485:-        fragment float4 q3_entity_portal_fragment(EntityVertexOut in [[stage_in]],
+491:+            // NOTE: No unconditional alpha-test discard here.
+494:+            // emulate GL alphaFunc, but Q3 alpha-test is a PER-SHADER-STAGE opt-in
+495:+            // (the `alphaFunc GT0|GE128|LT128` keyword on a stage), not a
+497:+            // ornamental arches go see-through whenever their stage0 texture
+499:+            // lightmap*vertexColor multiplied alpha below threshold.
+501:+            // Until the per-stage shader driver is in place, world fragments must
+502:+            // always write. Alpha-tested stages will be reintroduced through the
+510:+            // Per-shader alphaFunc: GT0 / GE128 / LT128.
+511:+            // Threshold >0 → discard if alpha < threshold (GT0=0.004, GE128=0.5)
+512:+            // Threshold <0 → discard if alpha >= |threshold| (LT128=-0.5)
+513:+            if (drawUniforms.alphaTestThreshold > 0.0) {
+514:+                if (texel.a < drawUniforms.alphaTestThreshold) discard_fragment();
+515:+            } else if (drawUniforms.alphaTestThreshold < 0.0) {
+516:+                if (texel.a >= -drawUniforms.alphaTestThreshold) discard_fragment();
+539:         fragment float4 q3_entity_fragment(EntityVertexOut in [[stage_in]],
+554:-        fragment float4 q3_entity_additive_fragment(EntityVertexOut in [[stage_in]],
+562:-            float alpha = texel.a * in.color.a;
+563:-            float3 glow = texel.rgb * alpha * in.color.rgb * 0.35;
+564:-            float4 outColor = float4(glow, alpha);
+580:             // Push to max depth so sky always renders behind everything
+588:             // slot: if tcMod==1 use .xy as scroll; if tcMod==4 use
+591:-            // Walk the tcMod chain; sky only applies scroll/scale slots
+594:-            for (int _i = 0; _i < drawUniforms.tcModCount; ++_i) {
+595:-                int tcMod = int(drawUniforms.tcModType[_i] + 0.5);
+596:-                float4 _p = (_i == 0) ? drawUniforms.tcModParams0
+597:-                          : (_i == 1) ? drawUniforms.tcModParams1
+598:-                          : (_i == 2) ? drawUniforms.tcModParams2
+599:-                                      : drawUniforms.tcModParams3;
+600:-                if (tcMod == 1) {
+605:-                } else if (tcMod == 4) {
+610:+            int tcMod = int(drawUniforms.tcMod + 0.5);
+611:+            if (tcMod == 1) {
+612:+                float2 scroll = drawUniforms.tcModParams.xy * drawUniforms.timeSeconds;
+616:+            } else if (tcMod == 4) {
+617:+                uvX *= drawUniforms.tcModParams.xy;
+618:+                uvY *= drawUniforms.tcModParams.xy;
+619:+                uvZ *= drawUniforms.tcModParams.xy;
+629:-        // `blendFunc GL_DST_COLOR GL_*` — without this, they render through
+630:-        // the default alpha pipeline as an opaque red overlay that blocks
+637:-        // Premultiplied-alpha blend (src=ONE, dst=ONE_MINUS_SRC_ALPHA).
+638:-        // For Q3 shaders with `blendFunc GL_ONE GL_ONE_MINUS_SRC_ALPHA` —
+639:-        // their texels are pre-multiplied by alpha, so using the plain
+640:-        // alpha pipeline (SRC_ALPHA / ONE_MINUS_SRC_ALPHA) darkens edges
+648:         private var depthHackDepthStencilState: MTLDepthStencilState?
+674:-            let depthDesc = MTLTextureDescriptor.texture2DDescriptor(
+675:-                pixelFormat: .depth32Float,
+680:-            depthDesc.usage = [.renderTarget]
+681:-            depthDesc.storageMode = .private
+682:-            portalDepthTexture = device.makeTexture(descriptor: depthDesc)
+714:-            // Q3 `cull front` inverts winding — we render back faces.
+726:-            // Per-pass RGB: 0=opaque (red), 1=filter (green), 2=alpha (blue),
+737:-                case 2: return SIMD4<Float>(0, 0, 1, debugAlpha) // alpha
+742:-            func worldPassIndex(blendMode: UInt32) -> Int {
+743:-                switch blendMode {
+745:-                case 2: return 2  // alpha
+747:-                case 4: return 2  // premultiplied-alpha (reuse alpha debug color)
+788:                 alpha: Double(snapshot.clearColor.3)
+794:-            // scope: opaque stage-0 draws only; sky and portal surfaces are
+815:-                // Rate-limited cull probe. Prints once per ~120 frames so
+857:-                    portalPassDescriptor.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+858:-                    portalPassDescriptor.depthAttachment.texture = portalDepth
+859:-                    portalPassDescriptor.depthAttachment.loadAction = .clear
+860:-                    portalPassDescriptor.depthAttachment.storeAction = .dontCare
+861:-                    portalPassDescriptor.depthAttachment.clearDepth = 1.0
+892:-                            for draw in portalWorldDraws where draw.indexCount > 0 && (draw.flags & SKY_FLAG_PORTAL) != 0 {
+893:-                                if (draw.flags & PORTAL_FLAG_PORTAL) != 0 { continue }
+894:-                                let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+895:-                                guard stageCount > 0 else { continue }
+896:-                                for stageIndex in 0..<stageCount {
+897:-                                    let stage = Self.worldStage(draw, stageIndex)
+898:-                                    guard let skyTex = texture(for: stage.textureHandle, device: view.device) else { continue }
+899:-                                    let useAdditiveSky = stage.blendMode == 1 && skyAdditivePipelineState != nil
+904:-                                        tcGen: Float(stage.tcGen),
+905:-                                        tcModCount: Self.fillTcMods(stage).count,
+906:-                                        rgbGen: Float(stage.rgbGen),
+908:-                                        tcModType: Self.fillTcMods(stage).types,
+909:-                                        tcModParams0: Self.fillTcMods(stage).p0,
+910:-                                        tcModParams1: Self.fillTcMods(stage).p1,
+911:-                                        tcModParams2: Self.fillTcMods(stage).p2,
+912:-                                        tcModParams3: Self.fillTcMods(stage).p3,
+915:-                                        alphaTestThreshold: 0,
+916:-                                        blendMode: Int32(stage.blendMode),
+917:-                                        alphaGen: Float(stage.alphaGen),
+932:-                            portalEncoder.setDepthStencilState(depthStencilState)
+936:-                        // ---- WORLD (in portal pass, full stage iteration) ----
+938:-                        // split, per-stage blend/pipeline/depth selection.
+941:-                        for draw in portalWorldDraws where draw.indexCount > 0 && (draw.flags & SKY_FLAG_PORTAL) == 0 {
+942:-                            if (draw.flags & PORTAL_FLAG_PORTAL) != 0 { continue }
+943:-                            let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+944:-                            guard stageCount > 0 else { continue }
+946:-                            portalEncoder.setCullMode((draw.flags & NOCULL_FLAG_PORTAL) != 0 ? .none : .back)
+949:-                                for stageIndex in 0..<stageCount {
+950:-                                    let stage = Self.worldStage(draw, stageIndex)
+951:-                                    let mode = stage.blendMode
+959:-                                    guard let stageTexture = texture(for: stage.textureHandle, device: view.device) else { continue }
+975:-                                        portalEncoder.setDepthStencilState(depthStencilState)
+980:-                                    portalEncoder.setFragmentTexture(stageTexture, index: 0)
+981:-                                    let usesLightmap = stage.useLightmap != 0
+989:-                                        tcGen: Float(stage.tcGen),
+990:-                                        tcModCount: Self.fillTcMods(stage).count,
+991:-                                        rgbGen: Float(stage.rgbGen),
+993:-                                        tcModType: Self.fillTcMods(stage).types,
+994:-                                        tcModParams0: Self.fillTcMods(stage).p0,
+995:-                                        tcModParams1: Self.fillTcMods(stage).p1,
+996:-                                        tcModParams2: Self.fillTcMods(stage).p2,
+997:-                                        tcModParams3: Self.fillTcMods(stage).p3,
+1000:-                                        alphaTestThreshold: Self.alphaTestThreshold(for: stage.alphaFunc),
+1001:-                                        blendMode: Int32(mode),
+1002:-                                        alphaGen: Float(stage.alphaGen),
+1018:-                        // stage metadata; only the model matrix changes per
+1049:-                                        if draw.indexCount == 0 || (draw.flags & SKY_FLAG_PORTAL) != 0 || (draw.flags & PORTAL_FLAG_PORTAL) != 0 {
+1053:-                                        let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+1054:-                                        guard stageCount > 0 else { continue }
+1056:-                                        portalEncoder.setCullMode((draw.flags & NOCULL_FLAG_PORTAL) != 0 ? .none : .back)
+1058:-                                        for stageIndex in 0..<stageCount {
+1059:-                                            let stage = Self.worldStage(draw, stageIndex)
+1060:-                                            let mode = stage.blendMode
+1063:-                                            guard let stageTexture = texture(for: stage.textureHandle, device: view.device) else { continue }
+1078:-                                            portalEncoder.setDepthStencilState(isOpaqueStage ? depthStencilState : additiveDepthStencilState)
+1079:-                                            portalEncoder.setFragmentTexture(stageTexture, index: 0)
+1080:-                                            let usesLightmap = stage.useLightmap != 0
+1087:-                                            let _tc = Self.fillTcMods(stage)
+1089:-                                                tcGen: Float(stage.tcGen),
+1090:-                                                tcModCount: _tc.count,
+1091:-                                                rgbGen: Float(stage.rgbGen),
+1093:-                                                tcModType: _tc.types,
+1094:-                                                tcModParams0: _tc.p0,
+1095:-                                                tcModParams1: _tc.p1,
+1096:-                                                tcModParams2: _tc.p2,
+1097:-                                                tcModParams3: _tc.p3,
+1100:-                                                alphaTestThreshold: Self.alphaTestThreshold(for: stage.alphaFunc),
+1101:-                                                blendMode: Int32(mode),
+1102:-                                                alphaGen: Float(stage.alphaGen),
+1166:-                for draw in worldDraws where draw.indexCount > 0 && (draw.flags & SKY_FLAG) != 0 {
+1167:-                    if noPortalsEnabled && (draw.flags & PORTAL_FLAG) != 0 {
+1170:-                    let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+1171:-                    guard stageCount > 0 else { continue }
+1173:-                    for stageIndex in 0..<stageCount {
+1174:-                        let stage = Self.worldStage(draw, stageIndex)
+1175:-                        guard let skyTexture = texture(for: stage.textureHandle, device: view.device) else {
+1179:-                        let useAdditiveSky = stage.blendMode == 1 && skyAdditivePipelineState != nil
+1185:-                        let _tc = Self.fillTcMods(stage)
+1187:-                            tcGen: Float(stage.tcGen),
+1188:-                            tcModCount: _tc.count,
+1189:-                            rgbGen: Float(stage.rgbGen),
+1191:-                            tcModType: _tc.types,
+1192:-                            tcModParams0: _tc.p0,
+1193:-                            tcModParams1: _tc.p1,
+1194:-                            tcModParams2: _tc.p2,
+1195:-                            tcModParams3: _tc.p3,
+1198:-                            alphaTestThreshold: 0,
+1199:-                            blendMode: Int32(stage.blendMode),
+1200:-                            alphaGen: Float(stage.alphaGen),
+1201:-                            debugPassColor: debugColor(pass: worldPassIndex(blendMode: stage.blendMode))
+1218:-                // Restore depth state for world/entities
+1219:-                encoder.setDepthStencilState(depthStencilState)
+1242:-                // tcMod to 0 on every stage. Used to isolate whether
+1243:-                // "flying texture" artifacts come from the tcMod parameter
+1260:-                encoder.setDepthStencilState(depthStencilState)
+1264:+                encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
+1279:-                // stages across draws emit contiguously, then coalesce runs
+1280:-                // of same-state stages with contiguous index ranges into a
+1297:-                var stagesSeen: Int = 0
+1321:+                    // 0 = opaque, 1 = filter, 2 = alpha, 3 = additive.
+1326:+                        let isSky = (draw.flags & skyFlagBit) != 0
+1332:+                            let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+1333:+                            guard stageCount > 0 else { continue }
+1345:-                    for draw in worldDraws where draw.indexCount > 0 && (draw.flags & SKY_FLAG) == 0 {
+1346:-                        if noPortalsEnabled && (draw.flags & PORTAL_FLAG) != 0 {
+1349:+                            // One-shot diagnostic: log the sky draw's stage
+1350:+                            // layout so we can confirm killsky (stage0=base,
+1351:+                            // stage1=additive cloud overlay) is wired end-to-end.
+1354:+                                print("[Metal] sky draw stageCount=\(stageCount) flags=0x\(String(draw.flags, radix: 16))")
+1355:+                                for i in 0..<stageCount {
+1357:+                                    print("[Metal]   sky stage \(i): tex=\(s.textureHandle) blend=\(s.blendMode) tcMod=\(s.tcMod) tcModParams=(\(s.tcModParams.0),\(s.tcModParams.1),\(s.tcModParams.2),\(s.tcModParams.3))")
+1366:-                        if (draw.flags & PORTAL_FLAG) != 0 {
+1375:+                            // Render each sky stage in order. Stage 0 is the
+1377:+                            // depth-write off). Subsequent stages are overlays
+1378:+                            // — killsky spec sheet stage 1 is GL_ONE/GL_ONE
+1379:+                            // additive. Use the stage's blendMode to decide.
+1380:+                            for stageIndex in 0..<stageCount {
+1381:+                                let stage = Self.worldStage(draw, stageIndex)
+1382:+                                guard let skyStageTexture = texture(for: stage.textureHandle, device: view.device) else {
+1385:+                                let isAdditive = (stageIndex > 0) && (Int(stage.blendMode) == 1)
+1390:+                                    tcGen: Float(stage.tcGen),
+1391:+                                    tcMod: Float(stage.tcMod),
+1392:+                                    rgbGen: Float(stage.rgbGen),
+1394:+                                    tcModParams: Self.stageTcModParams(stage),
+1397:+                                    alphaTestThreshold: 0,
+1420:-                            // normal stage path so the surface still draws.
+1427:                         let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+1428:                         guard stageCount > 0 else { continue }
+1430:-                        // Per-stage cullMode (parsed from shader `cull`
+1434:-                        let stage0CullMode = Self.worldStage(draw, 0).cullMode
+1437:-                            switch stage0CullMode {
+1444:                         for stageIndex in 0..<stageCount {
+1445:                             let stage = Self.worldStage(draw, stageIndex)
+1446:-                            let mode = stage.blendMode
+1450:-                            guard let stageTexture = texture(for: stage.textureHandle, device: view.device) else {
+1451:+                            let blendMode = Int(stage.blendMode)
+1452:+                            let drawPass = (blendMode == 1) ? 3 : ((blendMode == 2) ? 2 : ((blendMode == 3) ? 1 : 0))
+1454:+                            guard let baseTexture = texture(for: stage.textureHandle, device: view.device) else {
+1457:-                            stagesSeen += 1
+1470:-                                isOpaqueStage ? depthStencilState : additiveDepthStencilState
+1472:-                            let usesLightmap = stage.useLightmap != 0
+1490:-                            // DIAGNOSTIC: log chain for multi-tcMod stages.
+1491:-                            // `stage.tcMods` is a Swift tuple (C fixed-size
+1493:-                            if stage.tcModCount > 1 {
+1495:-                                let chain = [stage.tcMods.0, stage.tcMods.1, stage.tcMods.2, stage.tcMods.3]
+1497:-                                for i in 0..<Int(stage.tcModCount) {
+1503:-                                let shaderKey = String(format: "tex=0x%x", stage.textureHandle)
+1504:-                                print("[DRAW] \(shaderKey) tcModCount=\(stage.tcModCount) types=\(typeStr)")
+1506:+                                encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
+1508:-                            let _tc: TcModChainPack = disableTcMod ? Self.kZeroTcModPack : Self.fillTcMods(stage)
+1510:+                            let alphaTest = Self.alphaTestThreshold(for: stage.alphaFunc)
+1512:                                 tcGen: Float(stage.tcGen),
+1513:-                                tcModCount: _tc.count,
+1514:+                                tcMod: Float(stage.tcMod),
+1515:                                 rgbGen: Float(stage.rgbGen),
+1517:-                                tcModType: _tc.types,
+1518:-                                tcModParams0: _tc.p0,
+1519:-                                tcModParams1: _tc.p1,
+1520:-                                tcModParams2: _tc.p2,
+1521:-                                tcModParams3: _tc.p3,
+1523:-                                forceWhiteVertColor: (mode == 1 || stage.rgbGen == 0) ? 1 : 0,
+1524:-                                alphaTestThreshold: Self.alphaTestThreshold(for: stage.alphaFunc),
+1525:-                                blendMode: Int32(stage.blendMode),
+1526:-                                alphaGen: Float(stage.alphaGen),
+1527:-                                debugPassColor: debugColor(pass: worldPassIndex(blendMode: stage.blendMode))
+1528:+                                tcModParams: Self.stageTcModParams(stage),
+1530:+                                forceWhiteVertColor: (blendMode == 1) ? 1.0 : 0.0,
+1531:+                                alphaTestThreshold: alphaTest,
+1545:-                            if targetUniforms.tcModCount > 1 {
+1546:-                                print("[UNIFORM] tcModCount=\(targetUniforms.tcModCount) " +
+1547:-                                      "types=(\(targetUniforms.tcModType.x),\(targetUniforms.tcModType.y)," +
+1548:-                                      "\(targetUniforms.tcModType.z),\(targetUniforms.tcModType.w)) " +
+1549:-                                      "p0=(\(targetUniforms.tcModParams0.x),\(targetUniforms.tcModParams0.y)) " +
+1550:-                                      "p1=(\(targetUniforms.tcModParams1.x),\(targetUniforms.tcModParams1.y))")
+1557:-                                lastTex0 === stageTexture &&
+1588:-                            if lastTex0 !== stageTexture {
+1589:-                                encoder.setFragmentTexture(stageTexture, index: 0)
+1590:-                                lastTex0 = stageTexture
+1615:-                    print("[batch] world stages=\(stagesSeen) drawCalls=\(emittedDrawCalls)")
+1680:-                            if draw.indexCount == 0 || (draw.flags & SKY_FLAG) != 0 {
+1683:-                            if noPortalsEnabled && (draw.flags & PORTAL_FLAG) != 0 {
+1687:-                            if (draw.flags & PORTAL_FLAG) != 0 {
+1706:-                            let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+1707:-                            guard stageCount > 0 else { continue }
+1708:-                            // Per-stage cullMode (parsed from shader `cull`
+1710:-                            let stage0CullMode = Self.worldStage(draw, 0).cullMode
+1713:-                                switch stage0CullMode {
+1721:-                            for stageIndex in 0..<stageCount {
+1722:-                                let stage = Self.worldStage(draw, stageIndex)
+1723:-                                let mode = stage.blendMode
+1726:-                                guard let stageTexture = texture(for: stage.textureHandle, device: view.device) else {
+1743:-                                encoder.setDepthStencilState(isOpaqueStage ? depthStencilState : additiveDepthStencilState)
+1744:-                                encoder.setFragmentTexture(stageTexture, index: 0)
+1745:-                                let usesLightmap = stage.useLightmap != 0
+1753:-                                let _tc: TcModChainPack = disableTcMod ? Self.kZeroTcModPack : Self.fillTcMods(stage)
+1755:-                                    tcGen: Float(stage.tcGen),
+1756:-                                    tcModCount: _tc.count,
+1757:-                                    rgbGen: Float(stage.rgbGen),
+1759:-                                    tcModType: _tc.types,
+1760:-                                    tcModParams0: _tc.p0,
+1761:-                                    tcModParams1: _tc.p1,
+1762:-                                    tcModParams2: _tc.p2,
+1763:-                                    tcModParams3: _tc.p3,
+1765:-                                    forceWhiteVertColor: (mode == 1 || stage.rgbGen == 0) ? 1 : 0,
+1766:-                                    alphaTestThreshold: Self.alphaTestThreshold(for: stage.alphaFunc),
+1767:-                                    blendMode: Int32(stage.blendMode),
+1768:-                                    alphaGen: Float(stage.alphaGen),
+1769:-                                    debugPassColor: debugColor(pass: worldPassIndex(blendMode: stage.blendMode))
+1802:                 encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
+1809:-                let depthHackBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_DEPTHHACK)
+1811:-                let alphaBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ALPHA)
+1813:-                let nocullBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_NOCULL)
+1818:-                // system. Any blendMode on the weapon texture would otherwise
+1819:-                // flip wantsReadOnlyDepth on and lose the depth hack, causing
+1821:-                // + depth-hack stencil + no cull, and skip these draws in the
+1825:-                    guard (draw.flags & firstPersonBit) != 0 else { continue }
+1826:-                    if noPortalsEnabled && (draw.flags & portalBit) != 0 {
+1833:-                    encoder.setDepthStencilState(ensuredDepthStencilState(depthHackDepthStencilState, device: view.device))
+1848:+                    let depthHackBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_DEPTHHACK)
+1850:+                    let alphaBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ALPHA)
+1854:-                // 0 = opaque, 1 = filter, 2 = alpha, 3 = additive.
+1859:+                    // 0 = opaque, 1 = filter, 2 = alpha, 3 = additive.
+1862:-                        if (draw.flags & firstPersonBit) != 0 { continue }
+1863:-                        if noPortalsEnabled && (draw.flags & portalBit) != 0 {
+1873:-                        // MD3 UVs. Routed through the alpha pass only.
+1874:-                        if (draw.flags & portalBit) != 0,
+1906:-                        // Portal-flagged entities on non-alpha passes are
+1908:-                        if (draw.flags & portalBit) != 0 { continue }
+1910:                         let isEntityAdditive = (draw.flags & additiveBit) != 0
+1911:                         let isEntityAlpha = (draw.flags & alphaBit) != 0
+1912:                         let isEntityFilter = (draw.flags & filterBit) != 0
+1918:                         let wantsDepthHack = (draw.flags & depthHackBit) != 0
+1919:-                        let wantsNoCull = (draw.flags & nocullBit) != 0
+1939:+                            let state = wantsDepthHack ? depthHackDepthStencilState : depthStencilState
+1944:-                            : (wantsDepthHack ? depthHackDepthStencilState : depthStencilState)
+1987:-                        // Per-draw pipeline switch: blendMode==3 uses the
+1989:-                        // else uses the default alpha-blend UI pipeline.
+1991:-                            (draw.blendMode == 3) ? uiFilterPipelineState : uiPipelineState
+2048:-            uiFilterPipelineDescriptor.depthAttachmentPixelFormat = view.depthStencilPixelFormat
+2053:-            uiFilterPipelineDescriptor.colorAttachments[0].alphaBlendOperation = .add
+2067:             worldPipelineDescriptor.depthAttachmentPixelFormat = view.depthStencilPixelFormat
+2081:             worldFilterPipelineDescriptor.colorAttachments[0].alphaBlendOperation = .add
+2086:-            worldAlphaPipelineDescriptor.fragmentFunction = library.makeFunction(name: "q3_world_frag_alpha")
+2089:             worldAlphaPipelineDescriptor.colorAttachments[0].alphaBlendOperation = .add
+2091:                 print("[Metal] Failed to create alpha world pipeline: \\(error)")
+2094:-            // Portal pipeline: clone of the alpha pipeline with the portal
+2095:-            // fragment substituted. Same src-alpha/one-minus blend so the
+2110:             worldAdditivePipelineDescriptor.colorAttachments[0].alphaBlendOperation = .add
+2115:-            // Premultiplied-alpha pipeline. Shares the alpha fragment
+2117:-            // premultiplied sources) but blend factors are (ONE,
+2119:-            // src.a a second time during the blend.
+2132:             // Sky pipeline: view-direction spherical projection. No blending,
+2133:             // no depth write (depth test still uses lessEqual so if anything
+2137:             entityAdditiveDesc.depthAttachmentPixelFormat = view.depthStencilPixelFormat
+2145:                 print("[Metal] Failed to create alpha entity pipeline: \\(error)")
+2148:-            // Entity portal pipeline — clone of entity alpha with the
+2164:             additiveDepthDescriptor.depthCompareFunction = .lessEqual
+2168:-            // bypass depth testing; it compresses the draw into a reduced
+2169:-            // depth range near the camera. The special projection below does
+2172:+            // Depth-hack state for first-person viewmodel: always pass depth
+2174:+            // still writing depth so model self-occlusion stays correct.
+2175:             let depthHackDescriptor = MTLDepthStencilDescriptor()
+2176:             depthHackDescriptor.isDepthWriteEnabled = true
+2177:-            depthHackDescriptor.depthCompareFunction = .lessEqual
+2178:+            depthHackDescriptor.depthCompareFunction = .always
+2179:             depthHackDepthStencilState = device.makeDepthStencilState(descriptor: depthHackDescriptor)
+2209:-                                                 depthScale: Float = 0.3) -> simd_float4x4 {
+2211:-            hacked.columns.0.z *= depthScale
+2212:-            hacked.columns.1.z *= depthScale
+2213:-            hacked.columns.2.z *= depthScale
+2214:-            hacked.columns.3.z *= depthScale
+2237:-/* Unified per-stage data captured by ParseShaderText. One Q3MetalStage
+2238:- * per `{ ... }` block inside a shader. Replaces the old stage1/stage2
+2240:- * metalShaderMap_t.stages[0..stageCount-1] and emits one AddWorldDrawStage
+2244:-    int blendMode;
+2246:-    int alphaGen;
+2247:-    int alphaFunc;
+2248:-    int tcGen;            /* 0=base UV, 1=environment */
+2249:-    Q3TcMod tcMods[Q3_MAX_TCMODS];
+2250:-    int tcModCount;
+2256:-    int alphaWaveFunc;
+2257:-    float alphaWaveBase;
+2258:-    float alphaWaveAmp;
+2259:-    float alphaWavePhase;
+2260:-    float alphaWaveFreq;
+2261:-    int useLightmap;      /* 1 if stage's map is `$lightmap` */
+2266:-    /* Mirror of stages[0].mapPath (or first non-$lightmap stage's mapPath
+2267:-     * when stage 0 IS $lightmap). RegisterTexture's shader-map-first
+2270:-    qboolean tcGenEnv;       /* any stage uses tcGen environment */
+2271:-    int cullMode;            /* top-level cull (Q3 cull is per-shader, not per-stage) */
+2279:-    /* Authoritative per-stage data captured by ParseShaderText. Stage
+2281:-     * rendering iterates stages[0..stageCount-1]. */
+2282:-    Q3MetalStage stages[Q3_MAX_STAGES];
+2283:-    int stageCount;
+2292:-/* Sentinel returned by BlendModeFromTokens for stages whose blendFunc is a
+2293:- * Q3 no-op placeholder (e.g. GL_ZERO GL_ZERO — used as a depth prepass /
+2294:- * conditional stage marker; writes nothing to the framebuffer). World draws
+2295:- * discard these stages entirely. Distinct from 0 (OPAQUE) so we never
+2296:- * confuse "unknown blend → opaque fallback" with "intentional no-op". */
+2303:-/* Requested shader cull subset only. Q3's `cull disable` and
+2304:- * `cull twosided` both collapse to "no cull" in Metal; everything else
+2309:-    /* Q3 `cull front` — inverts winding (render back faces only).
+2318:     int blendMode; /* 0=opaque, 1=additive, 2=alpha, 3=filter; propagated
+2320:     int alphaFunc; /* 0=none, 1=GT0, 2=GE128, 3=LT128 */
+2321:-    int cullMode;  /* METAL_SHADER_CULL_* parsed from top-level `cull`. */
+2387:-/* Portal-visibility flags used by the Swift-side portal-pass culling gate
+2402:- * existing entity pipeline (alpha/additive depending on texture blendMode).
+2467:-    /* Use alpha blend semantics when this fallback is selected. */
+2468:-    texture->blendMode = 2;
+2505:- * drives all blendMode / tcMod / cull decisions. Kept as a stub so the
+2573:-        frameTexture->blendMode = texture->blendMode;
+2574:-        frameTexture->alphaFunc = texture->alphaFunc;
+2595:-/* Name-based shader-flag stamping — DISABLED. All blendMode / isAdditive /
+2610:                               int blendMode,
+2611:                               int tcGenEnv,
+2612:-                              const Q3TcMod *tcMods,
+2613:-                              int tcModCount,
+2614:+                              int tcModType,
+2615:+                              float tcModP0,
+2616:+                              float tcModP1,
+2617:+                              float tcModP2,
+2618:+                              float tcModP3,
+2620:-                              int alphaGen,
+2621:-                              int alphaFunc,
+2622:-                              int cullMode,
+2629:-                              int alphaWaveFunc,
+2630:-                              float alphaWaveBase,
+2631:-                              float alphaWaveAmp,
+2632:-                              float alphaWavePhase,
+2633:-                              float alphaWaveFreq) {
+2634:+                              int alphaFunc) {
+2635:     Q3MetalWorldStage *stage;
+2638:     if (draw == NULL || draw->stageCount >= Q3_METAL_MAX_STAGES) {
+2641:-    /* Q3_BLEND_SKIP — stage has `blendFunc GL_ZERO GL_ZERO` or equivalent
+2643:-    if (blendMode == Q3_BLEND_SKIP) {
+2649:-    /* All fields below are sourced from the parsed shader stage:
+2650:-     *   textureHandle   ← first-valid-stage `map` / `animmap` / `$whiteimage`
+2651:-     *   blendMode       ← first-valid-stage `blendFunc`
+2652:-     *   tcGenEnv        ← first-valid-stage `tcGen environment`
+2653:-     *   tcMods[]        ← first-valid-stage `tcMod …` chain (ORDER preserved)
+2654:-     *   rgbGen/alpha    ← first-valid-stage `rgbGen / alphaGen`
+2655:-     *   rgb/alphaWave*  ← first-valid-stage `rgbGen wave / alphaGen wave` params
+2656:-     *   alphaFunc       ← first-valid-stage `alphaFunc GT0/GE128/LT128`
+2657:-     *   cullMode        ← top-level `cull back|disable|twosided|front`
+2660:     stage = &draw->stages[draw->stageCount++];
+2661:     stage->textureHandle = (uint32_t)textureHandle;
+2662:     stage->blendMode = (uint32_t)blendMode;
+2663:     stage->tcGen = (uint32_t)((tcGenEnv != 0) ? 1 : 0);
+2665:-    clampedTcModCount = tcModCount;
+2669:-        if (i < clampedTcModCount && tcMods != NULL) {
+2670:-            stage->tcMods[i] = tcMods[i];
+2672:-            stage->tcMods[i].type = 0;
+2673:-            stage->tcMods[i].params[0] = 0.0f;
+2674:-            stage->tcMods[i].params[1] = 0.0f;
+2675:-            stage->tcMods[i].params[2] = 0.0f;
+2676:-            stage->tcMods[i].params[3] = 0.0f;
+2679:-    stage->tcModCount = (uint32_t)clampedTcModCount;
+2681:+    stage->tcMod = (uint32_t)tcModType;
+2682:+    stage->tcModParams[0] = tcModP0;
+2683:+    stage->tcModParams[1] = tcModP1;
+2684:+    stage->tcModParams[2] = tcModP2;
+2685:+    stage->tcModParams[3] = tcModP3;
+2686:     stage->rgbGen = (uint32_t)rgbGen;
+2687:-    stage->alphaGen = (uint32_t)alphaGen;
+2688:     stage->alphaFunc = (uint32_t)alphaFunc;
+2689:-    stage->cullMode = (uint32_t)cullMode;
+2690:-    stage->useLightmap = (uint32_t)((useLightmap != 0) ? 1 : 0);
+2691:-    stage->rgbWaveFunc = (uint32_t)rgbWaveFunc;
+2692:-    stage->rgbWaveBase = rgbWaveBase;
+2693:-    stage->rgbWaveAmp = rgbWaveAmp;
+2694:-    stage->rgbWavePhase = rgbWavePhase;
+2695:-    stage->rgbWaveFreq = rgbWaveFreq;
+2696:-    stage->alphaWaveFunc = (uint32_t)alphaWaveFunc;
+2697:-    stage->alphaWaveBase = alphaWaveBase;
+2698:-    stage->alphaWaveAmp = alphaWaveAmp;
+2699:-    stage->alphaWavePhase = alphaWavePhase;
+2700:-    stage->alphaWaveFreq = alphaWaveFreq;
+2771:-    /* Honour the `$whiteimage` engine sentinel up-front. FX shader stages
+2773:-     * derive color/alpha from rgbGen wave + alphaGen wave on top of pure
+2774:-     * white. Per-stage emission passes "$whiteimage" verbatim as the
+2775:-     * stage texture name; without this short-circuit it falls through to
+2785:                     if (parentAF != 0) animTex->alphaFunc = parentAF;
+2787:-                if (animTex->cullMode == METAL_SHADER_CULL_BACK) {
+2790:-                        animTex->cullMode = parentCull;
+2818:-                 * alphaGen wave on top of pure white. Allocate a PER-SHADER
+2820:-                 * so the shader's blendMode / alphaFunc / cullMode from
+2824:-                 * texture and loses its per-shader blend classification. */
+2882:-        (void)isWhiteImage; /* flag kept for future per-stage wiring */
+2892:-    /* Blend / alphaFunc / cull come straight from the shader-map entry
+2894:+    /* Propagate blend mode from the shader-map entry that resolved
+2896:     texture->blendMode = ShaderMap_GetBlendMode(name);
+2897:     texture->alphaFunc = ShaderMap_GetAlphaFunc(name);
+2898:-    texture->cullMode = ShaderMap_GetCullMode(name);
+3005:-        qhandle_t skyOverrideTexture; /* sky cubemap face / cloud-dome override for stage 0 */
+3006:+        qhandle_t stage2TextureHandle;
+3007:+        int stage0BlendMode;
+3008:+        int stage0AlphaFunc;
+3009:+        int stage0TcGenEnv;
+3010:+        int stage0TcModType;
+3011:+        float stage0TcModParams[4];
+3030:+        stage2TextureHandle = 0;
+3031:+        stage0BlendMode = 0;
+3032:+        stage0AlphaFunc = 0;
+3033:+        stage0TcGenEnv = 0;
+3034:+        stage0TcModType = 0;
+3035:+        stage0TcModParams[0] = 0.0f;
+3036:+        stage0TcModParams[1] = 0.0f;
+3037:+        stage0TcModParams[2] = 0.0f;
+3038:+        stage0TcModParams[3] = 0.0f;
+3054:-            /* Sky cube override: override stage 0 texture only. Cloud-dome
+3055:-             * sky uses entry->stages[0].mapPath (killsky_1) via the unified
+3086:-            /* `cull front` inverts winding; Swift picks MTLCullMode.front. */
+3088:+        /* Per-shader tcMod scroll (s,t) for lava-flow, scrolling fog,
+3091:+        stage0AlphaFunc = ShaderMap_GetAlphaFunc(shaders[shaderNum].shader);
+3092:+        stage0BlendMode = ShaderMap_GetBlendMode(shaders[shaderNum].shader);
+3093:+        stage0TcGenEnv = ShaderMap_GetTcGenEnv(shaders[shaderNum].shader);
+3095:+        /* Resolve tcMod for NON-sky surfaces (lava, scrolling fog, etc.).
+3099:+         * tcMod slot per stage in the current draw-uniform layout, so
+3109:+                stage0TcModType = 5;
+3110:+                stage0TcModParams[0] = turbAmp;
+3111:+                stage0TcModParams[1] = turbFreq;
+3112:+                stage0TcModParams[2] = turbPhase;
+3113:+                stage0TcModParams[3] = 0.0f;
+3115:+                stage0TcModType = 1;
+3116:+                stage0TcModParams[0] = s_pendingScrollS;
+3117:+                stage0TcModParams[1] = s_pendingScrollT;
+3119:+                stage0TcModType = 4;
+3120:+                stage0TcModParams[0] = nsScaleS;
+3121:+                stage0TcModParams[1] = nsScaleT;
+3125:-         * detection. If no parsed stage references $lightmap, do not bind
+3128:-         * the shader has no stages parsed at all (BSP-only texture path
+3133:-            if (_le == NULL || _le->stageCount == 0) {
+3138:+            qboolean stage0HasScroll = (fabsf(s_pendingScrollS) > 0.00001f || fabsf(s_pendingScrollT) > 0.00001f);
+3140:+            qboolean stage0HasScale = (fabsf(scaleS - 1.0f) > 0.00001f || fabsf(scaleT - 1.0f) > 0.00001f);
+3146:+            if (stage0HasScroll) {
+3147:+                stage0TcModType = 1;
+3148:+                stage0TcModParams[0] = s_pendingScrollS;
+3149:+                stage0TcModParams[1] = s_pendingScrollT;
+3150:+            } else if (stage0HasScale) {
+3151:+                stage0TcModType = 4;
+3152:+                stage0TcModParams[0] = scaleS;
+3153:+                stage0TcModParams[1] = scaleT;
+3156:-                for (_ls = 0; _ls < _le->stageCount; ++_ls) {
+3157:-                    if (_le->stages[_ls].useLightmap) { wantLightmap = qtrue; break; }
+3159:+                stage0TcModType = 0;
+3160:+                stage0TcModParams[0] = 0.0f;
+3161:+                stage0TcModParams[1] = 0.0f;
+3174:+                qboolean stage2HasScroll = (fabsf(skyStage2TcModParams[2]) > 0.00001f || fabsf(skyStage2TcModParams[3]) > 0.00001f);
+3175:+                qboolean stage2HasScale = (fabsf(skyStage2TcModParams[0] - 1.0f) > 0.00001f || fabsf(skyStage2TcModParams[1] - 1.0f) > 0.00001f);
+3181:+                stage2TextureHandle = RegisterTexture(skyStage2Map);
+3182:+                if (stage2HasScroll) {
+3186:+                } else if (stage2HasScale) {
+3195:+                          "Metal sky tcMod: '%s' stage1 raw_scale=(%.3f,%.3f) raw_scroll=(%.3f,%.3f) resolved=type=%d,(%.3f,%.3f)\n",
+3210:              * sky pipeline (view-direction projection, no depth write).
+3237:-                        draw->flags = 0;
+3255:+                                          stage0BlendMode,
+3256:+                                          stage0TcGenEnv,
+3257:+                                          stage0TcModType,
+3258:+                                          stage0TcModParams[0],
+3259:+                                          stage0TcModParams[1],
+3260:+                                          stage0TcModParams[2],
+3261:+                                          stage0TcModParams[3],
+3263:+                                          stage0AlphaFunc);
+3268:-                        /* UNIFIED per-stage emission. Iterates the parsed
+3269:-                         * stages[] array straight onto AddWorldDrawStage.
+3270:-                         * Sky cube override applies to stage 0 only. Plain
+3272:-                         * single default stage with RegisterTexture(name). */
+3277:-                            if (_e != NULL && _e->stageCount > 0) {
+3278:-                                for (_s = 0; _s < _e->stageCount; ++_s) {
+3279:-                                    const Q3MetalStage *_st = &_e->stages[_s];
+3289:-                                    AddWorldDrawStage(draw, _tex, _st->blendMode, _st->tcGen,
+3290:-                                                      (Q3TcMod *)_st->tcMods, _st->tcModCount,
+3291:-                                                      _st->rgbGen, _st->alphaGen, _st->alphaFunc,
+3295:-                                                      _st->alphaWaveFunc, _st->alphaWaveBase, _st->alphaWaveAmp,
+3296:-                                                      _st->alphaWavePhase, _st->alphaWaveFreq);
+3300:-                            if (_e == NULL || _e->stageCount == 0) {
+3301:-                                /* No parsed stages OR all stages dropped:
+3302:-                                 * emit single default stage. Sky cube
+3318:+                        if (hasSkyStage2 && stage2TextureHandle != 0) {
+3320:+                                              stage2TextureHandle,
+3338:-            draw->flags = 0;
+3356:+                              stage0BlendMode,
+3357:+                              stage0TcGenEnv,
+3358:+                              stage0TcModType,
+3359:+                              stage0TcModParams[0],
+3360:+                              stage0TcModParams[1],
+3361:+                              stage0TcModParams[2],
+3362:+                              stage0TcModParams[3],
+3364:+                              stage0AlphaFunc);
+3369:-            /* UNIFIED per-stage emission. */
+3374:-                if (_e != NULL && _e->stageCount > 0) {
+3375:-                    for (_s = 0; _s < _e->stageCount; ++_s) {
+3376:-                        const Q3MetalStage *_st = &_e->stages[_s];
+3386:-                        AddWorldDrawStage(draw, _tex, _st->blendMode, _st->tcGen,
+3387:-                                          (Q3TcMod *)_st->tcMods, _st->tcModCount,
+3388:-                                          _st->rgbGen, _st->alphaGen, _st->alphaFunc,
+3392:-                                          _st->alphaWaveFunc, _st->alphaWaveBase, _st->alphaWaveAmp,
+3393:-                                          _st->alphaWavePhase, _st->alphaWaveFreq);
+3397:-                if (_e == NULL || _e->stageCount == 0) {
+3411:+            if (hasSkyStage2 && stage2TextureHandle != 0) {
+3413:+                                  stage2TextureHandle,
+3447:  * the first stage's first map directive, and hash shader_name -> texture_path.
+3451:- * first stage's blend/tcMod data plus top-level sky/portal/cull state so the
+3453:+ * Ignored: tcGen environment, animMap frame sequencing, blendFunc, tcMod — bind
+3462:+    qboolean tcGenEnv;   /* any stage uses tcGen environment */
+3463:+    /* First stage's `tcMod scroll sx sy` values. Zero when absent.
+3467:+    float tcModScrollS;
+3468:+    float tcModScrollT;
+3469:+    float tcModScaleS;
+3470:+    float tcModScaleT;
+3471:+    /* tcMod turb (turbulence) — `tcMod turb <base> <amp> <phase> <freq>`.
+3473:+     * separately from scroll; stage1 resolution picks turb > scroll >
+3474:+     * scale as the visible tcMod type since turb produces the most
+3478:+    float tcModTurbAmp;
+3479:+    float tcModTurbPhase;
+3480:+    float tcModTurbFreq;
+3481:+    /* blendFunc from first stage. 0=opaque, 1=additive (GL_ONE GL_ONE),
+3482:+     * 2=alpha-blend (GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA or 'blend'),
+3484:+    int blendMode;
+3485:+    /* alphaFunc from first stage. 0=none, 1=GT0, 2=GE128, 3=LT128. */
+3486:+    int alphaFunc;
+3500:+    char stage2MapPath[MAX_QPATH];
+3501:+    int stage2BlendMode;
+3502:+    float stage2TcModScrollS;
+3503:+    float stage2TcModScrollT;
+3504:+    float stage2TcModScaleS;
+3505:+    float stage2TcModScaleT;
+3602:-    return (entry && entry->stageCount > 0) ? entry->stages[0].blendMode : 0;
+3603:+    return entry ? entry->blendMode : 0;
+3611:-    if (!Q_stricmp(src, "blend")) return 2;      /* alpha */
+3617:-    /* NO-OP stages: `blendFunc GL_ZERO GL_ZERO` writes nothing to the
+3618:-     * framebuffer and is used in Q3 shaders as a depth-only prepass or a
+3619:-     * conditional placeholder stage. Return SKIP so AddWorldDrawStage
+3620:-     * drops the stage entirely instead of spending a draw + pipeline
+3635:-    /* PREMULTIPLIED-ALPHA (blendMode 4). Source texel is expected to already
+3636:-     * have RGB pre-multiplied by its own alpha — the correct blend factors
+3638:-     * alpha pipeline (SRC_ALPHA / ONE_MINUS_SRC_ALPHA) double-multiplies
+3655:-    /* Generic no-op: any `blendFunc X X` where src and dst are the same
+3658:-     * use the idiom as a depth-prepass / conditional-stage marker. The
+3663:-     * "unknown blendFunc" warnings for no-op stages without emitting any
+3672:-              "[Q3-STAGE] unknown blendFunc '%s %s' → OPAQUE\n", src, dst);
+3677:+    if (!Q_stricmp(src, "blend") ||
+3694:-    return (entry && entry->stageCount > 0) ? entry->stages[0].alphaFunc : 0;
+3701:-    return entry ? entry->cullMode : METAL_SHADER_CULL_BACK;
+3708:-    return (entry && entry->stageCount > 0) ? entry->stages[0].rgbGen : 0;
+3715:-    return (entry && entry->stageCount > 0) ? entry->stages[0].alphaGen : 0;
+3716:+    return entry ? entry->alphaFunc : 0;
+3730:-    if (entry == NULL || entry->stageCount == 0) return;
+3731:-    for (i = 0; i < entry->stages[0].tcModCount; ++i) {
+3732:-        if (entry->stages[0].tcMods[i].type == 1) {
+3733:-            if (outS) *outS = entry->stages[0].tcMods[i].params[0];
+3734:-            if (outT) *outT = entry->stages[0].tcMods[i].params[1];
+3737:+            if (outS) *outS = s_shaderMap[i].tcModScrollS;
+3738:+            if (outT) *outT = s_shaderMap[i].tcModScrollT;
+3751:-    if (entry == NULL || entry->stageCount == 0) return;
+3752:-    for (i = 0; i < entry->stages[0].tcModCount; ++i) {
+3753:-        if (entry->stages[0].tcMods[i].type == 4) {
+3754:-            if (outS) *outS = entry->stages[0].tcMods[i].params[0];
+3755:-            if (outT) *outT = entry->stages[0].tcMods[i].params[1];
+3761:-/* Returns the parsed first-stage tcMod chain (preserves declaration order)
+3763:- * outCount is set to 0 if the shader is not in the map or has no tcMods. */
+3782:-    if (entry->stageCount == 0) return;
+3783:-    n = entry->stages[0].tcModCount;
+3788:-            outChain[i] = entry->stages[0].tcMods[i];
+3795:- * its first stage, and fills *outFunc/Base/Amp/Phase/Freq with the params.
+3808:-    if (entry == NULL || entry->stageCount == 0 || entry->stages[0].rgbWaveFunc == 0) return 0;
+3809:-    if (outFunc) *outFunc = entry->stages[0].rgbWaveFunc;
+3810:-    if (outBase) *outBase = entry->stages[0].rgbWaveBase;
+3811:-    if (outAmp) *outAmp = entry->stages[0].rgbWaveAmp;
+3812:-    if (outPhase) *outPhase = entry->stages[0].rgbWavePhase;
+3813:-    if (outFreq) *outFreq = entry->stages[0].rgbWaveFreq;
+3817:-/* Same as ShaderMap_GetRgbWave but for `alphaGen wave`. */
+3829:-    if (entry == NULL || entry->stageCount == 0 || entry->stages[0].alphaWaveFunc == 0) return 0;
+3830:-    if (outFunc) *outFunc = entry->stages[0].alphaWaveFunc;
+3831:-    if (outBase) *outBase = entry->stages[0].alphaWaveBase;
+3832:-    if (outAmp) *outAmp = entry->stages[0].alphaWaveAmp;
+3833:-    if (outPhase) *outPhase = entry->stages[0].alphaWavePhase;
+3834:-    if (outFreq) *outFreq = entry->stages[0].alphaWaveFreq;
+3836:+    if (outS) *outS = entry->tcModScaleS;
+3837:+    if (outT) *outT = entry->tcModScaleT;
+3848:-    if (entry == NULL || entry->stageCount == 0) return qfalse;
+3849:-    for (i = 0; i < entry->stages[0].tcModCount; ++i) {
+3850:-        if (entry->stages[0].tcMods[i].type == 5) {
+3851:-            if (outAmp) *outAmp = entry->stages[0].tcMods[i].params[0];
+3852:-            if (outFreq) *outFreq = entry->stages[0].tcMods[i].params[1];
+3853:-            if (outPhase) *outPhase = entry->stages[0].tcMods[i].params[2];
+3859:+    if (outAmp) *outAmp = entry->tcModTurbAmp;
+3860:+    if (outPhase) *outPhase = entry->tcModTurbPhase;
+3861:+    if (outFreq) *outFreq = entry->tcModTurbFreq;
+3877:-    if (entry == NULL || entry->stageCount < 2 || entry->stages[1].mapPath[0] == '\0') return qfalse;
+3878:+    if (entry == NULL || entry->stage2MapPath[0] == '\0') return qfalse;
+3880:-        Q_strncpyz(outMap, entry->stages[1].mapPath, outMapSize);
+3882:-    if (outBlendMode) *outBlendMode = entry->stages[1].blendMode;
+3883:-    for (i = 0; i < entry->stages[1].tcModCount; ++i) {
+3884:-        if (entry->stages[1].tcMods[i].type == 1) {
+3885:-            if (outScrollS) *outScrollS = entry->stages[1].tcMods[i].params[0];
+3886:-            if (outScrollT) *outScrollT = entry->stages[1].tcMods[i].params[1];
+3887:-        } else if (entry->stages[1].tcMods[i].type == 4) {
+3888:-            if (outScaleS) *outScaleS = entry->stages[1].tcMods[i].params[0];
+3889:-            if (outScaleT) *outScaleT = entry->stages[1].tcMods[i].params[1];
+3891:+        Q_strncpyz(outMap, entry->stage2MapPath, outMapSize);
+3893:+    if (outBlendMode) *outBlendMode = entry->stage2BlendMode;
+3894:+    if (outScaleS) *outScaleS = entry->stage2TcModScaleS;
+3895:+    if (outScaleT) *outScaleT = entry->stage2TcModScaleT;
+3896:+    if (outScrollS) *outScrollS = entry->stage2TcModScrollS;
+3897:+    if (outScrollT) *outScrollT = entry->stage2TcModScrollT;
+3904: static void ShaderMap_Register(const char *name, const char *path, qboolean tcGenEnv) {
+3914:     s_shaderMap[s_shaderMapCount].tcGenEnv = tcGenEnv;
+3915:-    s_shaderMap[s_shaderMapCount].cullMode = METAL_SHADER_CULL_BACK;
+3916:-    s_shaderMap[s_shaderMapCount].stageCount = 0;
+3917:+    s_shaderMap[s_shaderMapCount].tcModScaleS = 1.0f;
+3918:+    s_shaderMap[s_shaderMapCount].tcModScaleT = 1.0f;
+3919:+    s_shaderMap[s_shaderMapCount].stage2TcModScaleS = 1.0f;
+3920:+    s_shaderMap[s_shaderMapCount].stage2TcModScaleT = 1.0f;
+3925:                                        qboolean tcGenEnv) {
+3938:     s_shaderMap[s_shaderMapCount].tcGenEnv = tcGenEnv;
+3939:-    s_shaderMap[s_shaderMapCount].cullMode = METAL_SHADER_CULL_BACK;
+3940:-    s_shaderMap[s_shaderMapCount].stageCount = 0;
+3941:+    s_shaderMap[s_shaderMapCount].tcModScaleS = 1.0f;
+3942:+    s_shaderMap[s_shaderMapCount].tcModScaleT = 1.0f;
+3943:+    s_shaderMap[s_shaderMapCount].stage2TcModScaleS = 1.0f;
+3944:+    s_shaderMap[s_shaderMapCount].stage2TcModScaleT = 1.0f;
+3966:+        char stage2Map[MAX_QPATH];
+3968:+        float stage2ScrollS;
+3969:+        float stage2ScrollT;
+3970:+        float stage2ScaleS;
+3971:+        float stage2ScaleT;
+3974:+        int stage2BlendMode;
+3975:         int depth;
+3977:+        int stageIndex;
+3980:-        qboolean tcGenEnv;       /* any-stage env marker, top-level */
+3981:-        int cullMode;
+3982:+        qboolean tcGenEnv;
+3986:-        /* Per-stage in-flight capture + accumulated stages. Each `{ ... }`
+3987:-         * block resets cur on `{` and appends to stages[] on matching `}`. */
+3989:-        Q3MetalStage stages[Q3_MAX_STAGES];
+3990:-        int stagesCount;
+4011:+        stage2Map[0] = '\0';
+4013:+        stage2ScrollS = 0.0f;
+4014:+        stage2ScrollT = 0.0f;
+4015:+        stage2ScaleS = 1.0f;
+4016:+        stage2ScaleT = 1.0f;
+4019:+        stage2BlendMode = 0;
+4020:         depth = 1;
+4022:+        stageIndex = 0;
+4025:         tcGenEnv = qfalse;
+4026:-        cullMode = METAL_SHADER_CULL_BACK;
+4031:-        Com_Memset(stages, 0, sizeof(stages));
+4032:-        stagesCount = 0;
+4036:         while (depth > 0) {
+4041:                 depth += 1;
+4042:                 if (depth == 2) {
+4043:+                    stageIndex += 1;
+4050:                 depth -= 1;
+4051:                 if (depth <= 1) {
+4053:-                    /* Stage close: UNCONDITIONALLY append cur to stages[].
+4054:-                     * Every `{ ... }` block is ONE stage — no validity
+4055:-                     * heuristics, no "stageHasData" filtering. Excess
+4056:-                     * stages beyond Q3_MAX_STAGES are dropped. The
+4057:-                     * `$lightmap → blendMode=3` default still applies so
+4058:-                     * lightmap stages without explicit blendFunc render
+4060:-                    if (cur.useLightmap && cur.blendMode == 0) {
+4061:-                        cur.blendMode = 3; /* FILTER (GL_DST_COLOR/GL_ZERO) */
+4063:-                    if (stagesCount < Q3_MAX_STAGES) {
+4064:-                        stages[stagesCount++] = cur;
+4070:-            /* Top-level directives (outside any stage block). */
+4071:+            /* Top-level directives (outside any stage block). `skyparms`
+4086:-                } else if (!Q_stricmp(token, "cull")) {
+4092:-                        cullMode = METAL_SHADER_CULL_DISABLE;
+4094:-                        cullMode = METAL_SHADER_CULL_FRONT;
+4096:-                        cullMode = METAL_SHADER_CULL_BACK;
+4100:-                     * it before stage blocks. Most use is inside a stage;
+4101:-                     * the in-stage handler below is the primary site. */
+4107:-            /* In-stage directives. ALL stages handled identically — no
+4108:-             * stageIndex == 1 || == 2 gating. Each directive writes
+4121:-                            /* First `map` in this stage wins — do not
+4133:+                } else if (stageIndex == 2 && !gotStage2Map &&
+4137:+                        Q_strncpyz(stage2Map, token, sizeof(stage2Map));
+4158:                 } else if (!Q_stricmp(token, "tcGen") || !Q_stricmp(token, "tcgen")) {
+4162:-                        cur.tcGen = 1;
+4163:                         tcGenEnv = qtrue;
+4165:-                } else if (!Q_stricmp(token, "blendFunc") || !Q_stricmp(token, "blendfunc")) {
+4166:+                } else if (stageIndex == 1 && (!Q_stricmp(token, "blendFunc") || !Q_stricmp(token, "blendfunc"))) {
+4167:+                    /* Capture the first stage's blendFunc. Common combos:
+4169:+                     *   GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA → alpha blend
+4171:+                     *   add / blend / filter    → shorthand names
+4172:+                     * We only store a coarse category (additive vs alpha
+4177:-                        cur.blendMode = BlendModeFromTokens(src, dst);
+4180:-                } else if (!Q_stricmp(token, "alphaFunc") || !Q_stricmp(token, "alphafunc")) {
+4182:-                    if (!Q_stricmp(token, "GT0")) cur.alphaFunc = 1;
+4183:-                    else if (!Q_stricmp(token, "GE128")) cur.alphaFunc = 2;
+4184:-                    else if (!Q_stricmp(token, "LT128")) cur.alphaFunc = 3;
+4220:+                } else if (stageIndex == 2 && (!Q_stricmp(token, "blendFunc") || !Q_stricmp(token, "blendfunc"))) {
+4224:+                        stage2BlendMode = BlendModeFromTokens(src, dst);
+4226:-                } else if (!Q_stricmp(token, "alphaGen") || !Q_stricmp(token, "alphagen")) {
+4227:+                } else if (stageIndex == 1 && (!Q_stricmp(token, "alphaFunc") || !Q_stricmp(token, "alphafunc"))) {
+4229:-                    if (!Q_stricmp(token, "vertex")) cur.alphaGen = 1;
+4230:-                    else if (!Q_stricmp(token, "wave")) cur.alphaGen = 3;
+4231:-                    else cur.alphaGen = 0;
+4239:-                            if (!Q_stricmp(funcTok, "sin")) cur.alphaWaveFunc = 1;
+4240:-                            else if (!Q_stricmp(funcTok, "triangle")) cur.alphaWaveFunc = 2;
+4241:-                            else if (!Q_stricmp(funcTok, "square")) cur.alphaWaveFunc = 3;
+4242:-                            else if (!Q_stricmp(funcTok, "sawtooth")) cur.alphaWaveFunc = 4;
+4244:-                                     !Q_stricmp(funcTok, "inverseSawtooth")) cur.alphaWaveFunc = 5;
+4245:-                            else if (!Q_stricmp(funcTok, "noise")) cur.alphaWaveFunc = 6;
+4246:-                            else cur.alphaWaveFunc = 1;
+4248:-                        if (baseTok[0]) cur.alphaWaveBase = (float)atof(baseTok);
+4249:-                        if (ampTok[0]) cur.alphaWaveAmp = (float)atof(ampTok);
+4250:-                        if (phaseTok[0]) cur.alphaWavePhase = (float)atof(phaseTok);
+4251:-                        if (freqTok[0]) cur.alphaWaveFreq = (float)atof(freqTok);
+4263:-                } else if (!Q_stricmp(token, "tcMod") || !Q_stricmp(token, "tcmod")) {
+4264:+                } else if (stageIndex == 1 && (!Q_stricmp(token, "tcMod") || !Q_stricmp(token, "tcmod"))) {
+4265:+                    /* Capture first-stage tcMod directives. Q3 stages
+4266:+                     * frequently stack multiple tcMods (e.g. lava has
+4267:+                     * both `tcMod turb …` AND `tcMod scroll …` on the
+4268:+                     * same stage). All three are captured independently;
+4278:-                        if (sTok[0] && tTok[0] && cur.tcModCount < Q3_MAX_TCMODS) {
+4279:-                            cur.tcMods[cur.tcModCount].type = 1;
+4280:-                            cur.tcMods[cur.tcModCount].params[0] = (float)atof(sTok);
+4281:-                            cur.tcMods[cur.tcModCount].params[1] = (float)atof(tTok);
+4282:-                            cur.tcMods[cur.tcModCount].params[2] = 0.0f;
+4283:-                            cur.tcMods[cur.tcModCount].params[3] = 0.0f;
+4284:-                            cur.tcModCount += 1;
+4293:-                        if (sTok[0] && tTok[0] && cur.tcModCount < Q3_MAX_TCMODS) {
+4294:-                            cur.tcMods[cur.tcModCount].type = 4;
+4295:-                            cur.tcMods[cur.tcModCount].params[0] = (float)atof(sTok);
+4296:-                            cur.tcMods[cur.tcModCount].params[1] = (float)atof(tTok);
+4297:-                            cur.tcMods[cur.tcModCount].params[2] = 0.0f;
+4298:-                            cur.tcMods[cur.tcModCount].params[3] = 0.0f;
+4299:-                            cur.tcModCount += 1;
+4306:+                        /* Stock Q3: `tcMod turb <base> <amp> <phase> <freq>`.
+4314:-                        if (ampTok[0] && phaseTok[0] && freqTok[0] && cur.tcModCount < Q3_MAX_TCMODS) {
+4315:-                            cur.tcMods[cur.tcModCount].type = 5;
+4316:-                            cur.tcMods[cur.tcModCount].params[0] = (float)atof(ampTok);
+4317:-                            cur.tcMods[cur.tcModCount].params[1] = (float)atof(freqTok);
+4318:-                            cur.tcMods[cur.tcModCount].params[2] = (float)atof(phaseTok);
+4319:-                            cur.tcMods[cur.tcModCount].params[3] = 0.0f;
+4320:-                            cur.tcModCount += 1;
+4329:-                        if (speedTok[0] && cur.tcModCount < Q3_MAX_TCMODS) {
+4330:-                            cur.tcMods[cur.tcModCount].type = 3;
+4331:-                            cur.tcMods[cur.tcModCount].params[0] = (float)atof(speedTok);
+4332:-                            cur.tcMods[cur.tcModCount].params[1] = 0.0f;
+4333:-                            cur.tcMods[cur.tcModCount].params[2] = 0.0f;
+4334:-                            cur.tcMods[cur.tcModCount].params[3] = 0.0f;
+4335:-                            cur.tcModCount += 1;
+4353:+                } else if (stageIndex == 2 && (!Q_stricmp(token, "tcMod") || !Q_stricmp(token, "tcmod"))) {
+4359:+                            stage2ScrollS = (float)atof(sTok);
+4360:+                            stage2ScrollT = (float)atof(tTok);
+4367:+                            stage2ScaleS = (float)atof(sTok);
+4368:+                            stage2ScaleT = (float)atof(tTok);
+4373:-                /* unknown in-stage tokens silently consumed */
+4379:-         * shader-map-first lookup chain. Prefer the first stage with a
+4385:-            for (s = 0; s < stagesCount; ++s) {
+4386:-                if (stages[s].mapPath[0] != '\0' && !stages[s].useLightmap) {
+4387:-                    Q_strncpyz(shaderMapPath, stages[s].mapPath, sizeof(shaderMapPath));
+4392:-                ShaderMap_RegisterAnimated(shaderName, animFrames, animFrameCount, animFps, tcGenEnv);
+4394:-                ShaderMap_Register(shaderName, shaderMapPath, tcGenEnv);
+4397:+            ShaderMap_RegisterAnimated(shaderName, animFrames, animFrameCount, animFps, tcGenEnv);
+4399:+            ShaderMap_Register(shaderName, firstMap, tcGenEnv);
+4401:+            /* Sky-only shader (no renderable map stage). Register a
+4406:-        /* Direct copy of parsed stages[] + cullMode + skyparms + portal
+4410:+        /* Back-patch tcMod scroll and skyparms onto the just-registered
+4417:-                    last->stages[s] = stages[s];
+4419:+                    last->tcModScrollS = tcScrollS;
+4420:+                    last->tcModScrollT = tcScrollT;
+4423:+                    last->tcModScaleS = tcScaleS;
+4424:+                    last->tcModScaleT = tcScaleT;
+4428:+                    last->tcModTurbAmp = tcTurbAmp;
+4429:+                    last->tcModTurbPhase = tcTurbPhase;
+4430:+                    last->tcModTurbFreq = tcTurbFreq;
+4433:+                    last->blendMode = s_pendingBlendMode;
+4436:+                    last->alphaFunc = s_pendingAlphaFunc;
+4438:-                last->stageCount = stagesCount;
+4439:-                last->cullMode = cullMode;
+4440:-                last->tcGenEnv = tcGenEnv;
+4442:-                          last->shaderName, last->stageCount);
+4450:+                    Q_strncpyz(last->stage2MapPath, stage2Map, sizeof(last->stage2MapPath));
+4451:+                    last->stage2BlendMode = stage2BlendMode;
+4453:+                        last->stage2TcModScrollS = stage2ScrollS;
+4454:+                        last->stage2TcModScrollT = stage2ScrollT;
+4457:+                        last->stage2TcModScaleS = stage2ScaleS;
+4458:+                        last->stage2TcModScaleT = stage2ScaleT;
+4664:-            uint32_t stageIndex;
+4669:                     s_world.draws[i].stages[0].textureHandle = (uint32_t)h;
+4672:-            for (stageIndex = 0; stageIndex < s_world.draws[i].stageCount; ++stageIndex) {
+4673:-                qhandle_t h = ResolveFakeAnimatedTextureHandle((qhandle_t)s_world.draws[i].stages[stageIndex].textureHandle);
+4675:-                    s_world.draws[i].stages[stageIndex].textureHandle = (uint32_t)h;
+4690:     if (s_world.loaded && !(fd->rdflags & RDF_NOWORLDMODEL)) {
+4706:     if (fd->rdflags == 0 && s_sceneEntityCount > 0) {
+4791:+                 * Uses additive blend (flags bit) + the additive entity
+4792:+                 * pipeline which already runs depth-read-only (no write)
+4824:-                         * blendFunc only. No name-based / portal / isAdditive
+4829:-                         * rewrite the draw's blendMode. */
+4834:-                        if (tex->blendMode == 2) {
+4836:-                        } else if (tex->blendMode == 3) {
+4838:-                        } else if (tex->blendMode == 1) {
+4943:-                    s_entityDraws[entityDrawCursor].flags = drawFlags;
+4945:+                    s_entityDraws[entityDrawCursor].flags = Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE | Q3_METAL_ENTITY_DRAWFLAG_NOCULL;
+4951:-                        s_entityDraws[entityDrawCursor].flags = (drawFlags & ~(Q3_METAL_ENTITY_DRAWFLAG_ALPHA | Q3_METAL_ENTITY_DRAWFLAG_FILTER))
+4987:                     /* Check entity's shader for additive blending (e.g.
+4989:                      * texture's blendMode was propagated from the shader-
+4995:-                            if (tex->cullMode == METAL_SHADER_CULL_DISABLE) {
+5002:-                            if (tex->blendMode == 2) {
+5003:+                            if (tex->blendMode == 1) {
+5005:+                            } else if (tex->blendMode == 2) {
+5007:                             } else if (tex->blendMode == 3) {
+5009:-                            } else if (tex->blendMode == 1 || tex->isAdditive) {
+5031:                     s_entityDraws[entityDrawCursor].flags = drawFlags;
+5037:-                        s_entityDraws[entityDrawCursor].flags = (drawFlags & ~(Q3_METAL_ENTITY_DRAWFLAG_ALPHA | Q3_METAL_ENTITY_DRAWFLAG_FILTER))
+5051:-     * texture's parsed blendMode routes the draw to opaque/alpha/
+5054:-    if (fd->rdflags == 0 && s_scenePolyCount > 0) {
+5099:-                if (tex->blendMode == 1)      drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+5100:-                else if (tex->blendMode == 2) drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_ALPHA;
+5101:-                else if (tex->blendMode == 3) drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_FILTER;
+5107:-            s_entityDraws[entityDrawCursor].flags = drawFlags;
+5129:-    /* Plumb the shader's blendMode to the UI draw so the Swift side can
+5130:-     * pick a matching pipeline. Filter-mode (blendMode==3) is the one
+5132:-     * `blendFunc GL_DST_COLOR GL_SRC_ALPHA`, which we map to filter in
+5136:-    if (tex != NULL && tex->blendMode == 3) {
+5144:-    draw->blendMode = drawBlendMode;
+5267:-        s_cvarNoCull = ri.Cvar_Get("r_nocull", "0", CVAR_CHEAT);
+5296:-         * texture motion artifacts come from the tcMod uniform path.

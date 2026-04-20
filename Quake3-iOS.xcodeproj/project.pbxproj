@@ -289,7 +289,7 @@
 		3D5D5F8A80A1635E2325C250 /* jidctflt.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = jidctflt.c; sourceTree = "<group>"; };
 		3DB75E541CF7DB102F0AA1D3 /* be_aas_optimize.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = be_aas_optimize.h; sourceTree = "<group>"; };
 		3DC106CD30021E44C0E27C82 /* setup_32.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = setup_32.h; sourceTree = "<group>"; };
-		3F175305E092A16FBA69F38C /* libjpeg-changes.diff */ = {isa = PBXFileReference; path = "libjpeg-changes.diff"; sourceTree = "<group>"; };
+		3F175305E092A16FBA69F38C /* libjpeg-changes.diff */ = {isa = PBXFileReference; lastKnownFileType = text; path = "libjpeg-changes.diff"; sourceTree = "<group>"; };
 		3F4C653F1C1259F5BD0CF61F /* residue_44.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = residue_44.h; sourceTree = "<group>"; };
 		3F95A45FAD7F0E551431BD11 /* residue_44p51.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = residue_44p51.h; sourceTree = "<group>"; };
 		3FDA683D37C52CD981976290 /* be_aas_main.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = be_aas_main.c; sourceTree = "<group>"; };
@@ -315,7 +315,7 @@
 		4EC692968EE35E3D481A8C6B /* be_interface.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = be_interface.h; sourceTree = "<group>"; };
 		4ED53AE731C8D4BCE5B24F3E /* setup_44p51.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = setup_44p51.h; sourceTree = "<group>"; };
 		4F41838780E47305CCC4A9DB /* jcmarker.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = jcmarker.c; sourceTree = "<group>"; };
-		4F796B9C3C41114C938D6D65 /* dirty-files */ = {isa = PBXFileReference; path = "dirty-files"; sourceTree = "<group>"; };
+		4F796B9C3C41114C938D6D65 /* dirty-files */ = {isa = PBXFileReference; lastKnownFileType = text; path = "dirty-files"; sourceTree = "<group>"; };
 		508BCC2DCDC63D5891993661 /* codebook.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = codebook.h; sourceTree = "<group>"; };
 		519231DDABC6A8773BCB59E4 /* jcparam.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = jcparam.c; sourceTree = "<group>"; };
 		51FD1A0BBB75688B492F7777 /* tr_image_tga.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = tr_image_tga.c; sourceTree = "<group>"; };
@@ -327,7 +327,7 @@
 		55B41D3AF9FFB9BC33DABACA /* cg_consolecmds.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = cg_consolecmds.c; sourceTree = "<group>"; };
 		567EA27AA20FAE24FCAD6003 /* keycodes.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = keycodes.h; sourceTree = "<group>"; };
 		5759A510807AE6F11B8B5427 /* jconfig.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = jconfig.h; sourceTree = "<group>"; };
-		5764191E004EAED87E2353B4 /* COPYING */ = {isa = PBXFileReference; path = COPYING; sourceTree = "<group>"; };
+		5764191E004EAED87E2353B4 /* COPYING */ = {isa = PBXFileReference; lastKnownFileType = text; path = COPYING; sourceTree = "<group>"; };
 		583104C3F23778E23A10E33F /* l_crc.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = l_crc.c; sourceTree = "<group>"; };
 		5933FC512FBBC3D8602420B0 /* l_utils.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = l_utils.h; sourceTree = "<group>"; };
 		5AAAE72E2018098E33B62D54 /* crctable.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = crctable.h; sourceTree = "<group>"; };
@@ -348,7 +348,7 @@
 		672DF626CB5043B88376746D /* tr_font.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = tr_font.c; sourceTree = "<group>"; };
 		67AC44F4FD2D1552572680D8 /* tr_public.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = tr_public.h; sourceTree = "<group>"; };
 		67D1504E8B8AC35CAB46279A /* jdarith.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = jdarith.c; sourceTree = "<group>"; };
-		682486FAB747BF17B6326DAA /* README */ = {isa = PBXFileReference; path = README; sourceTree = "<group>"; };
+		682486FAB747BF17B6326DAA /* README */ = {isa = PBXFileReference; lastKnownFileType = text; path = README; sourceTree = "<group>"; };
 		6AA613B519FB57F9F6FB4790 /* setup_44.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = setup_44.h; sourceTree = "<group>"; };
 		6AE676A154892EE9812BB555 /* qfiles.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = qfiles.h; sourceTree = "<group>"; };
 		6AF21139679F9E7FC929A172 /* Quake3-iOS-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Quake3-iOS-Bridging-Header.h"; sourceTree = "<group>"; };
@@ -457,7 +457,7 @@
 		CACF78AE5823B426C1ECD6C7 /* window.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = window.h; sourceTree = "<group>"; };
 		CC07108D423757144E8083FB /* psych_11.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = psych_11.h; sourceTree = "<group>"; };
 		CC4AF53CEFF71643A97E075B /* residue_16.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = residue_16.h; sourceTree = "<group>"; };
-		CC809E1C2087FC3FE3F9C08D /* COPYING */ = {isa = PBXFileReference; path = COPYING; sourceTree = "<group>"; };
+		CC809E1C2087FC3FE3F9C08D /* COPYING */ = {isa = PBXFileReference; lastKnownFileType = text; path = COPYING; sourceTree = "<group>"; };
 		CCEFC4BC8348FE11DBAB37D7 /* be_aas_routealt.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = be_aas_routealt.h; sourceTree = "<group>"; };
 		CD62104F1A937699925D197D /* cm_local.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = cm_local.h; sourceTree = "<group>"; };
 		CD8443065242DDCE907219F4 /* be_aas_optimize.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = be_aas_optimize.c; sourceTree = "<group>"; };
