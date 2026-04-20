@@ -32,14 +32,34 @@ typedef struct {
     uint32_t textureHandle;
 } Q3MetalDrawCmd;
 
+#define Q3_MAX_TCMODS 4
+
+typedef struct {
+    uint32_t type;        /* 0=none,1=scroll,2=wave-sin,3=rotate,4=scale,5=turb */
+    float params[4];
+} Q3TcMod;
+
 typedef struct {
     uint32_t textureHandle;
     uint32_t blendMode;   /* 0=opaque,1=add,2=alpha,3=filter */
     uint32_t tcGen;       /* 0=base,1=environment */
-    uint32_t tcMod;       /* 0=none,1=scroll,2=turb,3=rotate,4=scale */
-    float tcModParams[4];
-    uint32_t rgbGen;      /* 0=identity,1=vertex */
+    Q3TcMod tcMods[Q3_MAX_TCMODS];
+    uint32_t tcModCount;
+    uint32_t rgbGen;      /* 0=identity,1=vertex,2=lightingDiffuse,3=wave */
+    uint32_t alphaGen;    /* 0=identity,1=vertex,3=wave */
     uint32_t alphaFunc;   /* 0=none, 1=GT0, 2=GE128, 3=LT128 */
+    uint32_t cullMode;    /* 0=back,1=none,2=front */
+    uint32_t useLightmap; /* 1 if stage sourced map from $lightmap */
+    uint32_t rgbWaveFunc;
+    float rgbWaveBase;
+    float rgbWaveAmp;
+    float rgbWavePhase;
+    float rgbWaveFreq;
+    uint32_t alphaWaveFunc;
+    float alphaWaveBase;
+    float alphaWaveAmp;
+    float alphaWavePhase;
+    float alphaWaveFreq;
 } Q3MetalWorldStage;
 
 #define Q3_METAL_MAX_STAGES 4

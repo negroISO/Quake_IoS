@@ -50,14 +50,18 @@ struct MetalView: UIViewRepresentable {
 
         struct WorldDrawUniforms {
             var tcGen: Float
-            var tcMod: Float
+            var tcModCount: Int32
             var rgbGen: Float
             var timeSeconds: Float
-            var tcModParams: SIMD4<Float>
+            var tcModType: SIMD4<Float>
+            var tcModParams0: SIMD4<Float>
+            var tcModParams1: SIMD4<Float>
+            var tcModParams2: SIMD4<Float>
+            var tcModParams3: SIMD4<Float>
             var debugMode: Float
-            var forceWhiteVertColor: Float  // 1.0 for additive (skip BSP vertex color)
-            var alphaTestThreshold: Float   // >0: discard if a<thresh; <0: discard if a>=|thresh|; 0: none
-            var _pad0: Float
+            var forceWhiteVertColor: Float
+            var alphaTestThreshold: Float
+            var _pad0: Float = 0
         }
 
         // Render debug: 0 = normal, 1 = base only, 2 = lightmap only,
@@ -90,8 +94,33 @@ struct MetalView: UIViewRepresentable {
             }
         }
 
-        private static func stageTcModParams(_ stage: Q3MetalWorldStage) -> SIMD4<Float> {
-            SIMD4<Float>(stage.tcModParams.0, stage.tcModParams.1, stage.tcModParams.2, stage.tcModParams.3)
+        typealias TcModChainPack = (types: SIMD4<Float>,
+                                    p0: SIMD4<Float>, p1: SIMD4<Float>,
+                                    p2: SIMD4<Float>, p3: SIMD4<Float>,
+                                    count: Int32)
+
+        private static func fillTcMods(_ stage: Q3MetalWorldStage) -> TcModChainPack {
+            var types = SIMD4<Float>(0, 0, 0, 0)
+            var p0 = SIMD4<Float>(0, 0, 0, 0)
+            var p1 = SIMD4<Float>(0, 0, 0, 0)
+            var p2 = SIMD4<Float>(0, 0, 0, 0)
+            var p3 = SIMD4<Float>(0, 0, 0, 0)
+            let n = Int(min(stage.tcModCount, 4))
+            let chain = [stage.tcMods.0, stage.tcMods.1, stage.tcMods.2, stage.tcMods.3]
+            for i in 0..<n {
+                let m = chain[i]
+                types[i] = Float(m.type)
+                let pp = m.params
+                let v = SIMD4<Float>(pp.0, pp.1, pp.2, pp.3)
+                switch i {
+                case 0: p0 = v
+                case 1: p1 = v
+                case 2: p2 = v
+                case 3: p3 = v
+                default: break
+                }
+            }
+            return (types, p0, p1, p2, p3, Int32(n))
         }
 
         struct GPUEntityVertex {
@@ -165,15 +194,44 @@ struct MetalView: UIViewRepresentable {
 
         struct WorldDrawUniforms {
             float tcGen;
-            float tcMod;
+            int tcModCount;
             float rgbGen;
             float timeSeconds;
-            float4 tcModParams;
+            float4 tcModType;
+            float4 tcModParams0;
+            float4 tcModParams1;
+            float4 tcModParams2;
+            float4 tcModParams3;
             float debugMode;
             float forceWhiteVertColor;
             float alphaTestThreshold;
             float _pad0;
         };
+
+        float2 applyTcMod(float2 uv, int type, float4 params, float timeSeconds) {
+            if (type == 1) {
+                return uv + params.xy * timeSeconds;
+            } else if (type == 2) {
+                float s = sin(timeSeconds * params.w) * params.y;
+                return uv + float2(s, s);
+            } else if (type == 3) {
+                float a = params.x * timeSeconds;
+                float c = cos(a);
+                float s = sin(a);
+                float2 p = uv - 0.5;
+                return float2(p.x * c - p.y * s, p.x * s + p.y * c) + 0.5;
+            } else if (type == 4) {
+                return uv * params.xy;
+            } else if (type == 5) {
+                float amp = params.x;
+                float freq = params.y;
+                float phase = params.z;
+                float t = (timeSeconds + phase) * freq * 2.0 * 3.14159265;
+                return uv + float2(sin(t + uv.y * 4.0) * amp,
+                                   sin(t + uv.x * 4.0) * amp);
+            }
+            return uv;
+        }
 
         struct EntityVertexIn {
             float3 position;
@@ -209,35 +267,14 @@ struct MetalView: UIViewRepresentable {
                                           texture2d<float> lightmapTexture [[texture(1)]],
                                           sampler textureSampler [[sampler(0)]]) {
             float2 texCoord = in.texCoord;
-            int tcMod = int(drawUniforms.tcMod + 0.5);
             int rgbGen = int(drawUniforms.rgbGen + 0.5);
-            if (tcMod == 1) {
-                texCoord += drawUniforms.tcModParams.xy * drawUniforms.timeSeconds;
-            } else if (tcMod == 2) {
-                float s = sin(drawUniforms.timeSeconds * drawUniforms.tcModParams.w) * drawUniforms.tcModParams.y;
-                texCoord += float2(s, s);
-            } else if (tcMod == 3) {
-                float a = drawUniforms.tcModParams.x * drawUniforms.timeSeconds;
-                float c = cos(a);
-                float s = sin(a);
-                float2 p = texCoord - 0.5;
-                texCoord = float2(p.x * c - p.y * s, p.x * s + p.y * c) + 0.5;
-            } else if (tcMod == 4) {
-                texCoord *= drawUniforms.tcModParams.xy;
-            } else if (tcMod == 5) {
-                // tcMod turb — position-dependent sine UV warp, drives
-                // Q3 lava/water surfaces. Stock Q3 uses per-vertex world
-                // position; we don't have it in the world fragment, so
-                // we approximate using texCoord as a position proxy.
-                // Produces the molten-wobble look on lava.
-                // params: (amp, freq, phase, unused)
-                float amp = drawUniforms.tcModParams.x;
-                float freq = drawUniforms.tcModParams.y;
-                float phase = drawUniforms.tcModParams.z;
-                float t = (drawUniforms.timeSeconds + phase) * freq * 2.0 * 3.14159265;
-                texCoord.x += sin(t + texCoord.y * 4.0) * amp;
-                texCoord.y += sin(t + texCoord.x * 4.0) * amp;
-            }
+            // tcMod chain — apply in order. Q3 shaders stack mods (e.g. scale
+            // then scroll); order matters and cannot be reduced to one slot.
+            int modCount = drawUniforms.tcModCount;
+            if (modCount > 0) texCoord = applyTcMod(texCoord, int(drawUniforms.tcModType.x + 0.5), drawUniforms.tcModParams0, drawUniforms.timeSeconds);
+            if (modCount > 1) texCoord = applyTcMod(texCoord, int(drawUniforms.tcModType.y + 0.5), drawUniforms.tcModParams1, drawUniforms.timeSeconds);
+            if (modCount > 2) texCoord = applyTcMod(texCoord, int(drawUniforms.tcModType.z + 0.5), drawUniforms.tcModParams2, drawUniforms.timeSeconds);
+            if (modCount > 3) texCoord = applyTcMod(texCoord, int(drawUniforms.tcModType.w + 0.5), drawUniforms.tcModParams3, drawUniforms.timeSeconds);
             float4 texel = colorTexture.sample(textureSampler, texCoord);
             float4 lightmap = lightmapTexture.sample(textureSampler, in.lightmapTexCoord);
             int mode = int(drawUniforms.debugMode + 0.5);
@@ -386,24 +423,33 @@ struct MetalView: UIViewRepresentable {
             float2 uvY = float2( dir.x, dir.z) / max(a.y, 1e-4) * 0.5 + 0.5;
             float2 uvZ = float2( dir.x, -dir.y) / max(a.z, 1e-4) * 0.5 + 0.5;
 
-            // tcMod as stacked scale+scroll. Q3 killsky has both
-            // `tcMod scale` and `tcMod scroll` on the same stage —
-            // Q3's runtime applies scale first, then scroll. Until
-            // the per-stage uniform carries both simultaneously, we
-            // derive them from the single `tcMod` + `tcModParams`
-            // slot: if tcMod==1 use .xy as scroll; if tcMod==4 use
-            // .xy as scale; otherwise no-op. Applied to all three
-            // projections identically so motion stays coherent.
-            int tcMod = int(drawUniforms.tcMod + 0.5);
-            if (tcMod == 1) {
-                float2 scroll = drawUniforms.tcModParams.xy * drawUniforms.timeSeconds;
-                uvX += scroll;
-                uvY += scroll;
-                uvZ += scroll;
-            } else if (tcMod == 4) {
-                uvX *= drawUniforms.tcModParams.xy;
-                uvY *= drawUniforms.tcModParams.xy;
-                uvZ *= drawUniforms.tcModParams.xy;
+            // Apply the full tcMod chain to each of the three axis-aligned
+            // projections uniformly. killsky stacks scale+scroll; order
+            // matters. We iterate the chain the same as the world fragment.
+            int skyModCount = drawUniforms.tcModCount;
+            if (skyModCount > 0) {
+                int t = int(drawUniforms.tcModType.x + 0.5);
+                uvX = applyTcMod(uvX, t, drawUniforms.tcModParams0, drawUniforms.timeSeconds);
+                uvY = applyTcMod(uvY, t, drawUniforms.tcModParams0, drawUniforms.timeSeconds);
+                uvZ = applyTcMod(uvZ, t, drawUniforms.tcModParams0, drawUniforms.timeSeconds);
+            }
+            if (skyModCount > 1) {
+                int t = int(drawUniforms.tcModType.y + 0.5);
+                uvX = applyTcMod(uvX, t, drawUniforms.tcModParams1, drawUniforms.timeSeconds);
+                uvY = applyTcMod(uvY, t, drawUniforms.tcModParams1, drawUniforms.timeSeconds);
+                uvZ = applyTcMod(uvZ, t, drawUniforms.tcModParams1, drawUniforms.timeSeconds);
+            }
+            if (skyModCount > 2) {
+                int t = int(drawUniforms.tcModType.z + 0.5);
+                uvX = applyTcMod(uvX, t, drawUniforms.tcModParams2, drawUniforms.timeSeconds);
+                uvY = applyTcMod(uvY, t, drawUniforms.tcModParams2, drawUniforms.timeSeconds);
+                uvZ = applyTcMod(uvZ, t, drawUniforms.tcModParams2, drawUniforms.timeSeconds);
+            }
+            if (skyModCount > 3) {
+                int t = int(drawUniforms.tcModType.w + 0.5);
+                uvX = applyTcMod(uvX, t, drawUniforms.tcModParams3, drawUniforms.timeSeconds);
+                uvY = applyTcMod(uvY, t, drawUniforms.tcModParams3, drawUniforms.timeSeconds);
+                uvZ = applyTcMod(uvZ, t, drawUniforms.tcModParams3, drawUniforms.timeSeconds);
             }
 
             float4 sX = skyTexture.sample(textureSampler, uvX);
@@ -549,7 +595,8 @@ struct MetalView: UIViewRepresentable {
                                 print("[Metal] sky draw stageCount=\(stageCount) flags=0x\(String(draw.flags, radix: 16))")
                                 for i in 0..<stageCount {
                                     let s = Self.worldStage(draw, i)
-                                    print("[Metal]   sky stage \(i): tex=\(s.textureHandle) blend=\(s.blendMode) tcMod=\(s.tcMod) tcModParams=(\(s.tcModParams.0),\(s.tcModParams.1),\(s.tcModParams.2),\(s.tcModParams.3))")
+                                    let m0 = s.tcMods.0
+                                    print("[Metal]   sky stage \(i): tex=\(s.textureHandle) blend=\(s.blendMode) tcModCount=\(s.tcModCount) tcMod0.type=\(m0.type) tcMod0.params=(\(m0.params.0),\(m0.params.1),\(m0.params.2),\(m0.params.3))")
                                 }
                             }
 
@@ -567,12 +614,17 @@ struct MetalView: UIViewRepresentable {
                                 let pipeline = isAdditive ? (skyAdditivePipelineState ?? skyPipelineState) : skyPipelineState
                                 encoder.setRenderPipelineState(pipeline)
                                 encoder.setDepthStencilState(skyDepthStencilState)
+                                let skyChain = Self.fillTcMods(stage)
                                 var skyDrawUniforms = WorldDrawUniforms(
                                     tcGen: Float(stage.tcGen),
-                                    tcMod: Float(stage.tcMod),
+                                    tcModCount: skyChain.count,
                                     rgbGen: Float(stage.rgbGen),
                                     timeSeconds: timeSeconds,
-                                    tcModParams: Self.stageTcModParams(stage),
+                                    tcModType: skyChain.types,
+                                    tcModParams0: skyChain.p0,
+                                    tcModParams1: skyChain.p1,
+                                    tcModParams2: skyChain.p2,
+                                    tcModParams3: skyChain.p3,
                                     debugMode: 0,
                                     forceWhiteVertColor: 0,
                                     alphaTestThreshold: 0,
@@ -617,12 +669,17 @@ struct MetalView: UIViewRepresentable {
                                 encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
                             }
                             let alphaTest = Self.alphaTestThreshold(for: stage.alphaFunc)
+                            let chain = Self.fillTcMods(stage)
                             var drawUniforms = WorldDrawUniforms(
                                 tcGen: Float(stage.tcGen),
-                                tcMod: Float(stage.tcMod),
+                                tcModCount: chain.count,
                                 rgbGen: Float(stage.rgbGen),
                                 timeSeconds: timeSeconds,
-                                tcModParams: Self.stageTcModParams(stage),
+                                tcModType: chain.types,
+                                tcModParams0: chain.p0,
+                                tcModParams1: chain.p1,
+                                tcModParams2: chain.p2,
+                                tcModParams3: chain.p3,
                                 debugMode: Coordinator.worldDebugMode,
                                 forceWhiteVertColor: (blendMode == 1) ? 1.0 : 0.0,
                                 alphaTestThreshold: alphaTest,
