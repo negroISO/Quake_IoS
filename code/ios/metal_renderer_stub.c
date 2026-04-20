@@ -584,12 +584,52 @@ static qhandle_t RegisterTexture(const char *name) {
     }
 
     if (!TryLoadImageRGBA(name, &rgba, &width, &height, resolvedName, sizeof(resolvedName))) {
-        const char *mapped = ShaderMap_Lookup(name);
-        if (mapped != NULL
-            && TryLoadImageRGBA(mapped, &rgba, &width, &height, resolvedName, sizeof(resolvedName))) {
-            ri.Printf(PRINT_DEVELOPER, "Metal shader: resolved '%s' -> '%s'\n", name, mapped);
-        } else {
-            ri.Printf(PRINT_WARNING, "Metal stub: failed to load UI texture '%s', falling back to white\n", name);
+        /* Shader-name → texture-path resolver. The .shader scripts map
+         * logical names (models/powerups/health/yellow) to actual files
+         * (textures/effects/envmapyel.tga). Historically we only tried
+         * entry->mapPath; walk the parsed stages + animFrames too so
+         * multi-stage + animated shaders also resolve. */
+        const metalShaderMap_t *entry = ShaderMap_LookupEntry(name);
+        qboolean resolved = qfalse;
+        if (entry != NULL) {
+            if (entry->animFrameCount > 0 && entry->animFrames[0][0] != '\0') {
+                if (TryLoadImageRGBA(entry->animFrames[0], &rgba, &width, &height, resolvedName, sizeof(resolvedName))) {
+                    resolved = qtrue;
+                }
+            }
+            if (!resolved && entry->mapPath[0] != '\0') {
+                if (TryLoadImageRGBA(entry->mapPath, &rgba, &width, &height, resolvedName, sizeof(resolvedName))) {
+                    resolved = qtrue;
+                }
+            }
+            if (!resolved) {
+                int si;
+                for (si = 0; si < entry->stageCount && !resolved; ++si) {
+                    if (entry->stages[si].useLightmap) continue;
+                    if (entry->stages[si].mapPath[0] == '\0') continue;
+                    if (TryLoadImageRGBA(entry->stages[si].mapPath, &rgba, &width, &height, resolvedName, sizeof(resolvedName))) {
+                        resolved = qtrue;
+                    }
+                }
+            }
+        }
+        if (!resolved) {
+            /* Remember the miss so subsequent lookups skip the shader-map
+             * walk and don't re-spam the warning. Finite cap, dedup by
+             * name. The returned handle is the shared white texture. */
+            static char s_missSeen[1024][MAX_QPATH];
+            static int s_missSeenCount = 0;
+            int mi;
+            qboolean alreadyLogged = qfalse;
+            for (mi = 0; mi < s_missSeenCount; ++mi) {
+                if (!Q_stricmp(s_missSeen[mi], name)) { alreadyLogged = qtrue; break; }
+            }
+            if (!alreadyLogged) {
+                if (s_missSeenCount < (int)(sizeof(s_missSeen) / sizeof(s_missSeen[0]))) {
+                    Q_strncpyz(s_missSeen[s_missSeenCount++], name, MAX_QPATH);
+                }
+                ri.Printf(PRINT_WARNING, "Metal stub: failed to load UI texture '%s', falling back to white\n", name);
+            }
             return EnsureWhiteTexture();
         }
     }
