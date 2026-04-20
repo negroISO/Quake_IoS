@@ -2411,15 +2411,23 @@ static void ParseShaderText(const char *text) {
                         if (ampTok[0]) cur.rgbWaveAmp = (float)atof(ampTok);
                         if (phaseTok[0]) cur.rgbWavePhase = (float)atof(phaseTok);
                         if (freqTok[0]) cur.rgbWaveFreq = (float)atof(freqTok);
-                    } else if (!Q_stricmp(token, "const") ||
-                               !Q_stricmp(token, "exactVertex") ||
-                               !Q_stricmp(token, "exactvertex")) {
+                    } else if (!Q_stricmp(token, "const")) {
+                        /* rgbGen const takes a parenthesized vec3:
+                         * '( r g b )' = 5 tokens. */
                         (void)COM_ParseExt(&p, qfalse);
                         (void)COM_ParseExt(&p, qfalse);
                         (void)COM_ParseExt(&p, qfalse);
                         (void)COM_ParseExt(&p, qfalse);
                         (void)COM_ParseExt(&p, qfalse);
                     }
+                    /* exactVertex / exactvertex / identity / vertex /
+                     * lightingDiffuse / oneMinusVertex / oneMinusEntity /
+                     * entity / lightingGrid take NO arguments. Consuming
+                     * any tokens here desyncs the parser against the
+                     * next shader's name — that's the bug that was
+                     * stopping sfx.shader at fanfx (line 1117) and
+                     * dropping ~230 downstream shaders including
+                     * border11c / xmetalfloor_wall_5b / killblock_i4b. */
                 } else if (!Q_stricmp(token, "alphaGen") || !Q_stricmp(token, "alphagen")) {
                     token = COM_ParseExt(&p, qfalse);
                     if (!Q_stricmp(token, "vertex")) cur.alphaGen = 1;
