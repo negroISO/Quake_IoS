@@ -133,12 +133,8 @@ static uint32_t s_entityRejectedModelThisFrame;
 #define MAX_SHADER_MAP_ENTRIES 4096
 #define METAL_ANIMMAP_MAX_FRAMES 16
 #define Q3_MAX_STAGES 4
-#define Q3_MAX_TCMODS 4
-
-typedef struct {
-    uint32_t type;
-    float params[4];
-} Q3TcMod;
+/* Q3_MAX_TCMODS and Q3TcMod live in metal_renderer_shared.h so both the
+ * stub and Swift bindings share the exact same tcMod chain layout. */
 
 typedef struct {
     char mapPath[MAX_QPATH];
@@ -417,30 +413,62 @@ static void SetupWorldDraw(Q3MetalWorldDrawCmd *draw,
 
 static void AddWorldDrawStage(Q3MetalWorldDrawCmd *draw,
                               qhandle_t textureHandle,
-                              int blendMode,
-                              int tcGenEnv,
-                              int tcModType,
-                              float tcModP0,
-                              float tcModP1,
-                              float tcModP2,
-                              float tcModP3,
-                              int rgbGen,
-                              int alphaFunc) {
+                              const Q3MetalStage *src) {
     Q3MetalWorldStage *stage;
-    if (draw == NULL || draw->stageCount >= Q3_METAL_MAX_STAGES) {
+    int i;
+    int count;
+    if (draw == NULL || src == NULL || draw->stageCount >= Q3_METAL_MAX_STAGES) {
         return;
     }
     stage = &draw->stages[draw->stageCount++];
     stage->textureHandle = (uint32_t)textureHandle;
-    stage->blendMode = (uint32_t)blendMode;
-    stage->tcGen = (uint32_t)((tcGenEnv != 0) ? 1 : 0);
-    stage->tcMod = (uint32_t)tcModType;
-    stage->tcModParams[0] = tcModP0;
-    stage->tcModParams[1] = tcModP1;
-    stage->tcModParams[2] = tcModP2;
-    stage->tcModParams[3] = tcModP3;
-    stage->rgbGen = (uint32_t)rgbGen;
-    stage->alphaFunc = (uint32_t)alphaFunc;
+    stage->blendMode = (uint32_t)src->blendMode;
+    stage->tcGen = (uint32_t)src->tcGen;
+    count = src->tcModCount;
+    if (count < 0) count = 0;
+    if (count > Q3_MAX_TCMODS) count = Q3_MAX_TCMODS;
+    stage->tcModCount = (uint32_t)count;
+    for (i = 0; i < count; ++i) {
+        stage->tcMods[i] = src->tcMods[i];
+    }
+    for (; i < Q3_MAX_TCMODS; ++i) {
+        stage->tcMods[i].type = 0;
+        stage->tcMods[i].params[0] = 0.0f;
+        stage->tcMods[i].params[1] = 0.0f;
+        stage->tcMods[i].params[2] = 0.0f;
+        stage->tcMods[i].params[3] = 0.0f;
+    }
+    stage->rgbGen = (uint32_t)src->rgbGen;
+    stage->alphaGen = (uint32_t)src->alphaGen;
+    stage->alphaFunc = (uint32_t)src->alphaFunc;
+    stage->cullMode = 0; /* default back; per-stage cull wiring is step 6 */
+    stage->useLightmap = (uint32_t)src->useLightmap;
+    stage->rgbWaveFunc = (uint32_t)src->rgbWaveFunc;
+    stage->rgbWaveBase = src->rgbWaveBase;
+    stage->rgbWaveAmp = src->rgbWaveAmp;
+    stage->rgbWavePhase = src->rgbWavePhase;
+    stage->rgbWaveFreq = src->rgbWaveFreq;
+    stage->alphaWaveFunc = (uint32_t)src->alphaWaveFunc;
+    stage->alphaWaveBase = src->alphaWaveBase;
+    stage->alphaWaveAmp = src->alphaWaveAmp;
+    stage->alphaWavePhase = src->alphaWavePhase;
+    stage->alphaWaveFreq = src->alphaWaveFreq;
+}
+
+/* Fallback for draws with no parsed .shader entry — construct a minimal
+ * opaque stage inline. Used when a texture binds directly via
+ * RegisterTexture() without going through the shader-map. */
+static void AddWorldDrawStageSimple(Q3MetalWorldDrawCmd *draw,
+                                    qhandle_t textureHandle,
+                                    int blendMode,
+                                    int rgbGen,
+                                    int alphaFunc) {
+    Q3MetalStage tmp;
+    Com_Memset(&tmp, 0, sizeof(tmp));
+    tmp.blendMode = blendMode;
+    tmp.rgbGen = rgbGen;
+    tmp.alphaFunc = alphaFunc;
+    AddWorldDrawStage(draw, textureHandle, &tmp);
 }
 
 static qboolean TryLoadImageRGBA(const char *name, byte **rgba, int *width, int *height, char *resolvedName, size_t resolvedNameSize) {
@@ -1640,17 +1668,7 @@ static qboolean LoadWorldMapData(const char *name) {
                                         _tex = (_st->mapPath[0] != '\0') ? RegisterTexture(_st->mapPath) : 0;
                                     }
                                     if (_tex == 0) continue;
-                                    AddWorldDrawStage(&s_world.draws[_dstIdx],
-                                                      _tex,
-                                                      _st->blendMode,
-                                                      _st->tcGen,
-                                                      0,
-                                                      0.0f,
-                                                      0.0f,
-                                                      0.0f,
-                                                      0.0f,
-                                                      _st->rgbGen,
-                                                      _st->alphaFunc);
+                                    AddWorldDrawStage(&s_world.draws[_dstIdx], _tex, _st);
                                 }
                             }
                             if (_e == NULL || _e->stageCount == 0) {
@@ -1658,17 +1676,7 @@ static qboolean LoadWorldMapData(const char *name) {
                                                ? skyOverrideTexture
                                                : RegisterTexture(shaders[shaderNum].shader);
                                 if (_tex != 0) {
-                                    AddWorldDrawStage(&s_world.draws[_dstIdx],
-                                                      _tex,
-                                                      0,
-                                                      0,
-                                                      0,
-                                                      0.0f,
-                                                      0.0f,
-                                                      0.0f,
-                                                      0.0f,
-                                                      0,
-                                                      0);
+                                    AddWorldDrawStageSimple(&s_world.draws[_dstIdx], _tex, 0, 0, 0);
                                 }
                             }
                         }
@@ -1726,17 +1734,7 @@ static qboolean LoadWorldMapData(const char *name) {
                             _tex = (_st->mapPath[0] != '\0') ? RegisterTexture(_st->mapPath) : 0;
                         }
                         if (_tex == 0) continue;
-                        AddWorldDrawStage(&s_world.draws[_dstIdx],
-                                          _tex,
-                                          _st->blendMode,
-                                          _st->tcGen,
-                                          0,
-                                          0.0f,
-                                          0.0f,
-                                          0.0f,
-                                          0.0f,
-                                          _st->rgbGen,
-                                          _st->alphaFunc);
+                        AddWorldDrawStage(&s_world.draws[_dstIdx], _tex, _st);
                     }
                 }
                 if (_e == NULL || _e->stageCount == 0) {
@@ -1744,17 +1742,7 @@ static qboolean LoadWorldMapData(const char *name) {
                                    ? skyOverrideTexture
                                    : RegisterTexture(shaders[shaderNum].shader);
                     if (_tex != 0) {
-                        AddWorldDrawStage(&s_world.draws[_dstIdx],
-                                          _tex,
-                                          0,
-                                          0,
-                                          0,
-                                          0.0f,
-                                          0.0f,
-                                          0.0f,
-                                          0.0f,
-                                          0,
-                                          0);
+                        AddWorldDrawStageSimple(&s_world.draws[_dstIdx], _tex, 0, 0, 0);
                     }
                 }
             }
