@@ -130,6 +130,76 @@ static uint32_t s_entityRejectedNullThisFrame;
 static uint32_t s_entityRejectedTypeThisFrame;
 static uint32_t s_entityRejectedModelThisFrame;
 
+#define MAX_SHADER_MAP_ENTRIES 4096
+#define METAL_ANIMMAP_MAX_FRAMES 16
+#define Q3_MAX_STAGES 4
+#define Q3_MAX_TCMODS 4
+
+typedef struct {
+    uint32_t type;
+    float params[4];
+} Q3TcMod;
+
+typedef struct {
+    char mapPath[MAX_QPATH];
+    int blendMode;
+    int rgbGen;
+    int alphaGen;
+    int alphaFunc;
+    int tcGen;
+    Q3TcMod tcMods[Q3_MAX_TCMODS];
+    int tcModCount;
+    int rgbWaveFunc;
+    float rgbWaveBase;
+    float rgbWaveAmp;
+    float rgbWavePhase;
+    float rgbWaveFreq;
+    int alphaWaveFunc;
+    float alphaWaveBase;
+    float alphaWaveAmp;
+    float alphaWavePhase;
+    float alphaWaveFreq;
+    int useLightmap;
+} Q3MetalStage;
+
+enum {
+    METAL_SHADER_CULL_BACK = 0,
+    METAL_SHADER_CULL_DISABLE = 1,
+    METAL_SHADER_CULL_FRONT = 2
+};
+
+typedef struct {
+    char shaderName[128];
+    char mapPath[MAX_QPATH];
+    qboolean tcGenEnv;
+    float tcModScrollS;
+    float tcModScrollT;
+    float tcModScaleS;
+    float tcModScaleT;
+    qboolean hasTurb;
+    float tcModTurbAmp;
+    float tcModTurbPhase;
+    float tcModTurbFreq;
+    int blendMode;
+    int alphaFunc;
+    int animFrameCount;
+    float animFps;
+    char animFrames[METAL_ANIMMAP_MAX_FRAMES][MAX_QPATH];
+    qhandle_t animTextures[METAL_ANIMMAP_MAX_FRAMES];
+    char skyBoxBase[MAX_QPATH];
+    qhandle_t skyFaceTextures[6];
+    char stage2MapPath[MAX_QPATH];
+    int stage2BlendMode;
+    float stage2TcModScrollS;
+    float stage2TcModScrollT;
+    float stage2TcModScaleS;
+    float stage2TcModScaleT;
+    int cullMode;
+    qboolean isPortal;
+    Q3MetalStage stages[Q3_MAX_STAGES];
+    int stageCount;
+} metalShaderMap_t;
+
 static void CopyColor(float *dst, const float *src) {
     dst[0] = src[0];
     dst[1] = src[1];
@@ -411,6 +481,7 @@ static const char *ShaderMap_Lookup(const char *name);
 static qhandle_t ShaderMap_ResolveCurrentFrame(const char *name);
 static int ShaderMap_FindAnimatedSlot(const char *name);
 static qhandle_t ShaderMap_AnimatedSlotCurrentHandle(int slot);
+static const metalShaderMap_t *ShaderMap_LookupEntry(const char *name);
 static void ShaderMap_GetScroll(const char *name, float *outS, float *outT);
 static void ShaderMap_GetScale(const char *name, float *outS, float *outT);
 static qboolean ShaderMap_GetTurb(const char *name, float *outAmp, float *outPhase, float *outFreq);
@@ -1404,17 +1475,7 @@ static qboolean LoadWorldMapData(const char *name) {
         uint32_t baseVertex;
         qhandle_t textureHandle;
         qhandle_t lightmapHandle;
-        qhandle_t stage2TextureHandle;
-        int stage0BlendMode;
-        int stage0AlphaFunc;
-        int stage0TcGenEnv;
-        int stage0TcModType;
-        float stage0TcModParams[4];
-        char skyStage2Map[MAX_QPATH];
-        int skyStage2BlendMode;
-        int skyStage2TcModType;
-        float skyStage2TcModParams[4];
-        qboolean hasSkyStage2;
+        qhandle_t skyOverrideTexture;
         int lightmapNum;
         qboolean hasLightmap;
         uint32_t worldFlags;
@@ -1431,23 +1492,7 @@ static qboolean LoadWorldMapData(const char *name) {
         shaderNum = LittleLong(surface->shaderNum);
         lightmapNum = LittleLong(surface->lightmapNum);
         hasLightmap = qfalse;
-        stage2TextureHandle = 0;
-        stage0BlendMode = 0;
-        stage0AlphaFunc = 0;
-        stage0TcGenEnv = 0;
-        stage0TcModType = 0;
-        stage0TcModParams[0] = 0.0f;
-        stage0TcModParams[1] = 0.0f;
-        stage0TcModParams[2] = 0.0f;
-        stage0TcModParams[3] = 0.0f;
-        skyStage2Map[0] = '\0';
-        skyStage2BlendMode = 0;
-        skyStage2TcModType = 0;
-        skyStage2TcModParams[0] = 0.0f;
-        skyStage2TcModParams[1] = 0.0f;
-        skyStage2TcModParams[2] = 0.0f;
-        skyStage2TcModParams[3] = 0.0f;
-        hasSkyStage2 = qfalse;
+        skyOverrideTexture = 0;
 
         if (shaderNum < 0 || shaderNum >= shaderCount) {
             continue;
@@ -1457,23 +1502,6 @@ static qboolean LoadWorldMapData(const char *name) {
         }
 
         if (IsSkyShaderName(shaders[shaderNum].shader)) {
-            /* Sky surface rendering picks one of three paths:
-             *
-             *  1. True 6-face cubemap (skyparms has a non-dash farbox):
-             *     pick the face whose outward direction best matches
-             *     the surface's averaged vertex normals.
-             *
-             *  2. Cloud-dome sky (skyparms farbox=='-' e.g. q3dm1's
-             *     killsky): render with the shader's first-stage map
-             *     (killsky_1) plus the parsed tcMod scroll. This gives
-             *     real scrolling clouds instead of a flat 1-pixel sky.
-             *     RegisterTexture consults the shader map and resolves
-             *     to the underlying texture; s_pendingScrollS/T already
-             *     holds the scroll values for this shader.
-             *
-             *  3. Last-resort fallback (shader not in map at all):
-             *     EnsureSkyTexture() 1-pixel color. Dark but harmless.
-             */
             qhandle_t skyFace = 0;
             if (numVerts > 0) {
                 float nx = 0, ny = 0, nz = 0;
@@ -1488,130 +1516,40 @@ static qboolean LoadWorldMapData(const char *name) {
                 skyFace = GetSkyFaceTextureForSurface(shaders[shaderNum].shader, nx, ny, nz);
             }
             if (skyFace != 0) {
+                skyOverrideTexture = skyFace;
                 textureHandle = skyFace;
             } else {
-                /* No farbox cubemap — use parsed cloud texture. */
-                textureHandle = RegisterTexture(shaders[shaderNum].shader);
-                if (textureHandle == 0) {
-                    textureHandle = EnsureSkyTexture();
-                }
+                textureHandle = 0;
             }
             skyDraws += 1;
         } else {
-            textureHandle = RegisterTexture(shaders[shaderNum].shader);
+            textureHandle = 0;
         }
 
-        /* Record animated-shader slot for this surface so RE_RenderScene
-         * can re-resolve the textureHandle each frame. Without this,
-         * world fire/lava/teleport surfaces cache frame-0 forever.
-         * Patch surfaces emit multiple draws, so we stash the slot and
-         * apply after each SetupWorldDraw below. */
         s_pendingAnimSlot = ShaderMap_FindAnimatedSlot(shaders[shaderNum].shader);
-        /* Per-shader tcMod scroll (s,t) for lava-flow, scrolling fog,
-         * etc. MSL applies `uv + scroll * timeSeconds` each frame. */
-        ShaderMap_GetScroll(shaders[shaderNum].shader, &s_pendingScrollS, &s_pendingScrollT);
-        stage0AlphaFunc = ShaderMap_GetAlphaFunc(shaders[shaderNum].shader);
-        stage0BlendMode = ShaderMap_GetBlendMode(shaders[shaderNum].shader);
-        stage0TcGenEnv = ShaderMap_GetTcGenEnv(shaders[shaderNum].shader);
-
-        /* Resolve tcMod for NON-sky surfaces (lava, scrolling fog, etc.).
-         * Sky branch below overrides this with its own sky-aware logic.
-         * Preference turb > scroll > scale because turb is the most
-         * visually distinctive — lava without turb looks dead. Only one
-         * tcMod slot per stage in the current draw-uniform layout, so
-         * we pick the most impactful. */
-        if (!IsSkyShaderName(shaders[shaderNum].shader)) {
-            float turbAmp = 0.0f, turbPhase = 0.0f, turbFreq = 0.0f;
-            qboolean nsHasTurb = ShaderMap_GetTurb(shaders[shaderNum].shader, &turbAmp, &turbPhase, &turbFreq);
-            qboolean nsHasScroll = (fabsf(s_pendingScrollS) > 0.00001f || fabsf(s_pendingScrollT) > 0.00001f);
-            float nsScaleS = 1.0f, nsScaleT = 1.0f;
-            ShaderMap_GetScale(shaders[shaderNum].shader, &nsScaleS, &nsScaleT);
-            qboolean nsHasScale = (fabsf(nsScaleS - 1.0f) > 0.00001f || fabsf(nsScaleT - 1.0f) > 0.00001f);
-            if (nsHasTurb) {
-                stage0TcModType = 5;
-                stage0TcModParams[0] = turbAmp;
-                stage0TcModParams[1] = turbFreq;
-                stage0TcModParams[2] = turbPhase;
-                stage0TcModParams[3] = 0.0f;
-            } else if (nsHasScroll) {
-                stage0TcModType = 1;
-                stage0TcModParams[0] = s_pendingScrollS;
-                stage0TcModParams[1] = s_pendingScrollT;
-            } else if (nsHasScale) {
-                stage0TcModType = 4;
-                stage0TcModParams[0] = nsScaleS;
-                stage0TcModParams[1] = nsScaleT;
-            }
-        }
-        if (IsSkyShaderName(shaders[shaderNum].shader)) {
-            float scaleS = 1.0f;
-            float scaleT = 1.0f;
-            qboolean stage0HasScroll = (fabsf(s_pendingScrollS) > 0.00001f || fabsf(s_pendingScrollT) > 0.00001f);
-            ShaderMap_GetScale(shaders[shaderNum].shader, &scaleS, &scaleT);
-            qboolean stage0HasScale = (fabsf(scaleS - 1.0f) > 0.00001f || fabsf(scaleT - 1.0f) > 0.00001f);
-            /* Scroll wins over scale — Q3 killsky has both but scroll
-             * is the animation; scale is a one-time tile. The old
-             * logic unconditionally overrode scroll→scale whenever
-             * the scale wasn't 1.0, which is exactly the "if anything
-             * interesting happens, ruin it" bug. */
-            if (stage0HasScroll) {
-                stage0TcModType = 1;
-                stage0TcModParams[0] = s_pendingScrollS;
-                stage0TcModParams[1] = s_pendingScrollT;
-            } else if (stage0HasScale) {
-                stage0TcModType = 4;
-                stage0TcModParams[0] = scaleS;
-                stage0TcModParams[1] = scaleT;
-            } else {
-                stage0TcModType = 0;
-                stage0TcModParams[0] = 0.0f;
-                stage0TcModParams[1] = 0.0f;
-            }
-            hasSkyStage2 = ShaderMap_GetSecondStage(
-                shaders[shaderNum].shader,
-                skyStage2Map, sizeof(skyStage2Map),
-                &skyStage2BlendMode,
-                &skyStage2TcModParams[0], &skyStage2TcModParams[1],
-                &skyStage2TcModParams[2], &skyStage2TcModParams[3]);
-            if (hasSkyStage2) {
-                qboolean stage2HasScroll = (fabsf(skyStage2TcModParams[2]) > 0.00001f || fabsf(skyStage2TcModParams[3]) > 0.00001f);
-                qboolean stage2HasScale = (fabsf(skyStage2TcModParams[0] - 1.0f) > 0.00001f || fabsf(skyStage2TcModParams[1] - 1.0f) > 0.00001f);
-                /* Preserve raw values for diagnostic BEFORE branches mutate params[0][1]. */
-                float rawScaleS = skyStage2TcModParams[0];
-                float rawScaleT = skyStage2TcModParams[1];
-                float rawScrollS = skyStage2TcModParams[2];
-                float rawScrollT = skyStage2TcModParams[3];
-                stage2TextureHandle = RegisterTexture(skyStage2Map);
-                if (stage2HasScroll) {
-                    skyStage2TcModType = 1;
-                    skyStage2TcModParams[0] = skyStage2TcModParams[2];
-                    skyStage2TcModParams[1] = skyStage2TcModParams[3];
-                } else if (stage2HasScale) {
-                    skyStage2TcModType = 4;
-                    /* params[0][1] already hold scale; nothing to do. */
-                } else {
-                    skyStage2TcModType = 0;
-                    skyStage2TcModParams[0] = 0.0f;
-                    skyStage2TcModParams[1] = 0.0f;
-                }
-                ri.Printf(PRINT_DEVELOPER,
-                          "Metal sky tcMod: '%s' stage1 raw_scale=(%.3f,%.3f) raw_scroll=(%.3f,%.3f) resolved=type=%d,(%.3f,%.3f)\n",
-                          shaders[shaderNum].shader,
-                          rawScaleS, rawScaleT, rawScrollS, rawScrollT,
-                          skyStage2TcModType, skyStage2TcModParams[0], skyStage2TcModParams[1]);
-            }
-        }
         lightmapHandle = EnsureWhiteTexture();
         worldFlags = defaultWorldFlags;
         if (!IsSkyShaderName(shaders[shaderNum].shader) && lightmapNum >= 0 && lightmapNum < s_worldLightmapCount) {
-            lightmapHandle = s_worldLightmapHandles[lightmapNum];
-            hasLightmap = qtrue;
-            worldFlags |= Q3_METAL_WORLD_DRAWFLAG_LIGHTMAP_MULTIPLY;
+            const metalShaderMap_t *_le = ShaderMap_LookupEntry(shaders[shaderNum].shader);
+            qboolean wantLightmap = qfalse;
+            if (_le == NULL || _le->stageCount == 0) {
+                wantLightmap = qtrue;
+            } else {
+                int _ls;
+                for (_ls = 0; _ls < _le->stageCount; ++_ls) {
+                    if (_le->stages[_ls].useLightmap) {
+                        wantLightmap = qtrue;
+                        break;
+                    }
+                }
+            }
+            if (wantLightmap) {
+                lightmapHandle = s_worldLightmapHandles[lightmapNum];
+                hasLightmap = qtrue;
+                worldFlags |= Q3_METAL_WORLD_DRAWFLAG_LIGHTMAP_MULTIPLY;
+            }
         }
         if (IsSkyShaderName(shaders[shaderNum].shader)) {
-            /* Flag sky draws so the Swift side can route them through the
-             * sky pipeline (view-direction projection, no depth write).
-             * Must be set after LIGHTMAP_MULTIPLY gate above. */
             worldFlags |= Q3_METAL_WORLD_DRAWFLAG_SKY;
         }
 
@@ -1683,33 +1621,56 @@ static qboolean LoadWorldMapData(const char *name) {
                                        indexCountForDraw,
                                        hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
                                        worldFlags);
-                        AddWorldDrawStage(&s_world.draws[_dstIdx],
-                                          textureHandle,
-                                          stage0BlendMode,
-                                          stage0TcGenEnv,
-                                          stage0TcModType,
-                                          stage0TcModParams[0],
-                                          stage0TcModParams[1],
-                                          stage0TcModParams[2],
-                                          stage0TcModParams[3],
-                                          0,
-                                          stage0AlphaFunc);
                         if (s_world.animShaderSlots && s_pendingAnimSlot >= 0) {
                             s_world.animShaderSlots[_dstIdx] = s_pendingAnimSlot;
                             s_world.animatedDrawCount += 1;
                         }
-                        if (hasSkyStage2 && stage2TextureHandle != 0) {
-                            AddWorldDrawStage(&s_world.draws[_dstIdx],
-                                              stage2TextureHandle,
-                                              skyStage2BlendMode,
-                                              0,
-                                              skyStage2TcModType,
-                                              skyStage2TcModParams[0],
-                                              skyStage2TcModParams[1],
-                                              skyStage2TcModParams[2],
-                                              skyStage2TcModParams[3],
-                                              0,
-                                              0);
+                        {
+                            const metalShaderMap_t *_e = ShaderMap_LookupEntry(shaders[shaderNum].shader);
+                            int _s;
+                            if (_e != NULL && _e->stageCount > 0) {
+                                for (_s = 0; _s < _e->stageCount; ++_s) {
+                                    const Q3MetalStage *_st = &_e->stages[_s];
+                                    qhandle_t _tex;
+                                    if (_st->useLightmap) {
+                                        _tex = lightmapHandle;
+                                    } else if (_s == 0 && skyOverrideTexture != 0) {
+                                        _tex = skyOverrideTexture;
+                                    } else {
+                                        _tex = (_st->mapPath[0] != '\0') ? RegisterTexture(_st->mapPath) : 0;
+                                    }
+                                    if (_tex == 0) continue;
+                                    AddWorldDrawStage(&s_world.draws[_dstIdx],
+                                                      _tex,
+                                                      _st->blendMode,
+                                                      _st->tcGen,
+                                                      0,
+                                                      0.0f,
+                                                      0.0f,
+                                                      0.0f,
+                                                      0.0f,
+                                                      _st->rgbGen,
+                                                      _st->alphaFunc);
+                                }
+                            }
+                            if (_e == NULL || _e->stageCount == 0) {
+                                qhandle_t _tex = (skyOverrideTexture != 0)
+                                               ? skyOverrideTexture
+                                               : RegisterTexture(shaders[shaderNum].shader);
+                                if (_tex != 0) {
+                                    AddWorldDrawStage(&s_world.draws[_dstIdx],
+                                                      _tex,
+                                                      0,
+                                                      0,
+                                                      0,
+                                                      0.0f,
+                                                      0.0f,
+                                                      0.0f,
+                                                      0.0f,
+                                                      0,
+                                                      0);
+                                }
+                            }
                         }
                     }
                 }
@@ -1746,33 +1707,56 @@ static qboolean LoadWorldMapData(const char *name) {
                            indexCountForDraw,
                            hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
                            worldFlags);
-            AddWorldDrawStage(&s_world.draws[_dstIdx],
-                              textureHandle,
-                              stage0BlendMode,
-                              stage0TcGenEnv,
-                              stage0TcModType,
-                              stage0TcModParams[0],
-                              stage0TcModParams[1],
-                              stage0TcModParams[2],
-                              stage0TcModParams[3],
-                              0,
-                              stage0AlphaFunc);
             if (s_world.animShaderSlots && s_pendingAnimSlot >= 0) {
                 s_world.animShaderSlots[_dstIdx] = s_pendingAnimSlot;
                 s_world.animatedDrawCount += 1;
             }
-            if (hasSkyStage2 && stage2TextureHandle != 0) {
-                AddWorldDrawStage(&s_world.draws[_dstIdx],
-                                  stage2TextureHandle,
-                                  skyStage2BlendMode,
-                                  0,
-                                  skyStage2TcModType,
-                                  skyStage2TcModParams[0],
-                                  skyStage2TcModParams[1],
-                                  skyStage2TcModParams[2],
-                                  skyStage2TcModParams[3],
-                                  0,
-                                  0);
+            {
+                const metalShaderMap_t *_e = ShaderMap_LookupEntry(shaders[shaderNum].shader);
+                int _s;
+                if (_e != NULL && _e->stageCount > 0) {
+                    for (_s = 0; _s < _e->stageCount; ++_s) {
+                        const Q3MetalStage *_st = &_e->stages[_s];
+                        qhandle_t _tex;
+                        if (_st->useLightmap) {
+                            _tex = lightmapHandle;
+                        } else if (_s == 0 && skyOverrideTexture != 0) {
+                            _tex = skyOverrideTexture;
+                        } else {
+                            _tex = (_st->mapPath[0] != '\0') ? RegisterTexture(_st->mapPath) : 0;
+                        }
+                        if (_tex == 0) continue;
+                        AddWorldDrawStage(&s_world.draws[_dstIdx],
+                                          _tex,
+                                          _st->blendMode,
+                                          _st->tcGen,
+                                          0,
+                                          0.0f,
+                                          0.0f,
+                                          0.0f,
+                                          0.0f,
+                                          _st->rgbGen,
+                                          _st->alphaFunc);
+                    }
+                }
+                if (_e == NULL || _e->stageCount == 0) {
+                    qhandle_t _tex = (skyOverrideTexture != 0)
+                                   ? skyOverrideTexture
+                                   : RegisterTexture(shaders[shaderNum].shader);
+                    if (_tex != 0) {
+                        AddWorldDrawStage(&s_world.draws[_dstIdx],
+                                          _tex,
+                                          0,
+                                          0,
+                                          0,
+                                          0.0f,
+                                          0.0f,
+                                          0.0f,
+                                          0.0f,
+                                          0,
+                                          0);
+                    }
+                }
             }
         }
     }
@@ -1816,58 +1800,6 @@ static void RE_Shutdown(refShutdownCode_t code) {
  * Ignored: tcGen environment, animMap frame sequencing, blendFunc, tcMod — bind
  * at least one plausible texture so the geometry is visible instead of white.
  */
-#define MAX_SHADER_MAP_ENTRIES 4096
-#define METAL_ANIMMAP_MAX_FRAMES 16
-
-typedef struct {
-    char shaderName[128];
-    char mapPath[MAX_QPATH];
-    qboolean tcGenEnv;   /* any stage uses tcGen environment */
-    /* First stage's `tcMod scroll sx sy` values. Zero when absent.
-     * The Q3MetalWorldDrawUniforms shader already multiplies
-     * texCoordScroll by timeSeconds, so these flow directly into the
-     * per-draw uniform with no further math needed. */
-    float tcModScrollS;
-    float tcModScrollT;
-    float tcModScaleS;
-    float tcModScaleT;
-    /* tcMod turb (turbulence) — `tcMod turb <base> <amp> <phase> <freq>`.
-     * Q3 lava / water surfaces use it for the wobbly warp. Stored
-     * separately from scroll; stage1 resolution picks turb > scroll >
-     * scale as the visible tcMod type since turb produces the most
-     * recognizable "molten" look. Base is unused in our impl (stock
-     * Q3 folds it into the wave-table lookup offset). */
-    qboolean hasTurb;
-    float tcModTurbAmp;
-    float tcModTurbPhase;
-    float tcModTurbFreq;
-    /* blendFunc from first stage. 0=opaque, 1=additive (GL_ONE GL_ONE),
-     * 2=alpha-blend (GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA or 'blend'),
-     * 3=filter (GL_DST_COLOR GL_ZERO or 'filter'). */
-    int blendMode;
-    /* alphaFunc from first stage. 0=none, 1=GT0, 2=GE128, 3=LT128. */
-    int alphaFunc;
-    /* animMap support. framePaths[0] == mapPath. 0 frames = not animated. */
-    int animFrameCount;
-    float animFps;
-    char animFrames[METAL_ANIMMAP_MAX_FRAMES][MAX_QPATH];
-    qhandle_t animTextures[METAL_ANIMMAP_MAX_FRAMES]; /* lazy resolve */
-    /* skyparms support. `skyparms <basename> <cloudHeight> <nearbox>`
-     * declares a 6-sided skybox. We load six face textures from
-     *   <basename>_up|dn|ft|bk|lf|rt.(tga|jpg)
-     * and pick the right face per world sky surface based on the
-     * surface's dominant vertex normal direction. Empty skyBoxBase =
-     * not a skyparms shader (normal map). */
-    char skyBoxBase[MAX_QPATH];
-    qhandle_t skyFaceTextures[6]; /* up, dn, ft, bk, lf, rt (lazy) */
-    char stage2MapPath[MAX_QPATH];
-    int stage2BlendMode;
-    float stage2TcModScrollS;
-    float stage2TcModScrollT;
-    float stage2TcModScaleS;
-    float stage2TcModScaleT;
-} metalShaderMap_t;
-
 /* Sky face enumeration. Order matches Q3 convention. */
 #define METAL_SKY_FACE_UP 0
 #define METAL_SKY_FACE_DN 1
@@ -2173,6 +2105,8 @@ static void ShaderMap_Register(const char *name, const char *path, qboolean tcGe
     s_shaderMap[s_shaderMapCount].stage2TcModScaleT = 1.0f;
     s_shaderMap[s_shaderMapCount].animFrameCount = 0;
     s_shaderMap[s_shaderMapCount].animFps = 0.0f;
+    s_shaderMap[s_shaderMapCount].cullMode = METAL_SHADER_CULL_BACK;
+    s_shaderMap[s_shaderMapCount].stageCount = 0;
     s_shaderMapCount += 1;
 }
 
@@ -2200,6 +2134,8 @@ static void ShaderMap_RegisterAnimated(const char *name,
     s_shaderMap[s_shaderMapCount].stage2TcModScaleT = 1.0f;
     s_shaderMap[s_shaderMapCount].animFrameCount = maxFrames;
     s_shaderMap[s_shaderMapCount].animFps = (fps > 0.0f) ? fps : 8.0f;
+    s_shaderMap[s_shaderMapCount].cullMode = METAL_SHADER_CULL_BACK;
+    s_shaderMap[s_shaderMapCount].stageCount = 0;
     for (i = 0; i < maxFrames; ++i) {
         Q_strncpyz(s_shaderMap[s_shaderMapCount].animFrames[i], frames[i],
                    sizeof(s_shaderMap[0].animFrames[i]));
@@ -2214,37 +2150,20 @@ static void ParseShaderText(const char *text) {
 
     while (1) {
         char shaderName[128];
-        char firstMap[MAX_QPATH];
         char animFrames[METAL_ANIMMAP_MAX_FRAMES][MAX_QPATH];
         int animFrameCount;
         float animFps;
-        float tcScrollS;
-        float tcScrollT;
-        float tcScaleS;
-        float tcScaleT;
-        float tcTurbAmp;
-        float tcTurbPhase;
-        float tcTurbFreq;
-        qboolean gotTcScroll;
-        qboolean gotTcScale;
-        qboolean gotTcTurb;
-        char stage2Map[MAX_QPATH];
-        qboolean gotStage2Map;
-        float stage2ScrollS;
-        float stage2ScrollT;
-        float stage2ScaleS;
-        float stage2ScaleT;
-        qboolean gotStage2Scroll;
-        qboolean gotStage2Scale;
-        int stage2BlendMode;
         int depth;
         qboolean inStage;
-        int stageIndex;
-        qboolean gotMap;
         qboolean gotAnim;
         qboolean tcGenEnv;
+        int cullMode;
         char skyBoxBase[MAX_QPATH];
         qboolean gotSkyParms;
+        qboolean gotPortal;
+        Q3MetalStage cur;
+        Q3MetalStage stages[Q3_MAX_STAGES];
+        int stagesCount;
 
         token = COM_ParseExt(&p, qtrue);
         if (!token[0]) break;
@@ -2253,38 +2172,19 @@ static void ParseShaderText(const char *text) {
         token = COM_ParseExt(&p, qtrue);
         if (token[0] != '{') continue;
 
-        firstMap[0] = '\0';
         animFrameCount = 0;
         animFps = 0.0f;
-        tcScrollS = 0.0f;
-        tcScrollT = 0.0f;
-        tcScaleS = 1.0f;
-        tcScaleT = 1.0f;
-        tcTurbAmp = 0.0f;
-        tcTurbPhase = 0.0f;
-        tcTurbFreq = 0.0f;
-        gotTcScroll = qfalse;
-        gotTcScale = qfalse;
-        gotTcTurb = qfalse;
-        stage2Map[0] = '\0';
-        gotStage2Map = qfalse;
-        stage2ScrollS = 0.0f;
-        stage2ScrollT = 0.0f;
-        stage2ScaleS = 1.0f;
-        stage2ScaleT = 1.0f;
-        gotStage2Scroll = qfalse;
-        gotStage2Scale = qfalse;
-        stage2BlendMode = 0;
         depth = 1;
         inStage = qfalse;
-        stageIndex = 0;
-        gotMap = qfalse;
         gotAnim = qfalse;
         tcGenEnv = qfalse;
+        cullMode = METAL_SHADER_CULL_BACK;
         skyBoxBase[0] = '\0';
         gotSkyParms = qfalse;
-        s_pendingBlendMode = 0;
-        s_pendingAlphaFunc = 0;
+        gotPortal = qfalse;
+        Com_Memset(&cur, 0, sizeof(cur));
+        Com_Memset(stages, 0, sizeof(stages));
+        stagesCount = 0;
 
         while (depth > 0) {
             token = COM_ParseExt(&p, qtrue);
@@ -2293,8 +2193,8 @@ static void ParseShaderText(const char *text) {
             if (token[0] == '{' && token[1] == '\0') {
                 depth += 1;
                 if (depth == 2) {
-                    stageIndex += 1;
                     inStage = qtrue;
+                    Com_Memset(&cur, 0, sizeof(cur));
                 }
                 continue;
             }
@@ -2302,56 +2202,64 @@ static void ParseShaderText(const char *text) {
                 depth -= 1;
                 if (depth <= 1) {
                     inStage = qfalse;
+                    if (cur.useLightmap && cur.blendMode == 0) {
+                        cur.blendMode = 3;
+                    }
+                    if (stagesCount < Q3_MAX_STAGES) {
+                        stages[stagesCount++] = cur;
+                    }
                 }
                 continue;
             }
 
-            /* Top-level directives (outside any stage block). `skyparms`
-             * is the most important one for us — declares the 6-face
-             * skybox basename that the world rendering will use per
-             * sky surface. */
             if (!inStage) {
                 if (!gotSkyParms && !Q_stricmp(token, "skyparms")) {
-                    /* skyparms <farbox> <cloudHeight> <nearbox>
-                     * `-` means "no farbox / nearbox"; take it as empty. */
                     token = COM_ParseExt(&p, qfalse);
                     if (token[0] && Q_stricmp(token, "-") != 0) {
                         Q_strncpyz(skyBoxBase, token, sizeof(skyBoxBase));
                         gotSkyParms = qtrue;
                     }
-                    /* Ignore the remaining two args. */
+                } else if (!gotPortal && !Q_stricmp(token, "portal")) {
+                    gotPortal = qtrue;
+                } else if (!Q_stricmp(token, "cull")) {
+                    token = COM_ParseExt(&p, qfalse);
+                    if (token[0] &&
+                        (!Q_stricmp(token, "disable") ||
+                         !Q_stricmp(token, "twosided") ||
+                         !Q_stricmp(token, "none"))) {
+                        cullMode = METAL_SHADER_CULL_DISABLE;
+                    } else if (token[0] && !Q_stricmp(token, "front")) {
+                        cullMode = METAL_SHADER_CULL_FRONT;
+                    } else {
+                        cullMode = METAL_SHADER_CULL_BACK;
+                    }
                 }
                 continue;
             }
 
-            if (inStage) {
-                if (!gotMap && !gotAnim && (!Q_stricmp(token, "map") || !Q_stricmp(token, "clampmap"))) {
+            {
+                if (!Q_stricmp(token, "map") || !Q_stricmp(token, "clampmap")) {
                     token = COM_ParseExt(&p, qfalse);
-                    if (token[0] && token[0] != '$') {
-                        Q_strncpyz(firstMap, token, sizeof(firstMap));
-                        gotMap = qtrue;
+                    if (token[0]) {
+                        if (!Q_stricmp(token, "$lightmap")) {
+                            cur.useLightmap = 1;
+                        } else if (cur.mapPath[0] == '\0') {
+                            Q_strncpyz(cur.mapPath, token, sizeof(cur.mapPath));
+                        }
                     }
-                } else if (stageIndex == 2 && !gotStage2Map &&
-                           (!Q_stricmp(token, "map") || !Q_stricmp(token, "clampmap"))) {
-                    token = COM_ParseExt(&p, qfalse);
-                    if (token[0] && token[0] != '$') {
-                        Q_strncpyz(stage2Map, token, sizeof(stage2Map));
-                        gotStage2Map = qtrue;
-                    }
-                } else if (!gotMap && !gotAnim && !Q_stricmp(token, "animmap")) {
-                    /* animMap <fps> <frame1> <frame2> ... up to end of line. */
+                } else if (!Q_stricmp(token, "animMap") || !Q_stricmp(token, "animmap")) {
                     token = COM_ParseExt(&p, qfalse);
                     animFps = (float)atof(token);
                     while (1) {
                         token = COM_ParseExt(&p, qfalse);
-                        if (!token[0]) break; /* end of line */
+                        if (!token[0]) break;
                         if (token[0] == '$') continue;
                         if (animFrameCount >= METAL_ANIMMAP_MAX_FRAMES) continue;
                         Q_strncpyz(animFrames[animFrameCount], token, MAX_QPATH);
                         animFrameCount += 1;
                     }
                     if (animFrameCount > 0) {
-                        Q_strncpyz(firstMap, animFrames[0], sizeof(firstMap));
+                        Q_strncpyz(cur.mapPath, animFrames[0], sizeof(cur.mapPath));
                         gotAnim = qtrue;
                     }
                 } else if (!Q_stricmp(token, "tcGen") || !Q_stricmp(token, "tcgen")) {
@@ -2360,162 +2268,201 @@ static void ParseShaderText(const char *text) {
                                      !Q_stricmp(token, "env"))) {
                         tcGenEnv = qtrue;
                     }
-                } else if (stageIndex == 1 && (!Q_stricmp(token, "blendFunc") || !Q_stricmp(token, "blendfunc"))) {
-                    /* Capture the first stage's blendFunc. Common combos:
-                     *   GL_ONE GL_ONE          → additive (flames, glow)
-                     *   GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA → alpha blend
-                     *   GL_DST_COLOR GL_ZERO   → filter (lightmap multiply)
-                     *   add / blend / filter    → shorthand names
-                     * We only store a coarse category (additive vs alpha
-                     * vs filter vs opaque) and skip uncommon combos. */
+                } else if (!Q_stricmp(token, "blendFunc") || !Q_stricmp(token, "blendfunc")) {
                     const char *src = COM_ParseExt(&p, qfalse);
                     const char *dst = COM_ParseExt(&p, qfalse);
                     if (src[0]) {
-                        s_pendingBlendMode = BlendModeFromTokens(src, dst);
+                        cur.blendMode = BlendModeFromTokens(src, dst);
                     }
-                } else if (stageIndex == 2 && (!Q_stricmp(token, "blendFunc") || !Q_stricmp(token, "blendfunc"))) {
-                    const char *src = COM_ParseExt(&p, qfalse);
-                    const char *dst = COM_ParseExt(&p, qfalse);
-                    if (src[0]) {
-                        stage2BlendMode = BlendModeFromTokens(src, dst);
-                    }
-                } else if (stageIndex == 1 && (!Q_stricmp(token, "alphaFunc") || !Q_stricmp(token, "alphafunc"))) {
+                } else if (!Q_stricmp(token, "alphaFunc") || !Q_stricmp(token, "alphafunc")) {
                     token = COM_ParseExt(&p, qfalse);
-                    if (!Q_stricmp(token, "GT0")) {
-                        s_pendingAlphaFunc = 1;
-                    } else if (!Q_stricmp(token, "GE128")) {
-                        s_pendingAlphaFunc = 2;
-                    } else if (!Q_stricmp(token, "LT128")) {
-                        s_pendingAlphaFunc = 3;
+                    if (!Q_stricmp(token, "GT0")) cur.alphaFunc = 1;
+                    else if (!Q_stricmp(token, "GE128")) cur.alphaFunc = 2;
+                    else if (!Q_stricmp(token, "LT128")) cur.alphaFunc = 3;
+                } else if (!Q_stricmp(token, "rgbGen") || !Q_stricmp(token, "rgbgen")) {
+                    token = COM_ParseExt(&p, qfalse);
+                    if (!Q_stricmp(token, "vertex")) cur.rgbGen = 1;
+                    else if (!Q_stricmp(token, "lightingDiffuse") ||
+                             !Q_stricmp(token, "lightingdiffuse")) cur.rgbGen = 2;
+                    else if (!Q_stricmp(token, "wave")) cur.rgbGen = 3;
+                    else cur.rgbGen = 0;
+                    if (!Q_stricmp(token, "wave")) {
+                        const char *funcTok = COM_ParseExt(&p, qfalse);
+                        const char *baseTok = COM_ParseExt(&p, qfalse);
+                        const char *ampTok = COM_ParseExt(&p, qfalse);
+                        const char *phaseTok = COM_ParseExt(&p, qfalse);
+                        const char *freqTok = COM_ParseExt(&p, qfalse);
+                        if (funcTok[0]) {
+                            if (!Q_stricmp(funcTok, "sin")) cur.rgbWaveFunc = 1;
+                            else if (!Q_stricmp(funcTok, "triangle")) cur.rgbWaveFunc = 2;
+                            else if (!Q_stricmp(funcTok, "square")) cur.rgbWaveFunc = 3;
+                            else if (!Q_stricmp(funcTok, "sawtooth")) cur.rgbWaveFunc = 4;
+                            else if (!Q_stricmp(funcTok, "inversesawtooth") ||
+                                     !Q_stricmp(funcTok, "inverseSawtooth")) cur.rgbWaveFunc = 5;
+                            else if (!Q_stricmp(funcTok, "noise")) cur.rgbWaveFunc = 6;
+                            else cur.rgbWaveFunc = 1;
+                        }
+                        if (baseTok[0]) cur.rgbWaveBase = (float)atof(baseTok);
+                        if (ampTok[0]) cur.rgbWaveAmp = (float)atof(ampTok);
+                        if (phaseTok[0]) cur.rgbWavePhase = (float)atof(phaseTok);
+                        if (freqTok[0]) cur.rgbWaveFreq = (float)atof(freqTok);
+                    } else if (!Q_stricmp(token, "const") ||
+                               !Q_stricmp(token, "exactVertex") ||
+                               !Q_stricmp(token, "exactvertex")) {
+                        (void)COM_ParseExt(&p, qfalse);
+                        (void)COM_ParseExt(&p, qfalse);
+                        (void)COM_ParseExt(&p, qfalse);
+                        (void)COM_ParseExt(&p, qfalse);
+                        (void)COM_ParseExt(&p, qfalse);
                     }
-                } else if (stageIndex == 1 && (!Q_stricmp(token, "tcMod") || !Q_stricmp(token, "tcmod"))) {
-                    /* Capture first-stage tcMod directives. Q3 stages
-                     * frequently stack multiple tcMods (e.g. lava has
-                     * both `tcMod turb …` AND `tcMod scroll …` on the
-                     * same stage). All three are captured independently;
-                     * the draw-setup site later picks a visible mod in
-                     * preference order turb > scroll > scale. Unhandled
-                     * variants (rotate, stretch, transform) must still
-                     * consume their params so the outer parse loop
-                     * doesn't then treat float tokens as keywords. */
+                } else if (!Q_stricmp(token, "alphaGen") || !Q_stricmp(token, "alphagen")) {
+                    token = COM_ParseExt(&p, qfalse);
+                    if (!Q_stricmp(token, "vertex")) cur.alphaGen = 1;
+                    else if (!Q_stricmp(token, "wave")) cur.alphaGen = 3;
+                    else cur.alphaGen = 0;
+                    if (!Q_stricmp(token, "wave")) {
+                        const char *funcTok = COM_ParseExt(&p, qfalse);
+                        const char *baseTok = COM_ParseExt(&p, qfalse);
+                        const char *ampTok = COM_ParseExt(&p, qfalse);
+                        const char *phaseTok = COM_ParseExt(&p, qfalse);
+                        const char *freqTok = COM_ParseExt(&p, qfalse);
+                        if (funcTok[0]) {
+                            if (!Q_stricmp(funcTok, "sin")) cur.alphaWaveFunc = 1;
+                            else if (!Q_stricmp(funcTok, "triangle")) cur.alphaWaveFunc = 2;
+                            else if (!Q_stricmp(funcTok, "square")) cur.alphaWaveFunc = 3;
+                            else if (!Q_stricmp(funcTok, "sawtooth")) cur.alphaWaveFunc = 4;
+                            else if (!Q_stricmp(funcTok, "inversesawtooth") ||
+                                     !Q_stricmp(funcTok, "inverseSawtooth")) cur.alphaWaveFunc = 5;
+                            else if (!Q_stricmp(funcTok, "noise")) cur.alphaWaveFunc = 6;
+                            else cur.alphaWaveFunc = 1;
+                        }
+                        if (baseTok[0]) cur.alphaWaveBase = (float)atof(baseTok);
+                        if (ampTok[0]) cur.alphaWaveAmp = (float)atof(ampTok);
+                        if (phaseTok[0]) cur.alphaWavePhase = (float)atof(phaseTok);
+                        if (freqTok[0]) cur.alphaWaveFreq = (float)atof(freqTok);
+                    } else if (!Q_stricmp(token, "const")) {
+                        (void)COM_ParseExt(&p, qfalse);
+                    } else if (!Q_stricmp(token, "portal")) {
+                        (void)COM_ParseExt(&p, qfalse);
+                    }
+                } else if (!Q_stricmp(token, "tcMod") || !Q_stricmp(token, "tcmod")) {
                     token = COM_ParseExt(&p, qfalse);
                     if (token[0] && !Q_stricmp(token, "scroll")) {
                         const char *sTok = COM_ParseExt(&p, qfalse);
                         const char *tTok = COM_ParseExt(&p, qfalse);
-                        if (sTok[0] && tTok[0]) {
-                            tcScrollS = (float)atof(sTok);
-                            tcScrollT = (float)atof(tTok);
-                            gotTcScroll = qtrue;
+                        if (sTok[0] && tTok[0] && cur.tcModCount < Q3_MAX_TCMODS) {
+                            cur.tcMods[cur.tcModCount].type = 1;
+                            cur.tcMods[cur.tcModCount].params[0] = (float)atof(sTok);
+                            cur.tcMods[cur.tcModCount].params[1] = (float)atof(tTok);
+                            cur.tcMods[cur.tcModCount].params[2] = 0.0f;
+                            cur.tcMods[cur.tcModCount].params[3] = 0.0f;
+                            cur.tcModCount += 1;
                         }
                     } else if (token[0] && !Q_stricmp(token, "scale")) {
                         const char *sTok = COM_ParseExt(&p, qfalse);
                         const char *tTok = COM_ParseExt(&p, qfalse);
-                        if (sTok[0] && tTok[0]) {
-                            tcScaleS = (float)atof(sTok);
-                            tcScaleT = (float)atof(tTok);
-                            gotTcScale = qtrue;
+                        if (sTok[0] && tTok[0] && cur.tcModCount < Q3_MAX_TCMODS) {
+                            cur.tcMods[cur.tcModCount].type = 4;
+                            cur.tcMods[cur.tcModCount].params[0] = (float)atof(sTok);
+                            cur.tcMods[cur.tcModCount].params[1] = (float)atof(tTok);
+                            cur.tcMods[cur.tcModCount].params[2] = 0.0f;
+                            cur.tcMods[cur.tcModCount].params[3] = 0.0f;
+                            cur.tcModCount += 1;
                         }
                     } else if (token[0] && !Q_stricmp(token, "turb")) {
-                        /* Stock Q3: `tcMod turb <base> <amp> <phase> <freq>`.
-                         * <base> is an unused legacy offset into the
-                         * sin-wave table. We consume but ignore it. */
                         const char *baseTok = COM_ParseExt(&p, qfalse);
                         const char *ampTok = COM_ParseExt(&p, qfalse);
                         const char *phaseTok = COM_ParseExt(&p, qfalse);
                         const char *freqTok = COM_ParseExt(&p, qfalse);
                         (void)baseTok;
-                        if (ampTok[0] && phaseTok[0] && freqTok[0]) {
-                            tcTurbAmp = (float)atof(ampTok);
-                            tcTurbPhase = (float)atof(phaseTok);
-                            tcTurbFreq = (float)atof(freqTok);
-                            gotTcTurb = qtrue;
+                        if (ampTok[0] && phaseTok[0] && freqTok[0] && cur.tcModCount < Q3_MAX_TCMODS) {
+                            cur.tcMods[cur.tcModCount].type = 5;
+                            cur.tcMods[cur.tcModCount].params[0] = (float)atof(ampTok);
+                            cur.tcMods[cur.tcModCount].params[1] = (float)atof(freqTok);
+                            cur.tcMods[cur.tcModCount].params[2] = (float)atof(phaseTok);
+                            cur.tcMods[cur.tcModCount].params[3] = 0.0f;
+                            cur.tcModCount += 1;
                         }
                     } else if (token[0] && !Q_stricmp(token, "rotate")) {
-                        COM_ParseExt(&p, qfalse); /* swallow 1 param */
+                        const char *speedTok = COM_ParseExt(&p, qfalse);
+                        if (speedTok[0] && cur.tcModCount < Q3_MAX_TCMODS) {
+                            cur.tcMods[cur.tcModCount].type = 3;
+                            cur.tcMods[cur.tcModCount].params[0] = (float)atof(speedTok);
+                            cur.tcMods[cur.tcModCount].params[1] = 0.0f;
+                            cur.tcMods[cur.tcModCount].params[2] = 0.0f;
+                            cur.tcMods[cur.tcModCount].params[3] = 0.0f;
+                            cur.tcModCount += 1;
+                        }
                     } else if (token[0] && !Q_stricmp(token, "stretch")) {
-                        COM_ParseExt(&p, qfalse); /* swallow 4 params */
+                        COM_ParseExt(&p, qfalse);
                         COM_ParseExt(&p, qfalse);
                         COM_ParseExt(&p, qfalse);
                         COM_ParseExt(&p, qfalse);
                     } else if (token[0] && !Q_stricmp(token, "transform")) {
-                        COM_ParseExt(&p, qfalse); /* 6 params */
                         COM_ParseExt(&p, qfalse);
                         COM_ParseExt(&p, qfalse);
                         COM_ParseExt(&p, qfalse);
                         COM_ParseExt(&p, qfalse);
                         COM_ParseExt(&p, qfalse);
-                    }
-                } else if (stageIndex == 2 && (!Q_stricmp(token, "tcMod") || !Q_stricmp(token, "tcmod"))) {
-                    token = COM_ParseExt(&p, qfalse);
-                    if (token[0] && !Q_stricmp(token, "scroll")) {
-                        const char *sTok = COM_ParseExt(&p, qfalse);
-                        const char *tTok = COM_ParseExt(&p, qfalse);
-                        if (sTok[0] && tTok[0]) {
-                            stage2ScrollS = (float)atof(sTok);
-                            stage2ScrollT = (float)atof(tTok);
-                            gotStage2Scroll = qtrue;
-                        }
-                    } else if (token[0] && !Q_stricmp(token, "scale")) {
-                        const char *sTok = COM_ParseExt(&p, qfalse);
-                        const char *tTok = COM_ParseExt(&p, qfalse);
-                        if (sTok[0] && tTok[0]) {
-                            stage2ScaleS = (float)atof(sTok);
-                            stage2ScaleT = (float)atof(tTok);
-                            gotStage2Scale = qtrue;
-                        }
                     }
                 }
             }
         }
 
-        if (gotAnim) {
-            ShaderMap_RegisterAnimated(shaderName, animFrames, animFrameCount, animFps, tcGenEnv);
-        } else if (gotMap) {
-            ShaderMap_Register(shaderName, firstMap, tcGenEnv);
-        } else if (gotSkyParms) {
-            /* Sky-only shader (no renderable map stage). Register a
-             * placeholder so the lookup succeeds and the skyparms
-             * back-patch below has a slot to attach to. */
-            ShaderMap_Register(shaderName, "", qfalse);
+        {
+            char shaderMapPath[MAX_QPATH];
+            int s;
+            shaderMapPath[0] = '\0';
+            for (s = 0; s < stagesCount; ++s) {
+                if (stages[s].mapPath[0] != '\0' && !stages[s].useLightmap) {
+                    Q_strncpyz(shaderMapPath, stages[s].mapPath, sizeof(shaderMapPath));
+                    break;
+                }
+            }
+            if (gotAnim && animFrameCount > 0) {
+                ShaderMap_RegisterAnimated(shaderName, animFrames, animFrameCount, animFps, tcGenEnv);
+            } else {
+                ShaderMap_Register(shaderName, shaderMapPath, tcGenEnv);
+            }
         }
-        /* Back-patch tcMod scroll and skyparms onto the just-registered
-         * entry. Deferred so the Register call chooses the slot. */
-        if ((gotAnim || gotMap || gotSkyParms) && s_shaderMapCount > 0) {
+
+        if (s_shaderMapCount > 0) {
             metalShaderMap_t *last = &s_shaderMap[s_shaderMapCount - 1];
             if (!Q_stricmp(last->shaderName, shaderName)) {
-                if (gotTcScroll) {
-                    last->tcModScrollS = tcScrollS;
-                    last->tcModScrollT = tcScrollT;
+                int s;
+                Com_Memset(last->stages, 0, sizeof(last->stages));
+                for (s = 0; s < Q3_MAX_STAGES; ++s) {
+                    last->stages[s] = stages[s];
                 }
-                if (gotTcScale) {
-                    last->tcModScaleS = tcScaleS;
-                    last->tcModScaleT = tcScaleT;
-                }
-                if (gotTcTurb) {
-                    last->hasTurb = qtrue;
-                    last->tcModTurbAmp = tcTurbAmp;
-                    last->tcModTurbPhase = tcTurbPhase;
-                    last->tcModTurbFreq = tcTurbFreq;
-                }
-                if (s_pendingBlendMode != 0) {
-                    last->blendMode = s_pendingBlendMode;
-                }
-                if (s_pendingAlphaFunc != 0) {
-                    last->alphaFunc = s_pendingAlphaFunc;
-                }
+                last->stageCount = stagesCount;
+                last->cullMode = cullMode;
+                last->isPortal = gotPortal;
                 if (gotSkyParms) {
                     Q_strncpyz(last->skyBoxBase, skyBoxBase, sizeof(last->skyBoxBase));
                 }
-                if (gotStage2Map) {
-                    Q_strncpyz(last->stage2MapPath, stage2Map, sizeof(last->stage2MapPath));
-                    last->stage2BlendMode = stage2BlendMode;
-                    if (gotStage2Scroll) {
-                        last->stage2TcModScrollS = stage2ScrollS;
-                        last->stage2TcModScrollT = stage2ScrollT;
-                    }
-                    if (gotStage2Scale) {
-                        last->stage2TcModScaleS = stage2ScaleS;
-                        last->stage2TcModScaleT = stage2ScaleT;
+                if (stagesCount > 0) {
+                    int m;
+                    last->blendMode = stages[0].blendMode;
+                    last->alphaFunc = stages[0].alphaFunc;
+                    last->tcModScrollS = 0.0f;
+                    last->tcModScrollT = 0.0f;
+                    last->tcModScaleS = 1.0f;
+                    last->tcModScaleT = 1.0f;
+                    last->hasTurb = qfalse;
+                    for (m = 0; m < stages[0].tcModCount; ++m) {
+                        const Q3TcMod *mod = &stages[0].tcMods[m];
+                        if (mod->type == 1) {
+                            last->tcModScrollS = mod->params[0];
+                            last->tcModScrollT = mod->params[1];
+                        } else if (mod->type == 4) {
+                            last->tcModScaleS = mod->params[0];
+                            last->tcModScaleT = mod->params[1];
+                        } else if (mod->type == 5) {
+                            last->hasTurb = qtrue;
+                            last->tcModTurbAmp = mod->params[0];
+                            last->tcModTurbFreq = mod->params[1];
+                            last->tcModTurbPhase = mod->params[2];
+                        }
                     }
                 }
             }
