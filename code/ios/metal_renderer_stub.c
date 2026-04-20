@@ -2185,6 +2185,16 @@ static qhandle_t ShaderMap_AnimatedSlotCurrentHandle(int slot) {
 static void ShaderMap_Register(const char *name, const char *path, qboolean tcGenEnv) {
     if (s_shaderMapCount >= MAX_SHADER_MAP_ENTRIES) return;
     if (ShaderMap_Lookup(name) != NULL) return; /* first wins */
+    if (name && (strstr(name, "border11c") || strstr(name, "killblock_i4b") ||
+                 strstr(name, "xmetalfloor_wall_5b"))) {
+        size_t nlen = strlen(name);
+        ri.Printf(PRINT_ALL, "[SHADER-REG] name=[%s] len=%zu last3bytes=%02x,%02x,%02x path=[%s]\n",
+            name, nlen,
+            (nlen >= 3) ? (unsigned char)name[nlen-3] : 0,
+            (nlen >= 2) ? (unsigned char)name[nlen-2] : 0,
+            (nlen >= 1) ? (unsigned char)name[nlen-1] : 0,
+            path ? path : "(null)");
+    }
     Q_strncpyz(s_shaderMap[s_shaderMapCount].shaderName, name,
         sizeof(s_shaderMap[0].shaderName));
     Q_strncpyz(s_shaderMap[s_shaderMapCount].mapPath, path,
@@ -2533,13 +2543,12 @@ static void ParseShaderText(const char *text) {
                 last->isPortal = gotPortal;
 
                 /* Diagnostic: dump full parse state for shaders we know
-                 * are falling back to white. Lets us see if the issue is
-                 * (a) the shader never reached here, (b) stageCount==0,
-                 * (c) stages[0].mapPath is empty, or (d) stages[0].mapPath
-                 * is correct and the miss lives in RegisterTexture. */
-                if (!Q_stricmp(shaderName, "textures/sfx/border11c") ||
-                    !Q_stricmp(shaderName, "textures/sfx/xmetalfloor_wall_5b") ||
-                    !Q_stricmp(shaderName, "textures/gothic_block/killblock_i4b")) {
+                 * are falling back to white. Substring match tolerates
+                 * stray trailing chars (\r, \t, spaces) that would break
+                 * an exact Q_stricmp comparison. */
+                if (strstr(shaderName, "border11c") ||
+                    strstr(shaderName, "xmetalfloor_wall_5b") ||
+                    strstr(shaderName, "killblock_i4b")) {
                     int ds;
                     ri.Printf(PRINT_ALL,
                         "[SHADER-DBG] registered '%s' stageCount=%d mapPath='%s' cull=%d portal=%d\n",
