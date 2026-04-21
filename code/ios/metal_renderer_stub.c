@@ -3255,10 +3255,30 @@ static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime
         s_entityAcceptedThisFrame += 1;
         return;
     }
+    /* RT_RAIL_CORE: the main rail gun beam — single view-aligned quad
+     * between origin and oldorigin. Essentially the same as RT_LIGHTNING
+     * but with r_railCoreWidth (Q3 default = 16). */
+    if (re->reType == RT_RAIL_CORE) {
+        AuditOnce("ENTITY:RT_RAIL_CORE");
+        s_sceneEntities[s_sceneEntityCount].entity = *re;
+        s_sceneEntities[s_sceneEntityCount].mirrored = qfalse;
+        s_sceneEntityCount += 1;
+        s_entityAcceptedThisFrame += 1;
+        return;
+    }
+    /* RT_RAIL_RINGS: the spiraling rings around the rail beam. Q3 emits
+     * 4 rotated quads per segment; we emit one simplified quad per
+     * segment with the ring texture (customShader) for MVP. */
+    if (re->reType == RT_RAIL_RINGS) {
+        AuditOnce("ENTITY:RT_RAIL_RINGS");
+        s_sceneEntities[s_sceneEntityCount].entity = *re;
+        s_sceneEntities[s_sceneEntityCount].mirrored = qfalse;
+        s_sceneEntityCount += 1;
+        s_entityAcceptedThisFrame += 1;
+        return;
+    }
     if (re->reType != RT_MODEL) {
         if (re->reType == RT_BEAM) AuditOnce("ENTITY:RT_BEAM");
-        else if (re->reType == RT_RAIL_CORE) AuditOnce("ENTITY:RT_RAIL_CORE");
-        else if (re->reType == RT_RAIL_RINGS) AuditOnce("ENTITY:RT_RAIL_RINGS");
         else if (re->reType == RT_PORTALSURFACE) AuditOnce("ENTITY:RT_PORTALSURFACE");
         else AuditOnce("ENTITY:reType unknown");
         s_entityRejectedTypeThisFrame += 1;
@@ -3770,6 +3790,20 @@ static void RE_RenderScene(const refdef_t *fd) {
                 totalEntityDraws += 1;
                 continue;
             }
+            /* Rail core: single view-aligned quad like lightning. */
+            if (sceneEntity->entity.reType == RT_RAIL_CORE) {
+                totalEntityVerts += 4;
+                totalEntityIndices += 6;
+                totalEntityDraws += 1;
+                continue;
+            }
+            /* Rail rings: up to 32 segments × 4 verts each, 1 draw. */
+            if (sceneEntity->entity.reType == RT_RAIL_RINGS) {
+                totalEntityVerts += 32 * 4;
+                totalEntityIndices += 32 * 6;
+                totalEntityDraws += 1;
+                continue;
+            }
 
             model = FindModelByHandle(sceneEntity->entity.hModel);
             if (model == NULL || model->md3 == NULL) {
@@ -4016,6 +4050,207 @@ static void RE_RenderScene(const refdef_t *fd) {
                      * (lightningBolt shader uses GL_ONE GL_ONE) — force
                      * the additive pipeline + no-cull so the beam is
                      * visible from both sides and blends over the world. */
+                    s_entityDraws[entityDrawCursor].flags =
+                        Q3_METAL_ENTITY_DRAWFLAG_NOCULL |
+                        Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                    entityDrawCursor += 1;
+                    continue;
+                }
+
+                /* RT_RAIL_CORE: identical geometry to lightning, just wider.
+                 * Q3's r_railCoreWidth defaults to 16 (vs lightning's 8). */
+                if (sceneEntity->entity.reType == RT_RAIL_CORE) {
+                    uint32_t baseVertex = entityVertexCursor;
+                    uint32_t firstIndex = entityIndexCursor;
+                    const float *start = sceneEntity->entity.origin;
+                    const float *end = sceneEntity->entity.oldorigin;
+                    vec3_t beamDir, v1, v2, right;
+                    vec3_t c0, c1, c2, c3;
+                    float len, t;
+                    float r, g, b, a;
+                    const float spanWidth = 16.0f;
+                    int i;
+
+                    VectorSubtract(end, start, beamDir);
+                    len = VectorLength(beamDir);
+                    if (len < 1.0f) continue;
+                    t = len / 256.0f;
+
+                    VectorSubtract(start, vieworg, v1); VectorNormalize(v1);
+                    VectorSubtract(end, vieworg, v2);   VectorNormalize(v2);
+                    CrossProduct(v1, v2, right);
+                    if (VectorLength(right) < 1e-4f) VectorCopy(axis2, right);
+                    VectorNormalize(right);
+                    VectorScale(right, spanWidth, right);
+
+                    VectorAdd(start, right, c0);
+                    VectorSubtract(start, right, c1);
+                    VectorAdd(end, right, c2);
+                    VectorSubtract(end, right, c3);
+
+                    r = (float)sceneEntity->entity.shader.rgba[0] / 255.0f;
+                    g = (float)sceneEntity->entity.shader.rgba[1] / 255.0f;
+                    b = (float)sceneEntity->entity.shader.rgba[2] / 255.0f;
+                    a = (float)sceneEntity->entity.shader.rgba[3] / 255.0f;
+                    if (a < 0.01f) a = 1.0f;
+
+                    s_entityVertices[baseVertex + 0].position[0] = c0[0];
+                    s_entityVertices[baseVertex + 0].position[1] = c0[1];
+                    s_entityVertices[baseVertex + 0].position[2] = c0[2];
+                    s_entityVertices[baseVertex + 0].texCoord[0] = 0.0f;
+                    s_entityVertices[baseVertex + 0].texCoord[1] = 0.0f;
+                    s_entityVertices[baseVertex + 1].position[0] = c1[0];
+                    s_entityVertices[baseVertex + 1].position[1] = c1[1];
+                    s_entityVertices[baseVertex + 1].position[2] = c1[2];
+                    s_entityVertices[baseVertex + 1].texCoord[0] = 0.0f;
+                    s_entityVertices[baseVertex + 1].texCoord[1] = 1.0f;
+                    s_entityVertices[baseVertex + 2].position[0] = c2[0];
+                    s_entityVertices[baseVertex + 2].position[1] = c2[1];
+                    s_entityVertices[baseVertex + 2].position[2] = c2[2];
+                    s_entityVertices[baseVertex + 2].texCoord[0] = t;
+                    s_entityVertices[baseVertex + 2].texCoord[1] = 0.0f;
+                    s_entityVertices[baseVertex + 3].position[0] = c3[0];
+                    s_entityVertices[baseVertex + 3].position[1] = c3[1];
+                    s_entityVertices[baseVertex + 3].position[2] = c3[2];
+                    s_entityVertices[baseVertex + 3].texCoord[0] = t;
+                    s_entityVertices[baseVertex + 3].texCoord[1] = 1.0f;
+                    for (i = 0; i < 4; ++i) {
+                        s_entityVertices[baseVertex + i].color[0] = r;
+                        s_entityVertices[baseVertex + i].color[1] = g;
+                        s_entityVertices[baseVertex + i].color[2] = b;
+                        s_entityVertices[baseVertex + i].color[3] = a;
+                    }
+                    s_entityIndices[entityIndexCursor + 0] = baseVertex + 0;
+                    s_entityIndices[entityIndexCursor + 1] = baseVertex + 1;
+                    s_entityIndices[entityIndexCursor + 2] = baseVertex + 2;
+                    s_entityIndices[entityIndexCursor + 3] = baseVertex + 2;
+                    s_entityIndices[entityIndexCursor + 4] = baseVertex + 1;
+                    s_entityIndices[entityIndexCursor + 5] = baseVertex + 3;
+                    entityVertexCursor += 4;
+                    entityIndexCursor += 6;
+
+                    s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
+                    s_entityDraws[entityDrawCursor].indexCount = 6;
+                    s_entityDraws[entityDrawCursor].textureHandle =
+                        (uint32_t)sceneEntity->entity.customShader;
+                    s_entityDraws[entityDrawCursor].flags =
+                        Q3_METAL_ENTITY_DRAWFLAG_NOCULL |
+                        Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                    entityDrawCursor += 1;
+                    continue;
+                }
+
+                /* RT_RAIL_RINGS: series of small billboard quads placed
+                 * every r_railSegmentLength units along the beam. Stock
+                 * Q3 draws 4 rotated quads per segment for a spiral
+                 * effect; we emit a single view-aligned quad per segment
+                 * for MVP, using the ring texture (customShader). */
+                if (sceneEntity->entity.reType == RT_RAIL_RINGS) {
+                    uint32_t baseVertex = entityVertexCursor;
+                    uint32_t firstIndex = entityIndexCursor;
+                    const float *a0 = sceneEntity->entity.oldorigin; /* start */
+                    const float *a1 = sceneEntity->entity.origin;    /* end */
+                    vec3_t beamDir, unitDir, right, up;
+                    float len;
+                    const float segmentLength = 64.0f;  /* r_railSegmentLength */
+                    const float ringSize = 8.0f;
+                    int numSegs;
+                    int seg;
+                    float r, g, b, a;
+                    uint32_t localIndexCount = 0;
+
+                    VectorSubtract(a1, a0, beamDir);
+                    len = VectorLength(beamDir);
+                    if (len < 1.0f) continue;
+                    VectorScale(beamDir, 1.0f / len, unitDir);
+
+                    /* Right + up axes perpendicular to beam for the ring
+                     * quads. Cheap Gram-Schmidt off the world up axis,
+                     * falling back if the beam is vertical. */
+                    {
+                        vec3_t worldUp = {0.0f, 0.0f, 1.0f};
+                        float d = DotProduct(unitDir, worldUp);
+                        if (fabsf(d) > 0.99f) {
+                            vec3_t alt = {1.0f, 0.0f, 0.0f};
+                            CrossProduct(unitDir, alt, right);
+                        } else {
+                            CrossProduct(unitDir, worldUp, right);
+                        }
+                        VectorNormalize(right);
+                        CrossProduct(unitDir, right, up);
+                        VectorNormalize(up);
+                    }
+
+                    numSegs = (int)(len / segmentLength);
+                    if (numSegs < 1) numSegs = 1;
+                    if (numSegs > 32) numSegs = 32;
+
+                    r = (float)sceneEntity->entity.shader.rgba[0] / 255.0f;
+                    g = (float)sceneEntity->entity.shader.rgba[1] / 255.0f;
+                    b = (float)sceneEntity->entity.shader.rgba[2] / 255.0f;
+                    a = (float)sceneEntity->entity.shader.rgba[3] / 255.0f;
+                    if (a < 0.01f) a = 1.0f;
+
+                    for (seg = 0; seg < numSegs; ++seg) {
+                        uint32_t segBase = entityVertexCursor;
+                        vec3_t center;
+                        vec3_t scaledRight, scaledUp;
+                        vec3_t rc0, rc1, rc2, rc3;
+                        float step = (float)(seg + 1) * segmentLength;
+                        int vi;
+
+                        center[0] = a0[0] + unitDir[0] * step;
+                        center[1] = a0[1] + unitDir[1] * step;
+                        center[2] = a0[2] + unitDir[2] * step;
+                        VectorScale(right, ringSize, scaledRight);
+                        VectorScale(up, ringSize, scaledUp);
+                        VectorSubtract(center, scaledRight, rc0); VectorSubtract(rc0, scaledUp, rc0);
+                        VectorAdd(center, scaledRight, rc1); VectorSubtract(rc1, scaledUp, rc1);
+                        VectorAdd(center, scaledRight, rc2); VectorAdd(rc2, scaledUp, rc2);
+                        VectorSubtract(center, scaledRight, rc3); VectorAdd(rc3, scaledUp, rc3);
+
+                        s_entityVertices[segBase + 0].position[0] = rc0[0];
+                        s_entityVertices[segBase + 0].position[1] = rc0[1];
+                        s_entityVertices[segBase + 0].position[2] = rc0[2];
+                        s_entityVertices[segBase + 0].texCoord[0] = 0.0f;
+                        s_entityVertices[segBase + 0].texCoord[1] = 1.0f;
+                        s_entityVertices[segBase + 1].position[0] = rc1[0];
+                        s_entityVertices[segBase + 1].position[1] = rc1[1];
+                        s_entityVertices[segBase + 1].position[2] = rc1[2];
+                        s_entityVertices[segBase + 1].texCoord[0] = 1.0f;
+                        s_entityVertices[segBase + 1].texCoord[1] = 1.0f;
+                        s_entityVertices[segBase + 2].position[0] = rc2[0];
+                        s_entityVertices[segBase + 2].position[1] = rc2[1];
+                        s_entityVertices[segBase + 2].position[2] = rc2[2];
+                        s_entityVertices[segBase + 2].texCoord[0] = 1.0f;
+                        s_entityVertices[segBase + 2].texCoord[1] = 0.0f;
+                        s_entityVertices[segBase + 3].position[0] = rc3[0];
+                        s_entityVertices[segBase + 3].position[1] = rc3[1];
+                        s_entityVertices[segBase + 3].position[2] = rc3[2];
+                        s_entityVertices[segBase + 3].texCoord[0] = 0.0f;
+                        s_entityVertices[segBase + 3].texCoord[1] = 0.0f;
+                        for (vi = 0; vi < 4; ++vi) {
+                            s_entityVertices[segBase + vi].color[0] = r;
+                            s_entityVertices[segBase + vi].color[1] = g;
+                            s_entityVertices[segBase + vi].color[2] = b;
+                            s_entityVertices[segBase + vi].color[3] = a;
+                        }
+                        s_entityIndices[entityIndexCursor + 0] = segBase + 0;
+                        s_entityIndices[entityIndexCursor + 1] = segBase + 1;
+                        s_entityIndices[entityIndexCursor + 2] = segBase + 2;
+                        s_entityIndices[entityIndexCursor + 3] = segBase + 0;
+                        s_entityIndices[entityIndexCursor + 4] = segBase + 2;
+                        s_entityIndices[entityIndexCursor + 5] = segBase + 3;
+                        entityVertexCursor += 4;
+                        entityIndexCursor += 6;
+                        localIndexCount += 6;
+                    }
+
+                    (void)baseVertex;
+                    s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
+                    s_entityDraws[entityDrawCursor].indexCount = localIndexCount;
+                    s_entityDraws[entityDrawCursor].textureHandle =
+                        (uint32_t)sceneEntity->entity.customShader;
                     s_entityDraws[entityDrawCursor].flags =
                         Q3_METAL_ENTITY_DRAWFLAG_NOCULL |
                         Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
