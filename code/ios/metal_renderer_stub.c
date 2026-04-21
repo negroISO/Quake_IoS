@@ -2115,6 +2115,24 @@ static int BlendModeFromTokens(const char *src, const char *dst) {
      * path later. */
     if (!Q_stricmp(src, "GL_ZERO") && !Q_stricmp(dst, "GL_ZERO")) return 0;
 
+    /* Less-common combos caught by the STEP 3 warn path. These don't
+     * map cleanly to our 4-mode pipeline (opaque/add/alpha/filter);
+     * pick the closest semantic approximation. */
+
+    /* src.a * src + src.a * dst = src.a * (src + dst). Alpha-scaled
+     * sum — closest to alpha-blend in feel. */
+    if (!Q_stricmp(src, "GL_SRC_ALPHA") && !Q_stricmp(dst, "GL_SRC_ALPHA")) return 2;
+    /* (1-src.a) * (src + dst). Inverse-alpha fade — alpha-blend. */
+    if (!Q_stricmp(src, "GL_ONE_MINUS_SRC_ALPHA") && !Q_stricmp(dst, "GL_ONE_MINUS_SRC_ALPHA")) return 2;
+    /* (1-dst.a) * (src + dst). Used for "fade by destination alpha"
+     * overlays; alpha-blend is the closest match. */
+    if (!Q_stricmp(src, "GL_ONE_MINUS_DST_ALPHA") && !Q_stricmp(dst, "GL_ONE_MINUS_DST_ALPHA")) return 2;
+    /* src * (src + dst). Color modulates itself onto the frame —
+     * behaves like a filter/modulate pass (result is darker). */
+    if (!Q_stricmp(src, "GL_SRC_COLOR") && !Q_stricmp(dst, "GL_SRC_COLOR")) return 3;
+    /* (1-src) * (src + dst). Inverse-color filter, still modulative. */
+    if (!Q_stricmp(src, "GL_ONE_MINUS_SRC_COLOR") && !Q_stricmp(dst, "GL_ONE_MINUS_SRC_COLOR")) return 3;
+
     /* Unknown combo: warn once. Adding here is cheaper than bisecting
      * visuals weeks later. */
     {
