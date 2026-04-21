@@ -869,7 +869,11 @@ struct MetalView: UIViewRepresentable {
                         if draw.blendMode != currentPipelineMode {
                             let pipeline: MTLRenderPipelineState? = {
                                 switch draw.blendMode {
-                                case 0: return uiOpaquePipelineState ?? uiPipelineState
+                                /* blendMode 0 (opaque) falls through to alpha-over:
+                                 * Q3 2D content is universally alpha-transparent
+                                 * (bigchars font atlas, HUD icons), and disabling
+                                 * blending turns transparent pixels into solid
+                                 * white boxes on map-load / waiting-for-players. */
                                 case 1: return uiAdditivePipelineState ?? uiPipelineState
                                 case 3: return uiFilterPipelineState ?? uiPipelineState
                                 default: return uiPipelineState
