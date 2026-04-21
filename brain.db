@@ -246,3 +246,47 @@ Verified on `20260421_164145_radial-mask`:
   be rendering within viewport but without sufficient lighting contrast)
 - Overbright lightmaps still commented out (2× multiply); reference
   screenshots will feel darker than Q3 PC at stock gamma
+
+### 2026-04-21 third iteration — overbright + quad investigation
+
+Shipped `aa20a0f`: restored the 2x overbright lightmap multiply
+(r_overBrightBits=1 equivalent). World brightness now matches reference
+Q3 PC — dark hallways in q3dm1/nv15 visibly lit, player models render
+with proper skin contrast, blood splats legible on brown floors.
+Verified on `20260421_173228_overbright-2x`.
+
+### Still investigating: #28 close-range quad shell renders yellow
+
+Frame_020 of demo four shows Thanatar (enemy with quad damage active)
+rendering as a solid yellow human silhouette at point-blank range.
+Expected: blue/purple additive environment-mapped shell over normal
+player skin (Q3 standard look).
+
+Confirmed:
+- quadmap2.jpg is BLUE/PURPLE with lightning patterns (verified by
+  extracting from pak0.pk3)
+- Shader parsed correctly: powerups/quad with blendfunc GL_ONE GL_ONE
+  (additive), tcGen environment, tcmod rotate 30, tcmod scroll 1 .1
+- Allow-list for alpha synth includes powerups/ → synth runs
+- cgame emits TWO entities per quad-damaged player: normal + shell
+
+Not yet confirmed: whether the base player entity is rendering AT ALL
+at point-blank range. If culled/near-plane-clipped, only the shell
+would show. Hypothesis: the shell's environment-map UV produces bright
+solid-color samples (not the intended blue pattern) when the underlying
+MD3 surface normal is stable across the mesh — tcGen environment in
+our fragment shader needs further verification for multi-surface MD3.
+
+Deferred — single-frame edge case, rest of build looks solid.
+
+### Current commit stack (branch metal-renderer-fresh)
+
+aa20a0f fix(metal): restore 2x overbright lightmap multiply
+864b9a7 docs(brain): explosion-rectangle diagnosis + radial-mask resolution
+b936513 fix(metal): radial soft-mask + luminance threshold in jpg alpha synth
+7eccf3a fix(metal): narrow alpha-synth to dark-bg FX textures only
+e95122a fix(metal): synthesize alpha from luminance for FX jpg fallbacks
+
+The narrow-synth (7eccf3a) is functionally superseded by the radial-mask
+(b936513) — both commits kept for history, with the latter being the
+intended behavior.
