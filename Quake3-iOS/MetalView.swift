@@ -76,6 +76,15 @@ struct MetalView: UIViewRepresentable {
         // bool is safe here without any isolation attribute.
         private var skyStagesLogged: Bool = false
 
+        private static func metalCullMode(for stageCullMode: UInt32) -> MTLCullMode {
+            // Matches C side METAL_SHADER_CULL_*: 0=back, 1=disable, 2=front.
+            switch stageCullMode {
+            case 1: return .none
+            case 2: return .front
+            default: return .back
+            }
+        }
+
         private static func alphaTestThreshold(for alphaFunc: UInt32) -> Float {
             switch alphaFunc {
             case 1: return 0.004 // GT0
@@ -553,7 +562,8 @@ struct MetalView: UIViewRepresentable {
                 encoder.setRenderPipelineState(worldPipelineState)
                 encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
                 encoder.setFrontFacing(.clockwise)
-                encoder.setCullMode(.none)
+                // Default: backface cull. Per-stage overrides below.
+                encoder.setCullMode(.back)
                 encoder.setVertexBuffer(worldVertexBuffer, offset: 0, index: 0)
                 encoder.setVertexBytes(&worldUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
                 // Also bind WorldUniforms at fragment index 1. The sky
@@ -614,6 +624,10 @@ struct MetalView: UIViewRepresentable {
                                 let pipeline = isAdditive ? (skyAdditivePipelineState ?? skyPipelineState) : skyPipelineState
                                 encoder.setRenderPipelineState(pipeline)
                                 encoder.setDepthStencilState(skyDepthStencilState)
+                                // Sky shaders commonly specify 'cull disable'
+                                // to render the sky sphere inside-out; honour
+                                // per-stage cullMode just like world stages.
+                                encoder.setCullMode(Self.metalCullMode(for: stage.cullMode))
                                 let skyChain = Self.fillTcMods(stage)
                                 var skyDrawUniforms = WorldDrawUniforms(
                                     tcGen: Float(stage.tcGen),
@@ -668,6 +682,10 @@ struct MetalView: UIViewRepresentable {
                                 encoder.setRenderPipelineState(worldPipelineState)
                                 encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
                             }
+                            // STEP 6: per-stage cull mode. Replaces the
+                            // previous hard-coded setCullMode(.none) which
+                            // forced every world surface to two-sided.
+                            encoder.setCullMode(Self.metalCullMode(for: stage.cullMode))
                             let alphaTest = Self.alphaTestThreshold(for: stage.alphaFunc)
                             let chain = Self.fillTcMods(stage)
                             var drawUniforms = WorldDrawUniforms(

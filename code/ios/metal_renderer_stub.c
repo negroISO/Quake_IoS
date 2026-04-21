@@ -156,6 +156,12 @@ typedef struct {
     float alphaWavePhase;
     float alphaWaveFreq;
     int useLightmap;
+    /* Stamped at shader-map register time from the shader-level
+     * METAL_SHADER_CULL_* value. Q3 'cull' is shader-wide so every
+     * stage copies from the same source, but propagating it here
+     * makes AddWorldDrawStage's single pointer carry all the data
+     * Swift needs to pick a pipeline cull state. */
+    int cullMode;
 } Q3MetalStage;
 
 enum {
@@ -436,7 +442,10 @@ static void AddWorldDrawStage(Q3MetalWorldDrawCmd *draw,
     stage->rgbGen = (uint32_t)src->rgbGen;
     stage->alphaGen = (uint32_t)src->alphaGen;
     stage->alphaFunc = (uint32_t)src->alphaFunc;
-    stage->cullMode = 0; /* default back; per-stage cull wiring is step 6 */
+    /* STEP 6: propagate shader cullMode. Values match
+     * METAL_SHADER_CULL_BACK=0 / DISABLE=1 / FRONT=2; Swift consumes
+     * this directly when picking setCullMode per draw. */
+    stage->cullMode = (uint32_t)src->cullMode;
     stage->useLightmap = (uint32_t)src->useLightmap;
     stage->rgbWaveFunc = (uint32_t)src->rgbWaveFunc;
     stage->rgbWaveBase = src->rgbWaveBase;
@@ -2530,6 +2539,12 @@ static void ParseShaderText(const char *text) {
                 }
                 last->stageCount = stagesCount;
                 last->cullMode = cullMode;
+                /* STEP 6: stamp the shader's cullMode onto every stage
+                 * so AddWorldDrawStage's single-pointer copy carries
+                 * everything Swift needs to choose a cull state. */
+                for (s = 0; s < last->stageCount; ++s) {
+                    last->stages[s].cullMode = cullMode;
+                }
                 last->isPortal = gotPortal;
                 last->hasFog = gotFog;
                 if (gotFog) {
