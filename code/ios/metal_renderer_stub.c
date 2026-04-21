@@ -3534,6 +3534,30 @@ static void SynthesizeViewmodelEntity(const vec3_t vieworg,
     slot->isSynthetic = qtrue;
     s_sceneEntityCount += 1;
     s_entityAcceptedThisFrame += 1;
+
+    /* Quad Damage overlay: Q3's cgame CG_AddPlayerWeapon submits the gun
+     * twice when ps.powerups[PW_QUAD] is active — once normally, once with
+     * customShader=quadWeaponShader. The bundled cgame.qvm's broken
+     * syscall ABI drops the second call. Replicate it engine-side so the
+     * blue additive quad shell appears on our viewmodel regardless of
+     * cgame's accept rate. The quad shader is registered lazily on first
+     * use so we don't pay for it on maps where the player never picks
+     * up the powerup. */
+    if (cl.snap.ps.powerups[PW_QUAD] > cl.snap.ps.commandTime) {
+        static qhandle_t s_quadShader = 0;
+        if (s_quadShader == 0) {
+            s_quadShader = RegisterTexture("powerups/quad");
+        }
+        if (s_quadShader != 0 && s_sceneEntityCount < Q3_METAL_MAX_REFENTITIES) {
+            metalSceneEntity_t *shellSlot = &s_sceneEntities[s_sceneEntityCount];
+            refEntity_t *shell;
+            *shellSlot = *slot;           /* copy geometry + origin/axis */
+            shell = &shellSlot->entity;
+            shell->customShader = s_quadShader;
+            s_sceneEntityCount += 1;
+            s_entityAcceptedThisFrame += 1;
+        }
+    }
 }
 
 static void RE_RenderScene(const refdef_t *fd) {
