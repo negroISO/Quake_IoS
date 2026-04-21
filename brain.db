@@ -154,3 +154,59 @@ env reflections), we'll need normals as a real vertex attribute, not pre-baked.
 **Design:** add `normal: float3` to `Q3MetalEntityVertex`, emit from MD3 build
 loop, pass through `q3_entity_vertex` to `q3_entity_fragment`. Drop the baked
 color Lambert in favor of per-pixel NdotL.
+
+---
+
+## Session log — 2026-04-21 (branch metal-renderer-fresh)
+
+### Shipped this session (all on `metal-renderer-fresh`)
+
+| Commit | Feature |
+|---|---|
+| `b13d176` | 2D font atlas — fall through opaque blendMode to alpha-over |
+| `1b81110` | Preserve `s_world.generation` across FreeWorldMapData (map-change fix) |
+| `63d24bb` | Dynamic lights infrastructure (RE_AddLightToScene end-to-end) — verified firing on nv15demo2 |
+| `9c83561` | Flare billboard pipeline (BSP MST_FLARE + q3map_flare shader directive) |
+| `b805d0f` | Sky classification by shader directive (surfaceparm sky / skyparms) |
+| `6691ef9` | RT_LIGHTNING beam geometry |
+| `3ee1f9a` | RE_AddPolyToScene (shadow blobs + bullet marks + blood splats) |
+| `fdd128e` | RT_RAIL_CORE + RT_RAIL_RINGS geometry |
+| `841b4d0` | RT_BEAM generic beam |
+| `21d34ba` | tcGen environment (view-reflection chrome) — formula verified against Kenny-Edition |
+| `1804ecb` | LLM_ONBOARDING refresh (Kenny-Edition + vkQuake3 reference repos) |
+| `8c40da0` | Synthetic quad-damage overlay on viewmodel |
+
+### The actual remaining bottleneck
+
+**Multi-scene architecture.** Native cgame is live (`5977485`). cgame submits
+~30-100 entities + 0-3 dlights + 0-1 polys per frame CORRECTLY, but ~95% of them
+target HUD sub-scenes (rdflags=RDF_NOWORLDMODEL, tiny viewports: player portrait
+head, rotating ammo pickup icon, weapon select bar, scoreboard, attacker face).
+Our renderer's `RE_RenderScene` gates entity emission on `rdflags==0`, so HUD
+sub-scenes are thrown away. The next `ClearScene` wipes them from the intake
+before Swift reads. Need:
+
+- Array of Q3MetalSceneSnapshot instead of single
+- Per-scene viewport/origin/axis/fovX/fovY captured at RenderScene time
+- Swift iterates scenes[], setViewport + setScissorRect per scene, renders each
+
+Est. 200 lines C + 80 lines Swift. Unlocks HUD heads, rotating ammo pickups,
+scoreboard portraits, attacker face, 3D menu models, viewmodel quad shell
+(currently faked), eliminates the entire synthesizer bandage farm
+(SynthesizeViewmodelEntity etc.).
+
+### nv15demo2 current state
+
+- Shows dlights (verified LIT-WALLS on plasma orbs)
+- Text legible (font atlas fix)
+- No crashes, 45 frames per autorun, 59-60 fps
+- Missing: HUD portrait head, rotating ammo icon, attacker face, quad shell on
+  weapon pickup, world-space powerup glow, third-person players.
+- Dark compared to reference Q3 screenshots — overbright lightmaps currently
+  commented out, revert pending.
+
+### Reference repos to consult before grinding on ioq3 C
+
+1. `/Users/targus/Documents/Quake-III-Arena-Kenny-Edition` — clean Vulkan port
+2. `/Users/targus/Documents/vkQuake3` — user's fork: ioq3 + Kenny backend
+3. `code/renderer/` — stock GL ioq3 for any ABI/enum confirmation
