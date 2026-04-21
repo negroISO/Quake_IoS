@@ -444,15 +444,15 @@ struct MetalView: UIViewRepresentable {
             // typically (0,0,0) because Q3 shaders use rgbGen identity.
             // forceWhiteVertColor=1.0 substitutes white, preventing the
             // multiply from zeroing out the fragment.
-            // Overbright 2x boost reverted (commit ed461eb). Now using the
-            // straightforward texel * lightmap * vertColor combine so the
-            // lighting baseline is unboosted — lets us see real lightmap
-            // output before entity lighting work. Bring the 2x back later
-            // as a tunable r_overBrightBits-style cvar if needed.
+            // Overbright (r_overBrightBits=1): stock Q3 multiplies the
+            // lightmap by 2.0 and clamps, giving bright-lit surfaces the
+            // washed-out punch that matches the reference PC build.
+            // Without it the whole world renders ~50% too dark.
+            // saturate() clamps to [0,1] so highlights don't wrap.
             float3 vertexColor = (rgbGen == 1) ? in.color.rgb : float3(1.0);
             float3 vc = mix(vertexColor, float3(1.0), drawUniforms.forceWhiteVertColor);
             float  va = mix(in.color.a,   1.0,          drawUniforms.forceWhiteVertColor);
-            float3 lit = texel.rgb * lightmap.rgb * vc;
+            float3 lit = texel.rgb * saturate(lightmap.rgb * 2.0) * vc;
             // Dynamic lights (muzzle flashes, rocket/plasma glow, lightning
             // halos). Applied BEFORE fog so distant explosions still fog
             // correctly. For filter/multiply stages the blend is source*dest
