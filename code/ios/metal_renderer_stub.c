@@ -2342,8 +2342,16 @@ static void ParseShaderText(const char *text) {
                     }
                 } else if (!Q_stricmp(token, "tcGen") || !Q_stricmp(token, "tcgen")) {
                     token = COM_ParseExt(&p, qfalse);
+                    /* STEP 5: per-stage tcGen. Only the stage that declares
+                     * 'tcGen environment' gets the env flag; sibling stages
+                     * stay at base UVs. Keeping the legacy shader-level
+                     * tcGenEnv in sync so Q3MetalStage's tcGen (consumed by
+                     * AddWorldDrawStage → MSL) still reflects the actual
+                     * intent during this transition — but readers should
+                     * prefer stages[i].tcGen over the shader-level bool. */
                     if (token[0] && (!Q_stricmp(token, "environment") ||
                                      !Q_stricmp(token, "env"))) {
+                        cur.tcGen = 1;
                         tcGenEnv = qtrue;
                     }
                 } else if (!Q_stricmp(token, "blendFunc") || !Q_stricmp(token, "blendfunc")) {
