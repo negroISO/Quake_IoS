@@ -4863,17 +4863,18 @@ static void RE_RenderScene(const refdef_t *fd) {
     s_frameSnapshot.lightCount = s_frameLightCount;
     s_frameSnapshot.sceneCount = s_sceneSnapshotCount;
     if ((s_sceneLogCounter % 60) == 0) {
-        ri.Printf(
-            PRINT_ALL,
-            "Metal scene frame: scenes=%u totalEntCmds=%u totalLights=%u (this scene idx=%u rdflags=0x%x viewport=%dx%d@%d,%d fov=%.1f,%.1f vieworg=(%.1f,%.1f,%.1f) ents=%u lights=%u)\n",
-            s_sceneSnapshotCount, s_entityDrawCount, s_frameLightCount,
-            s_sceneSnapshotCount - 1,
-            fd->rdflags, fd->width, fd->height, fd->x, fd->y,
-            fovX, fovY,
-            vieworg[0], vieworg[1], vieworg[2],
-            s_entityDrawCount - sceneEntityCommandFirst,
-            s_sceneLightCount
-        );
+        uint32_t i;
+        ri.Printf(PRINT_ALL,
+            "Metal scene frame: scenes=%u totalEntCmds=%u totalLights=%u\n",
+            s_sceneSnapshotCount, s_entityDrawCount, s_frameLightCount);
+        for (i = 0; i < s_sceneSnapshotCount; ++i) {
+            const Q3MetalSceneSnapshot *s = &s_sceneSnapshots[i];
+            ri.Printf(PRINT_ALL,
+                "  scene[%u]: rdflags=0x%x viewport=%ux%u@%u,%u fov=%.1fx%.1f ents=%u lights=%u\n",
+                i, s->rdflags, s->viewportWidth, s->viewportHeight,
+                s->viewportX, s->viewportY, s->fovX, s->fovY,
+                s->entityCommandCount, s->lightCount);
+        }
     }
 }
 
