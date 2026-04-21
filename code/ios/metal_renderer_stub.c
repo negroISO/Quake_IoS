@@ -580,12 +580,25 @@ static void AddWorldDrawStageSimple(Q3MetalWorldDrawCmd *draw,
  * orbs/rectangles instead of just the bright center. Synthesize alpha
  * from luminance for paths known to be FX-only. */
 static qboolean TextureNeedsLuminanceAlpha(const char *path) {
+    /* Only synthesize alpha for textures whose .tga was authored with
+     * a DARK (near-black) background + bright emissive core. Max(R,G,B)
+     * luminance then cleanly recovers the alpha mask: black borders
+     * become alpha=0, bright cores keep alpha~255.
+     *
+     * Explosion fireballs and rocket trails (models/weaphits/, gfx/damage/)
+     * don't fit this pattern — their "transparent" regions JPEG-compress
+     * into yellowish color artifacts near the bright core. max() treats
+     * yellow as high luminance → alpha=255 → full-quad rendering when the
+     * shader picks an alpha-blend pipeline. Those paths are now relying
+     * on additive blend + dark-background contribution instead.
+     *
+     * Keep synth strictly where the TGA's dark-bg convention is reliable:
+     * plasma bolts, flare billboards, quad damage shell. */
     if (path == NULL || path[0] == '\0') return qfalse;
-    if (!Q_stricmpn(path, "sprites/", 8)) return qtrue;
-    if (!Q_stricmpn(path, "models/weaphits/", 16)) return qtrue;
-    if (!Q_stricmpn(path, "gfx/damage/", 11)) return qtrue;
-    if (!Q_stricmpn(path, "gfx/misc/", 9)) return qtrue;
-    if (!Q_stricmpn(path, "powerups/", 9)) return qtrue;
+    if (!Q_stricmpn(path, "sprites/plasma", 14)) return qtrue;
+    if (!Q_stricmpn(path, "gfx/misc/flare", 14)) return qtrue;
+    if (!Q_stricmpn(path, "gfx/misc/lightning", 18)) return qtrue;
+    if (!Q_stricmpn(path, "powerups/quad", 13)) return qtrue;
     return qfalse;
 }
 
