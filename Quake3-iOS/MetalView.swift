@@ -621,6 +621,13 @@ struct MetalView: UIViewRepresentable {
         private var entityAlphaPipelineState: MTLRenderPipelineState?
         private var entityAdditivePipelineState: MTLRenderPipelineState?
         private var additiveEntityDepthStencilState: MTLDepthStencilState?
+        /* Always-pass depth state for multi-scene HUD sub-scene rendering.
+         * The world pass writes world-scale depth values across the entire
+         * framebuffer, and HUD sub-scenes draw origin-space geometry into a
+         * small viewport inside that — lessEqual would reject sub-scene
+         * fragments under nearby walls. This state ignores the existing
+         * depth buffer entirely so HUD portraits always render on top. */
+        private var alwaysPassDepthStencilState: MTLDepthStencilState?
         private var uiSamplerState: MTLSamplerState?
         private var worldSamplerState: MTLSamplerState?
         private var depthStencilState: MTLDepthStencilState?
@@ -1016,15 +1023,15 @@ struct MetalView: UIViewRepresentable {
 
                     encoder.setRenderPipelineState(entityPipelineState)
                     /* Sub-scenes share the framebuffer's depth buffer with
-                     * the world pass but use an independent projection —
-                     * world-scale depth values at the HUD rect will reject
-                     * the sub-scene's origin-space fragments under a
-                     * normal lessEqual test. Pass nil to get the always-
-                     * pass depth state so HUD geometry renders on top of
-                     * whatever the world wrote. Good enough for small
-                     * portrait viewports; a real per-scene depth clear
-                     * would need a new render pass. */
-                    encoder.setDepthStencilState(ensuredDepthStencilState(nil, device: view.device))
+                     * the world pass, so lessEqual depth-test would reject
+                     * origin-space HUD geometry under world pixels at the
+                     * same screen position. Use the dedicated always-pass
+                     * depth state so HUD portraits render on top regardless
+                     * of what the world wrote. ensuredDepthStencilState
+                     * with nil falls back to lessEqual — not what we want. */
+                    if let alwaysDepth = alwaysPassDepthStencilState {
+                        encoder.setDepthStencilState(alwaysDepth)
+                    }
                     encoder.setFrontFacing(.clockwise)
                     encoder.setCullMode(.none)
                     encoder.setVertexBuffer(entityVertexBuffer, offset: 0, index: 0)
@@ -1378,6 +1385,12 @@ struct MetalView: UIViewRepresentable {
             additiveEntityDepthDesc.depthCompareFunction = .lessEqual
             additiveEntityDepthDesc.isDepthWriteEnabled = false
             additiveEntityDepthStencilState = device.makeDepthStencilState(descriptor: additiveEntityDepthDesc)
+
+            // Always-pass depth for multi-scene HUD sub-scenes
+            let alwaysPassDesc = MTLDepthStencilDescriptor()
+            alwaysPassDesc.depthCompareFunction = .always
+            alwaysPassDesc.isDepthWriteEnabled = false
+            alwaysPassDepthStencilState = device.makeDepthStencilState(descriptor: alwaysPassDesc)
 
             let uiSamplerDescriptor = MTLSamplerDescriptor()
             uiSamplerDescriptor.minFilter = .linear
