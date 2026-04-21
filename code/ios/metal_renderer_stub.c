@@ -787,6 +787,12 @@ static void PushStretchPicVertex(float x, float y, float s, float t, const float
 }
 
 static void FreeWorldMapData(void) {
+    /* Preserve generation across the reset so Swift's cachedWorldGeneration
+     * check invalidates on every map change. Without this, Com_Memset resets
+     * generation to 0 and the subsequent LoadWorldMapData bump lands on 1
+     * for every map — Swift then keeps the previous map's MTLBuffer and the
+     * new map's draw commands index into stale geometry. */
+    uint32_t savedGeneration = s_world.generation;
     if (s_world.vertices != NULL) {
         ri.Free(s_world.vertices);
     }
@@ -808,6 +814,7 @@ static void FreeWorldMapData(void) {
     Com_Memset(s_worldFogs, 0, sizeof(s_worldFogs));
     Com_Memset(s_worldFogsPublic, 0, sizeof(s_worldFogsPublic));
     Com_Memset(&s_world, 0, sizeof(s_world));
+    s_world.generation = savedGeneration;
 }
 
 static void FreeEntitySceneData(void) {
