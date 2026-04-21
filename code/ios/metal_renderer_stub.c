@@ -131,6 +131,24 @@ static uint32_t s_sceneEntityCount;
 static Q3MetalLight s_sceneLights[Q3_METAL_MAX_LIGHTS];
 static uint32_t s_sceneLightCount;
 
+/* Scene polys — shadow blobs, bullet marks, blood splats, particle
+ * sprays. Submitted by cgame via RE_AddPolyToScene as world-space
+ * triangle fans (typically 3-4 verts). We copy into a pool and emit
+ * as entity draws at RenderScene time alongside sprites + bolts. */
+#define Q3_METAL_MAX_SCENE_POLYS 256
+#define Q3_METAL_MAX_SCENE_POLY_VERTS 4096
+
+typedef struct {
+    qhandle_t shader;
+    int firstVert;
+    int numVerts;
+} metalScenePoly_t;
+
+static metalScenePoly_t s_scenePolys[Q3_METAL_MAX_SCENE_POLYS];
+static polyVert_t s_scenePolyVerts[Q3_METAL_MAX_SCENE_POLY_VERTS];
+static int s_scenePolyCount;
+static int s_scenePolyVertCount;
+
 /* Audit: once-per-session dedup log for missing-feature tracking. Copies
  * the message string into owned storage so callers can safely pass stack
  * buffers. Only used for genuinely missing renderer features — do NOT
@@ -3184,6 +3202,10 @@ static void RE_ClearScene(void) {
      * already locked in by the world scene's RenderScene and is only
      * rewritten when rdflags==0, guarding HUD scenes). */
     s_sceneLightCount = 0;
+    /* Same reasoning as dlights: polys arrive between ClearScene and
+     * RenderScene of the world pass. HUD scenes never AddPoly. */
+    s_scenePolyCount = 0;
+    s_scenePolyVertCount = 0;
     /* DO NOT reset s_entity{Vertex,Index,Draw}Count here. Cgame calls
      * ClearScene between every scene (world + HUD + HUD). If we wiped the
      * draw buffer here, the world scene's draws would be lost before the
@@ -3284,8 +3306,24 @@ static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime
     s_entityAcceptedThisFrame += 1;
 }
 static void RE_AddPolyToScene(qhandle_t hShader, int numVerts, const polyVert_t *verts, int num) {
+    int polyIdx;
     AuditOnce("POLY:RE_AddPolyToScene");
-    (void)hShader; (void)numVerts; (void)verts; (void)num;
+    if (verts == NULL || numVerts < 3) return;
+    /* num is the number of polys in this batch, each with numVerts verts.
+     * Blood/shadow/marks typically call with num=1. Iterate all regardless. */
+    for (polyIdx = 0; polyIdx < num; ++polyIdx) {
+        int vi;
+        if (s_scenePolyCount >= Q3_METAL_MAX_SCENE_POLYS) return;
+        if (s_scenePolyVertCount + numVerts > Q3_METAL_MAX_SCENE_POLY_VERTS) return;
+        s_scenePolys[s_scenePolyCount].shader = hShader;
+        s_scenePolys[s_scenePolyCount].firstVert = s_scenePolyVertCount;
+        s_scenePolys[s_scenePolyCount].numVerts = numVerts;
+        for (vi = 0; vi < numVerts; ++vi) {
+            s_scenePolyVerts[s_scenePolyVertCount + vi] = verts[polyIdx * numVerts + vi];
+        }
+        s_scenePolyVertCount += numVerts;
+        s_scenePolyCount += 1;
+    }
 }
 static int R_LightForPoint(vec3_t point, vec3_t ambientLight, vec3_t directedLight, vec3_t lightDir) { return 0; }
 
@@ -3694,11 +3732,21 @@ static void RE_RenderScene(const refdef_t *fd) {
         s_entityDrawCount = 0;
     }
 
-    if (fd->rdflags == 0 && s_sceneEntityCount > 0) {
+    if (fd->rdflags == 0 && (s_sceneEntityCount > 0 || s_scenePolyCount > 0)) {
         uint32_t totalEntityVerts = 0;
         uint32_t totalEntityIndices = 0;
         uint32_t totalEntityDraws = 0;
         uint32_t entityIndex;
+        int polyIter;
+        /* Poly budget: each poly contributes its own vert count + fan
+         * triangulation (numVerts-2)*3 indices + 1 draw. */
+        for (polyIter = 0; polyIter < s_scenePolyCount; ++polyIter) {
+            int nv = s_scenePolys[polyIter].numVerts;
+            if (nv < 3) continue;
+            totalEntityVerts += (uint32_t)nv;
+            totalEntityIndices += (uint32_t)((nv - 2) * 3);
+            totalEntityDraws += 1;
+        }
 
         for (entityIndex = 0; entityIndex < s_sceneEntityCount; ++entityIndex) {
             const metalSceneEntity_t *sceneEntity = &s_sceneEntities[entityIndex];
@@ -4282,6 +4330,68 @@ static void RE_RenderScene(const refdef_t *fd) {
                     entityDrawCursor += 1;
 
                     surface = (const md3Surface_t *)((const byte *)surface + surface->ofsEnd);
+                }
+            }
+
+            /* Scene polys: triangle-fan emission. Each poly's vertices
+             * are already in world space. We fan from vertex 0: triangles
+             * (0,1,2), (0,2,3), (0,3,4)... — (numVerts-2) triangles. Blend
+             * follows the shader's blendMode like sprites. Alpha for
+             * transparency (typical for shadow blobs, bullet marks) and
+             * additive for muzzle-flare polys all fall out of the
+             * blendMode lookup on the poly's shader. */
+            {
+                int polyOut;
+                for (polyOut = 0; polyOut < s_scenePolyCount; ++polyOut) {
+                    const metalScenePoly_t *poly = &s_scenePolys[polyOut];
+                    int nv = poly->numVerts;
+                    uint32_t baseVertex;
+                    uint32_t firstIndex;
+                    int vi, ti;
+                    const metalTexture_t *ptex;
+                    uint32_t polyFlags = Q3_METAL_ENTITY_DRAWFLAG_NOCULL;
+
+                    if (nv < 3) continue;
+                    baseVertex = entityVertexCursor;
+                    firstIndex = entityIndexCursor;
+
+                    for (vi = 0; vi < nv; ++vi) {
+                        const polyVert_t *src = &s_scenePolyVerts[poly->firstVert + vi];
+                        Q3MetalEntityVertex *dst = &s_entityVertices[baseVertex + vi];
+                        dst->position[0] = src->xyz[0];
+                        dst->position[1] = src->xyz[1];
+                        dst->position[2] = src->xyz[2];
+                        dst->texCoord[0] = src->st[0];
+                        dst->texCoord[1] = src->st[1];
+                        dst->color[0] = (float)src->modulate.rgba[0] / 255.0f;
+                        dst->color[1] = (float)src->modulate.rgba[1] / 255.0f;
+                        dst->color[2] = (float)src->modulate.rgba[2] / 255.0f;
+                        dst->color[3] = (float)src->modulate.rgba[3] / 255.0f;
+                    }
+                    for (ti = 0; ti < nv - 2; ++ti) {
+                        s_entityIndices[entityIndexCursor + ti * 3 + 0] = baseVertex;
+                        s_entityIndices[entityIndexCursor + ti * 3 + 1] = baseVertex + ti + 1;
+                        s_entityIndices[entityIndexCursor + ti * 3 + 2] = baseVertex + ti + 2;
+                    }
+
+                    ptex = FindTextureByHandle(poly->shader);
+                    if (ptex != NULL) {
+                        if (ptex->blendMode == 1) polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                        else if (ptex->blendMode == 2) polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_ALPHA;
+                        else if (ptex->blendMode == 3) polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_FILTER;
+                        else polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_ALPHA;  /* default blood/shadow = alpha */
+                    } else {
+                        polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_ALPHA;
+                    }
+
+                    s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
+                    s_entityDraws[entityDrawCursor].indexCount = (uint32_t)((nv - 2) * 3);
+                    s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)poly->shader;
+                    s_entityDraws[entityDrawCursor].flags = polyFlags;
+
+                    entityVertexCursor += (uint32_t)nv;
+                    entityIndexCursor += (uint32_t)((nv - 2) * 3);
+                    entityDrawCursor += 1;
                 }
             }
 
