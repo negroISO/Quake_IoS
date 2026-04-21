@@ -12,11 +12,21 @@ Core files:
 
 | Path | Purpose |
 |---|---|
-| `code/ios/metal_renderer_stub.c` | main Metal render stub (~4400 lines) — most rendering work lives here |
+| `code/ios/metal_renderer_stub.c` | main Metal render stub (~4700 lines) — most rendering work lives here |
 | `code/ios/metal_renderer_shared.h` | Swift ↔ C struct layouts (`Q3MetalWorldStage`, `Q3MetalLight`, `Q3MetalFlare`, etc.) |
 | `Quake3-iOS/MetalView.swift` | Swift wrapper + MSL shader source string |
-| `code/ios/ios_main.m` | iOS entry + `Cbuf_AddText("demo nv15")` boot command (currently set to nv15 — revert before shipping) |
+| `code/ios/ios_main.m` | iOS entry + `Cbuf_AddText("demo nv15demo2")` boot command (currently set to nv15demo2 — revert before shipping) |
 | `code/renderervk/` | reference Vulkan renderer (working, complete) |
+
+Reference repos OUTSIDE this tree for cross-checking canonical behavior:
+
+| Path | What it is |
+|---|---|
+| `/Users/targus/Documents/Quake-III-Arena-Kenny-Edition` | kennyalive's Vulkan port of ioq3. Self-contained Vulkan renderer under `src/engine/renderer/`. Canonical formulas (env mapping, rail cores, flares) live here in clean form — cross-check against this before grinding on ioq3 C. |
+| `/Users/targus/Documents/vkQuake3` | User's fork: ioq3 base + Kenny-Edition's Vulkan backend as a modular backend. Useful for seeing how Kenny's renderer gets wired into a full ioq3 pipeline. |
+| `code/renderer/` (in this tree) | Stock GL ioq3 renderer — original 1999 behavior for any ABI/enum confirmation. |
+
+When in doubt about "what should this look like" consult in this order: Kenny-Edition Vulkan (cleanest), local `code/renderer/` (canonical GL), then delegate to Codex.
 
 ## Procedures — token discipline comes first
 
@@ -158,8 +168,14 @@ Recent commits on `metal-renderer-fresh`, newest first. Use `git log --oneline -
 
 | Commit | What shipped |
 |---|---|
+| `21d34ba` | **tcGen environment** — chrome/reflective surfaces via view-reflection UVs (formula verified against Kenny-Edition) |
+| `841b4d0` | **RT_BEAM** — grappling hook + CTF mission beams |
+| `fdd128e` | **RT_RAIL_CORE + RT_RAIL_RINGS** — rail gun beam + segment ring chain |
+| `3ee1f9a` | **RE_AddPolyToScene** — shadow blobs, bullet marks, blood splats |
+| `6691ef9` | **RT_LIGHTNING** — lightning gun beam |
+| `b805d0f` | **Sky classification via shader directive** — `surfaceparm sky`/`skyparms`, no longer prefix-only |
 | `9c83561` | **Flare billboard pipeline** — BSP MST_FLARE + `q3map_flare` shader directive → camera-facing additive sprites |
-| `63d24bb` | **Dynamic lights infra** — `RE_AddLightToScene` end-to-end, radial falloff, 32-light cap. Blocked on cgame syscall ABI (see below). |
+| `63d24bb` | **Dynamic lights infra** — `RE_AddLightToScene` end-to-end, radial falloff, 32-light cap. VERIFIED FIRING on nv15demo2 (Gemma: LIT-WALLS on plasma orbs). |
 | `1b81110` | **Map-change fix** — preserve `s_world.generation` across `FreeWorldMapData` so Swift re-uploads MTLBuffer on every map load |
 | `b13d176` | **Text fix** — 2D blendMode 0 falls through to alpha-over instead of opaque (font atlas glyphs were white squares) |
 | `fa7ed88` | **Scripts tooling** — `q3sim_session.sh` + `gemma_review.sh` landed |
@@ -168,18 +184,24 @@ Recent commits on `metal-renderer-fresh`, newest first. Use `git log --oneline -
 
 ## Ordered missing-subsystem backlog (from nv15 demo stress test)
 
-nv15 is the user's nvidia-logo benchmark demo — it's meant to exercise everything. Reviewing its output with Gemma surfaced this priority order:
+nv15 is the user's nvidia-logo benchmark demo — it's meant to exercise everything. The original 8-item backlog is all shipped:
 
-1. ~~**Dynamic lights**~~ — infra shipped (`63d24bb`). Blocked on cgame syscall ABI.
-2. ~~**Flares**~~ — infra shipped (`9c83561`). Visible on maps with MST_FLARE or `q3map_flare` directive.
-3. **Shader-sky classification for nv15 sky** — nv15 loads with 0 sky draws because its sky shader isn't classified. Need to detect via `surfaceparm sky` or `skyparms` block.
-4. **RT_RAIL_CORE + RT_RAIL_RINGS** — rail gun trails (rejected in `RE_AddRefEntityToScene`).
-5. **RT_LIGHTNING** — lightning gun beam.
-6. **RT_BEAM** — grappling hook + CTF mission beams.
-7. **RE_AddPolyToScene** — full no-op; breaks bullet marks, shadow blobs, blood splats.
-8. **tcGen environment** — chrome/reflective surfaces render flat.
+1. ~~**Dynamic lights**~~ — `63d24bb`. **Verified firing** on nv15demo2 (Gemma: LIT-WALLS on plasma orbs).
+2. ~~**Flares**~~ — `9c83561`. Visible on maps with MST_FLARE or `q3map_flare` directive.
+3. ~~**Sky classification**~~ — `b805d0f`. Shader-driven, prefix-independent.
+4. ~~**RT_RAIL_CORE + RT_RAIL_RINGS**~~ — `fdd128e`. Awaiting a rail demo to verify visually.
+5. ~~**RT_LIGHTNING**~~ — `6691ef9`. Verified path-live on nv15demo2 (1 submission).
+6. ~~**RT_BEAM**~~ — `841b4d0`. Awaiting a grapple/CTF demo to verify.
+7. ~~**RE_AddPolyToScene**~~ — `3ee1f9a`. Sporadic submissions in nv15demo2.
+8. ~~**tcGen environment**~~ — `21d34ba`. Chrome formula matches Kenny-Edition canonical.
 
-Work strictly in this order unless the user overrides. Each new feature: patch, run, Gemma-verify no regression, commit, move on.
+**Next-tier backlog** (what the user wants next — matching the reference screenshots):
+- **Overbright lightmaps** — reference Q3 looks significantly brighter than our output. Currently commented out (see MetalView.swift:350ish). Restore `r_overBrightBits`-style 2× lightmap multiply.
+- **Smooth per-vertex normals for tcGen env** — patches currently get faceted reflection (derivative normals). Add `normal[3]` to `Q3MetalWorldVertex`, plumb through the vertex pipeline, use in tcGen env + future lighting work.
+- **HUD player heads + armor/ammo icons** — multi-scene architecture needed.
+- **cgame QVM syscall ABI fix** — `addLight`/`addPoly` now partially work but RefEntity accept rate is ~1/1000. Unblocks real-looking combat.
+
+Each new feature: patch, run, Gemma-verify no regression, commit, move on.
 
 ## Known blockers
 
