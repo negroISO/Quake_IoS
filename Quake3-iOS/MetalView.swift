@@ -949,6 +949,32 @@ struct MetalView: UIViewRepresentable {
                 }
             }
 
+            /* Flare pass. Camera-facing additive billboards at each MST_FLARE
+             * BSP surface (map-compiler light entities). Scene-constant per
+             * map, recomputed per frame because quad corners are camera-
+             * relative. Depth-test on with depth-write off — flares occlude
+             * correctly behind walls but don't punch into the z-buffer. */
+            if let sceneView = Q3MetalRenderer_GetSceneView()?.pointee,
+               Q3MetalRenderer_GetFlareCount() > 0,
+               Q3MetalRenderer_GetFlareTextureHandle() != 0,
+               let flarePipeline = entityAdditivePipelineState,
+               let flareDepth = additiveEntityDepthStencilState,
+               let flareTexture = texture(for: Q3MetalRenderer_GetFlareTextureHandle(), device: view.device) {
+                let flareViewProjection = makeWorldViewProjection(sceneView)
+                var flareUniforms = EntityUniforms(viewProjection: flareViewProjection)
+                encoder.setRenderPipelineState(flarePipeline)
+                encoder.setDepthStencilState(flareDepth)
+                encoder.setCullMode(.none)
+                encoder.setFragmentSamplerState(worldSamplerState, index: 0)
+                encoder.setFragmentTexture(flareTexture, index: 0)
+                // Dlights still bound from entity pass; flare fragment path
+                // shares q3_entity_fragment which reads buffer(2). Rebind
+                // defensively in case a future pass clears it.
+                Self.bindDlightBlock(snapshot: snapshot, encoder: encoder, index: 2)
+
+                drawFlarePass(encoder: encoder, sceneView: sceneView, uniforms: &flareUniforms, device: view.device)
+            }
+
             let vertexCount = Int(snapshot.vertexCount)
             if vertexCount > 0, let verticesPointer = Q3MetalRenderer_GetVertices(),
                let vertexBuffer = uploadVertices(UnsafeBufferPointer(start: verticesPointer, count: vertexCount), device: view.device) {
@@ -1458,6 +1484,83 @@ struct MetalView: UIViewRepresentable {
                 SIMD4<Float>(0, 0, 1, 0),
                 SIMD4<Float>(-1, 1, 0, 1)
             ))
+        }
+
+        /* Build and draw camera-facing additive billboards for each BSP flare.
+         * Called inside an already-configured render pass: caller bound
+         * pipeline, depth-stencil, sampler, flare texture, and dlight block.
+         * We allocate a transient per-frame vertex buffer sized to the flare
+         * count × 4 corners. Flare size is fixed at 16 world units — the Q3
+         * behavior of world-space billboards that shrink with distance is
+         * visually acceptable for phase-one. */
+        private func drawFlarePass(encoder: MTLRenderCommandEncoder,
+                                   sceneView: Q3MetalSceneView,
+                                   uniforms: inout EntityUniforms,
+                                   device: MTLDevice?) {
+            guard let device,
+                  let flaresPointer = Q3MetalRenderer_GetFlares() else { return }
+            let flareCount = Int(Q3MetalRenderer_GetFlareCount())
+            guard flareCount > 0 else { return }
+
+            // Q3 axis convention: axis0=forward, axis1=left, axis2=up.
+            // Billboard plane spans (-axis1, axis2) — rotating left into
+            // "right" flips axis1 so +X on the quad is visually rightward.
+            let axis1 = SIMD3<Float>(sceneView.viewAxis.3, sceneView.viewAxis.4, sceneView.viewAxis.5)
+            let axis2 = SIMD3<Float>(sceneView.viewAxis.6, sceneView.viewAxis.7, sceneView.viewAxis.8)
+            let right = -axis1
+            let up = axis2
+            let halfSize: Float = 16.0
+
+            let corners: [(SIMD2<Float>, SIMD2<Float>)] = [
+                (SIMD2(-1, -1), SIMD2(0, 1)),
+                (SIMD2( 1, -1), SIMD2(1, 1)),
+                (SIMD2( 1,  1), SIMD2(1, 0)),
+                (SIMD2(-1,  1), SIMD2(0, 0)),
+            ]
+
+            var vertices = [Q3MetalEntityVertex]()
+            vertices.reserveCapacity(flareCount * 4)
+            var indices = [UInt32]()
+            indices.reserveCapacity(flareCount * 6)
+
+            let flares = UnsafeBufferPointer(start: flaresPointer, count: flareCount)
+            for (i, flare) in flares.enumerated() {
+                let origin = SIMD3<Float>(flare.origin.0, flare.origin.1, flare.origin.2)
+                let color = SIMD3<Float>(flare.color.0, flare.color.1, flare.color.2)
+                let base = UInt32(i * 4)
+                for (corner, uv) in corners {
+                    let p = origin + right * (corner.x * halfSize) + up * (corner.y * halfSize)
+                    var vert = Q3MetalEntityVertex(
+                        position: (p.x, p.y, p.z),
+                        texCoord: (uv.x, uv.y),
+                        color: (color.x, color.y, color.z, 1.0)
+                    )
+                    vertices.append(vert)
+                }
+                indices.append(contentsOf: [base, base + 1, base + 2, base, base + 2, base + 3])
+            }
+
+            let vertStride = MemoryLayout<Q3MetalEntityVertex>.stride
+            guard let vertexBuffer = device.makeBuffer(
+                bytes: vertices,
+                length: vertices.count * vertStride,
+                options: .storageModeShared
+            ),
+            let indexBuffer = device.makeBuffer(
+                bytes: indices,
+                length: indices.count * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared
+            ) else { return }
+
+            encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
+            encoder.drawIndexedPrimitives(
+                type: .triangle,
+                indexCount: indices.count,
+                indexType: .uint32,
+                indexBuffer: indexBuffer,
+                indexBufferOffset: 0
+            )
         }
 
         private func makeWorldViewProjection(_ sceneView: Q3MetalSceneView) -> simd_float4x4 {

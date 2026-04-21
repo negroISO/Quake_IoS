@@ -85,6 +85,19 @@ typedef struct {
 
 #define Q3_METAL_NO_FOG 0xFFFFFFFFu
 
+/* Flare point harvested from the BSP's MST_FLARE surfaces. Renders as an
+ * additive camera-facing billboard using the bundled gfx/misc/flare
+ * texture at draw time. Color comes from the map compiler (light entity's
+ * tint); origin is the light entity's world position. */
+typedef struct {
+    float origin[3];
+    float color[3];
+    uint32_t _pad0;
+    uint32_t _pad1;
+} Q3MetalFlare;
+
+#define Q3_METAL_MAX_FLARES 512
+
 typedef struct {
     uint32_t firstIndex;
     uint32_t indexCount;
@@ -177,6 +190,9 @@ const Q3MetalEntityVertex *Q3MetalRenderer_GetEntityVertices(void);
 const uint32_t *Q3MetalRenderer_GetEntityIndices(void);
 const Q3MetalEntityDrawCmd *Q3MetalRenderer_GetEntityDrawCommands(void);
 const Q3MetalLight *Q3MetalRenderer_GetLights(void);
+int Q3MetalRenderer_GetFlareCount(void);
+const Q3MetalFlare *Q3MetalRenderer_GetFlares(void);
+uint32_t Q3MetalRenderer_GetFlareTextureHandle(void);
 const Q3MetalSceneView *Q3MetalRenderer_GetSceneView(void);
 int Q3MetalRenderer_GetTextureInfo(uint32_t textureHandle, Q3MetalTextureInfo *outInfo);
 

@@ -75,6 +75,15 @@ static metalWorldFog_t s_worldFogs[METAL_MAX_WORLD_FOGS];
 static Q3MetalWorldFog s_worldFogsPublic[METAL_MAX_WORLD_FOGS];
 static int s_worldFogCount;
 
+/* Flare points harvested from the BSP's MST_FLARE lump. Populated at world
+ * load, consumed each frame by the Swift renderer to emit camera-facing
+ * additive billboards. Texture handle is set to the resolved 'flareShader'
+ * (gfx/misc/flare.tga) during world load — 0 means no flare texture
+ * available, flares skip rendering. */
+static Q3MetalFlare s_worldFlares[Q3_METAL_MAX_FLARES];
+static int s_worldFlareCount;
+static uint32_t s_flareTextureHandle;
+
 typedef struct {
     qboolean inUse;
     qhandle_t handle;
@@ -219,6 +228,11 @@ typedef struct {
     qboolean hasFog;
     float fogColor[3];
     float fogDistance;
+    /* Surface should emit a Q3 flare billboard at its centroid. Set when
+     * the shader script carries a 'flareShader <tex>' directive. The
+     * texture name is ignored — we use the canonical gfx/misc/flare
+     * globally, matching how Q3 ships flares visually. */
+    qboolean hasFlare;
     Q3MetalStage stages[Q3_MAX_STAGES];
     int stageCount;
 } metalShaderMap_t;
@@ -813,6 +827,9 @@ static void FreeWorldMapData(void) {
     }
     s_worldLightmapCount = 0;
     s_worldFogCount = 0;
+    s_worldFlareCount = 0;
+    s_flareTextureHandle = 0;
+    Com_Memset(s_worldFlares, 0, sizeof(s_worldFlares));
     Com_Memset(s_worldFogs, 0, sizeof(s_worldFogs));
     Com_Memset(s_worldFogsPublic, 0, sizeof(s_worldFogsPublic));
     Com_Memset(&s_world, 0, sizeof(s_world));
@@ -1644,6 +1661,22 @@ static qboolean LoadWorldMapData(const char *name) {
         int patchHeight;
         int shaderNum;
 
+        /* MST_FLARE surfaces carry no triangles — they're pure light
+         * points. Harvest origin/color into s_worldFlares and continue;
+         * IsSupportedWorldSurface below would otherwise reject them. */
+        if (surfaceType == MST_FLARE) {
+            if (s_worldFlareCount < Q3_METAL_MAX_FLARES) {
+                Q3MetalFlare *fl = &s_worldFlares[s_worldFlareCount++];
+                fl->origin[0] = LittleFloat(surface->lightmapOrigin[0]);
+                fl->origin[1] = LittleFloat(surface->lightmapOrigin[1]);
+                fl->origin[2] = LittleFloat(surface->lightmapOrigin[2]);
+                fl->color[0] = LittleFloat(surface->lightmapVecs[0][0]);
+                fl->color[1] = LittleFloat(surface->lightmapVecs[0][1]);
+                fl->color[2] = LittleFloat(surface->lightmapVecs[0][2]);
+            }
+            continue;
+        }
+
         if (!IsSupportedWorldSurface(surface, drawVertCount, drawIndexCount)) {
             continue;
         }
@@ -1832,6 +1865,31 @@ static qboolean LoadWorldMapData(const char *name) {
             if (_pe != NULL && _pe->isPortal) {
                 worldFlags |= Q3_METAL_WORLD_DRAWFLAG_PORTAL;
             }
+            /* flareShader directive: emit a flare billboard at the surface
+             * centroid. Skip patches (MST_PATCH) — their vertex layout
+             * isn't the flat strip we'd average naively. Planar + trisoup
+             * surfaces cover the stock case (lamp brushes, glow panels). */
+            if (_pe != NULL && _pe->hasFlare && surfaceType != MST_PATCH &&
+                s_worldFlareCount < Q3_METAL_MAX_FLARES) {
+                float cx = 0.0f, cy = 0.0f, cz = 0.0f;
+                int sampleCount = numVerts < 8 ? numVerts : 8;
+                int si;
+                for (si = 0; si < sampleCount; ++si) {
+                    const drawVert_t *dv = &drawVerts[firstVert + si];
+                    cx += dv->xyz[0];
+                    cy += dv->xyz[1];
+                    cz += dv->xyz[2];
+                }
+                if (sampleCount > 0) {
+                    Q3MetalFlare *fl = &s_worldFlares[s_worldFlareCount++];
+                    fl->origin[0] = cx / (float)sampleCount;
+                    fl->origin[1] = cy / (float)sampleCount;
+                    fl->origin[2] = cz / (float)sampleCount;
+                    fl->color[0] = 1.0f;
+                    fl->color[1] = 1.0f;
+                    fl->color[2] = 1.0f;
+                }
+            }
         }
 
         if (surfaceType == MST_PATCH) {
@@ -2011,10 +2069,18 @@ static qboolean LoadWorldMapData(const char *name) {
     s_world.drawCount = drawCursor;
     Q_strncpyz(s_world.name, name, sizeof(s_world.name));
 
+    /* Resolve the flare billboard texture once per map. The canonical Q3
+     * shader is 'flareShader' mapped to gfx/misc/flare. If the texture is
+     * missing we fall back to white — Swift will skip flare rendering when
+     * the handle is 0. */
+    if (s_worldFlareCount > 0) {
+        s_flareTextureHandle = (uint32_t)RegisterTexture("gfx/misc/flare");
+    }
+
     ri.Printf(PRINT_ALL,
-              "Metal world: loaded '%s' with %u verts, %u indices, %u draws (%u planar, %u patch, %u trisoup, %u sky)\n",
+              "Metal world: loaded '%s' with %u verts, %u indices, %u draws (%u planar, %u patch, %u trisoup, %u sky, %d flares)\n",
               name, s_world.vertexCount, s_world.indexCount, s_world.drawCount,
-              planarDraws, patchDraws, triSoupDraws, skyDraws);
+              planarDraws, patchDraws, triSoupDraws, skyDraws, s_worldFlareCount);
     if (skippedNoDrawSurfaces > 0) {
         ri.Printf(PRINT_ALL, "Metal world: skipped %u nodraw surfaces in '%s'\n", skippedNoDrawSurfaces, name);
     }
@@ -2402,6 +2468,7 @@ static void ParseShaderText(const char *text) {
         qboolean gotSkyParms;
         qboolean gotPortal;
         qboolean gotFog;
+        qboolean gotFlare;
         float fogColor[3];
         float fogDistance;
         Q3MetalStage cur;
@@ -2426,6 +2493,7 @@ static void ParseShaderText(const char *text) {
         gotSkyParms = qfalse;
         gotPortal = qfalse;
         gotFog = qfalse;
+        gotFlare = qfalse;
         fogColor[0] = fogColor[1] = fogColor[2] = 0.0f;
         fogDistance = 0.0f;
         Com_Memset(&cur, 0, sizeof(cur));
@@ -2482,6 +2550,15 @@ static void ParseShaderText(const char *text) {
                     } else {
                         cullMode = METAL_SHADER_CULL_BACK;
                     }
+                } else if (!Q_stricmp(token, "q3map_flare")) {
+                    /* Syntax: q3map_flare <shader>. Stock Q3 uses this
+                     * as a compile-time hint for the map compiler, which
+                     * then emits MST_FLARE BSP surfaces. We also pick it
+                     * up here so maps that shipped without baked flares
+                     * still render them at runtime. Texture name is
+                     * discarded — we use gfx/misc/flare globally. */
+                    (void)COM_ParseExt(&p, qfalse);
+                    gotFlare = qtrue;
                 } else if (!Q_stricmp(token, "fogparms") || !Q_stricmp(token, "fogParms")) {
                     /* Syntax: fogparms ( r g b ) distance
                      * Tokenizes as: '(' r g b ')' distance — seven tokens. */
@@ -2720,6 +2797,7 @@ static void ParseShaderText(const char *text) {
                 }
                 last->isPortal = gotPortal;
                 last->hasFog = gotFog;
+                last->hasFlare = gotFlare;
                 if (gotFog) {
                     last->fogColor[0] = fogColor[0];
                     last->fogColor[1] = fogColor[1];
@@ -4234,6 +4312,10 @@ int Q3MetalRenderer_GetWorldFogCount(void) {
 const Q3MetalWorldFog *Q3MetalRenderer_GetWorldFogs(void) {
     return s_worldFogsPublic;
 }
+
+int Q3MetalRenderer_GetFlareCount(void) { return s_worldFlareCount; }
+const Q3MetalFlare *Q3MetalRenderer_GetFlares(void) { return s_worldFlares; }
+uint32_t Q3MetalRenderer_GetFlareTextureHandle(void) { return s_flareTextureHandle; }
 
 const Q3MetalEntityVertex *Q3MetalRenderer_GetEntityVertices(void) {
     return s_entityVertices;
