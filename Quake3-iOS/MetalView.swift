@@ -499,6 +499,9 @@ struct MetalView: UIViewRepresentable {
 
         private var commandQueue: MTLCommandQueue?
         private var uiPipelineState: MTLRenderPipelineState?
+        private var uiOpaquePipelineState: MTLRenderPipelineState?
+        private var uiAdditivePipelineState: MTLRenderPipelineState?
+        private var uiFilterPipelineState: MTLRenderPipelineState?
         private var worldPipelineState: MTLRenderPipelineState?
         private var worldFilterPipelineState: MTLRenderPipelineState?
         private var worldAlphaPipelineState: MTLRenderPipelineState?
@@ -854,9 +857,6 @@ struct MetalView: UIViewRepresentable {
                 let projection = makeOrthoProjection(width: max(Float(snapshot.drawableWidth), 1.0), height: max(Float(snapshot.drawableHeight), 1.0))
                 var uniforms = Uniforms(projection: projection)
 
-                if let uiPipelineState {
-                    encoder.setRenderPipelineState(uiPipelineState)
-                }
                 encoder.setDepthStencilState(ensuredDepthStencilState(nil, device: view.device))
                 encoder.setFragmentSamplerState(uiSamplerState, index: 0)
                 encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
@@ -864,7 +864,22 @@ struct MetalView: UIViewRepresentable {
 
                 if let drawCommandsPointer = Q3MetalRenderer_GetDrawCommands() {
                     let drawCommands = UnsafeBufferPointer(start: drawCommandsPointer, count: Int(snapshot.commandCount))
+                    var currentPipelineMode: UInt32 = UInt32.max
                     for draw in drawCommands {
+                        if draw.blendMode != currentPipelineMode {
+                            let pipeline: MTLRenderPipelineState? = {
+                                switch draw.blendMode {
+                                case 0: return uiOpaquePipelineState ?? uiPipelineState
+                                case 1: return uiAdditivePipelineState ?? uiPipelineState
+                                case 3: return uiFilterPipelineState ?? uiPipelineState
+                                default: return uiPipelineState
+                                }
+                            }()
+                            if let pipeline {
+                                encoder.setRenderPipelineState(pipeline)
+                            }
+                            currentPipelineMode = draw.blendMode
+                        }
                         if let texture = texture(for: draw.textureHandle, device: view.device) {
                             encoder.setFragmentTexture(texture, index: 0)
                             encoder.drawPrimitives(type: .triangle, vertexStart: Int(draw.firstVertex), vertexCount: Int(draw.vertexCount))
@@ -909,6 +924,59 @@ struct MetalView: UIViewRepresentable {
                 uiPipelineState = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
             } catch {
                 print("[Metal] Failed to create UI pipeline: \\(error)")
+            }
+
+            // Per-blend-mode variants of the UI pipeline. Each Q3MetalDrawCmd
+            // carries a blendMode propagated from its shader's resolved blend,
+            // so 2D stages like the loading-screen `levelShotDetail` overlay
+            // multiply against the levelshot (filter) instead of washing the
+            // screen out as plain source-over alpha.
+            let uiOpaqueDesc = MTLRenderPipelineDescriptor()
+            uiOpaqueDesc.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            uiOpaqueDesc.depthAttachmentPixelFormat = view.depthStencilPixelFormat
+            uiOpaqueDesc.vertexFunction = library.makeFunction(name: "q3_ui_vertex")
+            uiOpaqueDesc.fragmentFunction = library.makeFunction(name: "q3_ui_fragment")
+            uiOpaqueDesc.colorAttachments[0].isBlendingEnabled = false
+            do {
+                uiOpaquePipelineState = try device.makeRenderPipelineState(descriptor: uiOpaqueDesc)
+            } catch {
+                print("[Metal] Failed to create UI opaque pipeline: \\(error)")
+            }
+
+            let uiAdditiveDesc = MTLRenderPipelineDescriptor()
+            uiAdditiveDesc.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            uiAdditiveDesc.depthAttachmentPixelFormat = view.depthStencilPixelFormat
+            uiAdditiveDesc.vertexFunction = library.makeFunction(name: "q3_ui_vertex")
+            uiAdditiveDesc.fragmentFunction = library.makeFunction(name: "q3_ui_fragment")
+            uiAdditiveDesc.colorAttachments[0].isBlendingEnabled = true
+            uiAdditiveDesc.colorAttachments[0].rgbBlendOperation = .add
+            uiAdditiveDesc.colorAttachments[0].alphaBlendOperation = .add
+            uiAdditiveDesc.colorAttachments[0].sourceRGBBlendFactor = .one
+            uiAdditiveDesc.colorAttachments[0].sourceAlphaBlendFactor = .one
+            uiAdditiveDesc.colorAttachments[0].destinationRGBBlendFactor = .one
+            uiAdditiveDesc.colorAttachments[0].destinationAlphaBlendFactor = .one
+            do {
+                uiAdditivePipelineState = try device.makeRenderPipelineState(descriptor: uiAdditiveDesc)
+            } catch {
+                print("[Metal] Failed to create UI additive pipeline: \\(error)")
+            }
+
+            let uiFilterDesc = MTLRenderPipelineDescriptor()
+            uiFilterDesc.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            uiFilterDesc.depthAttachmentPixelFormat = view.depthStencilPixelFormat
+            uiFilterDesc.vertexFunction = library.makeFunction(name: "q3_ui_vertex")
+            uiFilterDesc.fragmentFunction = library.makeFunction(name: "q3_ui_fragment")
+            uiFilterDesc.colorAttachments[0].isBlendingEnabled = true
+            uiFilterDesc.colorAttachments[0].rgbBlendOperation = .add
+            uiFilterDesc.colorAttachments[0].alphaBlendOperation = .add
+            uiFilterDesc.colorAttachments[0].sourceRGBBlendFactor = .destinationColor
+            uiFilterDesc.colorAttachments[0].sourceAlphaBlendFactor = .destinationAlpha
+            uiFilterDesc.colorAttachments[0].destinationRGBBlendFactor = .zero
+            uiFilterDesc.colorAttachments[0].destinationAlphaBlendFactor = .zero
+            do {
+                uiFilterPipelineState = try device.makeRenderPipelineState(descriptor: uiFilterDesc)
+            } catch {
+                print("[Metal] Failed to create UI filter pipeline: \\(error)")
             }
 
             let worldPipelineDescriptor = MTLRenderPipelineDescriptor()

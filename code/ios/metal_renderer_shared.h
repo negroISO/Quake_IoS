@@ -30,6 +30,12 @@ typedef struct {
     uint32_t firstVertex;
     uint32_t vertexCount;
     uint32_t textureHandle;
+    /* 0=opaque, 1=additive (src=one, dst=one), 2=alpha (src-over),
+     * 3=filter (src=dst_color, dst=zero, i.e. multiply). Propagated from
+     * the shader's resolved blend so 2D stages like the loading-screen
+     * `levelShotDetail` overlay multiply against the levelshot instead of
+     * washing it out as plain alpha-over. */
+    uint32_t blendMode;
 } Q3MetalDrawCmd;
 
 #define Q3_MAX_TCMODS 4

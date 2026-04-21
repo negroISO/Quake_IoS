@@ -3990,6 +3990,7 @@ static void RE_SetColor(const float *rgba) {
 static void RE_StretchPic(float x, float y, float w, float h, float s1, float t1, float s2, float t2, qhandle_t hShader) {
     Q3MetalDrawCmd *draw;
     qhandle_t textureHandle = hShader > 0 ? hShader : EnsureWhiteTexture();
+    metalTexture_t *tex = FindTextureByHandle(textureHandle);
 
     if (s_drawCount >= Q3_METAL_MAX_DRAWS || s_vertexCount + 6 > Q3_METAL_MAX_VERTICES) {
         return;
@@ -3999,6 +4000,7 @@ static void RE_StretchPic(float x, float y, float w, float h, float s1, float t1
     draw->firstVertex = s_vertexCount;
     draw->vertexCount = 6;
     draw->textureHandle = (uint32_t)textureHandle;
+    draw->blendMode = (uint32_t)(tex ? tex->blendMode : 0);
 
     PushStretchPicVertex(x, y, s1, t1, s_currentColor);
     PushStretchPicVertex(x + w, y, s2, t1, s_currentColor);
