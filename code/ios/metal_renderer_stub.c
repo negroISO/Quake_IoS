@@ -233,6 +233,12 @@ typedef struct {
      * texture name is ignored — we use the canonical gfx/misc/flare
      * globally, matching how Q3 ships flares visually. */
     qboolean hasFlare;
+    /* Shader declares itself as a sky via `surfaceparm sky` or `skyparms`.
+     * Name-prefix matching (textures/skies/, env/) only catches stock
+     * naming conventions; custom maps like nv15 use arbitrary paths but
+     * still tag the shader. Consulting this flag at surface classification
+     * time makes sky detection prefix-independent. */
+    qboolean isSky;
     Q3MetalStage stages[Q3_MAX_STAGES];
     int stageCount;
 } metalShaderMap_t;
@@ -400,7 +406,14 @@ static qhandle_t EnsureSkyTexture(void) {
 static qhandle_t GetSkyFaceTextureForSurface(const char *shaderName,
                                              float nx, float ny, float nz);
 
+/* Forward declaration — the shader-map lookup lives further down the
+ * file. IsSkyShaderName is called during BSP load, well after
+ * LoadAllShaders has populated the map, so the lookup always resolves. */
+static const metalShaderMap_t *ShaderMap_LookupEntry(const char *name);
+
 static qboolean IsSkyShaderName(const char *name) {
+    const metalShaderMap_t *entry;
+
     if (name == NULL || name[0] == '\0') {
         return qfalse;
     }
@@ -409,6 +422,16 @@ static qboolean IsSkyShaderName(const char *name) {
         return qtrue;
     }
     if (!Q_stricmpn(name, "env/", 4)) {
+        return qtrue;
+    }
+
+    /* Prefix heuristics miss maps that declare sky via shader directives
+     * at arbitrary paths (nv15 uses textures/nvidia/..., community maps
+     * use textures/outside/..., etc.). Consult the parsed shader-map
+     * entry's isSky flag as a fallback — set from 'surfaceparm sky'
+     * or 'skyparms' in the shader script. */
+    entry = ShaderMap_LookupEntry(name);
+    if (entry != NULL && entry->isSky) {
         return qtrue;
     }
 
@@ -2469,6 +2492,7 @@ static void ParseShaderText(const char *text) {
         qboolean gotPortal;
         qboolean gotFog;
         qboolean gotFlare;
+        qboolean gotSky;
         float fogColor[3];
         float fogDistance;
         Q3MetalStage cur;
@@ -2494,6 +2518,7 @@ static void ParseShaderText(const char *text) {
         gotPortal = qfalse;
         gotFog = qfalse;
         gotFlare = qfalse;
+        gotSky = qfalse;
         fogColor[0] = fogColor[1] = fogColor[2] = 0.0f;
         fogDistance = 0.0f;
         Com_Memset(&cur, 0, sizeof(cur));
@@ -2535,6 +2560,16 @@ static void ParseShaderText(const char *text) {
                     if (token[0] && Q_stricmp(token, "-") != 0) {
                         Q_strncpyz(skyBoxBase, token, sizeof(skyBoxBase));
                         gotSkyParms = qtrue;
+                    }
+                    gotSky = qtrue;   /* skyparms always implies sky */
+                } else if (!Q_stricmp(token, "surfaceparm")) {
+                    /* surfaceparm <keyword>. We only care about `sky`
+                     * right now — everything else (trans, nolightmap,
+                     * nomarks, noimpact, etc.) is ignored but we must
+                     * still consume its argument so the parser advances. */
+                    token = COM_ParseExt(&p, qfalse);
+                    if (token[0] && !Q_stricmp(token, "sky")) {
+                        gotSky = qtrue;
                     }
                 } else if (!gotPortal && !Q_stricmp(token, "portal")) {
                     gotPortal = qtrue;
@@ -2798,6 +2833,7 @@ static void ParseShaderText(const char *text) {
                 last->isPortal = gotPortal;
                 last->hasFog = gotFog;
                 last->hasFlare = gotFlare;
+                last->isSky = gotSky;
                 if (gotFog) {
                     last->fogColor[0] = fogColor[0];
                     last->fogColor[1] = fogColor[1];
