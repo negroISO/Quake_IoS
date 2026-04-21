@@ -496,7 +496,12 @@ struct MetalView: UIViewRepresentable {
             if let fallbackDepthStencilState { return fallbackDepthStencilState }
             guard let device else { return nil }
             let desc = MTLDepthStencilDescriptor()
-            desc.depthCompareFunction = .always
+            // STEP 8: .lessEqual (not .always) so downstream stages that
+            // land on this fallback path still honor depth ordering. The
+            // previous .always forced every stage drawn through the
+            // fallback to overwrite existing depth, producing flicker on
+            // stacked geometry.
+            desc.depthCompareFunction = .lessEqual
             desc.isDepthWriteEnabled = false
             fallbackDepthStencilState = device.makeDepthStencilState(descriptor: desc)
             return fallbackDepthStencilState
@@ -1044,12 +1049,16 @@ struct MetalView: UIViewRepresentable {
             additiveDepthDescriptor.depthCompareFunction = .lessEqual
             additiveDepthStencilState = device.makeDepthStencilState(descriptor: additiveDepthDescriptor)
 
-            // Depth-hack state for first-person viewmodel: always pass depth
-            // test so the gun is never occluded by world geometry, while
-            // still writing depth so model self-occlusion stays correct.
+            // Depth-hack state for first-person viewmodel (STEP 8).
+            // Q3's depth-hack trick compresses the weapon's depth range so
+            // the gun isn't clipped by walls. Depth TEST still runs with
+            // .lessEqual so the model's OWN parts occlude each other
+            // correctly; the previous .always disabled the test entirely,
+            // which broke self-occlusion inside the weapon mesh (e.g.
+            // barrel showing through the gun body).
             let depthHackDescriptor = MTLDepthStencilDescriptor()
             depthHackDescriptor.isDepthWriteEnabled = true
-            depthHackDescriptor.depthCompareFunction = .always
+            depthHackDescriptor.depthCompareFunction = .lessEqual
             depthHackDepthStencilState = device.makeDepthStencilState(descriptor: depthHackDescriptor)
         }
 
