@@ -4592,6 +4592,25 @@ static void RE_RenderScene(const refdef_t *fd) {
                                 drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_ALPHA;
                             } else if (tex->blendMode == 3) {
                                 drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_FILTER;
+                            } else {
+                                /* blendMode==0 for an FX model means its
+                                 * shader didn't parse and we loaded the
+                                 * texture from a .jpg fallback that lost
+                                 * the alpha channel. Opaque-render gives
+                                 * a hard yellow rectangle around explosion
+                                 * fireballs, blood splats, rocket trails.
+                                 * Force additive for the known FX paths —
+                                 * a black-border JPG contributes zero in
+                                 * additive blend, hiding the rectangle and
+                                 * showing just the bright fireball center. */
+                                const char *n = tex->name;
+                                if (n[0] != '\0' &&
+                                    (!Q_stricmpn(n, "models/weaphits/", 16) ||
+                                     !Q_stricmpn(n, "sprites/", 8) ||
+                                     !Q_stricmpn(n, "gfx/damage/", 11) ||
+                                     !Q_stricmpn(n, "gfx/misc/", 9))) {
+                                    drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                                }
                             }
                         }
                         /* Diagnostic: first 5 per frame */
@@ -4762,9 +4781,20 @@ static void RE_RenderScene(const refdef_t *fd) {
                         if (ptex->blendMode == 1) polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
                         else if (ptex->blendMode == 2) polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_ALPHA;
                         else if (ptex->blendMode == 3) polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_FILTER;
-                        else polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_ALPHA;  /* default blood/shadow = alpha */
+                        /* Fallback: when the poly's shader didn't resolve a
+                         * blend mode (blendMode==0), default to ADDITIVE not
+                         * ALPHA. Q3's explosion/trail/particle shaders are
+                         * GL_SRC_ALPHA GL_ONE (premult-additive); our parser
+                         * doesn't yet recognize that combo so they arrive
+                         * with blendMode=0. Alpha-blending an opaque JPG
+                         * (explosion textures load as .jpg when the .tga is
+                         * missing, which is the common case) draws a hard
+                         * yellow rectangle over the scene — "square around
+                         * explosion." Additive with a dark-border texture
+                         * renders correctly because black contributes zero. */
+                        else polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
                     } else {
-                        polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_ALPHA;
+                        polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
                     }
 
                     s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
