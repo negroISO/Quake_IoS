@@ -58,6 +58,10 @@ struct MetalView: UIViewRepresentable {
             var tcModParams1: SIMD4<Float>
             var tcModParams2: SIMD4<Float>
             var tcModParams3: SIMD4<Float>
+            // Fog for this draw. xyz = linear fog color, w = fog distance
+            // (units of world space). w == 0 ⇒ no fog, fragment skips the
+            // mix entirely. Populated per-draw from s_worldFogs[fogIndex].
+            var fogColorDistance: SIMD4<Float>
             var debugMode: Float
             var forceWhiteVertColor: Float
             var alphaTestThreshold: Float
@@ -199,6 +203,10 @@ struct MetalView: UIViewRepresentable {
             float2 texCoord;
             float2 lightmapTexCoord;
             float4 color;
+            // World-space vertex position. Needed so the fragment can
+            // compute linear view distance for fog. Interpolated with
+            // perspective correction automatically.
+            float3 worldPos;
         };
 
         struct WorldDrawUniforms {
@@ -211,6 +219,9 @@ struct MetalView: UIViewRepresentable {
             float4 tcModParams1;
             float4 tcModParams2;
             float4 tcModParams3;
+            // Fog: xyz = color, w = distance (world units). w == 0 ⇒
+            // no fog applies to this draw, fragment skips the mix.
+            float4 fogColorDistance;
             float debugMode;
             float forceWhiteVertColor;
             float alphaTestThreshold;
@@ -267,11 +278,16 @@ struct MetalView: UIViewRepresentable {
             out.texCoord = inVertex.texCoord;
             out.lightmapTexCoord = inVertex.lightmapTexCoord;
             out.color = inVertex.color;
+            // Pass through world-space position for the fog distance
+            // calculation in the fragment. Cheap; perspective-correct
+            // interpolation is what we want for linear fog.
+            out.worldPos = inVertex.position;
             return out;
         }
 
         fragment float4 q3_world_fragment(WorldVertexOut in [[stage_in]],
                                           constant WorldDrawUniforms &drawUniforms [[buffer(0)]],
+                                          constant WorldUniforms &uniforms [[buffer(1)]],
                                           texture2d<float> colorTexture [[texture(0)]],
                                           texture2d<float> lightmapTexture [[texture(1)]],
                                           sampler textureSampler [[sampler(0)]]) {
@@ -340,6 +356,17 @@ struct MetalView: UIViewRepresentable {
             float3 vc = mix(vertexColor, float3(1.0), drawUniforms.forceWhiteVertColor);
             float  va = mix(in.color.a,   1.0,          drawUniforms.forceWhiteVertColor);
             float3 lit = texel.rgb * lightmap.rgb * vc;
+            // Fog pass (F3). drawUniforms.fogColorDistance is:
+            //   .xyz = linear fog color, .w = fog distance (world units).
+            // .w == 0 means "no fog" (every surface outside any volume on
+            // q3dm6 hits this branch — effectively free). Otherwise mix
+            // toward fog color by saturated linear distance. Exponential
+            // falloff can replace the linear ramp later if needed.
+            if (drawUniforms.fogColorDistance.w > 0.0) {
+                float dist = length(in.worldPos - uniforms.cameraPos);
+                float f = saturate(dist / drawUniforms.fogColorDistance.w);
+                lit = mix(lit, drawUniforms.fogColorDistance.xyz, f);
+            }
             return float4(lit, texel.a * va);
         }
 
@@ -634,6 +661,7 @@ struct MetalView: UIViewRepresentable {
                                 // per-stage cullMode just like world stages.
                                 encoder.setCullMode(Self.metalCullMode(for: stage.cullMode))
                                 let skyChain = Self.fillTcMods(stage)
+                                // Sky never receives fog — fogColorDistance=0.
                                 var skyDrawUniforms = WorldDrawUniforms(
                                     tcGen: Float(stage.tcGen),
                                     tcModCount: skyChain.count,
@@ -644,6 +672,7 @@ struct MetalView: UIViewRepresentable {
                                     tcModParams1: skyChain.p1,
                                     tcModParams2: skyChain.p2,
                                     tcModParams3: skyChain.p3,
+                                    fogColorDistance: SIMD4<Float>(0, 0, 0, 0),
                                     debugMode: 0,
                                     forceWhiteVertColor: 0,
                                     alphaTestThreshold: 0,
@@ -693,6 +722,20 @@ struct MetalView: UIViewRepresentable {
                             encoder.setCullMode(Self.metalCullMode(for: stage.cullMode))
                             let alphaTest = Self.alphaTestThreshold(for: stage.alphaFunc)
                             let chain = Self.fillTcMods(stage)
+                            // Fog lookup. draw.fogIndex is Q3_METAL_NO_FOG
+                            // (0xFFFFFFFF) for surfaces outside any fog
+                            // volume; on q3dm6 this is every surface. The
+                            // MSL shader skips the fog mix when .w == 0.
+                            let noFog = UInt32(Q3_METAL_NO_FOG)
+                            var fogCD = SIMD4<Float>(0, 0, 0, 0)
+                            if draw.fogIndex != noFog {
+                                let count = Q3MetalRenderer_GetWorldFogCount()
+                                if Int(draw.fogIndex) < count,
+                                   let fogs = Q3MetalRenderer_GetWorldFogs() {
+                                    let f = fogs.advanced(by: Int(draw.fogIndex)).pointee
+                                    fogCD = SIMD4(f.color.0, f.color.1, f.color.2, f.distance)
+                                }
+                            }
                             var drawUniforms = WorldDrawUniforms(
                                 tcGen: Float(stage.tcGen),
                                 tcModCount: chain.count,
@@ -703,6 +746,7 @@ struct MetalView: UIViewRepresentable {
                                 tcModParams1: chain.p1,
                                 tcModParams2: chain.p2,
                                 tcModParams3: chain.p3,
+                                fogColorDistance: fogCD,
                                 debugMode: Coordinator.worldDebugMode,
                                 forceWhiteVertColor: (blendMode == 1) ? 1.0 : 0.0,
                                 alphaTestThreshold: alphaTest,

@@ -67,6 +67,12 @@ typedef struct {
     float distance;
 } metalWorldFog_t;
 static metalWorldFog_t s_worldFogs[METAL_MAX_WORLD_FOGS];
+/* Parallel array exposed to Swift via Q3MetalRenderer_GetWorldFogs.
+ * Same count as s_worldFogs; each entry's color[3]+distance matches
+ * s_worldFogs[i].color/distance. Entries whose hasColor==qfalse are
+ * zeroed out here so Swift seeing distance==0 reliably means "no
+ * fog for this volume" even if the fogIndex was passed through. */
+static Q3MetalWorldFog s_worldFogsPublic[METAL_MAX_WORLD_FOGS];
 static int s_worldFogCount;
 
 typedef struct {
@@ -800,6 +806,7 @@ static void FreeWorldMapData(void) {
     s_worldLightmapCount = 0;
     s_worldFogCount = 0;
     Com_Memset(s_worldFogs, 0, sizeof(s_worldFogs));
+    Com_Memset(s_worldFogsPublic, 0, sizeof(s_worldFogsPublic));
     Com_Memset(&s_world, 0, sizeof(s_world));
 }
 
@@ -1604,8 +1611,15 @@ static qboolean LoadWorldMapData(const char *name) {
                 s_worldFogs[fi].color[1] = fse->fogColor[1];
                 s_worldFogs[fi].color[2] = fse->fogColor[2];
                 s_worldFogs[fi].distance = fse->fogDistance;
+                s_worldFogsPublic[fi].color[0] = fse->fogColor[0];
+                s_worldFogsPublic[fi].color[1] = fse->fogColor[1];
+                s_worldFogsPublic[fi].color[2] = fse->fogColor[2];
+                s_worldFogsPublic[fi].distance = fse->fogDistance;
                 withColor += 1;
             }
+            /* Unresolved volumes leave s_worldFogsPublic[fi] at the
+             * zero-init state (distance==0), which the MSL fog branch
+             * reads as "no fog". */
         }
         if (fogCount > 0) {
             ri.Printf(PRINT_ALL,
@@ -4126,6 +4140,14 @@ const uint32_t *Q3MetalRenderer_GetWorldIndices(void) {
 
 const Q3MetalWorldDrawCmd *Q3MetalRenderer_GetWorldDrawCommands(void) {
     return s_world.draws;
+}
+
+int Q3MetalRenderer_GetWorldFogCount(void) {
+    return s_worldFogCount;
+}
+
+const Q3MetalWorldFog *Q3MetalRenderer_GetWorldFogs(void) {
+    return s_worldFogsPublic;
 }
 
 const Q3MetalEntityVertex *Q3MetalRenderer_GetEntityVertices(void) {

@@ -144,6 +144,15 @@ const Q3MetalDrawCmd *Q3MetalRenderer_GetDrawCommands(void);
 const Q3MetalWorldVertex *Q3MetalRenderer_GetWorldVertices(void);
 const uint32_t *Q3MetalRenderer_GetWorldIndices(void);
 const Q3MetalWorldDrawCmd *Q3MetalRenderer_GetWorldDrawCommands(void);
+/* Per-world fog LUT. fogIndex values on Q3MetalWorldDrawCmd are indices
+ * into this array. Returns 0/NULL if the loaded map has no fog volumes.
+ * Each entry's color is linear RGB and distance is world units. */
+typedef struct {
+    float color[3];
+    float distance;
+} Q3MetalWorldFog;
+int Q3MetalRenderer_GetWorldFogCount(void);
+const Q3MetalWorldFog *Q3MetalRenderer_GetWorldFogs(void);
 const Q3MetalEntityVertex *Q3MetalRenderer_GetEntityVertices(void);
 const uint32_t *Q3MetalRenderer_GetEntityIndices(void);
 const Q3MetalEntityDrawCmd *Q3MetalRenderer_GetEntityDrawCommands(void);
