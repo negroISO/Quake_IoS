@@ -3219,11 +3219,24 @@ static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime
         s_entityAcceptedThisFrame += 1;
         return;
     }
+    /* RT_LIGHTNING: beam from origin ("from") to oldorigin ("to"). We emit
+     * a single view-aligned quad per bolt at RenderScene time (Q3's stock
+     * path crosshatches 4 cores at 45°/90°/135° for volume; one core is
+     * enough to confirm the path and visibly render a bolt on screen).
+     * Follows the same defer-to-RenderScene pattern as RT_SPRITE because
+     * the billboard math needs the viewer origin. */
+    if (re->reType == RT_LIGHTNING) {
+        AuditOnce("ENTITY:RT_LIGHTNING");
+        s_sceneEntities[s_sceneEntityCount].entity = *re;
+        s_sceneEntities[s_sceneEntityCount].mirrored = qfalse;
+        s_sceneEntityCount += 1;
+        s_entityAcceptedThisFrame += 1;
+        return;
+    }
     if (re->reType != RT_MODEL) {
         if (re->reType == RT_BEAM) AuditOnce("ENTITY:RT_BEAM");
         else if (re->reType == RT_RAIL_CORE) AuditOnce("ENTITY:RT_RAIL_CORE");
         else if (re->reType == RT_RAIL_RINGS) AuditOnce("ENTITY:RT_RAIL_RINGS");
-        else if (re->reType == RT_LIGHTNING) AuditOnce("ENTITY:RT_LIGHTNING");
         else if (re->reType == RT_PORTALSURFACE) AuditOnce("ENTITY:RT_PORTALSURFACE");
         else AuditOnce("ENTITY:reType unknown");
         s_entityRejectedTypeThisFrame += 1;
@@ -3701,6 +3714,14 @@ static void RE_RenderScene(const refdef_t *fd) {
                 totalEntityDraws += 1;
                 continue;
             }
+            /* Lightning bolt: same quad budget as a sprite (single view-
+             * aligned rail core between origin and oldorigin). */
+            if (sceneEntity->entity.reType == RT_LIGHTNING) {
+                totalEntityVerts += 4;
+                totalEntityIndices += 6;
+                totalEntityDraws += 1;
+                continue;
+            }
 
             model = FindModelByHandle(sceneEntity->entity.hModel);
             if (model == NULL || model->md3 == NULL) {
@@ -3839,6 +3860,117 @@ static void RE_RenderScene(const refdef_t *fd) {
                         s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)sceneEntity->entity.customShader;
                         s_entityDraws[entityDrawCursor].flags = spriteFlags;
                     }
+                    entityDrawCursor += 1;
+                    continue;
+                }
+
+                /* RT_LIGHTNING: single rail-core quad between origin ("from")
+                 * and oldorigin ("to"). The side vector is perpendicular to
+                 * both the beam direction AND the viewer-to-beam direction,
+                 * so the quad is broadest when viewed from the side and
+                 * narrows into a line when viewed end-on — matches the Q3
+                 * lightning bolt look. Color from entity.shader.rgba.
+                 * Width fixed at 8 world units (Q3 reference). Stock Q3
+                 * crosshatches 4 cores for volume; we emit one core for
+                 * MVP (visible bolt). */
+                if (sceneEntity->entity.reType == RT_LIGHTNING) {
+                    uint32_t baseVertex = entityVertexCursor;
+                    uint32_t firstIndex = entityIndexCursor;
+                    const float *start = sceneEntity->entity.origin;
+                    const float *end = sceneEntity->entity.oldorigin;
+                    vec3_t beamDir, v1, v2, right;
+                    vec3_t corner0, corner1, corner2, corner3;
+                    float len;
+                    float t;
+                    float r, g, b, a;
+                    const float spanWidth = 8.0f;
+
+                    VectorSubtract(end, start, beamDir);
+                    len = VectorLength(beamDir);
+                    if (len < 1.0f) {
+                        /* Degenerate beam, skip. */
+                        continue;
+                    }
+                    t = len / 256.0f;     /* Q3 texcoord stretch */
+
+                    VectorSubtract(start, vieworg, v1);
+                    VectorNormalize(v1);
+                    VectorSubtract(end, vieworg, v2);
+                    VectorNormalize(v2);
+                    CrossProduct(v1, v2, right);
+                    if (VectorLength(right) < 1e-4f) {
+                        /* Viewer directly on the beam line — degenerate
+                         * cross product. Fall back to camera's up-right
+                         * axis so we still emit visible geometry. */
+                        VectorCopy(axis2, right);
+                    }
+                    VectorNormalize(right);
+                    VectorScale(right, spanWidth, right);
+
+                    /* corner0 = start + right, corner1 = start - right,
+                     * corner2 = end + right, corner3 = end - right. */
+                    VectorAdd(start, right, corner0);
+                    VectorSubtract(start, right, corner1);
+                    VectorAdd(end, right, corner2);
+                    VectorSubtract(end, right, corner3);
+
+                    r = (float)sceneEntity->entity.shader.rgba[0] / 255.0f;
+                    g = (float)sceneEntity->entity.shader.rgba[1] / 255.0f;
+                    b = (float)sceneEntity->entity.shader.rgba[2] / 255.0f;
+                    a = (float)sceneEntity->entity.shader.rgba[3] / 255.0f;
+                    /* cgame sometimes ships alpha=0 on lightning — treat
+                     * as fully opaque so the bolt is visible. */
+                    if (a < 0.01f) a = 1.0f;
+
+                    s_entityVertices[baseVertex + 0].position[0] = corner0[0];
+                    s_entityVertices[baseVertex + 0].position[1] = corner0[1];
+                    s_entityVertices[baseVertex + 0].position[2] = corner0[2];
+                    s_entityVertices[baseVertex + 0].texCoord[0] = 0.0f;
+                    s_entityVertices[baseVertex + 0].texCoord[1] = 0.0f;
+                    s_entityVertices[baseVertex + 1].position[0] = corner1[0];
+                    s_entityVertices[baseVertex + 1].position[1] = corner1[1];
+                    s_entityVertices[baseVertex + 1].position[2] = corner1[2];
+                    s_entityVertices[baseVertex + 1].texCoord[0] = 0.0f;
+                    s_entityVertices[baseVertex + 1].texCoord[1] = 1.0f;
+                    s_entityVertices[baseVertex + 2].position[0] = corner2[0];
+                    s_entityVertices[baseVertex + 2].position[1] = corner2[1];
+                    s_entityVertices[baseVertex + 2].position[2] = corner2[2];
+                    s_entityVertices[baseVertex + 2].texCoord[0] = t;
+                    s_entityVertices[baseVertex + 2].texCoord[1] = 0.0f;
+                    s_entityVertices[baseVertex + 3].position[0] = corner3[0];
+                    s_entityVertices[baseVertex + 3].position[1] = corner3[1];
+                    s_entityVertices[baseVertex + 3].position[2] = corner3[2];
+                    s_entityVertices[baseVertex + 3].texCoord[0] = t;
+                    s_entityVertices[baseVertex + 3].texCoord[1] = 1.0f;
+                    {
+                        int _i;
+                        for (_i = 0; _i < 4; ++_i) {
+                            s_entityVertices[baseVertex + _i].color[0] = r;
+                            s_entityVertices[baseVertex + _i].color[1] = g;
+                            s_entityVertices[baseVertex + _i].color[2] = b;
+                            s_entityVertices[baseVertex + _i].color[3] = a;
+                        }
+                    }
+                    s_entityIndices[entityIndexCursor + 0] = baseVertex + 0;
+                    s_entityIndices[entityIndexCursor + 1] = baseVertex + 1;
+                    s_entityIndices[entityIndexCursor + 2] = baseVertex + 2;
+                    s_entityIndices[entityIndexCursor + 3] = baseVertex + 2;
+                    s_entityIndices[entityIndexCursor + 4] = baseVertex + 1;
+                    s_entityIndices[entityIndexCursor + 5] = baseVertex + 3;
+                    entityVertexCursor += 4;
+                    entityIndexCursor += 6;
+
+                    s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
+                    s_entityDraws[entityDrawCursor].indexCount = 6;
+                    s_entityDraws[entityDrawCursor].textureHandle =
+                        (uint32_t)sceneEntity->entity.customShader;
+                    /* Lightning bolt texture is additive in stock Q3
+                     * (lightningBolt shader uses GL_ONE GL_ONE) — force
+                     * the additive pipeline + no-cull so the beam is
+                     * visible from both sides and blends over the world. */
+                    s_entityDraws[entityDrawCursor].flags =
+                        Q3_METAL_ENTITY_DRAWFLAG_NOCULL |
+                        Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
                     entityDrawCursor += 1;
                     continue;
                 }
