@@ -210,3 +210,39 @@ scoreboard portraits, attacker face, 3D menu models, viewmodel quad shell
 1. `/Users/targus/Documents/Quake-III-Arena-Kenny-Edition` — clean Vulkan port
 2. `/Users/targus/Documents/vkQuake3` — user's fork: ioq3 + Kenny backend
 3. `code/renderer/` — stock GL ioq3 for any ABI/enum confirmation
+
+### 2026-04-21 follow-up session — explosion rectangle fix
+
+Built on top of `22a938c`. Captured `demo four` runs side-by-side and caught
+the "yellow rectangle around rocket explosion" regression that e95122a
+triggered and 7eccf3a (narrow-synth) only partially addressed.
+
+Root cause: Q3 explosion textures are uniformly bright yellow/orange blobs
+that fill the texture without dark borders. The original .tga used a
+circular alpha mask; the .jpg fallback has no alpha, and max(R,G,B)
+recovers no mask when the texture is saturated.
+
+Fix (`b936513`): combine luminance-alpha with a radial smoothstep mask
+centered on the texture. Corners fade regardless of source content, and
+alpha<24 pixels get their RGB zeroed out so JPG noise can't leak under
+additive blends. Re-enabled broad allow-list (sprites/, models/weaphits/,
+gfx/damage/, gfx/misc/, gfx/2d/, powerups/, menu/art/) now that the radial
+mask makes it safe.
+
+Verified on `20260421_164145_radial-mask`:
+- Rocket explosions render round, not rectangular
+- World stays visible through the fireball
+- Plasma bolts, flares, quad shell unchanged (were already working)
+- Smoke wisps look natural (no yellow rect)
+- HUD portrait + weapon icon + score text all clean
+
+### Still open
+- Close-range explosions still dominate ~80% of screen (probably Q3-accurate,
+  not worth changing — reference gameplay shows the same)
+- Demo occasionally captures upside-down depending on sim launch state
+  (not a renderer bug — likely MetalView orientation sync on fresh launch)
+- HUD armor-icon spinning model: multi-scene path appears to deliver the
+  sub-scene, but armor model not visually distinct in captures (model may
+  be rendering within viewport but without sufficient lighting contrast)
+- Overbright lightmaps still commented out (2× multiply); reference
+  screenshots will feel darker than Q3 PC at stock gamma
