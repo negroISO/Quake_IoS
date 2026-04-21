@@ -374,6 +374,22 @@ struct MetalView: UIViewRepresentable {
                                           sampler textureSampler [[sampler(0)]]) {
             float2 texCoord = in.texCoord;
             int rgbGen = int(drawUniforms.rgbGen + 0.5);
+            /* tcGen environment: chrome/reflective surfaces. Instead of
+             * sampling by mesh UVs, compute the reflection vector off
+             * the face normal and use its y/z as texture coords.
+             * Per-fragment normal is derived from screen-space derivatives
+             * of worldPos — yields a flat face normal without requiring
+             * vertex normals in the pipeline. Matches Q3's RB_CalcEnvironmentTexCoords
+             * formula: s = 0.5 + reflected.y * 0.5, t = 0.5 - reflected.z * 0.5. */
+            if (drawUniforms.tcGen > 0.5) {
+                float3 dx = dfdx(in.worldPos);
+                float3 dy = dfdy(in.worldPos);
+                float3 n = normalize(cross(dx, dy));
+                float3 viewer = normalize(uniforms.cameraPos - in.worldPos);
+                float d = 2.0 * dot(viewer, n);
+                float3 refl = n * d - viewer;
+                texCoord = float2(0.5 + refl.y * 0.5, 0.5 - refl.z * 0.5);
+            }
             // tcMod chain — apply in order. Q3 shaders stack mods (e.g. scale
             // then scroll); order matters and cannot be reduced to one slot.
             int modCount = drawUniforms.tcModCount;
