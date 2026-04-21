@@ -192,6 +192,14 @@ typedef struct {
     float stage2TcModScaleT;
     int cullMode;
     qboolean isPortal;
+    /* Fog volume parameters, extracted from 'fogparms ( r g b ) distance'.
+     * hasFog=qtrue means this shader marks a fog volume; color + distance
+     * define how much fog accumulates at the far plane. Not yet consumed
+     * by the renderer — stored so per-surface fog assignment + a fog
+     * pass can be added later without another parser commit. */
+    qboolean hasFog;
+    float fogColor[3];
+    float fogDistance;
     Q3MetalStage stages[Q3_MAX_STAGES];
     int stageCount;
 } metalShaderMap_t;
@@ -2279,6 +2287,9 @@ static void ParseShaderText(const char *text) {
         char skyBoxBase[MAX_QPATH];
         qboolean gotSkyParms;
         qboolean gotPortal;
+        qboolean gotFog;
+        float fogColor[3];
+        float fogDistance;
         Q3MetalStage cur;
         Q3MetalStage stages[Q3_MAX_STAGES];
         int stagesCount;
@@ -2300,6 +2311,9 @@ static void ParseShaderText(const char *text) {
         skyBoxBase[0] = '\0';
         gotSkyParms = qfalse;
         gotPortal = qfalse;
+        gotFog = qfalse;
+        fogColor[0] = fogColor[1] = fogColor[2] = 0.0f;
+        fogDistance = 0.0f;
         Com_Memset(&cur, 0, sizeof(cur));
         Com_Memset(stages, 0, sizeof(stages));
         stagesCount = 0;
@@ -2354,6 +2368,17 @@ static void ParseShaderText(const char *text) {
                     } else {
                         cullMode = METAL_SHADER_CULL_BACK;
                     }
+                } else if (!Q_stricmp(token, "fogparms") || !Q_stricmp(token, "fogParms")) {
+                    /* Syntax: fogparms ( r g b ) distance
+                     * Tokenizes as: '(' r g b ')' distance — seven tokens. */
+                    const char *t;
+                    t = COM_ParseExt(&p, qfalse);  /* '(' */
+                    t = COM_ParseExt(&p, qfalse); if (t[0]) fogColor[0] = (float)atof(t);
+                    t = COM_ParseExt(&p, qfalse); if (t[0]) fogColor[1] = (float)atof(t);
+                    t = COM_ParseExt(&p, qfalse); if (t[0]) fogColor[2] = (float)atof(t);
+                    t = COM_ParseExt(&p, qfalse);  /* ')' */
+                    t = COM_ParseExt(&p, qfalse); if (t[0]) fogDistance = (float)atof(t);
+                    gotFog = qtrue;
                 }
                 continue;
             }
@@ -2566,6 +2591,13 @@ static void ParseShaderText(const char *text) {
                 last->stageCount = stagesCount;
                 last->cullMode = cullMode;
                 last->isPortal = gotPortal;
+                last->hasFog = gotFog;
+                if (gotFog) {
+                    last->fogColor[0] = fogColor[0];
+                    last->fogColor[1] = fogColor[1];
+                    last->fogColor[2] = fogColor[2];
+                    last->fogDistance = fogDistance;
+                }
 
                 /* Diagnostic: dump full parse state for shaders we know
                  * are falling back to white. Substring match tolerates
