@@ -167,29 +167,16 @@ enum {
 typedef struct {
     char shaderName[128];
     char mapPath[MAX_QPATH];
+    /* tcGenEnv is a shader-level flag kept for a STEP 5 follow-up that
+     * will move it onto individual stages. Do not read it for new code;
+     * prefer stages[i].tcGen. */
     qboolean tcGenEnv;
-    float tcModScrollS;
-    float tcModScrollT;
-    float tcModScaleS;
-    float tcModScaleT;
-    qboolean hasTurb;
-    float tcModTurbAmp;
-    float tcModTurbPhase;
-    float tcModTurbFreq;
-    int blendMode;
-    int alphaFunc;
     int animFrameCount;
     float animFps;
     char animFrames[METAL_ANIMMAP_MAX_FRAMES][MAX_QPATH];
     qhandle_t animTextures[METAL_ANIMMAP_MAX_FRAMES];
     char skyBoxBase[MAX_QPATH];
     qhandle_t skyFaceTextures[6];
-    char stage2MapPath[MAX_QPATH];
-    int stage2BlendMode;
-    float stage2TcModScrollS;
-    float stage2TcModScrollT;
-    float stage2TcModScaleS;
-    float stage2TcModScaleT;
     int cullMode;
     qboolean isPortal;
     /* Fog volume parameters, extracted from 'fogparms ( r g b ) distance'.
@@ -518,18 +505,9 @@ static qhandle_t ShaderMap_ResolveCurrentFrame(const char *name);
 static int ShaderMap_FindAnimatedSlot(const char *name);
 static qhandle_t ShaderMap_AnimatedSlotCurrentHandle(int slot);
 static const metalShaderMap_t *ShaderMap_LookupEntry(const char *name);
-static void ShaderMap_GetScroll(const char *name, float *outS, float *outT);
-static void ShaderMap_GetScale(const char *name, float *outS, float *outT);
-static qboolean ShaderMap_GetTurb(const char *name, float *outAmp, float *outPhase, float *outFreq);
 static int ShaderMap_GetBlendMode(const char *name);
 static int ShaderMap_GetAlphaFunc(const char *name);
 static int ShaderMap_GetTcGenEnv(const char *name);
-static qboolean ShaderMap_GetSecondStage(const char *name,
-                                         char *outMap, size_t outMapSize,
-                                         int *outBlendMode,
-                                         float *outScaleS, float *outScaleT,
-                                         float *outScrollS, float *outScrollT);
-
 static int s_pendingAnimSlot;
 static float s_pendingScrollS;
 static float s_pendingScrollT;
@@ -2069,12 +2047,13 @@ static qhandle_t GetSkyFaceTextureForSurface(const char *shaderName,
 static int ShaderMap_GetBlendMode(const char *name) {
     const metalShaderMap_t *entry;
     if (name == NULL || name[0] == '\0') return 0;
-    /* Use ShaderMap_LookupEntry which handles extension-stripped
-     * fallback (e.g. 'yellow.tga' → 'yellow'). A plain stricmp
-     * loop missed entity textures registered with their file
-     * extension while shader definitions omit it. */
+    /* Read stage[0].blendMode as the shader's primary blend. The old
+     * shader-level entry->blendMode field was a cached copy of the
+     * same value; STEP 4 removed that cache so stages[] is the single
+     * source of truth. */
     entry = ShaderMap_LookupEntry(name);
-    return entry ? entry->blendMode : 0;
+    if (entry == NULL || entry->stageCount <= 0) return 0;
+    return entry->stages[0].blendMode;
 }
 
 /* blendMode enum used throughout the stub and the Q3MetalWorldStage:
@@ -2137,7 +2116,8 @@ static int ShaderMap_GetAlphaFunc(const char *name) {
     const metalShaderMap_t *entry;
     if (name == NULL || name[0] == '\0') return 0;
     entry = ShaderMap_LookupEntry(name);
-    return entry ? entry->alphaFunc : 0;
+    if (entry == NULL || entry->stageCount <= 0) return 0;
+    return entry->stages[0].alphaFunc;
 }
 
 static int ShaderMap_GetTcGenEnv(const char *name) {
@@ -2145,69 +2125,6 @@ static int ShaderMap_GetTcGenEnv(const char *name) {
     if (name == NULL || name[0] == '\0') return 0;
     entry = ShaderMap_LookupEntry(name);
     return (entry && entry->tcGenEnv) ? 1 : 0;
-}
-
-static void ShaderMap_GetScroll(const char *name, float *outS, float *outT) {
-    int i;
-    if (outS) *outS = 0.0f;
-    if (outT) *outT = 0.0f;
-    if (name == NULL || name[0] == '\0') return;
-    for (i = 0; i < s_shaderMapCount; ++i) {
-        if (!Q_stricmp(s_shaderMap[i].shaderName, name)) {
-            if (outS) *outS = s_shaderMap[i].tcModScrollS;
-            if (outT) *outT = s_shaderMap[i].tcModScrollT;
-            return;
-        }
-    }
-}
-
-static void ShaderMap_GetScale(const char *name, float *outS, float *outT) {
-    const metalShaderMap_t *entry;
-    if (outS) *outS = 1.0f;
-    if (outT) *outT = 1.0f;
-    if (name == NULL || name[0] == '\0') return;
-    entry = ShaderMap_LookupEntry(name);
-    if (entry == NULL) return;
-    if (outS) *outS = entry->tcModScaleS;
-    if (outT) *outT = entry->tcModScaleT;
-}
-
-static qboolean ShaderMap_GetTurb(const char *name, float *outAmp, float *outPhase, float *outFreq) {
-    const metalShaderMap_t *entry;
-    if (outAmp) *outAmp = 0.0f;
-    if (outPhase) *outPhase = 0.0f;
-    if (outFreq) *outFreq = 0.0f;
-    if (name == NULL || name[0] == '\0') return qfalse;
-    entry = ShaderMap_LookupEntry(name);
-    if (entry == NULL || !entry->hasTurb) return qfalse;
-    if (outAmp) *outAmp = entry->tcModTurbAmp;
-    if (outPhase) *outPhase = entry->tcModTurbPhase;
-    if (outFreq) *outFreq = entry->tcModTurbFreq;
-    return qtrue;
-}
-
-static qboolean ShaderMap_GetSecondStage(const char *name,
-                                         char *outMap, size_t outMapSize,
-                                         int *outBlendMode,
-                                         float *outScaleS, float *outScaleT,
-                                         float *outScrollS, float *outScrollT) {
-    const metalShaderMap_t *entry = ShaderMap_LookupEntry(name);
-    if (outMap && outMapSize > 0) outMap[0] = '\0';
-    if (outBlendMode) *outBlendMode = 0;
-    if (outScaleS) *outScaleS = 1.0f;
-    if (outScaleT) *outScaleT = 1.0f;
-    if (outScrollS) *outScrollS = 0.0f;
-    if (outScrollT) *outScrollT = 0.0f;
-    if (entry == NULL || entry->stage2MapPath[0] == '\0') return qfalse;
-    if (outMap && outMapSize > 0) {
-        Q_strncpyz(outMap, entry->stage2MapPath, outMapSize);
-    }
-    if (outBlendMode) *outBlendMode = entry->stage2BlendMode;
-    if (outScaleS) *outScaleS = entry->stage2TcModScaleS;
-    if (outScaleT) *outScaleT = entry->stage2TcModScaleT;
-    if (outScrollS) *outScrollS = entry->stage2TcModScrollS;
-    if (outScrollT) *outScrollT = entry->stage2TcModScrollT;
-    return qtrue;
 }
 
 /* Current frame's texture handle for a known animated slot. Caller
@@ -2248,10 +2165,6 @@ static void ShaderMap_Register(const char *name, const char *path, qboolean tcGe
     Q_strncpyz(s_shaderMap[s_shaderMapCount].mapPath, path,
         sizeof(s_shaderMap[0].mapPath));
     s_shaderMap[s_shaderMapCount].tcGenEnv = tcGenEnv;
-    s_shaderMap[s_shaderMapCount].tcModScaleS = 1.0f;
-    s_shaderMap[s_shaderMapCount].tcModScaleT = 1.0f;
-    s_shaderMap[s_shaderMapCount].stage2TcModScaleS = 1.0f;
-    s_shaderMap[s_shaderMapCount].stage2TcModScaleT = 1.0f;
     s_shaderMap[s_shaderMapCount].animFrameCount = 0;
     s_shaderMap[s_shaderMapCount].animFps = 0.0f;
     s_shaderMap[s_shaderMapCount].cullMode = METAL_SHADER_CULL_BACK;
@@ -2277,10 +2190,6 @@ static void ShaderMap_RegisterAnimated(const char *name,
     Q_strncpyz(s_shaderMap[s_shaderMapCount].mapPath, frames[0],
         sizeof(s_shaderMap[0].mapPath));
     s_shaderMap[s_shaderMapCount].tcGenEnv = tcGenEnv;
-    s_shaderMap[s_shaderMapCount].tcModScaleS = 1.0f;
-    s_shaderMap[s_shaderMapCount].tcModScaleT = 1.0f;
-    s_shaderMap[s_shaderMapCount].stage2TcModScaleS = 1.0f;
-    s_shaderMap[s_shaderMapCount].stage2TcModScaleT = 1.0f;
     s_shaderMap[s_shaderMapCount].animFrameCount = maxFrames;
     s_shaderMap[s_shaderMapCount].animFps = (fps > 0.0f) ? fps : 8.0f;
     s_shaderMap[s_shaderMapCount].cullMode = METAL_SHADER_CULL_BACK;
@@ -2648,31 +2557,10 @@ static void ParseShaderText(const char *text) {
                 if (gotSkyParms) {
                     Q_strncpyz(last->skyBoxBase, skyBoxBase, sizeof(last->skyBoxBase));
                 }
-                if (stagesCount > 0) {
-                    int m;
-                    last->blendMode = stages[0].blendMode;
-                    last->alphaFunc = stages[0].alphaFunc;
-                    last->tcModScrollS = 0.0f;
-                    last->tcModScrollT = 0.0f;
-                    last->tcModScaleS = 1.0f;
-                    last->tcModScaleT = 1.0f;
-                    last->hasTurb = qfalse;
-                    for (m = 0; m < stages[0].tcModCount; ++m) {
-                        const Q3TcMod *mod = &stages[0].tcMods[m];
-                        if (mod->type == 1) {
-                            last->tcModScrollS = mod->params[0];
-                            last->tcModScrollT = mod->params[1];
-                        } else if (mod->type == 4) {
-                            last->tcModScaleS = mod->params[0];
-                            last->tcModScaleT = mod->params[1];
-                        } else if (mod->type == 5) {
-                            last->hasTurb = qtrue;
-                            last->tcModTurbAmp = mod->params[0];
-                            last->tcModTurbFreq = mod->params[1];
-                            last->tcModTurbPhase = mod->params[2];
-                        }
-                    }
-                }
+                /* STEP 4: the previous code here cached stages[0].blendMode,
+                 * alphaFunc, and a few tcMod params onto the shader-map
+                 * entry as globals. All consumers now read stages[0].* via
+                 * ShaderMap_GetBlendMode/AlphaFunc — no cache needed. */
             }
         }
     }
