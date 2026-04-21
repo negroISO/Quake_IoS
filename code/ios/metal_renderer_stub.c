@@ -639,6 +639,22 @@ static qhandle_t RegisterTexture(const char *name) {
                 }
             }
         }
+        /* Missing player icon (e.g. a bot in bots.txt whose model was
+         * never shipped — 'james' is the stock example). Before giving
+         * up, try the same file under models/players/sarge/, which is
+         * always present. Scoped by path so we don't accidentally route
+         * unrelated missing textures to sarge. */
+        if (!resolved) {
+            const char *sub = strstr(name, "models/players/");
+            const char *tail = strstr(name, "/icon_default");
+            if (sub != NULL && tail != NULL && tail > sub) {
+                char fallback[MAX_QPATH];
+                Q_strncpyz(fallback, "models/players/sarge/icon_default.tga", sizeof(fallback));
+                if (TryLoadImageRGBA(fallback, &rgba, &width, &height, resolvedName, sizeof(resolvedName))) {
+                    resolved = qtrue;
+                }
+            }
+        }
         if (!resolved) {
             /* Remember the miss so subsequent lookups skip the shader-map
              * walk and don't re-spam the warning. Finite cap, dedup by
