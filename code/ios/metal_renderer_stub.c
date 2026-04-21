@@ -580,43 +580,97 @@ static void AddWorldDrawStageSimple(Q3MetalWorldDrawCmd *draw,
  * orbs/rectangles instead of just the bright center. Synthesize alpha
  * from luminance for paths known to be FX-only. */
 static qboolean TextureNeedsLuminanceAlpha(const char *path) {
-    /* Only synthesize alpha for textures whose .tga was authored with
-     * a DARK (near-black) background + bright emissive core. Max(R,G,B)
-     * luminance then cleanly recovers the alpha mask: black borders
-     * become alpha=0, bright cores keep alpha~255.
+    /* Synthesize alpha for textures whose .tga was authored with a
+     * DARK (near-black) background + bright emissive core. Max(R,G,B)
+     * cleanly recovers the alpha mask: black/dark borders become
+     * alpha=0, bright cores keep alpha~255. Required because:
      *
-     * Explosion fireballs and rocket trails (models/weaphits/, gfx/damage/)
-     * don't fit this pattern — their "transparent" regions JPEG-compress
-     * into yellowish color artifacts near the bright core. max() treats
-     * yellow as high luminance → alpha=255 → full-quad rendering when the
-     * shader picks an alpha-blend pipeline. Those paths are now relying
-     * on additive blend + dark-background contribution instead.
+     *   1. When .tga is missing and we fall back to .jpg, there is no
+     *      alpha channel — RGB gets padded with alpha=255 everywhere,
+     *      producing hard-edged opaque quads under alpha-blend shaders
+     *      (the classic "yellow rectangle around the explosion").
+     *   2. Additive shaders don't technically need alpha, but the dark
+     *      borders still contribute non-zero color through JPEG
+     *      compression artifacts. Synthesizing alpha from luminance
+     *      doubles as a safe per-pixel RGB mask: we zero out RGB
+     *      alongside alpha when alpha would be ~0.
      *
-     * Keep synth strictly where the TGA's dark-bg convention is reliable:
-     * plasma bolts, flare billboards, quad damage shell. */
+     * Allow-list these FX prefixes (Q3 texture convention: FX/UI/HUD
+     * all use dark-bg TGAs). The pattern intentionally excludes
+     * world-surface textures like textures/ and env/ where a JPG
+     * without alpha is the right outcome. */
     if (path == NULL || path[0] == '\0') return qfalse;
-    if (!Q_stricmpn(path, "sprites/plasma", 14)) return qtrue;
-    if (!Q_stricmpn(path, "gfx/misc/flare", 14)) return qtrue;
-    if (!Q_stricmpn(path, "gfx/misc/lightning", 18)) return qtrue;
-    if (!Q_stricmpn(path, "powerups/quad", 13)) return qtrue;
+    if (!Q_stricmpn(path, "sprites/", 8)) return qtrue;
+    if (!Q_stricmpn(path, "models/weaphits/", 16)) return qtrue;
+    if (!Q_stricmpn(path, "gfx/damage/", 11)) return qtrue;
+    if (!Q_stricmpn(path, "gfx/misc/", 9)) return qtrue;
+    if (!Q_stricmpn(path, "gfx/2d/", 7)) return qtrue;
+    if (!Q_stricmpn(path, "powerups/", 9)) return qtrue;
+    if (!Q_stricmpn(path, "menu/art/", 9)) return qtrue;
     return qfalse;
 }
 
 static void SynthesizeAlphaFromLuminance(byte *rgba, int width, int height) {
-    /* A[i] = max(R, G, B). Plasma/explosion/flare textures are authored
-     * with a bright emissive core on a near-black background — luminance
-     * cleanly recovers the mask that the .tga's alpha channel used to
-     * encode. Clamp to [0, 255]; already in range but be explicit. */
-    int count = width * height;
+    /* Reconstruct an alpha mask for textures whose .tga (with proper
+     * alpha) is missing and we fell back to .jpg (which has no alpha
+     * channel — R_LoadJPG fills it 255). Without alpha, the entire
+     * billboard quad draws opaque (the classic "yellow rectangle
+     * around the rocket explosion").
+     *
+     * Q3 FX textures fall into two patterns and we have to handle both
+     * without knowing which one we have:
+     *
+     *   A. Emissive core on near-black background (plasma bolt sprites,
+     *      rail beam, lightning bolt). max(R,G,B) cleanly recovers the
+     *      original mask.
+     *   B. Uniform bright fireball / smoke puff that *fills* the
+     *      texture (rocketExplosion, plasmaExplosion, smokePuff). The
+     *      original .tga used a circular alpha mask to fade to corners
+     *      — luminance alone produces alpha=255 everywhere → a yellow
+     *      square. Apply a radial soft-mask centered on the texture so
+     *      corners fade out regardless of source content.
+     *
+     * Both factors are multiplied together. Pattern A is unaffected
+     * (the radial fade is gentle in the central area). Pattern B gets
+     * the round shape it needs.
+     *
+     * Also: clamp very low luminance to alpha=0 + zero RGB so JPG
+     * compression noise can't contribute under additive blending. */
+    const int count = width * height;
+    const int alphaFloor = 24;       /* ~9% of 255; below this → masked */
+    const float halfW = width  * 0.5f;
+    const float halfH = height * 0.5f;
+    const float invHalfW = 1.0f / (halfW > 0.0f ? halfW : 1.0f);
+    const float invHalfH = 1.0f / (halfH > 0.0f ? halfH : 1.0f);
     int i;
     for (i = 0; i < count; ++i) {
-        byte r = rgba[i * 4 + 0];
-        byte g = rgba[i * 4 + 1];
-        byte b = rgba[i * 4 + 2];
-        byte a = r;
-        if (g > a) a = g;
-        if (b > a) a = b;
-        rgba[i * 4 + 3] = a;
+        int r = rgba[i * 4 + 0];
+        int g = rgba[i * 4 + 1];
+        int b = rgba[i * 4 + 2];
+        int lum = r > g ? r : g;
+        if (b > lum) lum = b;
+
+        /* Radial soft mask: 1.0 at center, 0.0 at corners (r2>=1). */
+        int x = i % width;
+        int y = i / width;
+        float dx = ((float)x + 0.5f - halfW) * invHalfW;
+        float dy = ((float)y + 0.5f - halfH) * invHalfH;
+        float r2 = dx * dx + dy * dy;
+        float radial = 1.0f - r2;
+        if (radial < 0.0f) radial = 0.0f;
+        if (radial > 1.0f) radial = 1.0f;
+        /* Smoothstep-ish — softer falloff than linear. */
+        radial = radial * radial * (3.0f - 2.0f * radial);
+
+        int a = (int)(lum * radial + 0.5f);
+        if (a < alphaFloor) {
+            rgba[i * 4 + 0] = 0;
+            rgba[i * 4 + 1] = 0;
+            rgba[i * 4 + 2] = 0;
+            rgba[i * 4 + 3] = 0;
+        } else {
+            rgba[i * 4 + 3] = (byte)a;
+        }
     }
 }
 
