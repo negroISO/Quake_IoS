@@ -152,8 +152,40 @@ typedef struct {
     uint32_t entityIndexCount;
     uint32_t entityCommandCount;
     uint32_t lightCount;
+    /* Number of scenes captured this frame (world + HUD sub-scenes).
+     * Each RE_RenderScene call pushes one entry into the scenes[] array
+     * exposed by Q3MetalRenderer_GetSceneSnapshots. Swift iterates
+     * scenes[0..sceneCount] and renders each with its own viewport. */
+    uint32_t sceneCount;
     float clearColor[4];
 } Q3MetalFrameSnapshot;
+
+#define Q3_METAL_MAX_SCENES 8
+
+#define Q3_METAL_SCENE_FLAG_NOWORLDMODEL  (1u << 0)
+#define Q3_METAL_SCENE_FLAG_HYPERSPACE    (1u << 1)
+
+/* Per-scene snapshot: everything Swift needs to render one viewport.
+ * Entity and light ranges index into the shared per-frame pools
+ * (Q3MetalRenderer_GetEntityVertices / GetEntityIndices /
+ * GetEntityDrawCommands / GetLights). viewportW==0 means "full
+ * drawable"; Swift should clamp the rect to drawable bounds. */
+typedef struct {
+    uint32_t viewportX;
+    uint32_t viewportY;
+    uint32_t viewportWidth;
+    uint32_t viewportHeight;
+    float viewOrigin[3];
+    float viewAxis[9];
+    float fovX;
+    float fovY;
+    uint32_t rdflags;
+    uint32_t entityCommandFirst;
+    uint32_t entityCommandCount;
+    uint32_t lightFirst;
+    uint32_t lightCount;
+    float clearColor[4];
+} Q3MetalSceneSnapshot;
 
 typedef struct {
     uint32_t handle;
@@ -190,6 +222,7 @@ const Q3MetalEntityVertex *Q3MetalRenderer_GetEntityVertices(void);
 const uint32_t *Q3MetalRenderer_GetEntityIndices(void);
 const Q3MetalEntityDrawCmd *Q3MetalRenderer_GetEntityDrawCommands(void);
 const Q3MetalLight *Q3MetalRenderer_GetLights(void);
+const Q3MetalSceneSnapshot *Q3MetalRenderer_GetSceneSnapshots(void);
 int Q3MetalRenderer_GetFlareCount(void);
 const Q3MetalFlare *Q3MetalRenderer_GetFlares(void);
 uint32_t Q3MetalRenderer_GetFlareTextureHandle(void);

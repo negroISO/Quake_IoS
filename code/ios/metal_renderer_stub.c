@@ -131,6 +131,20 @@ static uint32_t s_sceneEntityCount;
 static Q3MetalLight s_sceneLights[Q3_METAL_MAX_LIGHTS];
 static uint32_t s_sceneLightCount;
 
+/* Per-frame scene pool. Captured in RE_RenderScene, consumed by Swift's
+ * draw(). sceneCount is reset at frame start in RE_BeginFrame; each
+ * RenderScene call appends one entry. Entity + light ranges index into
+ * the shared per-frame pools populated alongside. */
+static Q3MetalSceneSnapshot s_sceneSnapshots[Q3_METAL_MAX_SCENES];
+static uint32_t s_sceneSnapshotCount;
+
+/* Per-frame light pool. s_sceneLights[] is the intake buffer that
+ * AddLightToScene fills between ClearScene+RenderScene for the CURRENT
+ * scene. At RenderScene time we memcpy those lights to s_frameLights
+ * so each scene gets a stable range for Swift to bind by scene. */
+static Q3MetalLight s_frameLights[Q3_METAL_MAX_LIGHTS * Q3_METAL_MAX_SCENES];
+static uint32_t s_frameLightCount;
+
 /* Scene polys — shadow blobs, bullet marks, blood splats, particle
  * sprays. Submitted by cgame via RE_AddPolyToScene as world-space
  * triangle fans (typically 3-4 verts). We copy into a pool and emit
@@ -912,12 +926,17 @@ static void FreeModelData(void) {
 }
 
 static qboolean EnsureEntitySceneCapacity(uint32_t vertexCount, uint32_t indexCount, uint32_t drawCount) {
+    /* Multi-scene: the pool grows across scenes within a frame, so
+     * realloc must preserve existing data. vertexCount/indexCount/drawCount
+     * here are CUMULATIVE counts the caller wants to be able to address. */
     if (vertexCount > s_entityVertexCapacity) {
         Q3MetalEntityVertex *newVertices = ri.Malloc(vertexCount * sizeof(*newVertices));
         if (newVertices == NULL) {
             return qfalse;
         }
         if (s_entityVertices != NULL) {
+            Com_Memcpy(newVertices, s_entityVertices,
+                       s_entityVertexCapacity * sizeof(*newVertices));
             ri.Free(s_entityVertices);
         }
         s_entityVertices = newVertices;
@@ -930,6 +949,8 @@ static qboolean EnsureEntitySceneCapacity(uint32_t vertexCount, uint32_t indexCo
             return qfalse;
         }
         if (s_entityIndices != NULL) {
+            Com_Memcpy(newIndices, s_entityIndices,
+                       s_entityIndexCapacity * sizeof(*newIndices));
             ri.Free(s_entityIndices);
         }
         s_entityIndices = newIndices;
@@ -942,6 +963,8 @@ static qboolean EnsureEntitySceneCapacity(uint32_t vertexCount, uint32_t indexCo
             return qfalse;
         }
         if (s_entityDraws != NULL) {
+            Com_Memcpy(newDraws, s_entityDraws,
+                       s_entityDrawCapacity * sizeof(*newDraws));
             ri.Free(s_entityDraws);
         }
         s_entityDraws = newDraws;
@@ -3393,7 +3416,8 @@ static void RE_AddLinearLightToScene(const vec3_t start, const vec3_t end, float
     }
 }
 
-const Q3MetalLight *Q3MetalRenderer_GetLights(void) { return s_sceneLights; }
+const Q3MetalLight *Q3MetalRenderer_GetLights(void) { return s_frameLights; }
+const Q3MetalSceneSnapshot *Q3MetalRenderer_GetSceneSnapshots(void) { return s_sceneSnapshots; }
 /*
  * Synthetic first-person viewmodel.
  *
@@ -3773,20 +3797,17 @@ static void RE_RenderScene(const refdef_t *fd) {
         s_frameSnapshot.worldIndexCount = s_world.indexCount;
         s_frameSnapshot.worldCommandCount = s_world.drawCount;
         s_frameSnapshot.worldGeneration = s_world.generation;
-        s_frameSnapshot.lightCount = s_sceneLightCount;
     }
 
-    /* World-scene-only buffer rebuild. HUD scenes retain the world scene's
-     * draws so Swift's Coordinator.draw can consume them. Combined with
-     * removing buffer resets from RE_ClearScene (which is called between
-     * every scene) this preserves world draws across the frame. */
-    if (fd->rdflags == 0) {
-        s_entityVertexCount = 0;
-        s_entityIndexCount = 0;
-        s_entityDrawCount = 0;
-    }
+    /* Multi-scene: capture this scene's entity command range BEFORE
+     * emission, then measure how many commands emission pushed. Pool
+     * cursors (s_entityVertexCount etc.) grow monotonically across the
+     * frame — RE_BeginFrame resets them. This replaces the previous
+     * rdflags==0-gated reset which threw away HUD sub-scene geometry. */
+    uint32_t sceneEntityCommandFirst = s_entityDrawCount;
+    uint32_t sceneLightFirst = s_frameLightCount;
 
-    if (fd->rdflags == 0 && (s_sceneEntityCount > 0 || s_scenePolyCount > 0)) {
+    if (s_sceneEntityCount > 0 || s_scenePolyCount > 0) {
         uint32_t totalEntityVerts = 0;
         uint32_t totalEntityIndices = 0;
         uint32_t totalEntityDraws = 0;
@@ -3863,10 +3884,15 @@ static void RE_RenderScene(const refdef_t *fd) {
         }
 
         if (totalEntityVerts > 0 && totalEntityIndices > 0 && totalEntityDraws > 0 &&
-            EnsureEntitySceneCapacity(totalEntityVerts, totalEntityIndices, totalEntityDraws)) {
-            uint32_t entityVertexCursor = 0;
-            uint32_t entityIndexCursor = 0;
-            uint32_t entityDrawCursor = 0;
+            EnsureEntitySceneCapacity(s_entityVertexCount + totalEntityVerts,
+                                      s_entityIndexCount + totalEntityIndices,
+                                      s_entityDrawCount + totalEntityDraws)) {
+            /* Append to the per-frame pool instead of resetting. Pool
+             * cursors are reset in RE_BeginFrame at frame start; each
+             * RE_RenderScene pushes its scene's geometry onto the end. */
+            uint32_t entityVertexCursor = s_entityVertexCount;
+            uint32_t entityIndexCursor = s_entityIndexCount;
+            uint32_t entityDrawCursor = s_entityDrawCount;
 
             for (entityIndex = 0; entityIndex < s_sceneEntityCount; ++entityIndex) {
                 const metalSceneEntity_t *sceneEntity = &s_sceneEntities[entityIndex];
@@ -4758,14 +4784,64 @@ static void RE_RenderScene(const refdef_t *fd) {
         }
     }
 
+    /* Append the intake lights for this scene to the per-frame light
+     * pool so Swift can bind [lightFirst .. lightFirst+lightCount]
+     * per scene. The intake buffer s_sceneLights resets on next
+     * ClearScene; the per-frame pool does not until RE_BeginFrame. */
+    if (s_sceneLightCount > 0 &&
+        s_frameLightCount + s_sceneLightCount <= Q3_METAL_MAX_LIGHTS * Q3_METAL_MAX_SCENES) {
+        Com_Memcpy(&s_frameLights[s_frameLightCount],
+                   s_sceneLights,
+                   sizeof(Q3MetalLight) * s_sceneLightCount);
+        s_frameLightCount += s_sceneLightCount;
+    }
+
+    /* Push the scene snapshot. Viewport is verbatim from fd — cgame
+     * already called CG_AdjustFrom640 in CG_Draw3DModel to scale into
+     * pixel coords. Swift clamps to drawable bounds. Overflow past
+     * Q3_METAL_MAX_SCENES is a hard drop; log once and move on. */
+    if (s_sceneSnapshotCount < Q3_METAL_MAX_SCENES) {
+        Q3MetalSceneSnapshot *scene = &s_sceneSnapshots[s_sceneSnapshotCount];
+        scene->viewportX = (uint32_t)(fd->x < 0 ? 0 : fd->x);
+        scene->viewportY = (uint32_t)(fd->y < 0 ? 0 : fd->y);
+        scene->viewportWidth = (uint32_t)(fd->width < 0 ? 0 : fd->width);
+        scene->viewportHeight = (uint32_t)(fd->height < 0 ? 0 : fd->height);
+        scene->viewOrigin[0] = vieworg[0];
+        scene->viewOrigin[1] = vieworg[1];
+        scene->viewOrigin[2] = vieworg[2];
+        scene->viewAxis[0] = axis0[0]; scene->viewAxis[1] = axis0[1]; scene->viewAxis[2] = axis0[2];
+        scene->viewAxis[3] = axis1[0]; scene->viewAxis[4] = axis1[1]; scene->viewAxis[5] = axis1[2];
+        scene->viewAxis[6] = axis2[0]; scene->viewAxis[7] = axis2[1]; scene->viewAxis[8] = axis2[2];
+        scene->fovX = fovX;
+        scene->fovY = fovY;
+        scene->rdflags = (uint32_t)fd->rdflags;
+        scene->entityCommandFirst = sceneEntityCommandFirst;
+        scene->entityCommandCount = s_entityDrawCount - sceneEntityCommandFirst;
+        scene->lightFirst = sceneLightFirst;
+        scene->lightCount = s_sceneLightCount;
+        /* clearColor only matters for scene 0; sub-scenes use loadAction=.load */
+        scene->clearColor[0] = s_frameSnapshot.clearColor[0];
+        scene->clearColor[1] = s_frameSnapshot.clearColor[1];
+        scene->clearColor[2] = s_frameSnapshot.clearColor[2];
+        scene->clearColor[3] = s_frameSnapshot.clearColor[3];
+        s_sceneSnapshotCount += 1;
+    }
+
     s_frameSnapshot.entityVertexCount = s_entityVertexCount;
     s_frameSnapshot.entityIndexCount = s_entityIndexCount;
     s_frameSnapshot.entityCommandCount = s_entityDrawCount;
+    s_frameSnapshot.lightCount = s_frameLightCount;
+    s_frameSnapshot.sceneCount = s_sceneSnapshotCount;
     if ((s_sceneLogCounter % 60) == 0) {
         ri.Printf(
             PRINT_ALL,
-            "Metal entity frame: sceneEntities=%u drawCmds=%u verts=%u idx=%u lights=%u\n",
-            s_sceneEntityCount, s_entityDrawCount, s_entityVertexCount, s_entityIndexCount,
+            "Metal scene frame: scenes=%u totalEntCmds=%u totalLights=%u (this scene idx=%u rdflags=0x%x viewport=%dx%d@%d,%d fov=%.1f,%.1f vieworg=(%.1f,%.1f,%.1f) ents=%u lights=%u)\n",
+            s_sceneSnapshotCount, s_entityDrawCount, s_frameLightCount,
+            s_sceneSnapshotCount - 1,
+            fd->rdflags, fd->width, fd->height, fd->x, fd->y,
+            fovX, fovY,
+            vieworg[0], vieworg[1], vieworg[2],
+            s_entityDrawCount - sceneEntityCommandFirst,
             s_sceneLightCount
         );
     }
@@ -4821,6 +4897,17 @@ static void RE_BeginFrame(stereoFrame_t stereoFrame) {
     s_frameSnapshot.entityVertexCount = 0;
     s_frameSnapshot.entityIndexCount = 0;
     s_frameSnapshot.entityCommandCount = 0;
+    /* Multi-scene: reset the per-frame scene pool + entity pool cursors.
+     * Each subsequent RE_RenderScene call appends one scene and its
+     * entity/light ranges. Swift iterates scenes[0..sceneCount] and
+     * renders each with setViewport + setScissorRect. */
+    s_sceneSnapshotCount = 0;
+    s_entityVertexCount = 0;
+    s_entityIndexCount = 0;
+    s_entityDrawCount = 0;
+    s_frameLightCount = 0;
+    s_frameSnapshot.sceneCount = 0;
+    s_frameSnapshot.lightCount = 0;
 }
 
 static void RE_EndFrame(int *frontEndMsec, int *backEndMsec) {
@@ -4889,7 +4976,29 @@ static int R_LerpTag(orientation_t *tag, qhandle_t handle, int startFrame, int e
 
     return 0;
 }
-static void R_ModelBounds(qhandle_t model, vec3_t mins, vec3_t maxs) {}
+static void R_ModelBounds(qhandle_t model, vec3_t mins, vec3_t maxs) {
+    /* Read the MD3's frame[0] bounds directly. CG_DrawHead relies on this
+     * to compute the HUD portrait's camera-relative origin — a zeroed
+     * return puts the head inside the near plane and nothing draws. */
+    const metalModel_t *mdl;
+    const md3Header_t *header;
+    const md3Frame_t *frame;
+
+    VectorClear(mins);
+    VectorClear(maxs);
+
+    mdl = FindModelByHandle(model);
+    if (mdl == NULL || mdl->md3 == NULL) {
+        return;
+    }
+    header = mdl->md3;
+    if (header->numFrames <= 0) {
+        return;
+    }
+    frame = (const md3Frame_t *)((const byte *)header + header->ofsFrames);
+    VectorCopy(frame->bounds[0], mins);
+    VectorCopy(frame->bounds[1], maxs);
+}
 
 static void RE_RemapShader(const char *oldShader, const char *newShader, const char *offsetTime) {}
 static qboolean RE_GetEntityToken(char *buffer, int size) { return qfalse; }

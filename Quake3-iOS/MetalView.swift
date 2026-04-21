@@ -919,7 +919,16 @@ struct MetalView: UIViewRepresentable {
                 Self.bindDlightBlock(snapshot: snapshot, encoder: encoder, index: 2)
 
                 if let entityDrawsPointer = Q3MetalRenderer_GetEntityDrawCommands() {
-                    let entityDraws = UnsafeBufferPointer(start: entityDrawsPointer, count: Int(snapshot.entityCommandCount))
+                    /* Multi-scene: clamp the world pass's entity loop to
+                     * scene[0]'s range. The pool now contains entities for
+                     * EVERY scene (world + HUD sub-scenes) back-to-back;
+                     * unclamped iteration would render HUD entities at
+                     * origin (0,0,0) inside the main world view. */
+                    var mainEntityCount = Int(snapshot.entityCommandCount)
+                    if snapshot.sceneCount > 0, let scenesPtr = Q3MetalRenderer_GetSceneSnapshots() {
+                        mainEntityCount = Int(UnsafeBufferPointer(start: scenesPtr, count: 1)[0].entityCommandCount)
+                    }
+                    let entityDraws = UnsafeBufferPointer(start: entityDrawsPointer, count: mainEntityCount)
                     let depthHackBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_DEPTHHACK)
                     let additiveBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE)
                     let alphaBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ALPHA)
@@ -963,6 +972,94 @@ struct MetalView: UIViewRepresentable {
                     }
                     } // end entityPass loop
                 }
+            }
+
+            /* Multi-scene HUD sub-scenes. Scene 0 is the main world view
+             * handled by the blocks above. Scenes 1..sceneCount are HUD
+             * portrait heads, rotating ammo pickups, scoreboard faces,
+             * etc. Each has its own viewport rect + camera. Render only
+             * the entities in each scene's [entityCommandFirst .. +Count)
+             * range. Depth is cleared between sub-scenes by wrapping the
+             * whole thing after the world pass — currently we rely on
+             * each sub-scene's entities self-overlapping cleanly since
+             * they all submit at origin (0,0,0) with close depths. */
+            if snapshot.sceneCount > 1,
+               let scenesPointer = Q3MetalRenderer_GetSceneSnapshots(),
+               let entityDrawsPointer = Q3MetalRenderer_GetEntityDrawCommands(),
+               let entityPipelineState,
+               let entityVertexBuffer = uploadEntityBuffers(device: view.device),
+               let entityIndexBuffer {
+                let scenes = UnsafeBufferPointer(start: scenesPointer, count: Int(snapshot.sceneCount))
+                let allEntityDraws = UnsafeBufferPointer(start: entityDrawsPointer, count: Int(snapshot.entityCommandCount))
+                for sceneIdx in 1..<Int(snapshot.sceneCount) {
+                    let scene = scenes[sceneIdx]
+                    guard scene.entityCommandCount > 0 else { continue }
+                    guard scene.viewportWidth > 0 && scene.viewportHeight > 0 else { continue }
+
+                    encoder.setViewport(MTLViewport(
+                        originX: Double(scene.viewportX),
+                        originY: Double(scene.viewportY),
+                        width: Double(scene.viewportWidth),
+                        height: Double(scene.viewportHeight),
+                        znear: 0.0, zfar: 1.0))
+                    encoder.setScissorRect(MTLScissorRect(
+                        x: Int(scene.viewportX),
+                        y: Int(scene.viewportY),
+                        width: Int(scene.viewportWidth),
+                        height: Int(scene.viewportHeight)))
+
+                    let subSceneView = Q3MetalSceneView(
+                        fovX: scene.fovX, fovY: scene.fovY,
+                        viewOrigin: scene.viewOrigin, viewAxis: scene.viewAxis)
+                    let subViewProj = makeWorldViewProjection(subSceneView)
+                    var subUniforms = EntityUniforms(viewProjection: subViewProj)
+
+                    encoder.setRenderPipelineState(entityPipelineState)
+                    /* Sub-scenes share the framebuffer's depth buffer with
+                     * the world pass but use an independent projection —
+                     * world-scale depth values at the HUD rect will reject
+                     * the sub-scene's origin-space fragments under a
+                     * normal lessEqual test. Pass nil to get the always-
+                     * pass depth state so HUD geometry renders on top of
+                     * whatever the world wrote. Good enough for small
+                     * portrait viewports; a real per-scene depth clear
+                     * would need a new render pass. */
+                    encoder.setDepthStencilState(ensuredDepthStencilState(nil, device: view.device))
+                    encoder.setFrontFacing(.clockwise)
+                    encoder.setCullMode(.none)
+                    encoder.setVertexBuffer(entityVertexBuffer, offset: 0, index: 0)
+                    encoder.setVertexBytes(&subUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
+                    encoder.setFragmentSamplerState(worldSamplerState, index: 0)
+                    Self.bindDlightBlock(snapshot: snapshot, encoder: encoder, index: 2)
+
+                    let first = Int(scene.entityCommandFirst)
+                    let rawEnd = first + Int(scene.entityCommandCount)
+                    let end = min(max(first, rawEnd), allEntityDraws.count)
+                    guard first < end else { continue }
+                    for drawIdx in first..<end {
+                        let draw = allEntityDraws[drawIdx]
+                        guard draw.indexCount > 0 else { continue }
+                        guard let texture = texture(for: draw.textureHandle, device: view.device) else { continue }
+                        encoder.setFragmentTexture(texture, index: 0)
+                        encoder.drawIndexedPrimitives(
+                            type: .triangle,
+                            indexCount: Int(draw.indexCount),
+                            indexType: .uint32,
+                            indexBuffer: entityIndexBuffer,
+                            indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride)
+                    }
+                }
+
+                // Restore full-screen viewport for flare + UI passes
+                encoder.setViewport(MTLViewport(
+                    originX: 0, originY: 0,
+                    width: Double(view.drawableSize.width),
+                    height: Double(view.drawableSize.height),
+                    znear: 0.0, zfar: 1.0))
+                encoder.setScissorRect(MTLScissorRect(
+                    x: 0, y: 0,
+                    width: Int(view.drawableSize.width),
+                    height: Int(view.drawableSize.height)))
             }
 
             /* Flare pass. Camera-facing additive billboards at each MST_FLARE
