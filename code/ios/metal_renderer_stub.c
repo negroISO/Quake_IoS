@@ -572,6 +572,41 @@ static void AddWorldDrawStageSimple(Q3MetalWorldDrawCmd *draw,
     AddWorldDrawStage(draw, textureHandle, &tmp);
 }
 
+/* Heuristic: should alpha be synthesized when a JPG fallback is loaded
+ * for this texture? Stock Q3's FX sprites (plasma bolts, explosions,
+ * blood splats, flares) ship as .tga with alpha; when the .tga is
+ * missing we fall through to a .jpg that has no alpha channel. Without
+ * alpha the full billboard quad draws opaque, producing hard-edged
+ * orbs/rectangles instead of just the bright center. Synthesize alpha
+ * from luminance for paths known to be FX-only. */
+static qboolean TextureNeedsLuminanceAlpha(const char *path) {
+    if (path == NULL || path[0] == '\0') return qfalse;
+    if (!Q_stricmpn(path, "sprites/", 8)) return qtrue;
+    if (!Q_stricmpn(path, "models/weaphits/", 16)) return qtrue;
+    if (!Q_stricmpn(path, "gfx/damage/", 11)) return qtrue;
+    if (!Q_stricmpn(path, "gfx/misc/", 9)) return qtrue;
+    if (!Q_stricmpn(path, "powerups/", 9)) return qtrue;
+    return qfalse;
+}
+
+static void SynthesizeAlphaFromLuminance(byte *rgba, int width, int height) {
+    /* A[i] = max(R, G, B). Plasma/explosion/flare textures are authored
+     * with a bright emissive core on a near-black background — luminance
+     * cleanly recovers the mask that the .tga's alpha channel used to
+     * encode. Clamp to [0, 255]; already in range but be explicit. */
+    int count = width * height;
+    int i;
+    for (i = 0; i < count; ++i) {
+        byte r = rgba[i * 4 + 0];
+        byte g = rgba[i * 4 + 1];
+        byte b = rgba[i * 4 + 2];
+        byte a = r;
+        if (g > a) a = g;
+        if (b > a) a = b;
+        rgba[i * 4 + 3] = a;
+    }
+}
+
 static qboolean TryLoadImageRGBA(const char *name, byte **rgba, int *width, int *height, char *resolvedName, size_t resolvedNameSize) {
     static const char *extensions[] = { ".tga", ".jpg", ".jpeg" };
     char base[MAX_QPATH];
@@ -590,14 +625,22 @@ static qboolean TryLoadImageRGBA(const char *name, byte **rgba, int *width, int 
 
     for (i = 0; i < ARRAY_LEN(extensions); ++i) {
         char candidate[MAX_QPATH];
+        qboolean isJpg = Q_stricmp(extensions[i], ".tga") != 0;
         Com_sprintf(candidate, sizeof(candidate), "%s%s", base, extensions[i]);
-        if (!Q_stricmp(extensions[i], ".tga")) {
+        if (!isJpg) {
             R_LoadTGA(candidate, rgba, width, height);
         } else {
             R_LoadJPG(candidate, rgba, width, height);
         }
 
         if (*rgba != NULL && *width > 0 && *height > 0) {
+            /* JPG has no alpha — R_LoadJPG fills it with 255. For FX
+             * paths that expected the .tga's alpha mask, synthesize
+             * one from the RGB luminance so the bright core draws and
+             * the dark background is masked out. */
+            if (isJpg && TextureNeedsLuminanceAlpha(name)) {
+                SynthesizeAlphaFromLuminance(*rgba, *width, *height);
+            }
             Q_strncpyz(resolvedName, candidate, resolvedNameSize);
             return qtrue;
         }
