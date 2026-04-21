@@ -119,6 +119,8 @@ static metalModel_t s_models[Q3_METAL_MAX_MODELS];
 static qhandle_t s_nextModelHandle = 1;
 static metalSceneEntity_t s_sceneEntities[Q3_METAL_MAX_REFENTITIES];
 static uint32_t s_sceneEntityCount;
+static Q3MetalLight s_sceneLights[Q3_METAL_MAX_LIGHTS];
+static uint32_t s_sceneLightCount;
 
 /* Audit: once-per-session dedup log for missing-feature tracking. Copies
  * the message string into owned storage so callers can safely pass stack
@@ -3061,6 +3063,13 @@ static uint32_t s_renderSceneCalls;
 static void RE_ClearScene(void) {
     s_clearSceneCalls += 1;
     s_sceneEntityCount = 0;
+    /* Dlights are pushed AFTER ClearScene and consumed at RenderScene time.
+     * Resetting here is safe: the world scene repopulates before its
+     * RenderScene fires the snapshot write; the HUD scenes don't add
+     * lights so an extra reset there is a no-op (snapshot.lightCount is
+     * already locked in by the world scene's RenderScene and is only
+     * rewritten when rdflags==0, guarding HUD scenes). */
+    s_sceneLightCount = 0;
     /* DO NOT reset s_entity{Vertex,Index,Draw}Count here. Cgame calls
      * ClearScene between every scene (world + HUD + HUD). If we wiped the
      * draw buffer here, the world scene's draws would be lost before the
@@ -3152,9 +3161,44 @@ static void RE_AddPolyToScene(qhandle_t hShader, int numVerts, const polyVert_t 
     (void)hShader; (void)numVerts; (void)verts; (void)num;
 }
 static int R_LightForPoint(vec3_t point, vec3_t ambientLight, vec3_t directedLight, vec3_t lightDir) { return 0; }
-static void RE_AddLightToScene(const vec3_t org, float intensity, float r, float g, float b) {}
-static void RE_AddAdditiveLightToScene(const vec3_t org, float intensity, float r, float g, float b) {}
-static void RE_AddLinearLightToScene(const vec3_t start, const vec3_t end, float intensity, float r, float g, float b) {}
+
+static void AppendSceneLight(const vec3_t org, float intensity, float r, float g, float b) {
+    Q3MetalLight *L;
+    if (s_sceneLightCount >= Q3_METAL_MAX_LIGHTS) return;
+    L = &s_sceneLights[s_sceneLightCount++];
+    L->origin[0] = org[0]; L->origin[1] = org[1]; L->origin[2] = org[2];
+    L->radius = intensity;
+    L->color[0] = r; L->color[1] = g; L->color[2] = b;
+    L->_pad = 0.0f;
+}
+
+static void RE_AddLightToScene(const vec3_t org, float intensity, float r, float g, float b) {
+    AppendSceneLight(org, intensity, r, g, b);
+}
+
+static void RE_AddAdditiveLightToScene(const vec3_t org, float intensity, float r, float g, float b) {
+    /* Additive light in stock Q3 modulates the surface by a separate pass.
+     * Our fragment adds contributions unconditionally, so additive vs
+     * subtractive is already modeled by the color sign. Treat identically. */
+    AppendSceneLight(org, intensity, r, g, b);
+}
+
+static void RE_AddLinearLightToScene(const vec3_t start, const vec3_t end, float intensity, float r, float g, float b) {
+    /* Linear light (lightning beam) → 3 point lights spaced along the line.
+     * Keeps the per-light struct uniform and is enough to light the beam's
+     * glow along its length without a capsule distance calculation. */
+    int i;
+    for (i = 0; i < 3; ++i) {
+        float t = (float)i * 0.5f;   /* 0.0, 0.5, 1.0 */
+        vec3_t p;
+        p[0] = start[0] + t * (end[0] - start[0]);
+        p[1] = start[1] + t * (end[1] - start[1]);
+        p[2] = start[2] + t * (end[2] - start[2]);
+        AppendSceneLight(p, intensity, r, g, b);
+    }
+}
+
+const Q3MetalLight *Q3MetalRenderer_GetLights(void) { return s_sceneLights; }
 /*
  * Synthetic first-person viewmodel.
  *
@@ -3510,6 +3554,7 @@ static void RE_RenderScene(const refdef_t *fd) {
         s_frameSnapshot.worldIndexCount = s_world.indexCount;
         s_frameSnapshot.worldCommandCount = s_world.drawCount;
         s_frameSnapshot.worldGeneration = s_world.generation;
+        s_frameSnapshot.lightCount = s_sceneLightCount;
     }
 
     /* World-scene-only buffer rebuild. HUD scenes retain the world scene's
@@ -4006,8 +4051,9 @@ static void RE_RenderScene(const refdef_t *fd) {
     if ((s_sceneLogCounter % 60) == 0) {
         ri.Printf(
             PRINT_ALL,
-            "Metal entity frame: sceneEntities=%u drawCmds=%u verts=%u idx=%u\n",
-            s_sceneEntityCount, s_entityDrawCount, s_entityVertexCount, s_entityIndexCount
+            "Metal entity frame: sceneEntities=%u drawCmds=%u verts=%u idx=%u lights=%u\n",
+            s_sceneEntityCount, s_entityDrawCount, s_entityVertexCount, s_entityIndexCount,
+            s_sceneLightCount
         );
     }
 }

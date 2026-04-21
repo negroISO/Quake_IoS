@@ -70,6 +70,19 @@ typedef struct {
 
 #define Q3_METAL_MAX_STAGES 4
 
+#define Q3_METAL_MAX_LIGHTS 32
+
+/* Dynamic light (point). Emitted by cgame for muzzle flashes, rocket/plasma
+ * glow, explosion flashes, lightning halos. Fragment shaders add a radial
+ * falloff contribution per active light to the lit color before fog.
+ * Layout matches MSL packed_float3 + float pattern (32 bytes, 16-aligned). */
+typedef struct {
+    float origin[3];
+    float radius;
+    float color[3];
+    float _pad;
+} Q3MetalLight;
+
 #define Q3_METAL_NO_FOG 0xFFFFFFFFu
 
 typedef struct {
@@ -125,6 +138,7 @@ typedef struct {
     uint32_t entityVertexCount;
     uint32_t entityIndexCount;
     uint32_t entityCommandCount;
+    uint32_t lightCount;
     float clearColor[4];
 } Q3MetalFrameSnapshot;
 
@@ -162,6 +176,7 @@ const Q3MetalWorldFog *Q3MetalRenderer_GetWorldFogs(void);
 const Q3MetalEntityVertex *Q3MetalRenderer_GetEntityVertices(void);
 const uint32_t *Q3MetalRenderer_GetEntityIndices(void);
 const Q3MetalEntityDrawCmd *Q3MetalRenderer_GetEntityDrawCommands(void);
+const Q3MetalLight *Q3MetalRenderer_GetLights(void);
 const Q3MetalSceneView *Q3MetalRenderer_GetSceneView(void);
 int Q3MetalRenderer_GetTextureInfo(uint32_t textureHandle, Q3MetalTextureInfo *outInfo);
 

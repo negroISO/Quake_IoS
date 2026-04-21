@@ -146,6 +146,40 @@ struct MetalView: UIViewRepresentable {
             var viewProjection: simd_float4x4
         }
 
+        /* Fragment-side dlight block bound at buffer(2) for both world and
+         * entity passes. Layout: count + 12B pad (align to 16), then 32
+         * Q3MetalLight entries (32B each). Total 1040B, well under the
+         * 4KB setFragmentBytes limit. */
+        private static let dlightMaxCount = 32
+        private static let dlightHeaderSize = 16
+        private static let dlightBlockSize = dlightHeaderSize + dlightMaxCount * MemoryLayout<Q3MetalLight>.stride
+
+        /* Builds and binds the dlight block into the given encoder's
+         * fragment buffer slot in a single step. MUST do the bind inside
+         * the `withUnsafeMutableBytes` closure — the raw pointer is only
+         * valid for the closure's duration, and setFragmentBytes copies
+         * immediately, so the sequence is safe. Previously this returned
+         * a `[UInt8]` and the caller used `&block` in setFragmentBytes,
+         * which bound the Array struct metadata (8-byte heap pointer +
+         * counters) instead of the buffer contents — the fragment read
+         * garbage as `count` and iterated 32 junk lights, producing red
+         * flood artifacts during high-action frames. */
+        private static func bindDlightBlock(snapshot: Q3MetalFrameSnapshot,
+                                            encoder: MTLRenderCommandEncoder,
+                                            index: Int) {
+            var block = [UInt8](repeating: 0, count: dlightBlockSize)
+            let count = min(Int(snapshot.lightCount), dlightMaxCount)
+            block.withUnsafeMutableBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                base.bindMemory(to: UInt32.self, capacity: 1).pointee = UInt32(count)
+                if count > 0, let src = Q3MetalRenderer_GetLights() {
+                    memcpy(base.advanced(by: dlightHeaderSize), src,
+                           count * MemoryLayout<Q3MetalLight>.stride)
+                }
+                encoder.setFragmentBytes(base, length: dlightBlockSize, index: index)
+            }
+        }
+
         private let shaderSource = """
         #include <metal_stdlib>
         using namespace metal;
@@ -209,6 +243,49 @@ struct MetalView: UIViewRepresentable {
             float3 worldPos;
         };
 
+        /* Dynamic point light, matches C Q3MetalLight. */
+        struct MSLLight {
+            packed_float3 origin;
+            float radius;
+            packed_float3 color;
+            float _pad;
+        };
+
+        /* Fragment-buffer(2) dlight block. count first, 12-byte pad aligns
+         * the lights array to 16-byte boundary. */
+        struct DLightBlock {
+            uint count;
+            uint _pad0;
+            uint _pad1;
+            uint _pad2;
+            MSLLight lights[32];
+        };
+
+        /* Apply additive dlight contribution to a lit color. Each light is
+         * a radial falloff: (1 - dist/radius)^2, clamped and scaled by color.
+         * Called unconditionally by world + entity fragments except where the
+         * stage blend mode explicitly masks it (filter/multiply would darken
+         * the screen if we added to already-multiplied output). */
+        float3 applyDlights(float3 lit, float3 worldPos, constant DLightBlock &block) {
+            uint count = min(block.count, 32u);
+            float3 accum = float3(0.0);
+            for (uint i = 0; i < count; ++i) {
+                MSLLight L = block.lights[i];
+                float r = max(L.radius, 1.0);
+                float3 d = worldPos - float3(L.origin);
+                float dist = length(d);
+                float atten = saturate(1.0 - dist / r);
+                atten = atten * atten;
+                accum += float3(L.color) * atten;
+            }
+            /* Clamp accumulated contribution so stacked explosions don't
+             * white out the scene. 1.5 keeps a strong punch for nearby
+             * rockets + muzzle flashes without saturating the base lit
+             * color beyond what the eye reads as "bright". */
+            accum = min(accum, float3(1.5));
+            return lit + accum;
+        }
+
         struct WorldDrawUniforms {
             float tcGen;
             int tcModCount;
@@ -267,6 +344,9 @@ struct MetalView: UIViewRepresentable {
             float4 position [[position]];
             float2 texCoord;
             float4 color;
+            // World-space position — entity verts are pre-transformed to
+            // world space C-side so this is a direct pass-through.
+            float3 worldPos;
         };
 
         vertex WorldVertexOut q3_world_vertex(const device WorldVertexIn *vertices [[buffer(0)]],
@@ -288,6 +368,7 @@ struct MetalView: UIViewRepresentable {
         fragment float4 q3_world_fragment(WorldVertexOut in [[stage_in]],
                                           constant WorldDrawUniforms &drawUniforms [[buffer(0)]],
                                           constant WorldUniforms &uniforms [[buffer(1)]],
+                                          constant DLightBlock &dlights [[buffer(2)]],
                                           texture2d<float> colorTexture [[texture(0)]],
                                           texture2d<float> lightmapTexture [[texture(1)]],
                                           sampler textureSampler [[sampler(0)]]) {
@@ -356,6 +437,12 @@ struct MetalView: UIViewRepresentable {
             float3 vc = mix(vertexColor, float3(1.0), drawUniforms.forceWhiteVertColor);
             float  va = mix(in.color.a,   1.0,          drawUniforms.forceWhiteVertColor);
             float3 lit = texel.rgb * lightmap.rgb * vc;
+            // Dynamic lights (muzzle flashes, rocket/plasma glow, lightning
+            // halos). Applied BEFORE fog so distant explosions still fog
+            // correctly. For filter/multiply stages the blend is source*dest
+            // so contribution flips meaning, but the visual impact is small
+            // and the per-draw blendMode isn't currently in WorldDrawUniforms.
+            lit = applyDlights(lit, in.worldPos, dlights);
             // Fog pass (F3). drawUniforms.fogColorDistance is:
             //   .xyz = linear fog color, .w = fog distance (world units).
             // .w == 0 means "no fog" (every surface outside any volume on
@@ -378,14 +465,18 @@ struct MetalView: UIViewRepresentable {
             out.position = uniforms.viewProjection * float4(inVertex.position, 1.0);
             out.texCoord = inVertex.texCoord;
             out.color = inVertex.color;
+            out.worldPos = inVertex.position;
             return out;
         }
 
         fragment float4 q3_entity_fragment(EntityVertexOut in [[stage_in]],
+                                           constant DLightBlock &dlights [[buffer(2)]],
                                            texture2d<float> colorTexture [[texture(0)]],
                                            sampler textureSampler [[sampler(0)]]) {
             float4 texel = colorTexture.sample(textureSampler, in.texCoord);
-            return texel * in.color;
+            float4 base = texel * in.color;
+            base.rgb = applyDlights(base.rgb, in.worldPos, dlights);
+            return base;
         }
 
         /* ================ Sky rendering ================
@@ -609,6 +700,10 @@ struct MetalView: UIViewRepresentable {
                 encoder.setFragmentBytes(&worldUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
                 encoder.setFragmentSamplerState(worldSamplerState, index: 0)
 
+                // Bind dlight block at fragment buffer(2). Shared across all
+                // world draws in this scene — scene-constant, not per-draw.
+                Self.bindDlightBlock(snapshot: snapshot, encoder: encoder, index: 2)
+
                 if let worldDrawsPointer = Q3MetalRenderer_GetWorldDrawCommands(),
                    let indicesPointer = Q3MetalRenderer_GetWorldIndices() {
                     let _ = indicesPointer
@@ -802,6 +897,10 @@ struct MetalView: UIViewRepresentable {
                 encoder.setVertexBuffer(entityVertexBuffer, offset: 0, index: 0)
                 encoder.setVertexBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
                 encoder.setFragmentSamplerState(worldSamplerState, index: 0)
+
+                // Dlights for entities (viewmodel, players, pickups lit by
+                // nearby muzzle flash / rocket glow). Same block as world pass.
+                Self.bindDlightBlock(snapshot: snapshot, encoder: encoder, index: 2)
 
                 if let entityDrawsPointer = Q3MetalRenderer_GetEntityDrawCommands() {
                     let entityDraws = UnsafeBufferPointer(start: entityDrawsPointer, count: Int(snapshot.entityCommandCount))
