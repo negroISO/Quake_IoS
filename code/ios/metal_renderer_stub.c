@@ -3277,9 +3277,19 @@ static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime
         s_entityAcceptedThisFrame += 1;
         return;
     }
+    /* RT_BEAM: grappling hook chain, CTF mission beams. Stock Q3 renders
+     * it as a 6-segment solid-red cylinder; we emit a view-aligned red
+     * quad between origin ("from") and oldorigin ("to") for MVP. */
+    if (re->reType == RT_BEAM) {
+        AuditOnce("ENTITY:RT_BEAM");
+        s_sceneEntities[s_sceneEntityCount].entity = *re;
+        s_sceneEntities[s_sceneEntityCount].mirrored = qfalse;
+        s_sceneEntityCount += 1;
+        s_entityAcceptedThisFrame += 1;
+        return;
+    }
     if (re->reType != RT_MODEL) {
-        if (re->reType == RT_BEAM) AuditOnce("ENTITY:RT_BEAM");
-        else if (re->reType == RT_PORTALSURFACE) AuditOnce("ENTITY:RT_PORTALSURFACE");
+        if (re->reType == RT_PORTALSURFACE) AuditOnce("ENTITY:RT_PORTALSURFACE");
         else AuditOnce("ENTITY:reType unknown");
         s_entityRejectedTypeThisFrame += 1;
         return;
@@ -3804,6 +3814,14 @@ static void RE_RenderScene(const refdef_t *fd) {
                 totalEntityDraws += 1;
                 continue;
             }
+            /* Generic beam: single view-aligned quad, same budget as
+             * lightning/rail-core. */
+            if (sceneEntity->entity.reType == RT_BEAM) {
+                totalEntityVerts += 4;
+                totalEntityIndices += 6;
+                totalEntityDraws += 1;
+                continue;
+            }
 
             model = FindModelByHandle(sceneEntity->entity.hModel);
             if (model == NULL || model->md3 == NULL) {
@@ -4133,6 +4151,86 @@ static void RE_RenderScene(const refdef_t *fd) {
                     s_entityDraws[entityDrawCursor].indexCount = 6;
                     s_entityDraws[entityDrawCursor].textureHandle =
                         (uint32_t)sceneEntity->entity.customShader;
+                    s_entityDraws[entityDrawCursor].flags =
+                        Q3_METAL_ENTITY_DRAWFLAG_NOCULL |
+                        Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                    entityDrawCursor += 1;
+                    continue;
+                }
+
+                /* RT_BEAM: grapple / mission beam. View-aligned quad with
+                 * stock Q3's red color (1,0,0,1) and width 4. Uses the
+                 * white fallback texture (customShader is typically 0
+                 * for RT_BEAM — Q3 disables texturing entirely for it). */
+                if (sceneEntity->entity.reType == RT_BEAM) {
+                    uint32_t baseVertex = entityVertexCursor;
+                    uint32_t firstIndex = entityIndexCursor;
+                    const float *start = sceneEntity->entity.origin;
+                    const float *end = sceneEntity->entity.oldorigin;
+                    vec3_t beamDir, v1, v2, right;
+                    vec3_t c0, c1, c2, c3;
+                    float len;
+                    const float spanWidth = 4.0f;
+                    qhandle_t texHandle;
+                    int i;
+
+                    VectorSubtract(end, start, beamDir);
+                    len = VectorLength(beamDir);
+                    if (len < 1.0f) continue;
+
+                    VectorSubtract(start, vieworg, v1); VectorNormalize(v1);
+                    VectorSubtract(end, vieworg, v2);   VectorNormalize(v2);
+                    CrossProduct(v1, v2, right);
+                    if (VectorLength(right) < 1e-4f) VectorCopy(axis2, right);
+                    VectorNormalize(right);
+                    VectorScale(right, spanWidth, right);
+
+                    VectorAdd(start, right, c0);
+                    VectorSubtract(start, right, c1);
+                    VectorAdd(end, right, c2);
+                    VectorSubtract(end, right, c3);
+
+                    s_entityVertices[baseVertex + 0].position[0] = c0[0];
+                    s_entityVertices[baseVertex + 0].position[1] = c0[1];
+                    s_entityVertices[baseVertex + 0].position[2] = c0[2];
+                    s_entityVertices[baseVertex + 0].texCoord[0] = 0.0f;
+                    s_entityVertices[baseVertex + 0].texCoord[1] = 0.0f;
+                    s_entityVertices[baseVertex + 1].position[0] = c1[0];
+                    s_entityVertices[baseVertex + 1].position[1] = c1[1];
+                    s_entityVertices[baseVertex + 1].position[2] = c1[2];
+                    s_entityVertices[baseVertex + 1].texCoord[0] = 0.0f;
+                    s_entityVertices[baseVertex + 1].texCoord[1] = 1.0f;
+                    s_entityVertices[baseVertex + 2].position[0] = c2[0];
+                    s_entityVertices[baseVertex + 2].position[1] = c2[1];
+                    s_entityVertices[baseVertex + 2].position[2] = c2[2];
+                    s_entityVertices[baseVertex + 2].texCoord[0] = 1.0f;
+                    s_entityVertices[baseVertex + 2].texCoord[1] = 0.0f;
+                    s_entityVertices[baseVertex + 3].position[0] = c3[0];
+                    s_entityVertices[baseVertex + 3].position[1] = c3[1];
+                    s_entityVertices[baseVertex + 3].position[2] = c3[2];
+                    s_entityVertices[baseVertex + 3].texCoord[0] = 1.0f;
+                    s_entityVertices[baseVertex + 3].texCoord[1] = 1.0f;
+                    for (i = 0; i < 4; ++i) {
+                        s_entityVertices[baseVertex + i].color[0] = 1.0f;
+                        s_entityVertices[baseVertex + i].color[1] = 0.0f;
+                        s_entityVertices[baseVertex + i].color[2] = 0.0f;
+                        s_entityVertices[baseVertex + i].color[3] = 1.0f;
+                    }
+                    s_entityIndices[entityIndexCursor + 0] = baseVertex + 0;
+                    s_entityIndices[entityIndexCursor + 1] = baseVertex + 1;
+                    s_entityIndices[entityIndexCursor + 2] = baseVertex + 2;
+                    s_entityIndices[entityIndexCursor + 3] = baseVertex + 2;
+                    s_entityIndices[entityIndexCursor + 4] = baseVertex + 1;
+                    s_entityIndices[entityIndexCursor + 5] = baseVertex + 3;
+                    entityVertexCursor += 4;
+                    entityIndexCursor += 6;
+
+                    texHandle = (sceneEntity->entity.customShader > 0)
+                        ? sceneEntity->entity.customShader
+                        : (qhandle_t)EnsureWhiteTexture();
+                    s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
+                    s_entityDraws[entityDrawCursor].indexCount = 6;
+                    s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)texHandle;
                     s_entityDraws[entityDrawCursor].flags =
                         Q3_METAL_ENTITY_DRAWFLAG_NOCULL |
                         Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
