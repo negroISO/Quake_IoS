@@ -534,6 +534,19 @@ static qhandle_t RegisterTexture(const char *name) {
     if (name == NULL || name[0] == '\0' || !Q_stricmp(name, "white")) {
         return EnsureWhiteTexture();
     }
+    /* Q3 internal sentinel shaders use '$whiteimage' / '*white' /
+     * '*whiteimage' / '*default' as their stage map. The engine was
+     * expected to return the built-in 1x1 white texture; our filesystem
+     * loader otherwise burns cycles trying to find a file that never
+     * existed and falls through to the warn + white-cache path. Short-
+     * circuit here so direct Q3 calls (RegisterShader("$whiteimage"))
+     * and texture lookups routed through here both resolve instantly. */
+    if (!Q_stricmp(name, "$whiteimage") ||
+        !Q_stricmp(name, "*white") ||
+        !Q_stricmp(name, "*whiteimage") ||
+        !Q_stricmp(name, "*default")) {
+        return EnsureWhiteTexture();
+    }
 
     {
         static char seen[256][MAX_QPATH];
@@ -598,6 +611,33 @@ static qhandle_t RegisterTexture(const char *name) {
                 entry ? (entry->mapPath[0] ? entry->mapPath : "(empty)") : "n/a");
         }
         if (entry != NULL) {
+            /* If any stage's mapPath is a sentinel ($whiteimage / *white /
+             * *whiteimage / *default) the shader's intent is "render a
+             * stage of 1x1 white, alpha/rgbGen-driven". Return the built-
+             * in white handle directly instead of walking the stages and
+             * failing to load from disk. Caches the miss-free path for
+             * sprite effects like viewBloodBlend, smokePuff, tracers, etc. */
+            int ws;
+            qboolean wantsWhite = qfalse;
+            const char *mp = entry->mapPath;
+            if (mp[0] == '$' || mp[0] == '*') {
+                if (!Q_stricmp(mp, "$whiteimage") || !Q_stricmp(mp, "*white") ||
+                    !Q_stricmp(mp, "*whiteimage") || !Q_stricmp(mp, "*default")) {
+                    wantsWhite = qtrue;
+                }
+            }
+            for (ws = 0; !wantsWhite && ws < entry->stageCount; ++ws) {
+                const char *sp = entry->stages[ws].mapPath;
+                if (sp[0] != '$' && sp[0] != '*') continue;
+                if (!Q_stricmp(sp, "$whiteimage") || !Q_stricmp(sp, "*white") ||
+                    !Q_stricmp(sp, "*whiteimage") || !Q_stricmp(sp, "*default")) {
+                    wantsWhite = qtrue;
+                }
+            }
+            if (wantsWhite) {
+                if (diag) ri.Printf(PRINT_ALL, "[TEX-DBG]   entry uses $whiteimage sentinel → white\n");
+                return EnsureWhiteTexture();
+            }
             if (entry->animFrameCount > 0 && entry->animFrames[0][0] != '\0') {
                 if (TryLoadImageRGBA(entry->animFrames[0], &rgba, &width, &height, resolvedName, sizeof(resolvedName))) {
                     resolved = qtrue;
