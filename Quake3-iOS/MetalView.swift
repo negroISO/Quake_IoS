@@ -424,76 +424,37 @@ struct MetalView: UIViewRepresentable {
                                         constant WorldDrawUniforms &drawUniforms [[buffer(0)]],
                                         texture2d<float> skyTexture [[texture(0)]],
                                         sampler textureSampler [[sampler(0)]]) {
-            // Q3 cloud-dome sky: a single texture projected onto a
-            // virtual sphere around the camera. NOT lat-lon (zenith
-            // singularity), NOT hard cube-face switch (visible seams
-            // where faces meet — the diagonal bands we saw in the
-            // prior build). Instead we sample all three axis-aligned
-            // cube projections and blend with weights that sharpen
-            // toward the dominant axis, so the sum is smooth
-            // everywhere. `pow(abs(dir), 4)` gives a narrow bell
-            // around each axis; normalization keeps the final color
-            // energy-preserving. This matches Q3's "fake spherical
-            // projection without poles" look without true cubemaps.
-            float3 dir = normalize(in.worldPos - uniforms.cameraPos);
-            float3 a = abs(dir);
-
-            // Blend weights: pow(|dir|, 4) sharpens each axis's
-            // contribution near its face, softens it into adjacent
-            // faces across the seams. Divide by sum to normalize —
-            // keeps total contribution = 1.
-            float3 w = pow(a, float3(4.0));
-            float wSum = max(w.x + w.y + w.z, 1e-4);
-            w /= wSum;
-
-            // Three axis-aligned cube projections. NO V-flip on the
-            // negative-axis half — with blended sampling the apparent
-            // "mirror" at each axis center is invisible (the `pow(4)`
-            // weight near zero collapses that face's contribution to
-            // ~0 anyway). Adding a V-flip here would create a
-            // discontinuity inside the blend, re-introducing seams.
-            // 1e-4 floor prevents divide-by-zero exactly on the axis
-            // (dir = (±1, 0, 0) etc.) where the other two components
-            // collapse.
-            float2 uvX = float2(-dir.y, dir.z) / max(a.x, 1e-4) * 0.5 + 0.5;
-            float2 uvY = float2( dir.x, dir.z) / max(a.y, 1e-4) * 0.5 + 0.5;
-            float2 uvZ = float2( dir.x, -dir.y) / max(a.z, 1e-4) * 0.5 + 0.5;
-
-            // Apply the full tcMod chain to each of the three axis-aligned
-            // projections uniformly. killsky stacks scale+scroll; order
-            // matters. We iterate the chain the same as the world fragment.
+            // Option A: sample the face texture with the BSP mesh UV.
+            // For skybox skies (q3dm17 env/space_*), C picks one of the
+            // six face textures per surface based on surface normal; the
+            // BSP carries per-vertex UVs that already map that face onto
+            // the geometry, so a straight sample produces the face image.
+            // For cloud-dome skies (killsky) the mesh UV is the cloud
+            // tiling coord — authored values are sensible and the tcMod
+            // chain (scroll, scale) still drives motion. This replaces
+            // the three-axis blended view-direction projection which only
+            // worked for a single full-sphere texture and produced near-
+            // black output on the per-face skybox path.
+            float2 uv = in.scrollTex;
             int skyModCount = drawUniforms.tcModCount;
             if (skyModCount > 0) {
-                int t = int(drawUniforms.tcModType.x + 0.5);
-                uvX = applyTcMod(uvX, t, drawUniforms.tcModParams0, drawUniforms.timeSeconds);
-                uvY = applyTcMod(uvY, t, drawUniforms.tcModParams0, drawUniforms.timeSeconds);
-                uvZ = applyTcMod(uvZ, t, drawUniforms.tcModParams0, drawUniforms.timeSeconds);
+                uv = applyTcMod(uv, int(drawUniforms.tcModType.x + 0.5),
+                                drawUniforms.tcModParams0, drawUniforms.timeSeconds);
             }
             if (skyModCount > 1) {
-                int t = int(drawUniforms.tcModType.y + 0.5);
-                uvX = applyTcMod(uvX, t, drawUniforms.tcModParams1, drawUniforms.timeSeconds);
-                uvY = applyTcMod(uvY, t, drawUniforms.tcModParams1, drawUniforms.timeSeconds);
-                uvZ = applyTcMod(uvZ, t, drawUniforms.tcModParams1, drawUniforms.timeSeconds);
+                uv = applyTcMod(uv, int(drawUniforms.tcModType.y + 0.5),
+                                drawUniforms.tcModParams1, drawUniforms.timeSeconds);
             }
             if (skyModCount > 2) {
-                int t = int(drawUniforms.tcModType.z + 0.5);
-                uvX = applyTcMod(uvX, t, drawUniforms.tcModParams2, drawUniforms.timeSeconds);
-                uvY = applyTcMod(uvY, t, drawUniforms.tcModParams2, drawUniforms.timeSeconds);
-                uvZ = applyTcMod(uvZ, t, drawUniforms.tcModParams2, drawUniforms.timeSeconds);
+                uv = applyTcMod(uv, int(drawUniforms.tcModType.z + 0.5),
+                                drawUniforms.tcModParams2, drawUniforms.timeSeconds);
             }
             if (skyModCount > 3) {
-                int t = int(drawUniforms.tcModType.w + 0.5);
-                uvX = applyTcMod(uvX, t, drawUniforms.tcModParams3, drawUniforms.timeSeconds);
-                uvY = applyTcMod(uvY, t, drawUniforms.tcModParams3, drawUniforms.timeSeconds);
-                uvZ = applyTcMod(uvZ, t, drawUniforms.tcModParams3, drawUniforms.timeSeconds);
+                uv = applyTcMod(uv, int(drawUniforms.tcModType.w + 0.5),
+                                drawUniforms.tcModParams3, drawUniforms.timeSeconds);
             }
-
-            float4 sX = skyTexture.sample(textureSampler, uvX);
-            float4 sY = skyTexture.sample(textureSampler, uvY);
-            float4 sZ = skyTexture.sample(textureSampler, uvZ);
-
-            float3 sky = sX.rgb * w.x + sY.rgb * w.y + sZ.rgb * w.z;
-            return float4(sky, 1.0);
+            float4 s = skyTexture.sample(textureSampler, uv);
+            return float4(s.rgb, 1.0);
         }
         """
 
