@@ -1481,7 +1481,12 @@ static qboolean LoadWorldMapData(const char *name) {
     uint32_t triSoupDraws = 0;
     uint32_t skippedNoDrawSurfaces = 0;
 
-    static const uint32_t defaultWorldFlags = Q3_METAL_WORLD_DRAWFLAG_NOCULL;
+    /* STEP 9: start from zero. The previous default of NOCULL forced
+     * every world surface two-sided regardless of its shader's cull
+     * directive — a leftover from before per-stage culling (STEP 6)
+     * worked. Individual draws still OR in the appropriate flags
+     * (LIGHTMAP_MULTIPLY, SKY, PORTAL, etc) as they're assembled. */
+    static const uint32_t defaultWorldFlags = 0;
 
     if (ri.FS_ReadFile(name, &fileBuffer) <= 0 || fileBuffer == NULL) {
         ri.Printf(PRINT_WARNING, "Metal world: failed to read BSP '%s'\n", name);
