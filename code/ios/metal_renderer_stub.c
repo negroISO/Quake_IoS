@@ -1232,7 +1232,30 @@ static qhandle_t ResolveAndRegisterModel(const char *name) {
     }
 
     Com_Memset(modelSlot, 0, sizeof(*modelSlot));
-    ri.Printf(PRINT_WARNING, "Metal model: failed to load '%s'\n", name);
+    /* Suppress warnings for known-optional model references that the
+     * stock Q3 engine silently ignores:
+     *   - '*N' sentinels (cgame registers '*1','*2',… as placeholder
+     *     model handles; they're not filesystem paths).
+     *   - weapons2/<weapon>/<weapon>_barrel.md3 — the barrel MD3 is a
+     *     TAG-attached sub-part that only exists for gauntlet,
+     *     machinegun, bfg. Other weapons simply don't have one.
+     *   - players/james, players/characters/james — bot roster entry
+     *     whose model was never shipped in any pak (see cycle 1).
+     * Returning 0 here keeps the caller's lookup correct; we just
+     * don't spam the log. Any OTHER missing model still prints, so
+     * real loading bugs stay visible. */
+    {
+        const char *barrel = strstr(name, "_barrel.md3");
+        const char *weap2 = strstr(name, "models/weapons2/");
+        qboolean silent = qfalse;
+        if (name[0] == '*') silent = qtrue;
+        else if (barrel != NULL && weap2 != NULL && weap2 < barrel) silent = qtrue;
+        else if (strstr(name, "players/james/") != NULL) silent = qtrue;
+        else if (strstr(name, "players/characters/james/") != NULL) silent = qtrue;
+        if (!silent) {
+            ri.Printf(PRINT_WARNING, "Metal model: failed to load '%s'\n", name);
+        }
+    }
     return 0;
 }
 
