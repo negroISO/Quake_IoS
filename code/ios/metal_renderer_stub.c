@@ -3639,10 +3639,40 @@ static void RE_RenderScene(const refdef_t *fd) {
                     s_entityIndices[entityIndexCursor + 5] = baseVertex + 3;
                     entityVertexCursor += 4;
                     entityIndexCursor += 6;
-                    s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
-                    s_entityDraws[entityDrawCursor].indexCount = 6;
-                    s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)sceneEntity->entity.customShader;
-                    s_entityDraws[entityDrawCursor].flags = Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE | Q3_METAL_ENTITY_DRAWFLAG_NOCULL;
+
+                    /* Derive sprite blend from the resolved shader's
+                     * blendMode instead of hard-coding additive. The old
+                     * path rendered every sprite through the additive
+                     * entity pipeline, which lights up the transparent
+                     * corners of alpha-blended textures like smokePuff
+                     * and shotgunSmokePuff as solid orange rectangles.
+                     * Model entities already do this at ~line 3827.
+                     * Legacy fallback: unknown / opaque → additive, to
+                     * preserve the prior behavior for plasma bolts,
+                     * rail cores, and muzzle flashes whose shaders we
+                     * haven't parsed. */
+                    {
+                        uint32_t spriteFlags = Q3_METAL_ENTITY_DRAWFLAG_NOCULL;
+                        const metalTexture_t *tex = FindTextureByHandle(
+                            (qhandle_t)sceneEntity->entity.customShader);
+                        if (tex != NULL) {
+                            if (tex->blendMode == 1) {
+                                spriteFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                            } else if (tex->blendMode == 2) {
+                                spriteFlags |= Q3_METAL_ENTITY_DRAWFLAG_ALPHA;
+                            } else if (tex->blendMode == 3) {
+                                spriteFlags |= Q3_METAL_ENTITY_DRAWFLAG_FILTER;
+                            } else {
+                                spriteFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                            }
+                        } else {
+                            spriteFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                        }
+                        s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
+                        s_entityDraws[entityDrawCursor].indexCount = 6;
+                        s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)sceneEntity->entity.customShader;
+                        s_entityDraws[entityDrawCursor].flags = spriteFlags;
+                    }
                     entityDrawCursor += 1;
                     continue;
                 }
