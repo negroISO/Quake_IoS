@@ -1680,6 +1680,15 @@ static qboolean LoadWorldMapData(const char *name) {
         if (IsSkyShaderName(shaders[shaderNum].shader)) {
             worldFlags |= Q3_METAL_WORLD_DRAWFLAG_SKY;
         }
+        /* STEP 7: propagate portal flag into the draw command so renderer
+         * consumers don't have to re-infer it per frame. The parser has
+         * already captured 'portal' on entry->isPortal. */
+        {
+            const metalShaderMap_t *_pe = ShaderMap_LookupEntry(shaders[shaderNum].shader);
+            if (_pe != NULL && _pe->isPortal) {
+                worldFlags |= Q3_METAL_WORLD_DRAWFLAG_PORTAL;
+            }
+        }
 
         if (surfaceType == MST_PATCH) {
             int patchX;
