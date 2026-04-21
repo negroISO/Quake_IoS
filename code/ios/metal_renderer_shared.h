@@ -64,12 +64,20 @@ typedef struct {
 
 #define Q3_METAL_MAX_STAGES 4
 
+#define Q3_METAL_NO_FOG 0xFFFFFFFFu
+
 typedef struct {
     uint32_t firstIndex;
     uint32_t indexCount;
     uint32_t lightmapTextureHandle;
     uint32_t flags;
     uint32_t stageCount;
+    /* Fog volume index matching the per-world fog LUT stored C-side
+     * (s_worldFogs[]). Q3_METAL_NO_FOG means the BSP's surface->fogNum
+     * was -1 (surface lies outside any fog volume). Swift reads this
+     * and, when the fog MSL pass ships, looks up color + distance by
+     * this index. */
+    uint32_t fogIndex;
     Q3MetalWorldStage stages[Q3_METAL_MAX_STAGES];
 } Q3MetalWorldDrawCmd;
 

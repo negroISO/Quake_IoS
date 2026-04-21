@@ -422,12 +422,14 @@ static void SetupWorldDraw(Q3MetalWorldDrawCmd *draw,
                            uint32_t firstIndex,
                            uint32_t indexCount,
                            qhandle_t lightmapTextureHandle,
-                           uint32_t flags) {
+                           uint32_t flags,
+                           uint32_t fogIndex) {
     draw->firstIndex = firstIndex;
     draw->indexCount = indexCount;
     draw->lightmapTextureHandle = (uint32_t)lightmapTextureHandle;
     draw->flags = flags;
     draw->stageCount = 0;
+    draw->fogIndex = fogIndex;
 }
 
 static void AddWorldDrawStage(Q3MetalWorldDrawCmd *draw,
@@ -1714,6 +1716,8 @@ static qboolean LoadWorldMapData(const char *name) {
         int lightmapNum;
         qboolean hasLightmap;
         uint32_t worldFlags;
+        uint32_t fogIndex;
+        int surfFogNum;
         int j;
 
         if (!IsSupportedWorldSurface(surface, drawVertCount, drawIndexCount)) {
@@ -1764,6 +1768,16 @@ static qboolean LoadWorldMapData(const char *name) {
         s_pendingAnimSlot = ShaderMap_FindAnimatedSlot(shaders[shaderNum].shader);
         lightmapHandle = EnsureWhiteTexture();
         worldFlags = defaultWorldFlags;
+        /* Pull the fog volume the BSP assigned to this surface. -1 or
+         * out-of-range values map to Q3_METAL_NO_FOG so the Swift/MSL
+         * side can branch cheaply without an extra bool. */
+        surfFogNum = LittleLong(surface->fogNum);
+        if (surfFogNum < 0 || surfFogNum >= s_worldFogCount ||
+            !s_worldFogs[surfFogNum].hasColor) {
+            fogIndex = Q3_METAL_NO_FOG;
+        } else {
+            fogIndex = (uint32_t)surfFogNum;
+        }
         if (!IsSkyShaderName(shaders[shaderNum].shader) && lightmapNum >= 0 && lightmapNum < s_worldLightmapCount) {
             const metalShaderMap_t *_le = ShaderMap_LookupEntry(shaders[shaderNum].shader);
             qboolean wantLightmap = qfalse;
@@ -1864,7 +1878,8 @@ static qboolean LoadWorldMapData(const char *name) {
                                        firstIndexForDraw,
                                        indexCountForDraw,
                                        hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
-                                       worldFlags);
+                                       worldFlags,
+                                       fogIndex);
                         if (s_world.animShaderSlots && s_pendingAnimSlot >= 0) {
                             s_world.animShaderSlots[_dstIdx] = s_pendingAnimSlot;
                             s_world.animatedDrawCount += 1;
@@ -1930,7 +1945,8 @@ static qboolean LoadWorldMapData(const char *name) {
                            firstIndexForDraw,
                            indexCountForDraw,
                            hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
-                           worldFlags);
+                           worldFlags,
+                           fogIndex);
             if (s_world.animShaderSlots && s_pendingAnimSlot >= 0) {
                 s_world.animShaderSlots[_dstIdx] = s_pendingAnimSlot;
                 s_world.animatedDrawCount += 1;
