@@ -51,6 +51,24 @@ static qhandle_t s_timHellAddTextureHandle;
 static qhandle_t *s_worldLightmapHandles;
 static int s_worldLightmapCount;
 
+/* Per-map fog LUT (cycle F1 of fog rendering). LUMP_FOGS in the BSP
+ * holds one dfog_t per fog volume; each one names a shader whose
+ * fogparms directive we parsed earlier into
+ * metalShaderMap_t.hasFog/fogColor/fogDistance. We resolve the name
+ * once at world-load time and cache the result so per-frame drawing
+ * can index by surface->fogNum without another shader-map walk.
+ * hasColor==qfalse means the referenced shader either wasn't parsed
+ * or didn't declare fogparms — treat as "no fog" for that volume. */
+#define METAL_MAX_WORLD_FOGS 256  /* matches MAX_MAP_FOGS in qfiles.h */
+typedef struct {
+    char  shaderName[MAX_QPATH];
+    qboolean hasColor;
+    float color[3];
+    float distance;
+} metalWorldFog_t;
+static metalWorldFog_t s_worldFogs[METAL_MAX_WORLD_FOGS];
+static int s_worldFogCount;
+
 typedef struct {
     qboolean inUse;
     qhandle_t handle;
@@ -778,6 +796,8 @@ static void FreeWorldMapData(void) {
         s_worldLightmapHandles = NULL;
     }
     s_worldLightmapCount = 0;
+    s_worldFogCount = 0;
+    Com_Memset(s_worldFogs, 0, sizeof(s_worldFogs));
     Com_Memset(&s_world, 0, sizeof(s_world));
 }
 
@@ -1549,6 +1569,48 @@ static qboolean LoadWorldMapData(const char *name) {
     drawVertCount = LittleLong(header->lumps[LUMP_DRAWVERTS].filelen) / (int)sizeof(drawVert_t);
     drawIndexCount = LittleLong(header->lumps[LUMP_DRAWINDEXES].filelen) / (int)sizeof(int);
     surfaceCount = LittleLong(header->lumps[LUMP_SURFACES].filelen) / (int)sizeof(dsurface_t);
+
+    /* LUMP_FOGS — one dfog_t per fog volume. Resolve each fog's shader
+     * into the pre-parsed shader map to recover (r,g,b,distance) from
+     * the 'fogparms' directive. Later cycles thread each surface's
+     * fogNum (index into this table) into Q3MetalWorldDrawCmd so the
+     * Metal fragment shader can apply fog per-surface. */
+    {
+        const dfog_t *fogs = (const dfog_t *)((const byte *)header +
+            LittleLong(header->lumps[LUMP_FOGS].fileofs));
+        int fogBytes = LittleLong(header->lumps[LUMP_FOGS].filelen);
+        int fogCount = (fogBytes > 0) ? (fogBytes / (int)sizeof(dfog_t)) : 0;
+        int fi;
+        int withColor = 0;
+
+        if (fogCount > METAL_MAX_WORLD_FOGS) fogCount = METAL_MAX_WORLD_FOGS;
+        s_worldFogCount = fogCount;
+        for (fi = 0; fi < fogCount; ++fi) {
+            const metalShaderMap_t *fse;
+            Q_strncpyz(s_worldFogs[fi].shaderName, fogs[fi].shader,
+                       sizeof(s_worldFogs[fi].shaderName));
+            s_worldFogs[fi].hasColor = qfalse;
+            s_worldFogs[fi].color[0] = 0.0f;
+            s_worldFogs[fi].color[1] = 0.0f;
+            s_worldFogs[fi].color[2] = 0.0f;
+            s_worldFogs[fi].distance = 0.0f;
+
+            fse = ShaderMap_LookupEntry(fogs[fi].shader);
+            if (fse != NULL && fse->hasFog) {
+                s_worldFogs[fi].hasColor = qtrue;
+                s_worldFogs[fi].color[0] = fse->fogColor[0];
+                s_worldFogs[fi].color[1] = fse->fogColor[1];
+                s_worldFogs[fi].color[2] = fse->fogColor[2];
+                s_worldFogs[fi].distance = fse->fogDistance;
+                withColor += 1;
+            }
+        }
+        if (fogCount > 0) {
+            ri.Printf(PRINT_ALL,
+                "Metal world: %d fog volumes (%d with resolved fogparms)\n",
+                fogCount, withColor);
+        }
+    }
 
     for (i = 0; i < surfaceCount; ++i) {
         const dsurface_t *surface = &surfaces[i];
