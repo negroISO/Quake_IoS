@@ -961,6 +961,7 @@ struct MetalView: UIViewRepresentable {
         private var entityPipelineState: MTLRenderPipelineState?
         private var entityFilterPipelineState: MTLRenderPipelineState?
         private var entityAlphaPipelineState: MTLRenderPipelineState?
+        private var entitySubtractPipelineState: MTLRenderPipelineState?
         private var entityAdditivePipelineState: MTLRenderPipelineState?
         private var additiveEntityDepthStencilState: MTLDepthStencilState?
         /* Always-pass depth state for multi-scene HUD sub-scene rendering.
@@ -1298,16 +1299,23 @@ struct MetalView: UIViewRepresentable {
                     let additiveBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE)
                     let alphaBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ALPHA)
                     let filterBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_FILTER)
+                    let subtractBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_SUBTRACT)
                     let tcGenEnvBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_TCGEN_ENV)
 
                     // Ordered entity passes:
-                    // 0 = opaque, 1 = filter, 2 = alpha, 3 = additive.
-                    for entityPass in 0..<4 {
+                    // 0 = opaque, 1 = filter, 2 = alpha, 3 = additive,
+                    // 4 = subtract (blood/bullet/shadow decals).
+                    for entityPass in 0..<5 {
                     for draw in entityDraws where draw.indexCount > 0 {
                         let isEntityAdditive = (draw.flags & additiveBit) != 0
                         let isEntityAlpha = (draw.flags & alphaBit) != 0
                         let isEntityFilter = (draw.flags & filterBit) != 0
-                        let drawPass = isEntityAdditive ? 3 : (isEntityAlpha ? 2 : (isEntityFilter ? 1 : 0))
+                        let isEntitySubtract = (draw.flags & subtractBit) != 0
+                        let drawPass = isEntitySubtract ? 4
+                                     : isEntityAdditive ? 3
+                                     : isEntityAlpha ? 2
+                                     : isEntityFilter ? 1
+                                     : 0
                         guard drawPass == entityPass else { continue }
                         guard let texture = texture(for: draw.textureHandle, device: view.device) else {
                             continue
@@ -1323,7 +1331,10 @@ struct MetalView: UIViewRepresentable {
                         Self.packEntityAlphaFunc(handle: draw.textureHandle, into: &entityUniforms)
                         Self.packEntityRgbGen(handle: draw.textureHandle, into: &entityUniforms)
                         encoder.setFragmentBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
-                        if drawPass == 3, let entityAdditivePipelineState {
+                        if drawPass == 4, let entitySubtractPipelineState {
+                            encoder.setRenderPipelineState(entitySubtractPipelineState)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveEntityDepthStencilState, device: view.device))
+                        } else if drawPass == 3, let entityAdditivePipelineState {
                             encoder.setRenderPipelineState(entityAdditivePipelineState)
                             encoder.setDepthStencilState(ensuredDepthStencilState(additiveEntityDepthStencilState, device: view.device))
                         } else if drawPass == 2, let entityAlphaPipelineState {
@@ -1798,6 +1809,28 @@ struct MetalView: UIViewRepresentable {
                 entityFilterPipelineState = try device.makeRenderPipelineState(descriptor: entityFilterDesc)
             } catch {
                 print("[Metal] Failed to create filter entity pipeline: \\(error)")
+            }
+
+            // Subtract (GL_ZERO / GL_ONE_MINUS_SRC_COLOR) — out = dst * (1 - src).
+            // Used by blood marks, bullet marks, burn marks, markShadow.
+            // Dark-valued source bytes darken the destination without
+            // replacing it. Without this pipeline, those decals were
+            // falling through to additive which made them invisible
+            // against lit stone/metal surfaces.
+            let entitySubtractDesc = MTLRenderPipelineDescriptor()
+            entitySubtractDesc.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            entitySubtractDesc.colorAttachments[0].isBlendingEnabled = true
+            entitySubtractDesc.colorAttachments[0].sourceRGBBlendFactor = .zero
+            entitySubtractDesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceColor
+            entitySubtractDesc.colorAttachments[0].sourceAlphaBlendFactor = .zero
+            entitySubtractDesc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            entitySubtractDesc.depthAttachmentPixelFormat = view.depthStencilPixelFormat
+            entitySubtractDesc.vertexFunction = library.makeFunction(name: "q3_entity_vertex")
+            entitySubtractDesc.fragmentFunction = library.makeFunction(name: "q3_entity_fragment")
+            do {
+                entitySubtractPipelineState = try device.makeRenderPipelineState(descriptor: entitySubtractDesc)
+            } catch {
+                print("[Metal] Failed to create subtract entity pipeline: \\(error)")
             }
 
             // Depth state for additive entities — read but no write

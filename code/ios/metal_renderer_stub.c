@@ -2563,10 +2563,11 @@ static int ShaderMap_GetBlendMode(const char *name) {
 }
 
 /* blendMode enum used throughout the stub and the Q3MetalWorldStage:
- *   0 = opaque (no blend)
- *   1 = additive (GL_ONE/GL_ONE, GL_SRC_ALPHA/GL_ONE)
- *   2 = alpha   (GL_SRC_ALPHA/GL_ONE_MINUS_SRC_ALPHA)
- *   3 = filter  (GL_DST_COLOR/GL_ZERO and commutative form GL_ZERO/GL_SRC_COLOR)
+ *   0 = opaque     (no blend)
+ *   1 = additive   (GL_ONE/GL_ONE, GL_SRC_ALPHA/GL_ONE)
+ *   2 = alpha      (GL_SRC_ALPHA/GL_ONE_MINUS_SRC_ALPHA)
+ *   3 = filter     (GL_DST_COLOR/GL_ZERO and commutative form GL_ZERO/GL_SRC_COLOR)
+ *   4 = subtract   (GL_ZERO/GL_ONE_MINUS_SRC_COLOR — blood/bullet/shadow decals)
  * If Q3 supports the blendFunc combo, we must map it. Unrecognized combos
  * fall through to opaque AND log once so missing cases surface without
  * re-introducing stage0/stage2 heuristics. */
@@ -2590,6 +2591,9 @@ static int BlendModeFromTokens(const char *src, const char *dst) {
     if (!Q_stricmp(src, "GL_DST_COLOR") && !Q_stricmp(dst, "GL_ZERO")) return 3;
     /* Filter (commutative factor ordering — some shaders author this form). */
     if (!Q_stricmp(src, "GL_ZERO") && !Q_stricmp(dst, "GL_SRC_COLOR")) return 3;
+    /* Subtractive darkening for decals (blood marks, bullet marks,
+     * burn marks, markShadow). out = dst * (1 - src). */
+    if (!Q_stricmp(src, "GL_ZERO") && !Q_stricmp(dst, "GL_ONE_MINUS_SRC_COLOR")) return 4;
     /* Opaque explicit (no-op blend). */
     if (!Q_stricmp(src, "GL_ONE") && !Q_stricmp(dst, "GL_ZERO")) return 0;
     /* Skip stage — GL_ZERO/GL_ZERO writes black. We render opaque-black
@@ -4365,6 +4369,8 @@ static void RE_RenderScene(const refdef_t *fd) {
                                 spriteFlags |= Q3_METAL_ENTITY_DRAWFLAG_ALPHA;
                             } else if (tex->blendMode == 3) {
                                 spriteFlags |= Q3_METAL_ENTITY_DRAWFLAG_FILTER;
+                            } else if (tex->blendMode == 4) {
+                                spriteFlags |= Q3_METAL_ENTITY_DRAWFLAG_SUBTRACT;
                             } else {
                                 spriteFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
                             }
@@ -4958,6 +4964,8 @@ static void RE_RenderScene(const refdef_t *fd) {
                                 drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_ALPHA;
                             } else if (tex->blendMode == 3) {
                                 drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_FILTER;
+                            } else if (tex->blendMode == 4) {
+                                drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_SUBTRACT;
                             } else {
                                 /* blendMode==0 for an FX model means its
                                  * shader didn't parse and we loaded the
@@ -5159,6 +5167,7 @@ static void RE_RenderScene(const refdef_t *fd) {
                         if (ptex->blendMode == 1) polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
                         else if (ptex->blendMode == 2) polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_ALPHA;
                         else if (ptex->blendMode == 3) polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_FILTER;
+                        else if (ptex->blendMode == 4) polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_SUBTRACT;
                         /* Fallback: when the poly's shader didn't resolve a
                          * blend mode (blendMode==0), default to ADDITIVE not
                          * ALPHA. Q3's explosion/trail/particle shaders are
