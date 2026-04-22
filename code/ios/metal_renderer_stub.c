@@ -1255,25 +1255,56 @@ static void LoadWorldLightmaps(const dheader_t *header, const char *mapName) {
     s_worldLightmapCount = lightmapCount;
     lightmapBytes = (const byte *)header + LittleLong(header->lumps[LUMP_LIGHTMAPS].fileofs);
 
-    for (i = 0; i < lightmapCount; ++i) {
-        byte *rgba = ri.Malloc(LIGHTMAP_WIDTH * LIGHTMAP_HEIGHT * 4);
-        const byte *source = lightmapBytes + i * LIGHTMAP_WIDTH * LIGHTMAP_HEIGHT * 3;
-        int pixel;
-        char lightmapName[MAX_QPATH];
+    /* Mirror ioquake3's R_ColorShiftLightingBytes: Q3 lightmaps are
+     * authored at half brightness (raw bytes mostly 0..127) expecting
+     * the renderer to upscale by 2^(r_mapOverBrightBits - r_overBright-
+     * Bits) at load time. With the stock cvars (mapOverBright=2,
+     * overBright=1) that's a single left-shift per channel. Without
+     * this, sampled lightmap values stay in the ~0.25-0.5 range and
+     * the world renders ~60% too dark even with the shader-side
+     * saturate(lightmap * 2) multiply.
+     *
+     * r_mapOverBrightBits is an archived cvar (default 2); r_over-
+     * BrightBits defaults to 1. We read them via Cvar_VariableIntegerValue
+     * so the cvar-block overrides in ios_main.m flow through naturally. */
+    {
+        int mapOverbright = ri.Cvar_VariableIntegerValue("r_mapOverBrightBits");
+        int frameOverbright = ri.Cvar_VariableIntegerValue("r_overBrightBits");
+        int shift = mapOverbright - frameOverbright;
+        if (shift < 0) shift = 0; /* we never downshift — behaviour matches stock path 122-138 */
+        for (i = 0; i < lightmapCount; ++i) {
+            byte *rgba = ri.Malloc(LIGHTMAP_WIDTH * LIGHTMAP_HEIGHT * 4);
+            const byte *source = lightmapBytes + i * LIGHTMAP_WIDTH * LIGHTMAP_HEIGHT * 3;
+            int pixel;
+            char lightmapName[MAX_QPATH];
 
-        if (rgba == NULL) {
-            break;
+            if (rgba == NULL) {
+                break;
+            }
+
+            for (pixel = 0; pixel < LIGHTMAP_WIDTH * LIGHTMAP_HEIGHT; ++pixel) {
+                int r = source[pixel * 3 + 0] << shift;
+                int g = source[pixel * 3 + 1] << shift;
+                int b = source[pixel * 3 + 2] << shift;
+                /* Normalize by color instead of clamping to white so
+                 * we preserve color balance on lit surfaces (same as
+                 * R_ColorShiftLightingBytes lines 127-133). */
+                int maxc = r > g ? r : g;
+                if (b > maxc) maxc = b;
+                if (maxc > 255) {
+                    r = r * 255 / maxc;
+                    g = g * 255 / maxc;
+                    b = b * 255 / maxc;
+                }
+                rgba[pixel * 4 + 0] = (byte)r;
+                rgba[pixel * 4 + 1] = (byte)g;
+                rgba[pixel * 4 + 2] = (byte)b;
+                rgba[pixel * 4 + 3] = 255;
+            }
+
+            Com_sprintf(lightmapName, sizeof(lightmapName), "*lightmap:%s:%d", mapName, i);
+            s_worldLightmapHandles[i] = RegisterRawTexture(lightmapName, rgba, LIGHTMAP_WIDTH, LIGHTMAP_HEIGHT);
         }
-
-        for (pixel = 0; pixel < LIGHTMAP_WIDTH * LIGHTMAP_HEIGHT; ++pixel) {
-            rgba[pixel * 4 + 0] = source[pixel * 3 + 0];
-            rgba[pixel * 4 + 1] = source[pixel * 3 + 1];
-            rgba[pixel * 4 + 2] = source[pixel * 3 + 2];
-            rgba[pixel * 4 + 3] = 255;
-        }
-
-        Com_sprintf(lightmapName, sizeof(lightmapName), "*lightmap:%s:%d", mapName, i);
-        s_worldLightmapHandles[i] = RegisterRawTexture(lightmapName, rgba, LIGHTMAP_WIDTH, LIGHTMAP_HEIGHT);
     }
 }
 
