@@ -227,10 +227,13 @@ struct MetalView: UIViewRepresentable {
         private static func packEntityRgbGen(handle: UInt32, into uniforms: inout EntityUniforms) {
             uniforms.rgbGenMode = 2 /* default to lightingDiffuse to preserve existing behavior */
             uniforms.alphaGenMode = 1 /* default to vertex alpha so existing entity alpha fades still work */
+            uniforms.rgbGenWaveParams = SIMD4<Float>(0, 0, 0, 0)
             var info = Q3MetalTextureInfo()
             guard Q3MetalRenderer_GetTextureInfo(handle, &info) == 1 else { return }
             uniforms.rgbGenMode = info.rgbGen
             uniforms.alphaGenMode = info.alphaGen
+            uniforms.rgbGenWaveParams = SIMD4<Float>(
+                info.rgbWaveBase, info.rgbWaveAmp, info.rgbWavePhase, info.rgbWaveFreq)
         }
 
         struct EntityUniforms {
@@ -275,6 +278,12 @@ struct MetalView: UIViewRepresentable {
             var alphaGenMode: UInt32 = 0
             var _genPad0: UInt32 = 0
             var _genPad1: UInt32 = 0
+            /* rgbGen wave params (only consulted when rgbGenMode == 3):
+             * (base, amp, phase, freq). GF_SIN only for minimal scope —
+             * matches ioquake3 RB_CalcWaveColor: glow = clamp(base +
+             * sin(2π*(phase + t*freq)) * amp, 0, 1); rgb = texel.rgb *
+             * glow. Keeps struct stride at 208 bytes, 16-aligned. */
+            var rgbGenWaveParams: SIMD4<Float> = SIMD4<Float>(0, 0, 0, 0)
         }
 
         /* Fragment-side dlight block bound at buffer(2) for both world and
@@ -509,6 +518,7 @@ struct MetalView: UIViewRepresentable {
             uint alphaGenMode;
             uint _genPad0;
             uint _genPad1;
+            float4 rgbGenWaveParams;
         };
 
         struct EntityVertexOut {
@@ -725,9 +735,23 @@ struct MetalView: UIViewRepresentable {
              * the existing `texel * in.color` multiply (Lambert baked
              * into vertex color C-side). Alpha follows vertex color in
              * both cases so additive/alpha blends stay intact. */
-            float3 baseRgb = (uniforms.rgbGenMode == 0u)
-                ? texel.rgb
-                : (texel.rgb * in.color.rgb);
+            /* rgbGen selection:
+             *   0 (identity) = texel.rgb (full-bright)
+             *   3 (wave)     = texel.rgb * clamp(base + sin(2π*(phase +
+             *                  t*freq)) * amp, 0, 1) — matches
+             *                  RB_CalcWaveColor (GF_SIN scope)
+             *   default      = texel.rgb * in.color.rgb (Lambert) */
+            float3 baseRgb;
+            if (uniforms.rgbGenMode == 0u) {
+                baseRgb = texel.rgb;
+            } else if (uniforms.rgbGenMode == 3u) {
+                float4 wp = uniforms.rgbGenWaveParams; /* (base, amp, phase, freq) */
+                float angle = 2.0 * 3.14159265 * (wp.z + uniforms.timeSeconds * wp.w);
+                float glow = clamp(wp.x + sin(angle) * wp.y, 0.0, 1.0);
+                baseRgb = texel.rgb * glow;
+            } else {
+                baseRgb = texel.rgb * in.color.rgb;
+            }
             /* alphaGen identity (0) — mirror CGEN_IDENTITY on the alpha
              * channel. Upstream AGEN_IDENTITY overrides vertex alpha
              * with 255, so a fading entityColor alpha does not leak

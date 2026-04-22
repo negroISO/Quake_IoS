@@ -224,6 +224,13 @@ typedef struct {
      * alpha-faded entityColor doesn't leak into stages that want
      * opaque output — matches upstream AGEN_IDENTITY. */
     uint32_t alphaGen;
+    /* Stage 0 rgbGen wave parameters (base, amp, phase, freq). Only
+     * meaningful when rgbGen == 3. GF_SIN only for minimal scope,
+     * matches ioquake3 RB_CalcWaveColor's glow calculation. */
+    float rgbWaveBase;
+    float rgbWaveAmp;
+    float rgbWavePhase;
+    float rgbWaveFreq;
 } Q3MetalTextureInfo;
 
 typedef struct {
