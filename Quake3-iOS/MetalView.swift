@@ -178,6 +178,9 @@ struct MetalView: UIViewRepresentable {
                 case 3: /* rotate: degrees/sec → radians/sec, negated */
                     types[i] = 3
                     packed[i] = SIMD4(-pp.0 * .pi / 180.0, 0, 0, 0)
+                case 4: /* scale: params.xy = s/t scale factors, unchanged */
+                    types[i] = 4
+                    packed[i] = SIMD4(pp.0, pp.1, 0, 0)
                 default:
                     /* outside scope — leave type=0 so applyTcMod no-ops */
                     break
