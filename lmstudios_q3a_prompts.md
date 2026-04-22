@@ -39,3 +39,12 @@ the source texture coordinates.**
 Gemma-4-31B: **YES. The OpenGL glAlphaFunc specification dictates that
 fragments are passed if they satisfy the specified comparison against the
 reference value and discarded otherwise.**
+
+## [VERIFY_PIPELINE] tcMod scale is pure component-wise multiply
+> In ioquake3 RB_CalcScaleTexCoords (tr_shade_calc.c), the per-vertex
+> operation is `dst[0] = src[0] * scale[0]` and `dst[1] = src[1] *
+> scale[1]` — pure component-wise multiplication with NO time dependency.
+> Answer YES or NO.
+
+Gemma-4-31B: **YES. The function performs a simple component-wise
+multiplication of the source coordinates by the scale factors.**
