@@ -142,6 +142,50 @@ struct MetalView: UIViewRepresentable {
             var color: SIMD4<Float>
         }
 
+        /* Fetch the stage-0 tcMod chain for a texture handle and pack it
+         * into the fragment-side slots of the provided EntityUniforms.
+         * Scope is scroll (type=1) and rotate (type=3) only — any other
+         * type is cleared to 0 so applyTcMod becomes a no-op. Rotate's
+         * speed gets converted from degrees/sec to radians/sec AND
+         * negated to match ioquake3's `degs = -degsPerSecond * timeScale`
+         * sign convention (so CW rotation looks like Q3's quad shell). */
+        private static func packEntityTcMods(handle: UInt32, into uniforms: inout EntityUniforms) {
+            uniforms.tcModCount = 0
+            uniforms.tcModType = SIMD4<Float>(0, 0, 0, 0)
+            uniforms.tcModParams0 = SIMD4<Float>(0, 0, 0, 0)
+            uniforms.tcModParams1 = SIMD4<Float>(0, 0, 0, 0)
+            uniforms.tcModParams2 = SIMD4<Float>(0, 0, 0, 0)
+            uniforms.tcModParams3 = SIMD4<Float>(0, 0, 0, 0)
+            var info = Q3MetalTextureInfo()
+            guard Q3MetalRenderer_GetTextureInfo(handle, &info) == 1 else { return }
+            let count = Int(min(info.tcModCount, 4))
+            if count == 0 { return }
+            let chain = [info.tcMods.0, info.tcMods.1, info.tcMods.2, info.tcMods.3]
+            var types = SIMD4<Float>(0, 0, 0, 0)
+            var packed: [SIMD4<Float>] = [SIMD4(0,0,0,0), SIMD4(0,0,0,0), SIMD4(0,0,0,0), SIMD4(0,0,0,0)]
+            for i in 0..<count {
+                let m = chain[i]
+                let pp = m.params
+                switch m.type {
+                case 1: /* scroll: params.xy = s/t speed, unchanged */
+                    types[i] = 1
+                    packed[i] = SIMD4(pp.0, pp.1, 0, 0)
+                case 3: /* rotate: degrees/sec → radians/sec, negated */
+                    types[i] = 3
+                    packed[i] = SIMD4(-pp.0 * .pi / 180.0, 0, 0, 0)
+                default:
+                    /* outside scope — leave type=0 so applyTcMod no-ops */
+                    break
+                }
+            }
+            uniforms.tcModCount = Int32(count)
+            uniforms.tcModType = types
+            uniforms.tcModParams0 = packed[0]
+            uniforms.tcModParams1 = packed[1]
+            uniforms.tcModParams2 = packed[2]
+            uniforms.tcModParams3 = packed[3]
+        }
+
         struct EntityUniforms {
             var viewProjection: simd_float4x4
             /* Camera origin in world space — used by q3_entity_fragment
@@ -153,11 +197,21 @@ struct MetalView: UIViewRepresentable {
              * Set per entity based on Q3_METAL_ENTITY_DRAWFLAG_TCGEN_ENV.
              * 0.0 otherwise — fragment keeps mesh ST coords. */
             var tcGen: Float = 0
-            /* Explicit padding to keep the struct 16-byte aligned so
-             * setVertexBytes / setFragmentBytes agree on stride. */
-            var _pad0: Float = 0
-            var _pad1: Float = 0
-            var _pad2: Float = 0
+            /* Time in seconds for tcMod scroll/rotate — matches
+             * tess.shaderTime upstream. */
+            var timeSeconds: Float = 0
+            /* tcMod chain (stage 0). applyTcMod matches the world
+             * fragment's types (1=scroll, 3=rotate — others clamp no-op
+             * per the entity scope limitation). Rotate.x is packed as
+             * `-degsPerSecond * π/180` so MSL cos/sin treat it as
+             * radians/sec with Q3's CW sign convention. */
+            var tcModCount: Int32 = 0
+            var _pad0: Float = 0   /* aligns tcModType to the next 16-byte slot */
+            var tcModType: SIMD4<Float> = SIMD4<Float>(0, 0, 0, 0)
+            var tcModParams0: SIMD4<Float> = SIMD4<Float>(0, 0, 0, 0)
+            var tcModParams1: SIMD4<Float> = SIMD4<Float>(0, 0, 0, 0)
+            var tcModParams2: SIMD4<Float> = SIMD4<Float>(0, 0, 0, 0)
+            var tcModParams3: SIMD4<Float> = SIMD4<Float>(0, 0, 0, 0)
         }
 
         /* Fragment-side dlight block bound at buffer(2) for both world and
@@ -357,9 +411,14 @@ struct MetalView: UIViewRepresentable {
              * the Swift layout. Read by q3_entity_fragment for tcGen env. */
             float3 cameraPos;
             float  tcGen;
+            float  timeSeconds;
+            int    tcModCount;
             float  _pad0;
-            float  _pad1;
-            float  _pad2;
+            float4 tcModType;
+            float4 tcModParams0;
+            float4 tcModParams1;
+            float4 tcModParams2;
+            float4 tcModParams3;
         };
 
         struct EntityVertexOut {
@@ -533,6 +592,16 @@ struct MetalView: UIViewRepresentable {
                 float3 refl = n * d - viewer;
                 texCoord = float2(0.5 + refl.y * 0.5, 0.5 - refl.z * 0.5);
             }
+            /* Apply stage 0 tcMod chain after tcGen (matches upstream
+             * order: tcGen first, then each tcMod directive sequentially).
+             * Scope: scroll (type=1) and rotate (type=3) only — rotate
+             * param.x is packed as `-degs * π/180` so applyTcMod's
+             * cos/sin treat it as radians/sec with CW sign. */
+            int entityModCount = uniforms.tcModCount;
+            if (entityModCount > 0) texCoord = applyTcMod(texCoord, int(uniforms.tcModType.x + 0.5), uniforms.tcModParams0, uniforms.timeSeconds);
+            if (entityModCount > 1) texCoord = applyTcMod(texCoord, int(uniforms.tcModType.y + 0.5), uniforms.tcModParams1, uniforms.timeSeconds);
+            if (entityModCount > 2) texCoord = applyTcMod(texCoord, int(uniforms.tcModType.z + 0.5), uniforms.tcModParams2, uniforms.timeSeconds);
+            if (entityModCount > 3) texCoord = applyTcMod(texCoord, int(uniforms.tcModType.w + 0.5), uniforms.tcModParams3, uniforms.timeSeconds);
             float4 texel = colorTexture.sample(textureSampler, texCoord);
             float4 base = texel * in.color;
             base.rgb = applyDlights(base.rgb, in.worldPos, dlights);
@@ -957,7 +1026,8 @@ struct MetalView: UIViewRepresentable {
                let entityIndexBuffer {
                 let entityViewProjection = makeWorldViewProjection(sceneView)
                 let cameraPos = SIMD3<Float>(sceneView.viewOrigin.0, sceneView.viewOrigin.1, sceneView.viewOrigin.2)
-                var entityUniforms = EntityUniforms(viewProjection: entityViewProjection, cameraPos: cameraPos, tcGen: 0)
+                let entityTimeSeconds = Float(CACurrentMediaTime() - frameTimeOrigin)
+                var entityUniforms = EntityUniforms(viewProjection: entityViewProjection, cameraPos: cameraPos, tcGen: 0, timeSeconds: entityTimeSeconds)
                 encoder.setRenderPipelineState(entityPipelineState)
                 encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
                 encoder.setFrontFacing(.clockwise)
@@ -1007,6 +1077,7 @@ struct MetalView: UIViewRepresentable {
                         // battlesuit carry TCGEN_ENV, sharing a viewProjection
                         // and cameraPos with the base entity pass.
                         entityUniforms.tcGen = (draw.flags & tcGenEnvBit) != 0 ? 1.0 : 0.0
+                        Self.packEntityTcMods(handle: draw.textureHandle, into: &entityUniforms)
                         encoder.setFragmentBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
                         if drawPass == 3, let entityAdditivePipelineState {
                             encoder.setRenderPipelineState(entityAdditivePipelineState)

@@ -197,6 +197,12 @@ typedef struct {
     uint32_t height;
     uint32_t generation;
     const uint8_t *rgbaBytes;
+    /* Stage 0 tcMod chain for this texture's resolved shader.
+     * Entity pipeline reads this to apply scroll/rotate on the quad
+     * shell / regen / battlesuit shaders — matches ioquake3's
+     * RB_CalcScrollTexCoords + RB_CalcRotateTexCoords order. */
+    uint32_t tcModCount;
+    Q3TcMod tcMods[Q3_MAX_TCMODS];
 } Q3MetalTextureInfo;
 
 typedef struct {

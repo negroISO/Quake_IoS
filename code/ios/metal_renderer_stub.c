@@ -33,6 +33,12 @@ typedef struct {
                     * (chrome/reflective like powerups/quad, shell shaders).
                     * Entity pipeline reads this to switch UV generation
                     * from mesh ST to the reflection formula. */
+    /* Stage 0 tcMod chain, copied from the resolved shader-map entry at
+     * registration time. Entity pipeline propagates to Swift so the
+     * fragment shader can apply scroll/rotate after tcGen env — matches
+     * ioquake3's RB_CalcScrollTexCoords + RB_CalcRotateTexCoords order. */
+    int tcModCount;
+    Q3TcMod tcMods[Q3_MAX_TCMODS];
 } metalTexture_t;
 
 refimport_t ri;
@@ -728,6 +734,7 @@ static const metalShaderMap_t *ShaderMap_LookupEntry(const char *name);
 static int ShaderMap_GetBlendMode(const char *name);
 static int ShaderMap_GetAlphaFunc(const char *name);
 static int ShaderMap_GetTcGenEnv(const char *name);
+static void ShaderMap_GetTcMods(const char *name, int *outCount, Q3TcMod *outMods);
 static int s_pendingAnimSlot;
 static float s_pendingScrollS;
 static float s_pendingScrollT;
@@ -938,6 +945,7 @@ static qhandle_t RegisterTexture(const char *name) {
     texture->blendMode = ShaderMap_GetBlendMode(name);
     texture->alphaFunc = ShaderMap_GetAlphaFunc(name);
     texture->tcGenEnv = ShaderMap_GetTcGenEnv(name);
+    ShaderMap_GetTcMods(name, &texture->tcModCount, texture->tcMods);
     if (Q_stricmp(name, resolvedName)) {
         ri.Printf(PRINT_ALL, "Metal stub: loaded '%s' from '%s' (%dx%d)\n", name, resolvedName, width, height);
     }
@@ -2552,6 +2560,31 @@ static int ShaderMap_GetTcGenEnv(const char *name) {
     if (name == NULL || name[0] == '\0') return 0;
     entry = ShaderMap_LookupEntry(name);
     return (entry && entry->tcGenEnv) ? 1 : 0;
+}
+
+/* Stage 0's tcMod chain for a shader name. Entity pipeline consumes
+ * this through metalTexture_t so the fragment can run scroll/rotate
+ * after tcGen env. Returns count=0 when the shader has no tcMods or
+ * the name fails to resolve. */
+static void ShaderMap_GetTcMods(const char *name, int *outCount, Q3TcMod *outMods) {
+    const metalShaderMap_t *entry;
+    int i;
+    if (outCount) *outCount = 0;
+    if (name == NULL || name[0] == '\0' || outMods == NULL || outCount == NULL) return;
+    for (i = 0; i < Q3_MAX_TCMODS; ++i) {
+        outMods[i].type = 0;
+        outMods[i].params[0] = 0.0f;
+        outMods[i].params[1] = 0.0f;
+        outMods[i].params[2] = 0.0f;
+        outMods[i].params[3] = 0.0f;
+    }
+    entry = ShaderMap_LookupEntry(name);
+    if (entry == NULL || entry->stageCount <= 0) return;
+    *outCount = entry->stages[0].tcModCount;
+    if (*outCount > Q3_MAX_TCMODS) *outCount = Q3_MAX_TCMODS;
+    for (i = 0; i < *outCount; ++i) {
+        outMods[i] = entry->stages[0].tcMods[i];
+    }
 }
 
 /* Current frame's texture handle for a known animated slot. Caller
@@ -5237,6 +5270,13 @@ int Q3MetalRenderer_GetTextureInfo(uint32_t textureHandle, Q3MetalTextureInfo *o
     outInfo->height = (uint32_t)texture->height;
     outInfo->generation = texture->generation;
     outInfo->rgbaBytes = texture->rgbaBytes;
+    outInfo->tcModCount = (uint32_t)texture->tcModCount;
+    {
+        int i;
+        for (i = 0; i < Q3_MAX_TCMODS; ++i) {
+            outInfo->tcMods[i] = texture->tcMods[i];
+        }
+    }
     return 1;
 }
 
