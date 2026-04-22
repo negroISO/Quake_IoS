@@ -231,6 +231,7 @@ struct MetalView: UIViewRepresentable {
             uniforms.alphaWaveFunc = 1
             uniforms.rgbGenWaveParams = SIMD4<Float>(0, 0, 0, 0)
             uniforms.alphaGenWaveParams = SIMD4<Float>(0, 0, 0, 0)
+            uniforms.rgbConstColor = SIMD4<Float>(1, 1, 1, 1)
             var info = Q3MetalTextureInfo()
             guard Q3MetalRenderer_GetTextureInfo(handle, &info) == 1 else { return }
             uniforms.rgbGenMode = info.rgbGen
@@ -241,6 +242,8 @@ struct MetalView: UIViewRepresentable {
                 info.rgbWaveBase, info.rgbWaveAmp, info.rgbWavePhase, info.rgbWaveFreq)
             uniforms.alphaGenWaveParams = SIMD4<Float>(
                 info.alphaWaveBase, info.alphaWaveAmp, info.alphaWavePhase, info.alphaWaveFreq)
+            uniforms.rgbConstColor = SIMD4<Float>(
+                info.rgbConstColor.0, info.rgbConstColor.1, info.rgbConstColor.2, 1.0)
         }
 
         struct EntityUniforms {
@@ -296,9 +299,14 @@ struct MetalView: UIViewRepresentable {
             var rgbGenWaveParams: SIMD4<Float> = SIMD4<Float>(0, 0, 0, 0)
             /* alphaGen wave params (only consulted when alphaGenMode
              * == 3): (base, amp, phase, freq). Matches RB_CalcWaveAlpha:
-             * alpha = clamp(base + sin(...)*amp, 0, 1). Struct stride
-             * now 224 bytes, still 16-aligned. */
+             * alpha = clamp(base + sin(...)*amp, 0, 1). */
             var alphaGenWaveParams: SIMD4<Float> = SIMD4<Float>(0, 0, 0, 0)
+            /* rgbGen const tint (only consulted when rgbGenMode == 4).
+             * Upstream CGEN_CONST sets per-vertex rgb = constant color;
+             * fragment multiplies texel.rgb by .xyz. Defaults to white
+             * so a no-op when the shader doesn't opt in. Struct stride
+             * grows to 240 bytes (16-aligned). */
+            var rgbConstColor: SIMD4<Float> = SIMD4<Float>(1, 1, 1, 1)
         }
 
         /* Fragment-side dlight block bound at buffer(2) for both world and
@@ -563,6 +571,7 @@ struct MetalView: UIViewRepresentable {
             uint alphaWaveFunc;
             float4 rgbGenWaveParams;
             float4 alphaGenWaveParams;
+            float4 rgbConstColor;
         };
 
         struct EntityVertexOut {
@@ -792,6 +801,11 @@ struct MetalView: UIViewRepresentable {
                 float4 wp = uniforms.rgbGenWaveParams; /* (base, amp, phase, freq) */
                 float glow = clamp(evalWave(uniforms.rgbWaveFunc, wp.x, wp.y, wp.z, wp.w, uniforms.timeSeconds), 0.0, 1.0);
                 baseRgb = texel.rgb * glow;
+            } else if (uniforms.rgbGenMode == 4u) {
+                /* CGEN_CONST: fixed RGB tint. Upstream builds a
+                 * color4ub_t from pStage->constantColor and writes it
+                 * to every vertex color. */
+                baseRgb = texel.rgb * uniforms.rgbConstColor.rgb;
             } else {
                 baseRgb = texel.rgb * in.color.rgb;
             }
