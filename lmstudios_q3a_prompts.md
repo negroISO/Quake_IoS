@@ -73,3 +73,15 @@ evaluation accurately reflect the implementation in tr_shade_calc.c.**
 Gemma-4-31B: **YES. The calculation uses world-space positions scaled
 by a constant factor and offset by time and phase to perturb texture
 coordinates.**
+
+## [VERIFY_SHADER] CGEN_IDENTITY sets full-white per-vertex color
+> In ioquake3 tr_shade.c RB_IterateStagesGeneric, the CGEN_IDENTITY
+> case does `Com_Memset(tess.svars.colors, 0xff, tess.numVertexes *
+> 4)` — setting all per-vertex RGBA bytes to 0xff, which is equivalent
+> to each vertex color being (1.0, 1.0, 1.0, 1.0). So a shader stage
+> with `rgbGen identity` outputs vertex colors that, when multiplied
+> with the texel, leave the texel unchanged (full-bright). YES/NO.
+
+Gemma-4-31B: **YES. The memset to 0xff sets all RGBA components to
+maximum value, resulting in a multiplicative identity for the texture
+color.**
