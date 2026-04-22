@@ -140,6 +140,11 @@ struct MetalView: UIViewRepresentable {
             var position: SIMD3<Float>
             var texCoord: SIMD2<Float>
             var color: SIMD4<Float>
+            /* World-space normal — non-zero means MD3 emit path
+             * supplied a smooth per-vertex normal; zero means non-MD3
+             * path (sprite, beam, flare, synthetic) and the fragment
+             * should fall back to dfdx/dfdy face-normal derivation. */
+            var normal: SIMD3<Float>
         }
 
         /* Fetch the stage-0 tcMod chain for a texture handle and pack it
@@ -425,6 +430,7 @@ struct MetalView: UIViewRepresentable {
             float3 position;
             float2 texCoord;
             float4 color;
+            float3 normal;
         };
 
         struct EntityUniforms {
@@ -451,6 +457,10 @@ struct MetalView: UIViewRepresentable {
             // World-space position — entity verts are pre-transformed to
             // world space C-side so this is a direct pass-through.
             float3 worldPos;
+            // World-space normal. Zero vector means "no normal supplied"
+            // (sprite / beam / synthetic overlay); the fragment falls
+            // back to a flat face normal via dfdx/dfdy of worldPos.
+            float3 normal;
         };
 
         vertex WorldVertexOut q3_world_vertex(const device WorldVertexIn *vertices [[buffer(0)]],
@@ -586,6 +596,7 @@ struct MetalView: UIViewRepresentable {
             out.texCoord = inVertex.texCoord;
             out.color = inVertex.color;
             out.worldPos = inVertex.position;
+            out.normal = inVertex.normal;
             return out;
         }
 
@@ -607,9 +618,18 @@ struct MetalView: UIViewRepresentable {
             // derivatives (same technique the world pipeline uses).
             float2 texCoord = in.texCoord;
             if (uniforms.tcGen > 0.5) {
-                float3 dx = dfdx(in.worldPos);
-                float3 dy = dfdy(in.worldPos);
-                float3 n = normalize(cross(dx, dy));
+                /* Prefer the per-vertex normal supplied by the MD3 emit
+                 * path; fall back to a flat face normal via dfdx/dfdy of
+                 * worldPos when none was supplied (sprites, beams,
+                 * flares, synthetic overlays) or when length²==0. */
+                float3 n;
+                if (dot(in.normal, in.normal) > 0.0001) {
+                    n = normalize(in.normal);
+                } else {
+                    float3 dx = dfdx(in.worldPos);
+                    float3 dy = dfdy(in.worldPos);
+                    n = normalize(cross(dx, dy));
+                }
                 float3 viewer = normalize(uniforms.cameraPos - in.worldPos);
                 float d = 2.0 * dot(viewer, n);
                 float3 refl = n * d - viewer;
@@ -1697,7 +1717,8 @@ struct MetalView: UIViewRepresentable {
                 rawVertexPointer[i] = GPUEntityVertex(
                     position: SIMD3<Float>(vertex.position.0, vertex.position.1, vertex.position.2),
                     texCoord: SIMD2<Float>(vertex.texCoord.0, vertex.texCoord.1),
-                    color: SIMD4<Float>(vertex.color.0, vertex.color.1, vertex.color.2, vertex.color.3)
+                    color: SIMD4<Float>(vertex.color.0, vertex.color.1, vertex.color.2, vertex.color.3),
+                    normal: SIMD3<Float>(vertex.normal.0, vertex.normal.1, vertex.normal.2)
                 )
             }
 
@@ -1820,7 +1841,8 @@ struct MetalView: UIViewRepresentable {
                     var vert = Q3MetalEntityVertex(
                         position: (p.x, p.y, p.z),
                         texCoord: (uv.x, uv.y),
-                        color: (color.x, color.y, color.z, 1.0)
+                        color: (color.x, color.y, color.z, 1.0),
+                        normal: (0, 0, 0)
                     )
                     vertices.append(vert)
                 }

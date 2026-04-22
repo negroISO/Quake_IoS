@@ -24,6 +24,12 @@ typedef struct {
     float position[3];
     float texCoord[2];
     float color[4];
+    /* World-space normal. MD3 emit paths decode the lat/long packed
+     * normal and rotate by the entity axis (see tr_main.c's
+     * RB_CalcEnvironmentTexCoords); non-MD3 paths (sprites, beams,
+     * flares, synthetic overlays) leave this zero and q3_entity_fragment
+     * falls back to a flat face normal via dfdx/dfdy of worldPos. */
+    float normal[3];
 } Q3MetalEntityVertex;
 
 typedef struct {

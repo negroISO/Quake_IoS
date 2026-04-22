@@ -1057,6 +1057,10 @@ static qboolean EnsureEntitySceneCapacity(uint32_t vertexCount, uint32_t indexCo
         if (newVertices == NULL) {
             return qfalse;
         }
+        /* Zero-init so non-MD3 emit paths (sprites, beams, flares,
+         * synthetic overlays) leave normal[] at 0 — the fragment then
+         * falls back to the dfdx/dfdy flat face normal. */
+        Com_Memset(newVertices, 0, vertexCount * sizeof(*newVertices));
         if (s_entityVertices != NULL) {
             Com_Memcpy(newVertices, s_entityVertices,
                        s_entityVertexCapacity * sizeof(*newVertices));
@@ -4844,6 +4848,15 @@ static void RE_RenderScene(const refdef_t *fd) {
                              * entities. VectorNormalize returns early
                              * on zero-length vectors so it's safe. */
                             VectorNormalize(worldN);
+
+                            /* Pass the normalized world-space normal down
+                             * to the shader so tcGen environment can use
+                             * smooth per-vertex normals instead of flat
+                             * faceted dfdx/dfdy derivatives on quad-shell
+                             * / regen / battlesuit reflections. */
+                            outVertex->normal[0] = worldN[0];
+                            outVertex->normal[1] = worldN[1];
+                            outVertex->normal[2] = worldN[2];
 
                             ndotl = worldN[0] * entityLightDir[0]
                                   + worldN[1] * entityLightDir[1]
