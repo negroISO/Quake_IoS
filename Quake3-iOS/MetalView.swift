@@ -186,6 +186,23 @@ struct MetalView: UIViewRepresentable {
             uniforms.tcModParams3 = packed[3]
         }
 
+        /* Entity alphaFunc → alphaTestThreshold packing. Reuses the
+         * world pipeline's sign convention: positive = discard below,
+         * negative = discard at-or-above. Must be called per entity
+         * draw so alpha-tested textures (grates, chain-link) get the
+         * fragment-kill behavior upstream gets from qglAlphaFunc. */
+        private static func packEntityAlphaFunc(handle: UInt32, into uniforms: inout EntityUniforms) {
+            uniforms.alphaTestThreshold = 0
+            var info = Q3MetalTextureInfo()
+            guard Q3MetalRenderer_GetTextureInfo(handle, &info) == 1 else { return }
+            switch info.alphaFunc {
+            case 1: uniforms.alphaTestThreshold = 0.004  /* GT0  — discard alpha==0 */
+            case 2: uniforms.alphaTestThreshold = 0.5    /* GE128 */
+            case 3: uniforms.alphaTestThreshold = -0.5   /* LT128 — inverted */
+            default: break
+            }
+        }
+
         struct EntityUniforms {
             var viewProjection: simd_float4x4
             /* Camera origin in world space — used by q3_entity_fragment
@@ -206,7 +223,13 @@ struct MetalView: UIViewRepresentable {
              * `-degsPerSecond * π/180` so MSL cos/sin treat it as
              * radians/sec with Q3's CW sign convention. */
             var tcModCount: Int32 = 0
-            var _pad0: Float = 0   /* aligns tcModType to the next 16-byte slot */
+            /* Entity alphaFunc packed the same way the world pipeline
+             * does (alphaTestThreshold helper): positive = discard if
+             * texel.a < t; negative = discard if texel.a >= -t; zero =
+             * no alpha test. Populated from Q3MetalTextureInfo.alphaFunc
+             * per draw. Lives in the former padding slot so layout stays
+             * 176 bytes total (16-aligned). */
+            var alphaTestThreshold: Float = 0
             var tcModType: SIMD4<Float> = SIMD4<Float>(0, 0, 0, 0)
             var tcModParams0: SIMD4<Float> = SIMD4<Float>(0, 0, 0, 0)
             var tcModParams1: SIMD4<Float> = SIMD4<Float>(0, 0, 0, 0)
@@ -413,7 +436,7 @@ struct MetalView: UIViewRepresentable {
             float  tcGen;
             float  timeSeconds;
             int    tcModCount;
-            float  _pad0;
+            float  alphaTestThreshold;
             float4 tcModType;
             float4 tcModParams0;
             float4 tcModParams1;
@@ -603,6 +626,18 @@ struct MetalView: UIViewRepresentable {
             if (entityModCount > 2) texCoord = applyTcMod(texCoord, int(uniforms.tcModType.z + 0.5), uniforms.tcModParams2, uniforms.timeSeconds);
             if (entityModCount > 3) texCoord = applyTcMod(texCoord, int(uniforms.tcModType.w + 0.5), uniforms.tcModParams3, uniforms.timeSeconds);
             float4 texel = colorTexture.sample(textureSampler, texCoord);
+            /* Entity alphaFunc discard — mirrors upstream GLS_ATEST_GT_0 /
+             * GE_80 / LT_80 as fragment kills so grate-style meshes and
+             * any entity using `alphaFunc GT0` (sparks, explosion puffs on
+             * sprite quads once sprite path learns it) show their cutout
+             * shape instead of a solid rectangle. Threshold packing
+             * matches the world pipeline: positive = discard on below,
+             * negative = discard on at-or-above (inverted LT_80). */
+            if (uniforms.alphaTestThreshold > 0.0) {
+                if (texel.a < uniforms.alphaTestThreshold) discard_fragment();
+            } else if (uniforms.alphaTestThreshold < 0.0) {
+                if (texel.a >= -uniforms.alphaTestThreshold) discard_fragment();
+            }
             float4 base = texel * in.color;
             base.rgb = applyDlights(base.rgb, in.worldPos, dlights);
             return base;
@@ -1078,6 +1113,7 @@ struct MetalView: UIViewRepresentable {
                         // and cameraPos with the base entity pass.
                         entityUniforms.tcGen = (draw.flags & tcGenEnvBit) != 0 ? 1.0 : 0.0
                         Self.packEntityTcMods(handle: draw.textureHandle, into: &entityUniforms)
+                        Self.packEntityAlphaFunc(handle: draw.textureHandle, into: &entityUniforms)
                         encoder.setFragmentBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
                         if drawPass == 3, let entityAdditivePipelineState {
                             encoder.setRenderPipelineState(entityAdditivePipelineState)

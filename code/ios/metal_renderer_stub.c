@@ -5277,6 +5277,7 @@ int Q3MetalRenderer_GetTextureInfo(uint32_t textureHandle, Q3MetalTextureInfo *o
             outInfo->tcMods[i] = texture->tcMods[i];
         }
     }
+    outInfo->alphaFunc = (uint32_t)texture->alphaFunc;
     return 1;
 }
 

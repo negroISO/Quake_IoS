@@ -203,6 +203,11 @@ typedef struct {
      * RB_CalcScrollTexCoords + RB_CalcRotateTexCoords order. */
     uint32_t tcModCount;
     Q3TcMod tcMods[Q3_MAX_TCMODS];
+    /* Stage 0 alphaFunc: 0=none, 1=GT0, 2=GE128, 3=LT128. Entity
+     * fragment translates to an MSL discard so alpha-tested textures
+     * (grates, chain-link, vegetation billboards) render with holes
+     * instead of solid silhouettes. Matches ioquake3's GLS_ATEST_*. */
+    uint32_t alphaFunc;
 } Q3MetalTextureInfo;
 
 typedef struct {
