@@ -48,3 +48,16 @@ reference value and discarded otherwise.**
 
 Gemma-4-31B: **YES. The function performs a simple component-wise
 multiplication of the source coordinates by the scale factors.**
+
+## [VERIFY_PIPELINE] tcMod stretch is center-zoom by 1/EvalWave
+> In ioquake3 RB_CalcStretchTexCoords (tr_shade_calc.c), the
+> implementation sets `p = 1 / EvalWaveForm(wf)` then builds a
+> texModInfo with matrix={{p,0},{0,p}} and translate={0.5-0.5*p,
+> 0.5-0.5*p}, then calls RB_CalcTransformTexCoords. This is equivalent
+> to: `dst = (src - 0.5) * p + 0.5` — a zoom about the texture center
+> by factor p. For a GF_SIN wave with base B, amplitude A, phase P,
+> frequency F, EvalWaveForm returns B + sin(2π*(P + t*F)) * A where
+> t = tess.shaderTime. Is this math description accurate? YES/NO.
+
+Gemma-4-31B: **YES. The described transformation and waveform
+evaluation accurately reflect the implementation in tr_shade_calc.c.**
