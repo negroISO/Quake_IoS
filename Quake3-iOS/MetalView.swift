@@ -414,7 +414,7 @@ struct MetalView: UIViewRepresentable {
             float _pad0;
         };
 
-        float2 applyTcMod(float2 uv, int type, float4 params, float timeSeconds) {
+        float2 applyTcMod(float2 uv, float3 worldPos, int type, float4 params, float timeSeconds) {
             if (type == 1) {
                 return uv + params.xy * timeSeconds;
             } else if (type == 2) {
@@ -429,12 +429,21 @@ struct MetalView: UIViewRepresentable {
             } else if (type == 4) {
                 return uv * params.xy;
             } else if (type == 5) {
+                /* Turbulent: upstream RB_CalcTurbulentTexCoords samples
+                 * tr.sinTable with world-space xyz as the domain, NOT UV
+                 * space. params = (amp, freq, phase, _). The expression
+                 * `1/128 * 0.125 = 1/1024` matches upstream's world-unit
+                 * scale so e.g. a 1024-unit-wide lava pool sees one full
+                 * sin cycle of perturbation in-plane. */
                 float amp = params.x;
                 float freq = params.y;
                 float phase = params.z;
-                float t = (timeSeconds + phase) * freq * 2.0 * 3.14159265;
-                return uv + float2(sin(t + uv.y * 4.0) * amp,
-                                   sin(t + uv.x * 4.0) * amp);
+                float now = phase + timeSeconds * freq;
+                float kX = (worldPos.x + worldPos.z) * (1.0 / 1024.0) + now;
+                float kY = worldPos.y * (1.0 / 1024.0) + now;
+                float twoPi = 2.0 * 3.14159265;
+                return uv + float2(sin(kX * twoPi) * amp,
+                                   sin(kY * twoPi) * amp);
             } else if (type == 6) {
                 /* stretch: sin-wave zoom about texture center.
                  * params = (base, amp, phase, freq). Mirrors
@@ -533,10 +542,10 @@ struct MetalView: UIViewRepresentable {
             // tcMod chain — apply in order. Q3 shaders stack mods (e.g. scale
             // then scroll); order matters and cannot be reduced to one slot.
             int modCount = drawUniforms.tcModCount;
-            if (modCount > 0) texCoord = applyTcMod(texCoord, int(drawUniforms.tcModType.x + 0.5), drawUniforms.tcModParams0, drawUniforms.timeSeconds);
-            if (modCount > 1) texCoord = applyTcMod(texCoord, int(drawUniforms.tcModType.y + 0.5), drawUniforms.tcModParams1, drawUniforms.timeSeconds);
-            if (modCount > 2) texCoord = applyTcMod(texCoord, int(drawUniforms.tcModType.z + 0.5), drawUniforms.tcModParams2, drawUniforms.timeSeconds);
-            if (modCount > 3) texCoord = applyTcMod(texCoord, int(drawUniforms.tcModType.w + 0.5), drawUniforms.tcModParams3, drawUniforms.timeSeconds);
+            if (modCount > 0) texCoord = applyTcMod(texCoord, in.worldPos, int(drawUniforms.tcModType.x + 0.5), drawUniforms.tcModParams0, drawUniforms.timeSeconds);
+            if (modCount > 1) texCoord = applyTcMod(texCoord, in.worldPos, int(drawUniforms.tcModType.y + 0.5), drawUniforms.tcModParams1, drawUniforms.timeSeconds);
+            if (modCount > 2) texCoord = applyTcMod(texCoord, in.worldPos, int(drawUniforms.tcModType.z + 0.5), drawUniforms.tcModParams2, drawUniforms.timeSeconds);
+            if (modCount > 3) texCoord = applyTcMod(texCoord, in.worldPos, int(drawUniforms.tcModType.w + 0.5), drawUniforms.tcModParams3, drawUniforms.timeSeconds);
             float4 texel = colorTexture.sample(textureSampler, texCoord);
             float4 lightmap = lightmapTexture.sample(textureSampler, in.lightmapTexCoord);
             int mode = int(drawUniforms.debugMode + 0.5);
@@ -667,10 +676,10 @@ struct MetalView: UIViewRepresentable {
              * param.x is packed as `-degs * π/180` so applyTcMod's
              * cos/sin treat it as radians/sec with CW sign. */
             int entityModCount = uniforms.tcModCount;
-            if (entityModCount > 0) texCoord = applyTcMod(texCoord, int(uniforms.tcModType.x + 0.5), uniforms.tcModParams0, uniforms.timeSeconds);
-            if (entityModCount > 1) texCoord = applyTcMod(texCoord, int(uniforms.tcModType.y + 0.5), uniforms.tcModParams1, uniforms.timeSeconds);
-            if (entityModCount > 2) texCoord = applyTcMod(texCoord, int(uniforms.tcModType.z + 0.5), uniforms.tcModParams2, uniforms.timeSeconds);
-            if (entityModCount > 3) texCoord = applyTcMod(texCoord, int(uniforms.tcModType.w + 0.5), uniforms.tcModParams3, uniforms.timeSeconds);
+            if (entityModCount > 0) texCoord = applyTcMod(texCoord, in.worldPos, int(uniforms.tcModType.x + 0.5), uniforms.tcModParams0, uniforms.timeSeconds);
+            if (entityModCount > 1) texCoord = applyTcMod(texCoord, in.worldPos, int(uniforms.tcModType.y + 0.5), uniforms.tcModParams1, uniforms.timeSeconds);
+            if (entityModCount > 2) texCoord = applyTcMod(texCoord, in.worldPos, int(uniforms.tcModType.z + 0.5), uniforms.tcModParams2, uniforms.timeSeconds);
+            if (entityModCount > 3) texCoord = applyTcMod(texCoord, in.worldPos, int(uniforms.tcModType.w + 0.5), uniforms.tcModParams3, uniforms.timeSeconds);
             float4 texel = colorTexture.sample(textureSampler, texCoord);
             /* Entity alphaFunc discard — mirrors upstream GLS_ATEST_GT_0 /
              * GE_80 / LT_80 as fragment kills so grate-style meshes and
@@ -766,27 +775,27 @@ struct MetalView: UIViewRepresentable {
             int skyModCount = drawUniforms.tcModCount;
             if (skyModCount > 0) {
                 int t = int(drawUniforms.tcModType.x + 0.5);
-                uvX = applyTcMod(uvX, t, drawUniforms.tcModParams0, drawUniforms.timeSeconds);
-                uvY = applyTcMod(uvY, t, drawUniforms.tcModParams0, drawUniforms.timeSeconds);
-                uvZ = applyTcMod(uvZ, t, drawUniforms.tcModParams0, drawUniforms.timeSeconds);
+                uvX = applyTcMod(uvX, in.worldPos, t, drawUniforms.tcModParams0, drawUniforms.timeSeconds);
+                uvY = applyTcMod(uvY, in.worldPos, t, drawUniforms.tcModParams0, drawUniforms.timeSeconds);
+                uvZ = applyTcMod(uvZ, in.worldPos, t, drawUniforms.tcModParams0, drawUniforms.timeSeconds);
             }
             if (skyModCount > 1) {
                 int t = int(drawUniforms.tcModType.y + 0.5);
-                uvX = applyTcMod(uvX, t, drawUniforms.tcModParams1, drawUniforms.timeSeconds);
-                uvY = applyTcMod(uvY, t, drawUniforms.tcModParams1, drawUniforms.timeSeconds);
-                uvZ = applyTcMod(uvZ, t, drawUniforms.tcModParams1, drawUniforms.timeSeconds);
+                uvX = applyTcMod(uvX, in.worldPos, t, drawUniforms.tcModParams1, drawUniforms.timeSeconds);
+                uvY = applyTcMod(uvY, in.worldPos, t, drawUniforms.tcModParams1, drawUniforms.timeSeconds);
+                uvZ = applyTcMod(uvZ, in.worldPos, t, drawUniforms.tcModParams1, drawUniforms.timeSeconds);
             }
             if (skyModCount > 2) {
                 int t = int(drawUniforms.tcModType.z + 0.5);
-                uvX = applyTcMod(uvX, t, drawUniforms.tcModParams2, drawUniforms.timeSeconds);
-                uvY = applyTcMod(uvY, t, drawUniforms.tcModParams2, drawUniforms.timeSeconds);
-                uvZ = applyTcMod(uvZ, t, drawUniforms.tcModParams2, drawUniforms.timeSeconds);
+                uvX = applyTcMod(uvX, in.worldPos, t, drawUniforms.tcModParams2, drawUniforms.timeSeconds);
+                uvY = applyTcMod(uvY, in.worldPos, t, drawUniforms.tcModParams2, drawUniforms.timeSeconds);
+                uvZ = applyTcMod(uvZ, in.worldPos, t, drawUniforms.tcModParams2, drawUniforms.timeSeconds);
             }
             if (skyModCount > 3) {
                 int t = int(drawUniforms.tcModType.w + 0.5);
-                uvX = applyTcMod(uvX, t, drawUniforms.tcModParams3, drawUniforms.timeSeconds);
-                uvY = applyTcMod(uvY, t, drawUniforms.tcModParams3, drawUniforms.timeSeconds);
-                uvZ = applyTcMod(uvZ, t, drawUniforms.tcModParams3, drawUniforms.timeSeconds);
+                uvX = applyTcMod(uvX, in.worldPos, t, drawUniforms.tcModParams3, drawUniforms.timeSeconds);
+                uvY = applyTcMod(uvY, in.worldPos, t, drawUniforms.tcModParams3, drawUniforms.timeSeconds);
+                uvZ = applyTcMod(uvZ, in.worldPos, t, drawUniforms.tcModParams3, drawUniforms.timeSeconds);
             }
 
             float4 sX = skyTexture.sample(textureSampler, uvX);
