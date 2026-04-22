@@ -228,12 +228,15 @@ struct MetalView: UIViewRepresentable {
             uniforms.rgbGenMode = 2 /* default to lightingDiffuse to preserve existing behavior */
             uniforms.alphaGenMode = 1 /* default to vertex alpha so existing entity alpha fades still work */
             uniforms.rgbGenWaveParams = SIMD4<Float>(0, 0, 0, 0)
+            uniforms.alphaGenWaveParams = SIMD4<Float>(0, 0, 0, 0)
             var info = Q3MetalTextureInfo()
             guard Q3MetalRenderer_GetTextureInfo(handle, &info) == 1 else { return }
             uniforms.rgbGenMode = info.rgbGen
             uniforms.alphaGenMode = info.alphaGen
             uniforms.rgbGenWaveParams = SIMD4<Float>(
                 info.rgbWaveBase, info.rgbWaveAmp, info.rgbWavePhase, info.rgbWaveFreq)
+            uniforms.alphaGenWaveParams = SIMD4<Float>(
+                info.alphaWaveBase, info.alphaWaveAmp, info.alphaWavePhase, info.alphaWaveFreq)
         }
 
         struct EntityUniforms {
@@ -282,8 +285,13 @@ struct MetalView: UIViewRepresentable {
              * (base, amp, phase, freq). GF_SIN only for minimal scope —
              * matches ioquake3 RB_CalcWaveColor: glow = clamp(base +
              * sin(2π*(phase + t*freq)) * amp, 0, 1); rgb = texel.rgb *
-             * glow. Keeps struct stride at 208 bytes, 16-aligned. */
+             * glow. */
             var rgbGenWaveParams: SIMD4<Float> = SIMD4<Float>(0, 0, 0, 0)
+            /* alphaGen wave params (only consulted when alphaGenMode
+             * == 3): (base, amp, phase, freq). Matches RB_CalcWaveAlpha:
+             * alpha = clamp(base + sin(...)*amp, 0, 1). Struct stride
+             * now 224 bytes, still 16-aligned. */
+            var alphaGenWaveParams: SIMD4<Float> = SIMD4<Float>(0, 0, 0, 0)
         }
 
         /* Fragment-side dlight block bound at buffer(2) for both world and
@@ -519,6 +527,7 @@ struct MetalView: UIViewRepresentable {
             uint _genPad0;
             uint _genPad1;
             float4 rgbGenWaveParams;
+            float4 alphaGenWaveParams;
         };
 
         struct EntityVertexOut {
@@ -752,13 +761,22 @@ struct MetalView: UIViewRepresentable {
             } else {
                 baseRgb = texel.rgb * in.color.rgb;
             }
-            /* alphaGen identity (0) — mirror CGEN_IDENTITY on the alpha
-             * channel. Upstream AGEN_IDENTITY overrides vertex alpha
-             * with 255, so a fading entityColor alpha does not leak
-             * into stages that want opaque output. */
-            float baseA = (uniforms.alphaGenMode == 0u)
-                ? texel.a
-                : (texel.a * in.color.a);
+            /* alphaGen selection:
+             *   0 (identity) = texel.a (force opaque)
+             *   3 (wave)     = texel.a * clamp(base + sin(2π*(phase +
+             *                  t*freq)) * amp, 0, 1) — RB_CalcWaveAlpha
+             *   default      = texel.a * in.color.a (vertex alpha) */
+            float baseA;
+            if (uniforms.alphaGenMode == 0u) {
+                baseA = texel.a;
+            } else if (uniforms.alphaGenMode == 3u) {
+                float4 ap = uniforms.alphaGenWaveParams;
+                float aAngle = 2.0 * 3.14159265 * (ap.z + uniforms.timeSeconds * ap.w);
+                float aWave = clamp(ap.x + sin(aAngle) * ap.y, 0.0, 1.0);
+                baseA = texel.a * aWave;
+            } else {
+                baseA = texel.a * in.color.a;
+            }
             float4 base = float4(baseRgb, baseA);
             base.rgb = applyDlights(base.rgb, in.worldPos, dlights);
             return base;

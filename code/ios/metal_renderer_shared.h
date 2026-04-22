@@ -231,6 +231,13 @@ typedef struct {
     float rgbWaveAmp;
     float rgbWavePhase;
     float rgbWaveFreq;
+    /* Stage 0 alphaGen wave parameters (base, amp, phase, freq). Only
+     * meaningful when alphaGen == 3. Matches RB_CalcWaveAlpha's
+     * EvalWaveFormClamped, GF_SIN scope. */
+    float alphaWaveBase;
+    float alphaWaveAmp;
+    float alphaWavePhase;
+    float alphaWaveFreq;
 } Q3MetalTextureInfo;
 
 typedef struct {

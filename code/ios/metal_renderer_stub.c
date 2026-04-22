@@ -49,6 +49,13 @@ typedef struct {
     float rgbWaveAmp;
     float rgbWavePhase;
     float rgbWaveFreq;
+    /* Stage 0 alphaGen wave parameters — mirrors rgbWave* and is
+     * consumed when alphaGen == 3. Matches RB_CalcWaveAlpha's
+     * EvalWaveFormClamped, GF_SIN scope. */
+    float alphaWaveBase;
+    float alphaWaveAmp;
+    float alphaWavePhase;
+    float alphaWaveFreq;
     /* Stage 0 tcMod chain, copied from the resolved shader-map entry at
      * registration time. Entity pipeline propagates to Swift so the
      * fragment shader can apply scroll/rotate after tcGen env — matches
@@ -753,6 +760,7 @@ static int ShaderMap_GetTcGenEnv(const char *name);
 static int ShaderMap_GetRgbGen(const char *name);
 static int ShaderMap_GetAlphaGen(const char *name);
 static void ShaderMap_GetRgbWave(const char *name, float *base, float *amp, float *phase, float *freq);
+static void ShaderMap_GetAlphaWave(const char *name, float *base, float *amp, float *phase, float *freq);
 static void ShaderMap_GetTcMods(const char *name, int *outCount, Q3TcMod *outMods);
 static int s_pendingAnimSlot;
 static float s_pendingScrollS;
@@ -968,6 +976,8 @@ static qhandle_t RegisterTexture(const char *name) {
     texture->alphaGen = ShaderMap_GetAlphaGen(name);
     ShaderMap_GetRgbWave(name, &texture->rgbWaveBase, &texture->rgbWaveAmp,
                          &texture->rgbWavePhase, &texture->rgbWaveFreq);
+    ShaderMap_GetAlphaWave(name, &texture->alphaWaveBase, &texture->alphaWaveAmp,
+                           &texture->alphaWavePhase, &texture->alphaWaveFreq);
     ShaderMap_GetTcMods(name, &texture->tcModCount, texture->tcMods);
     if (Q_stricmp(name, resolvedName)) {
         ri.Printf(PRINT_ALL, "Metal stub: loaded '%s' from '%s' (%dx%d)\n", name, resolvedName, width, height);
@@ -2629,6 +2639,22 @@ static void ShaderMap_GetRgbWave(const char *name, float *base, float *amp,
     if (amp)   *amp   = entry->stages[0].rgbWaveAmp;
     if (phase) *phase = entry->stages[0].rgbWavePhase;
     if (freq)  *freq  = entry->stages[0].rgbWaveFreq;
+}
+
+static void ShaderMap_GetAlphaWave(const char *name, float *base, float *amp,
+                                   float *phase, float *freq) {
+    const metalShaderMap_t *entry;
+    if (base) *base = 0.0f;
+    if (amp) *amp = 0.0f;
+    if (phase) *phase = 0.0f;
+    if (freq) *freq = 0.0f;
+    if (name == NULL || name[0] == '\0') return;
+    entry = ShaderMap_LookupEntry(name);
+    if (entry == NULL || entry->stageCount <= 0) return;
+    if (base)  *base  = entry->stages[0].alphaWaveBase;
+    if (amp)   *amp   = entry->stages[0].alphaWaveAmp;
+    if (phase) *phase = entry->stages[0].alphaWavePhase;
+    if (freq)  *freq  = entry->stages[0].alphaWaveFreq;
 }
 
 /* Stage 0's tcMod chain for a shader name. Entity pipeline consumes
@@ -5378,6 +5404,10 @@ int Q3MetalRenderer_GetTextureInfo(uint32_t textureHandle, Q3MetalTextureInfo *o
     outInfo->rgbWaveAmp   = texture->rgbWaveAmp;
     outInfo->rgbWavePhase = texture->rgbWavePhase;
     outInfo->rgbWaveFreq  = texture->rgbWaveFreq;
+    outInfo->alphaWaveBase  = texture->alphaWaveBase;
+    outInfo->alphaWaveAmp   = texture->alphaWaveAmp;
+    outInfo->alphaWavePhase = texture->alphaWavePhase;
+    outInfo->alphaWaveFreq  = texture->alphaWaveFreq;
     return 1;
 }
 
