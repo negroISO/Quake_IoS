@@ -836,6 +836,7 @@ struct MetalView: UIViewRepresentable {
             return base;
         }
 
+
         /* ================ Sky rendering ================
          * Q3 sky is NOT drawn with mesh UVs. The BSP's sky brushes
          * mark a region of screen; actual sky texture is sampled by
@@ -1741,11 +1742,20 @@ struct MetalView: UIViewRepresentable {
                 print("[Metal] Failed to create entity pipeline: \\(error)")
             }
 
-            // Additive entity pipeline (flames, health orb glow, etc.)
+            // Additive entity pipeline (flames, health orb glow, muzzle
+            // flashes, explosion sprites). Q3's shader parser accepts
+            // BOTH `GL_ONE, GL_ONE` (true additive) AND `GL_SRC_ALPHA,
+            // GL_ONE` (alpha-weighted additive). Our parser folds both
+            // into blendMode=1. Binding GL_SRC_ALPHA/GL_ONE here is
+            // strictly better: sprites with alpha=1 (pure additive)
+            // behave identically (src*1+dst=src+dst), while sprites
+            // with alpha<1 (muzzle flashes, explosion particles) now
+            // get correctly weighted instead of saturating the frame
+            // yellow from stacked unweighted additions.
             let entityAdditiveDesc = MTLRenderPipelineDescriptor()
             entityAdditiveDesc.colorAttachments[0].pixelFormat = view.colorPixelFormat
             entityAdditiveDesc.colorAttachments[0].isBlendingEnabled = true
-            entityAdditiveDesc.colorAttachments[0].sourceRGBBlendFactor = .one
+            entityAdditiveDesc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
             entityAdditiveDesc.colorAttachments[0].destinationRGBBlendFactor = .one
             entityAdditiveDesc.colorAttachments[0].sourceAlphaBlendFactor = .one
             entityAdditiveDesc.colorAttachments[0].destinationAlphaBlendFactor = .one
