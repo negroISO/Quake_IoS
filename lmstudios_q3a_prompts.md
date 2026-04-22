@@ -61,3 +61,15 @@ multiplication of the source coordinates by the scale factors.**
 
 Gemma-4-31B: **YES. The described transformation and waveform
 evaluation accurately reflect the implementation in tr_shade_calc.c.**
+
+## [VERIFY_PIPELINE] tcMod turb uses world-space domain
+> In ioquake3 RB_CalcTurbulentTexCoords, the per-vertex formula reduces
+> to: `dst[0] = src[0] + sin(2π*((xyz[0]+xyz[2]) / 1024 + phase + t*freq))
+> * amp` and `dst[1] = src[1] + sin(2π*(xyz[1] / 1024 + phase + t*freq))
+> * amp`, where t = tess.shaderTime, and 1024 comes from `1.0/128 *
+> 0.125 = 1/1024`. Note: the domain uses WORLD-SPACE xyz (tess.xyz),
+> NOT UV coordinates. Is this reduction correct? YES/NO.
+
+Gemma-4-31B: **YES. The calculation uses world-space positions scaled
+by a constant factor and offset by time and phase to perturb texture
+coordinates.**
