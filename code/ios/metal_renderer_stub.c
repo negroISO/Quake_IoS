@@ -61,6 +61,9 @@ typedef struct {
     /* rgbGen const (CGEN_CONST): static RGB tint multiplied against the
      * texel when rgbGen == 4. Copied from stage[0].rgbConstColor. */
     float rgbConstColor[3];
+    /* alphaGen const: static alpha multiplier when alphaGen == 4.
+     * Default 1.0 (no-op). */
+    float alphaConst;
     /* Stage 0 tcMod chain, copied from the resolved shader-map entry at
      * registration time. Entity pipeline propagates to Swift so the
      * fragment shader can apply scroll/rotate after tcGen env — matches
@@ -264,6 +267,9 @@ typedef struct {
      * rgbGen == 4 (CGEN_CONST equivalent). Populated from the
      * `rgbGen const ( r g b )` directive. */
     float rgbConstColor[3];
+    /* alphaGen const <v>: fixed alpha in [0,1]. Default 1.0. Only
+     * meaningful when alphaGen == 4. */
+    float alphaConst;
     int useLightmap;
     /* Stamped at shader-map register time from the shader-level
      * METAL_SHADER_CULL_* value. Q3 'cull' is shader-wide so every
@@ -771,6 +777,7 @@ static int ShaderMap_GetAlphaGen(const char *name);
 static void ShaderMap_GetRgbWave(const char *name, int *func, float *base, float *amp, float *phase, float *freq);
 static void ShaderMap_GetAlphaWave(const char *name, int *func, float *base, float *amp, float *phase, float *freq);
 static void ShaderMap_GetRgbConst(const char *name, float outRgb[3]);
+static float ShaderMap_GetAlphaConst(const char *name);
 static void ShaderMap_GetTcMods(const char *name, int *outCount, Q3TcMod *outMods);
 static int s_pendingAnimSlot;
 static float s_pendingScrollS;
@@ -991,6 +998,7 @@ static qhandle_t RegisterTexture(const char *name) {
                            &texture->alphaWaveBase, &texture->alphaWaveAmp,
                            &texture->alphaWavePhase, &texture->alphaWaveFreq);
     ShaderMap_GetRgbConst(name, texture->rgbConstColor);
+    texture->alphaConst = ShaderMap_GetAlphaConst(name);
     ShaderMap_GetTcMods(name, &texture->tcModCount, texture->tcMods);
     if (Q_stricmp(name, resolvedName)) {
         ri.Printf(PRINT_ALL, "Metal stub: loaded '%s' from '%s' (%dx%d)\n", name, resolvedName, width, height);
@@ -2688,6 +2696,14 @@ static void ShaderMap_GetRgbConst(const char *name, float outRgb[3]) {
     outRgb[2] = entry->stages[0].rgbConstColor[2];
 }
 
+static float ShaderMap_GetAlphaConst(const char *name) {
+    const metalShaderMap_t *entry;
+    if (name == NULL || name[0] == '\0') return 1.0f;
+    entry = ShaderMap_LookupEntry(name);
+    if (entry == NULL || entry->stageCount <= 0) return 1.0f;
+    return entry->stages[0].alphaConst;
+}
+
 /* Stage 0's tcMod chain for a shader name. Entity pipeline consumes
  * this through metalTexture_t so the fragment can run scroll/rotate
  * after tcGen env. Returns count=0 when the shader has no tcMods or
@@ -2837,6 +2853,7 @@ static void ParseShaderText(const char *text) {
         fogColor[0] = fogColor[1] = fogColor[2] = 0.0f;
         fogDistance = 0.0f;
         Com_Memset(&cur, 0, sizeof(cur));
+        cur.alphaConst = 1.0f;
         Com_Memset(stages, 0, sizeof(stages));
         stagesCount = 0;
 
@@ -2849,6 +2866,10 @@ static void ParseShaderText(const char *text) {
                 if (depth == 2) {
                     inStage = qtrue;
                     Com_Memset(&cur, 0, sizeof(cur));
+                    /* alphaConst defaults to 1.0 so a stage that sets
+                     * alphaGen const without a numeric argument stays
+                     * opaque instead of going fully transparent. */
+                    cur.alphaConst = 1.0f;
                 }
                 continue;
             }
@@ -3029,6 +3050,7 @@ static void ParseShaderText(const char *text) {
                     token = COM_ParseExt(&p, qfalse);
                     if (!Q_stricmp(token, "vertex")) cur.alphaGen = 1;
                     else if (!Q_stricmp(token, "wave")) cur.alphaGen = 3;
+                    else if (!Q_stricmp(token, "const")) cur.alphaGen = 4;
                     else cur.alphaGen = 0;
                     if (!Q_stricmp(token, "wave")) {
                         const char *funcTok = COM_ParseExt(&p, qfalse);
@@ -3051,7 +3073,9 @@ static void ParseShaderText(const char *text) {
                         if (phaseTok[0]) cur.alphaWavePhase = (float)atof(phaseTok);
                         if (freqTok[0]) cur.alphaWaveFreq = (float)atof(freqTok);
                     } else if (!Q_stricmp(token, "const")) {
-                        (void)COM_ParseExt(&p, qfalse);
+                        /* alphaGen const <value>: fixed alpha channel. */
+                        const char *vTok = COM_ParseExt(&p, qfalse);
+                        cur.alphaConst = (vTok && vTok[0]) ? (float)atof(vTok) : 1.0f;
                     } else if (!Q_stricmp(token, "portal")) {
                         (void)COM_ParseExt(&p, qfalse);
                     }
@@ -5451,6 +5475,7 @@ int Q3MetalRenderer_GetTextureInfo(uint32_t textureHandle, Q3MetalTextureInfo *o
     outInfo->rgbConstColor[0] = texture->rgbConstColor[0];
     outInfo->rgbConstColor[1] = texture->rgbConstColor[1];
     outInfo->rgbConstColor[2] = texture->rgbConstColor[2];
+    outInfo->alphaConst = texture->alphaConst;
     return 1;
 }
 

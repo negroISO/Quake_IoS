@@ -243,7 +243,8 @@ struct MetalView: UIViewRepresentable {
             uniforms.alphaGenWaveParams = SIMD4<Float>(
                 info.alphaWaveBase, info.alphaWaveAmp, info.alphaWavePhase, info.alphaWaveFreq)
             uniforms.rgbConstColor = SIMD4<Float>(
-                info.rgbConstColor.0, info.rgbConstColor.1, info.rgbConstColor.2, 1.0)
+                info.rgbConstColor.0, info.rgbConstColor.1, info.rgbConstColor.2,
+                info.alphaConst)
         }
 
         struct EntityUniforms {
@@ -301,11 +302,12 @@ struct MetalView: UIViewRepresentable {
              * == 3): (base, amp, phase, freq). Matches RB_CalcWaveAlpha:
              * alpha = clamp(base + sin(...)*amp, 0, 1). */
             var alphaGenWaveParams: SIMD4<Float> = SIMD4<Float>(0, 0, 0, 0)
-            /* rgbGen const tint (only consulted when rgbGenMode == 4).
+            /* rgbGen const tint (.xyz) + alphaGen const (.w).
              * Upstream CGEN_CONST sets per-vertex rgb = constant color;
-             * fragment multiplies texel.rgb by .xyz. Defaults to white
-             * so a no-op when the shader doesn't opt in. Struct stride
-             * grows to 240 bytes (16-aligned). */
+             * AGEN_CONST does the same for alpha. Fragment multiplies
+             * texel.rgb by .xyz when rgbGenMode == 4 and texel.a by
+             * .w when alphaGenMode == 4. Defaults to (1,1,1,1) so
+             * a no-op for shaders that don't opt in. */
             var rgbConstColor: SIMD4<Float> = SIMD4<Float>(1, 1, 1, 1)
         }
 
@@ -821,6 +823,11 @@ struct MetalView: UIViewRepresentable {
                 float4 ap = uniforms.alphaGenWaveParams;
                 float aWave = clamp(evalWave(uniforms.alphaWaveFunc, ap.x, ap.y, ap.z, ap.w, uniforms.timeSeconds), 0.0, 1.0);
                 baseA = texel.a * aWave;
+            } else if (uniforms.alphaGenMode == 4u) {
+                /* AGEN_CONST: fixed alpha multiplier, stashed in
+                 * rgbConstColor.w (unused pad of the rgbGen const
+                 * SIMD4). */
+                baseA = texel.a * uniforms.rgbConstColor.w;
             } else {
                 baseA = texel.a * in.color.a;
             }

@@ -241,6 +241,9 @@ typedef struct {
     /* Stage 0 rgbGen const tint — only read when rgbGen == 4
      * (CGEN_CONST). Defaults to (1,1,1) which is a no-op multiply. */
     float rgbConstColor[3];
+    /* Stage 0 alphaGen const — only read when alphaGen == 4
+     * (AGEN_CONST). Default 1.0 (no-op). */
+    float alphaConst;
 } Q3MetalTextureInfo;
 
 typedef struct {
