@@ -120,3 +120,14 @@ components of the vertex color.**
 Gemma-4-31B: **YES. The function EvalWaveFormClamped applies a clamp
 to the result of EvalWaveForm, ensuring the output is within the
 [0, 1] range.**
+
+## [VERIFY_SHADER] CGEN_CONST modulates texel via vertex color copy
+> In ioquake3 tr_shade.c RB_IterateStagesGeneric, the CGEN_CONST case
+> does `for i in vertexes: tess.svars.colors[i] = pStage->constantColor;`
+> — copying the shader stage fixed RGBA color into every vertex
+> color. So a stage with `rgbGen const ( R G B )` outputs vertex RGB
+> = (R, G, B). When multiplied with the texel in the fragment, the
+> texel is TINTED by that constant color. YES/NO.
+
+Gemma-4-31B: **YES. The constant color is assigned to each vertex and
+subsequently modulates the texture sample during fragment shading.**
