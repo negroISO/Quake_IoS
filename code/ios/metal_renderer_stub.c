@@ -37,6 +37,11 @@ typedef struct {
                     * Stored per-texture so the entity fragment can skip
                     * the baked-in Lambert color for chrome shells that
                     * upstream treats as full-bright (CGEN_IDENTITY). */
+    int alphaGen;  /* 0=identity (force alpha 1.0), 1=vertex, 3=wave.
+                    * Parallels rgbGen and matches upstream AGEN_IDENTITY,
+                    * which overrides vertex alpha with 255 so stages that
+                    * opt into identity alpha stay opaque regardless of
+                    * the entity shaderRGBA alpha channel. */
     /* Stage 0 tcMod chain, copied from the resolved shader-map entry at
      * registration time. Entity pipeline propagates to Swift so the
      * fragment shader can apply scroll/rotate after tcGen env — matches
@@ -739,6 +744,7 @@ static int ShaderMap_GetBlendMode(const char *name);
 static int ShaderMap_GetAlphaFunc(const char *name);
 static int ShaderMap_GetTcGenEnv(const char *name);
 static int ShaderMap_GetRgbGen(const char *name);
+static int ShaderMap_GetAlphaGen(const char *name);
 static void ShaderMap_GetTcMods(const char *name, int *outCount, Q3TcMod *outMods);
 static int s_pendingAnimSlot;
 static float s_pendingScrollS;
@@ -951,6 +957,7 @@ static qhandle_t RegisterTexture(const char *name) {
     texture->alphaFunc = ShaderMap_GetAlphaFunc(name);
     texture->tcGenEnv = ShaderMap_GetTcGenEnv(name);
     texture->rgbGen = ShaderMap_GetRgbGen(name);
+    texture->alphaGen = ShaderMap_GetAlphaGen(name);
     ShaderMap_GetTcMods(name, &texture->tcModCount, texture->tcMods);
     if (Q_stricmp(name, resolvedName)) {
         ri.Printf(PRINT_ALL, "Metal stub: loaded '%s' from '%s' (%dx%d)\n", name, resolvedName, width, height);
@@ -2581,6 +2588,17 @@ static int ShaderMap_GetRgbGen(const char *name) {
     entry = ShaderMap_LookupEntry(name);
     if (entry == NULL || entry->stageCount <= 0) return 0;
     return entry->stages[0].rgbGen;
+}
+
+/* Stage 0 alphaGen. Entity fragment honors identity by forcing alpha
+ * to 1.0 regardless of per-vertex alpha, matching upstream
+ * AGEN_IDENTITY semantics. */
+static int ShaderMap_GetAlphaGen(const char *name) {
+    const metalShaderMap_t *entry;
+    if (name == NULL || name[0] == '\0') return 0;
+    entry = ShaderMap_LookupEntry(name);
+    if (entry == NULL || entry->stageCount <= 0) return 0;
+    return entry->stages[0].alphaGen;
 }
 
 /* Stage 0's tcMod chain for a shader name. Entity pipeline consumes
@@ -5325,6 +5343,7 @@ int Q3MetalRenderer_GetTextureInfo(uint32_t textureHandle, Q3MetalTextureInfo *o
     }
     outInfo->alphaFunc = (uint32_t)texture->alphaFunc;
     outInfo->rgbGen = (uint32_t)texture->rgbGen;
+    outInfo->alphaGen = (uint32_t)texture->alphaGen;
     return 1;
 }
 

@@ -219,6 +219,11 @@ typedef struct {
      * bypass the per-vertex Lambert color and render at full
      * brightness — upstream's CGEN_IDENTITY semantics. */
     uint32_t rgbGen;
+    /* Stage 0 alphaGen: 0=identity (force alpha 1.0), 1=vertex, 3=wave.
+     * Entity fragment overrides in.color.a with 1.0 for identity so
+     * alpha-faded entityColor doesn't leak into stages that want
+     * opaque output — matches upstream AGEN_IDENTITY. */
+    uint32_t alphaGen;
 } Q3MetalTextureInfo;
 
 typedef struct {

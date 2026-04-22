@@ -226,9 +226,11 @@ struct MetalView: UIViewRepresentable {
          * keep the existing Lambert-baked vertex color multiply. */
         private static func packEntityRgbGen(handle: UInt32, into uniforms: inout EntityUniforms) {
             uniforms.rgbGenMode = 2 /* default to lightingDiffuse to preserve existing behavior */
+            uniforms.alphaGenMode = 1 /* default to vertex alpha so existing entity alpha fades still work */
             var info = Q3MetalTextureInfo()
             guard Q3MetalRenderer_GetTextureInfo(handle, &info) == 1 else { return }
             uniforms.rgbGenMode = info.rgbGen
+            uniforms.alphaGenMode = info.alphaGen
         }
 
         struct EntityUniforms {
@@ -268,9 +270,11 @@ struct MetalView: UIViewRepresentable {
              * Three padding UInt32s keep the struct 16-byte aligned
              * and stride = 192 so setFragmentBytes works. */
             var rgbGenMode: UInt32 = 0
-            var _rgbGenPad0: UInt32 = 0
-            var _rgbGenPad1: UInt32 = 0
-            var _rgbGenPad2: UInt32 = 0
+            /* 0=identity (force alpha 1.0), 1=vertex, 3=wave.
+             * Mirrors AGEN_IDENTITY. */
+            var alphaGenMode: UInt32 = 0
+            var _genPad0: UInt32 = 0
+            var _genPad1: UInt32 = 0
         }
 
         /* Fragment-side dlight block bound at buffer(2) for both world and
@@ -502,9 +506,9 @@ struct MetalView: UIViewRepresentable {
             float4 tcModParams2;
             float4 tcModParams3;
             uint rgbGenMode;
-            uint _rgbGenPad0;
-            uint _rgbGenPad1;
-            uint _rgbGenPad2;
+            uint alphaGenMode;
+            uint _genPad0;
+            uint _genPad1;
         };
 
         struct EntityVertexOut {
@@ -724,7 +728,14 @@ struct MetalView: UIViewRepresentable {
             float3 baseRgb = (uniforms.rgbGenMode == 0u)
                 ? texel.rgb
                 : (texel.rgb * in.color.rgb);
-            float4 base = float4(baseRgb, texel.a * in.color.a);
+            /* alphaGen identity (0) — mirror CGEN_IDENTITY on the alpha
+             * channel. Upstream AGEN_IDENTITY overrides vertex alpha
+             * with 255, so a fading entityColor alpha does not leak
+             * into stages that want opaque output. */
+            float baseA = (uniforms.alphaGenMode == 0u)
+                ? texel.a
+                : (texel.a * in.color.a);
+            float4 base = float4(baseRgb, baseA);
             base.rgb = applyDlights(base.rgb, in.worldPos, dlights);
             return base;
         }
