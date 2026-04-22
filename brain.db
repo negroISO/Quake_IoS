@@ -290,3 +290,39 @@ e95122a fix(metal): synthesize alpha from luminance for FX jpg fallbacks
 The narrow-synth (7eccf3a) is functionally superseded by the radial-mask
 (b936513) — both commits kept for history, with the latter being the
 intended behavior.
+
+### 2026-04-21 ralph-loop iteration — tcGen env for entities
+
+Shipped `385c01c`: entity-pipeline tcGen environment support.
+
+Upstream reference: `code/renderer/tr_shade_calc.c:1034` —
+RB_CalcEnvironmentTexCoords. Mirrors the formula exactly:
+  viewer = normalize(viewOrigin - vertex)
+  refl   = normal*2*(normal·viewer) - viewer
+  st     = (0.5 + refl.y*0.5, 0.5 - refl.z*0.5)
+
+Problem: `q3_entity_fragment` was sampling colorTexture by mesh ST
+regardless of shader directive. powerups/quad, powerups/regen,
+battleSuit all use `tcGen environment`. Sampling quadmap2.jpg (blue
+envmap) at player-skin UVs gave a solid yellow silhouette.
+
+Fix path:
+  1. metalTexture_t gained `tcGenEnv` field (propagated from shader
+     parser at RegisterTexture via ShaderMap_GetTcGenEnv).
+  2. New draw flag Q3_METAL_ENTITY_DRAWFLAG_TCGEN_ENV (bit 5) in
+     metal_renderer_shared.h.
+  3. MD3 draw-builder sets flag when `tex->tcGenEnv` is 1.
+  4. EntityUniforms expanded with cameraPos (SIMD3) + tcGen (Float) +
+     16-byte padding aligned to MSL layout.
+  5. q3_entity_fragment switches on uniforms.tcGen>0.5 and applies the
+     upstream formula. Face normal derived from dfdx/dfdy of worldPos
+     since entity verts carry no normal attribute.
+
+Verified on demo four `20260421_191058_tcgen-entity` frame_020:
+Thanatar (quad-damaged enemy point-blank) renders as proper player
+with skin/clothing detail. Frames 001/010/015/025 — no regressions.
+
+The ralph-loop LMStudio guard flagged LMStudio unreachable
+(23.113.11.205:8389). Fell back to direct upstream source review +
+Codex-not-required patch (diagnostic was unambiguous from upstream
+read). Total diff 69 lines added, 3 removed across 3 files.
