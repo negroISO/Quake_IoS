@@ -83,13 +83,18 @@ SUMMARY="$SESSION/summary.txt"
   echo "OUT_DIR=$SESSION/frames_960x444"
 } > "$SUMMARY"
 
-# Frame alignment: demo playback is deterministic per engine time, but
-# the reference capture and ours may start from slightly different
-# demo moments (warmup offset, boot load time, etc). Auto-detect the
-# offset K such that ours[i] best matches ref[i + K] by sampling a
-# handful of anchor frames and searching a ±60 frame window.
+# STEP 1 pipeline:
+# 1. Find first non-black frame (mean pixel < 5) on BOTH streams.
+#    Both capture + reference have leading black frames from
+#    map-load; aligning AFTER the first real frame removes that
+#    artifact from the offset math.
+# 2. Content-based alignment via RGB histogram correlation on the
+#    first-non-black pair, searching ±20 frames for the best match.
+#    Timing-based heuristics are REMOVED.
+# 3. Apply the detected offset, diff every matched pair.
 python3 - "$SESSION/frames_960x444" "$REF" "$SUMMARY" "$SESSION/diff" "$SESSION/diff.log" <<'PY'
-import os, sys, glob, statistics
+import os, sys, glob
+import numpy as np
 from PIL import Image, ImageChops
 out_dir, ref_dir, summary_path, diff_dir, diff_log_path = sys.argv[1:6]
 
@@ -97,67 +102,78 @@ out_frames = sorted(glob.glob(os.path.join(out_dir, "*.png")))
 ref_frames = sorted(glob.glob(os.path.join(ref_dir, "*.png")))
 
 def idx_of(path):
-    """Extract the 4-digit frame index from frame_NNNN.png."""
     name = os.path.basename(path).removesuffix(".png").replace("frame_", "")
-    try:
-        return int(name)
-    except ValueError:
-        return -1
+    try: return int(name)
+    except ValueError: return -1
 
-def ae(a_path, b_path):
-    a = Image.open(a_path).convert("RGB").resize((320, 148))  # downsample for speed
-    b = Image.open(b_path).convert("RGB").resize((320, 148))
-    d = ImageChops.difference(a, b)
-    # Sum of absolute byte differences — cheaper than counting
-    # nonzero pixels and gives a smoother landscape for argmin.
-    return sum(d.tobytes())
+def is_black(path):
+    """True when mean luminance < 5 (per the spec)."""
+    img = np.asarray(Image.open(path).convert("L"), dtype=np.float32)
+    return float(img.mean()) < 5.0
 
+def hist_similarity(path_a, path_b):
+    """RGB histogram correlation — higher is more similar.
+    Downsample to 160x74 for speed; 32 bins per channel."""
+    a = np.asarray(Image.open(path_a).convert("RGB").resize((160, 74)))
+    b = np.asarray(Image.open(path_b).convert("RGB").resize((160, 74)))
+    score = 0.0
+    for c in range(3):
+        ha, _ = np.histogram(a[..., c], bins=32, range=(0, 256), density=True)
+        hb, _ = np.histogram(b[..., c], bins=32, range=(0, 256), density=True)
+        # Normalized cross-correlation on normalised histograms.
+        na = ha - ha.mean(); nb = hb - hb.mean()
+        den = float(np.sqrt((na * na).sum() * (nb * nb).sum())) + 1e-9
+        score += float((na * nb).sum()) / den
+    return score
+
+def first_non_black(paths):
+    for p in paths:
+        if not is_black(p):
+            return p
+    return None
+
+out_first = first_non_black(out_frames)
+ref_first = first_non_black(ref_frames)
+if out_first is None or ref_first is None:
+    raise SystemExit("FAIL: all frames black on one side")
+
+out_first_idx = idx_of(out_first)
+ref_first_idx = idx_of(ref_first)
+
+# Content-based alignment: ref[out_first_idx + offset] should best
+# match out[out_first_idx]. offset = ref_first_idx - out_first_idx
+# is the starting point; search ±20 around that.
+base_offset = ref_first_idx - out_first_idx
+best_score = -1e9
+best_offset = base_offset
+for d in range(-20, 21):
+    cand = base_offset + d
+    ref_idx = out_first_idx + cand
+    ref_path = os.path.join(ref_dir, f"frame_{ref_idx:04d}.png")
+    if not os.path.isfile(ref_path):
+        continue
+    score = hist_similarity(out_first, ref_path)
+    if score > best_score:
+        best_score = score
+        best_offset = cand
+
+print(f"out_first={out_first_idx} ref_first={ref_first_idx} "
+      f"base_offset={base_offset} best_offset={best_offset} "
+      f"best_score={best_score:.4f}", flush=True)
+
+# Diff every frame using the detected offset.
 ref_by_idx = {idx_of(p): p for p in ref_frames}
-out_by_idx = {idx_of(p): p for p in out_frames}
-
-# Pick three anchor frames from the middle-ish of our capture to
-# avoid boot-time transients. For each, search reference window
-# [anchor - 60, anchor + 60] for minimum-AE match; the offset
-# difference is our candidate K. Average across anchors.
-out_indices = sorted(out_by_idx.keys())
-n_out = len(out_indices)
-if n_out < 30:
-    offset = 0
-else:
-    anchors = [out_indices[n_out // 4], out_indices[n_out // 2], out_indices[3 * n_out // 4]]
-    offsets = []
-    ref_max = max(ref_by_idx.keys())
-    for anchor_out in anchors:
-        best = None
-        # Widen search to ±400 frames — the `wait N` warmup before
-        # recording starts can easily shift us 75-200 frames relative
-        # to reference, and simulator-speed skew adds more drift over
-        # the capture window.
-        for delta in range(-400, 401):
-            cand = anchor_out + delta
-            if cand < 1 or cand > ref_max:
-                continue
-            if cand not in ref_by_idx:
-                continue
-            score = ae(out_by_idx[anchor_out], ref_by_idx[cand])
-            if best is None or score < best[0]:
-                best = (score, delta)
-        if best is not None:
-            offsets.append(best[1])
-    # Anchors may land at different offsets if the demos drift (ours
-    # running slightly faster/slower than ref); fall back to the
-    # median, report all three for inspection.
-    offset = int(round(statistics.median(offsets))) if offsets else 0
-    print(f"anchor_offsets={offsets} median={offset}", flush=True)
-
-# Apply offset: ours[i] pairs with ref[i + offset].
 total_ae = 0
 per_frame = []
 lines = []
 matched = 0
+skipped_black = 0
 for out_path in out_frames:
+    if is_black(out_path):
+        skipped_black += 1
+        continue
     oi = idx_of(out_path)
-    ri = oi + offset
+    ri = oi + best_offset
     if ri not in ref_by_idx:
         continue
     out_img = Image.open(out_path).convert("RGB")
@@ -166,7 +182,7 @@ for out_path in out_frames:
         out_img = out_img.resize(ref_img.size)
     diff = ImageChops.difference(out_img, ref_img)
     diff.save(os.path.join(diff_dir, os.path.basename(out_path)))
-    frame_ae = sum(1 for p in diff.getdata() if p != (0, 0, 0))
+    frame_ae = int(np.count_nonzero(np.asarray(diff).any(axis=-1)))
     total_ae += frame_ae
     per_frame.append(frame_ae)
     lines.append(f"{os.path.basename(out_path)} <-> frame_{ri:04d}.png: AE={frame_ae}")
@@ -176,14 +192,16 @@ with open(diff_log_path, "w") as f:
     f.write("\n".join(lines) + "\n")
 
 with open(summary_path, "a") as f:
-    f.write(f"DETECTED_OFFSET={offset}\n")
+    f.write(f"DETECTED_OFFSET={best_offset}\n")
+    f.write(f"ALIGN_SCORE={best_score:.4f}\n")
+    f.write(f"SKIPPED_BLACK={skipped_black}\n")
     f.write(f"MATCHED_FRAMES={matched}\n")
     f.write(f"TOTAL_AE={total_ae}\n")
     if per_frame:
         avg = total_ae / len(per_frame)
         f.write(f"AVG_AE_PER_FRAME={avg:.1f}\n")
 
-print(f"OFFSET={offset} MATCHED={matched} TOTAL_AE={total_ae}")
+print(f"OFFSET={best_offset} MATCHED={matched} TOTAL_AE={total_ae}")
 PY
 
 echo ""
