@@ -221,6 +221,16 @@ struct MetalView: UIViewRepresentable {
             }
         }
 
+        /* Route rgbGen mode from the texture's resolved shader. Identity
+         * (0) tells the fragment to render full-bright; all other modes
+         * keep the existing Lambert-baked vertex color multiply. */
+        private static func packEntityRgbGen(handle: UInt32, into uniforms: inout EntityUniforms) {
+            uniforms.rgbGenMode = 2 /* default to lightingDiffuse to preserve existing behavior */
+            var info = Q3MetalTextureInfo()
+            guard Q3MetalRenderer_GetTextureInfo(handle, &info) == 1 else { return }
+            uniforms.rgbGenMode = info.rgbGen
+        }
+
         struct EntityUniforms {
             var viewProjection: simd_float4x4
             /* Camera origin in world space — used by q3_entity_fragment
@@ -253,6 +263,14 @@ struct MetalView: UIViewRepresentable {
             var tcModParams1: SIMD4<Float> = SIMD4<Float>(0, 0, 0, 0)
             var tcModParams2: SIMD4<Float> = SIMD4<Float>(0, 0, 0, 0)
             var tcModParams3: SIMD4<Float> = SIMD4<Float>(0, 0, 0, 0)
+            /* 0=identity (ignore Lambert, full bright), 1=vertex,
+             * 2=lightingDiffuse, 3=wave. Chrome shells use identity.
+             * Three padding UInt32s keep the struct 16-byte aligned
+             * and stride = 192 so setFragmentBytes works. */
+            var rgbGenMode: UInt32 = 0
+            var _rgbGenPad0: UInt32 = 0
+            var _rgbGenPad1: UInt32 = 0
+            var _rgbGenPad2: UInt32 = 0
         }
 
         /* Fragment-side dlight block bound at buffer(2) for both world and
@@ -483,6 +501,10 @@ struct MetalView: UIViewRepresentable {
             float4 tcModParams1;
             float4 tcModParams2;
             float4 tcModParams3;
+            uint rgbGenMode;
+            uint _rgbGenPad0;
+            uint _rgbGenPad1;
+            uint _rgbGenPad2;
         };
 
         struct EntityVertexOut {
@@ -693,7 +715,16 @@ struct MetalView: UIViewRepresentable {
             } else if (uniforms.alphaTestThreshold < 0.0) {
                 if (texel.a >= -uniforms.alphaTestThreshold) discard_fragment();
             }
-            float4 base = texel * in.color;
+            /* rgbGen: identity (0) — ignore the per-vertex Lambert,
+             * render at full brightness. Matches upstream CGEN_IDENTITY
+             * which sets colors to 0xff. Other modes fall through to
+             * the existing `texel * in.color` multiply (Lambert baked
+             * into vertex color C-side). Alpha follows vertex color in
+             * both cases so additive/alpha blends stay intact. */
+            float3 baseRgb = (uniforms.rgbGenMode == 0u)
+                ? texel.rgb
+                : (texel.rgb * in.color.rgb);
+            float4 base = float4(baseRgb, texel.a * in.color.a);
             base.rgb = applyDlights(base.rgb, in.worldPos, dlights);
             return base;
         }
@@ -1169,6 +1200,7 @@ struct MetalView: UIViewRepresentable {
                         entityUniforms.tcGen = (draw.flags & tcGenEnvBit) != 0 ? 1.0 : 0.0
                         Self.packEntityTcMods(handle: draw.textureHandle, into: &entityUniforms)
                         Self.packEntityAlphaFunc(handle: draw.textureHandle, into: &entityUniforms)
+                        Self.packEntityRgbGen(handle: draw.textureHandle, into: &entityUniforms)
                         encoder.setFragmentBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
                         if drawPass == 3, let entityAdditivePipelineState {
                             encoder.setRenderPipelineState(entityAdditivePipelineState)

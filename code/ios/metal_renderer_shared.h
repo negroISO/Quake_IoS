@@ -214,6 +214,11 @@ typedef struct {
      * (grates, chain-link, vegetation billboards) render with holes
      * instead of solid silhouettes. Matches ioquake3's GLS_ATEST_*. */
     uint32_t alphaFunc;
+    /* Stage 0 rgbGen: 0=identity, 1=vertex, 2=lightingDiffuse, 3=wave.
+     * Entity pipeline consults this so chrome shells (rgbGen identity)
+     * bypass the per-vertex Lambert color and render at full
+     * brightness — upstream's CGEN_IDENTITY semantics. */
+    uint32_t rgbGen;
 } Q3MetalTextureInfo;
 
 typedef struct {

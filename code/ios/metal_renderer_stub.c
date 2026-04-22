@@ -33,6 +33,10 @@ typedef struct {
                     * (chrome/reflective like powerups/quad, shell shaders).
                     * Entity pipeline reads this to switch UV generation
                     * from mesh ST to the reflection formula. */
+    int rgbGen;    /* 0=identity, 1=vertex, 2=lightingDiffuse, 3=wave.
+                    * Stored per-texture so the entity fragment can skip
+                    * the baked-in Lambert color for chrome shells that
+                    * upstream treats as full-bright (CGEN_IDENTITY). */
     /* Stage 0 tcMod chain, copied from the resolved shader-map entry at
      * registration time. Entity pipeline propagates to Swift so the
      * fragment shader can apply scroll/rotate after tcGen env — matches
@@ -734,6 +738,7 @@ static const metalShaderMap_t *ShaderMap_LookupEntry(const char *name);
 static int ShaderMap_GetBlendMode(const char *name);
 static int ShaderMap_GetAlphaFunc(const char *name);
 static int ShaderMap_GetTcGenEnv(const char *name);
+static int ShaderMap_GetRgbGen(const char *name);
 static void ShaderMap_GetTcMods(const char *name, int *outCount, Q3TcMod *outMods);
 static int s_pendingAnimSlot;
 static float s_pendingScrollS;
@@ -945,6 +950,7 @@ static qhandle_t RegisterTexture(const char *name) {
     texture->blendMode = ShaderMap_GetBlendMode(name);
     texture->alphaFunc = ShaderMap_GetAlphaFunc(name);
     texture->tcGenEnv = ShaderMap_GetTcGenEnv(name);
+    texture->rgbGen = ShaderMap_GetRgbGen(name);
     ShaderMap_GetTcMods(name, &texture->tcModCount, texture->tcMods);
     if (Q_stricmp(name, resolvedName)) {
         ri.Printf(PRINT_ALL, "Metal stub: loaded '%s' from '%s' (%dx%d)\n", name, resolvedName, width, height);
@@ -2564,6 +2570,17 @@ static int ShaderMap_GetTcGenEnv(const char *name) {
     if (name == NULL || name[0] == '\0') return 0;
     entry = ShaderMap_LookupEntry(name);
     return (entry && entry->tcGenEnv) ? 1 : 0;
+}
+
+/* Stage 0 rgbGen for a shader name. Entity pipeline uses this so
+ * chrome shells (rgbGen identity) bypass the per-vertex Lambert
+ * color that would otherwise dim their full-bright reflection. */
+static int ShaderMap_GetRgbGen(const char *name) {
+    const metalShaderMap_t *entry;
+    if (name == NULL || name[0] == '\0') return 0;
+    entry = ShaderMap_LookupEntry(name);
+    if (entry == NULL || entry->stageCount <= 0) return 0;
+    return entry->stages[0].rgbGen;
 }
 
 /* Stage 0's tcMod chain for a shader name. Entity pipeline consumes
@@ -5307,6 +5324,7 @@ int Q3MetalRenderer_GetTextureInfo(uint32_t textureHandle, Q3MetalTextureInfo *o
         }
     }
     outInfo->alphaFunc = (uint32_t)texture->alphaFunc;
+    outInfo->rgbGen = (uint32_t)texture->rgbGen;
     return 1;
 }
 
