@@ -96,3 +96,16 @@ color.**
 
 Gemma-4-31B: **YES. The code explicitly assigns 255 to the alpha
 component, overriding any existing vertex alpha data.**
+
+## [VERIFY_SHADER] RB_CalcWaveColor outputs grayscale brightness
+> In ioquake3 tr_shade_calc.c RB_CalcWaveColor, for the GF_SIN
+> waveform the implementation computes `glow = EvalWaveForm(wf) *
+> tr.identityLight` where EvalWaveForm returns `base + sin(2π*(phase
+> + t*freq)) * amplitude` for GF_SIN. It then clamps `v = myftol(255
+> * glow)` to [0, 255] and writes rgb = (v, v, v) and alpha = 255
+> into the per-vertex color. So the output is a GRAYSCALE brightness
+> multiplier applied to all three rgb channels. YES/NO.
+
+Gemma-4-31B: **YES. The implementation calculates a single scalar
+glow value that is applied uniformly to the red, green, and blue
+components of the vertex color.**
