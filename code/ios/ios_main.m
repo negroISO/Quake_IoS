@@ -672,7 +672,59 @@ void Quake3_Init(const char *basePath) {
      * Call it explicitly here, after Com_Init so the cvar and command
      * subsystems are up. */
     IN_Init();
-    Cbuf_AddText("timedemo 1; demo four\n");
+    /* TEMPORARY TROUBLESHOOTING cvar block — paired with the MetalView
+     * drawable-lock patch. Locks resolution at 960x444, disables 2D HUD
+     * (keeps gun+no crosshair), sets max texture quality, standard
+     * overbright, vsync off, 60fps cap. REVERT once the rendering
+     * investigation is complete. */
+    Cbuf_AddText(
+        "seta r_mode -1; "
+        "seta r_customwidth 960; "
+        "seta r_customheight 444; "
+        "seta r_fullscreen 0; "
+        /* Match the reference capture's HUD state: obituary kill-feed
+         * visible (via default con_notifytime), no bottom HUD numbers
+         * (cg_draw2D 0 kills health/armor/ammo counters). */
+        "seta cg_draw2D 0; "
+        "seta cg_drawGun 1; "
+        "seta cg_drawCrosshair 0; "
+        "seta r_picmip 0; "
+        "seta r_texturebits 32; "
+        "seta r_colorbits 32; "
+        "seta r_depthbits 24; "
+        "seta r_overBrightBits 1; "
+        "seta r_mapOverBrightBits 2; "
+        "seta r_dynamiclight 1; "
+        /* com_maxfps 25 matches the reference AVI frame rate so demo
+         * replay advances deterministically frame-for-frame with
+         * reference — no warmup alignment skew. */
+        "seta com_maxfps 25; "
+        "seta r_swapinterval 0; "
+        /* Disable sound so the AVI muxer skips the audio stream (our
+         * sim build doesn't wire up CoreAudio — dma.speed stays 0,
+         * which ffprobe rejects as Invalid sample rate). */
+        "seta s_initsound 0; "
+        /* Notify area off: obituary kill-feed and engine diagnostic
+         * spam both route through Com_Printf, so we can't show one
+         * without the other. Losing obituary-text parity with the
+         * reference capture (small top-left region only) in exchange
+         * for clean frames with no `[cgame syscalls] / Metal scene
+         * frame:` spam dominating the top of every frame. Follow-up:
+         * gate engine Com_Printf spam behind !CL_VideoRecording so
+         * obituary can coexist cleanly. */
+        "seta con_notifytime 0; "
+        /* Full demo-four AVI capture. 180 frame warmup @ 60fps = 3s for
+         * the demo to reach gameplay state. 3600 frame record = 60s,
+         * matching the reference's ~1497 frames at 25fps. Path:
+         * ~/Library/Developer/CoreSimulator/Devices/<UDID>/data/
+         * Containers/Data/Application/<UUID>/Documents/baseq3/videos/
+         * four.avi. */
+        /* Give the demo + map load ~2s of engine time to produce a
+         * rendered scene before video starts (opening instantly
+         * captures the pre-load black clear-color). Then record 12s
+         * at 25fps (300 frames), stop, quit. Bump wait 1500 for full
+         * 60s demo. */
+        "demo four; wait 50; video four; wait 300; stopvideo; quit\n");
     engine_initialized = qtrue;
 
     Com_Printf("=== Quake3 iOS Engine Initialized ===\n");

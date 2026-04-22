@@ -83,51 +83,107 @@ SUMMARY="$SESSION/summary.txt"
   echo "OUT_DIR=$SESSION/frames_960x444"
 } > "$SUMMARY"
 
-# Diff every frame pair that exists in both sets. Naming is the same
-# on both sides (frame_NNNN.png) so we just pair by name. Frames in
-# ref-only or out-only get reported as unmatched.
+# Frame alignment: demo playback is deterministic per engine time, but
+# the reference capture and ours may start from slightly different
+# demo moments (warmup offset, boot load time, etc). Auto-detect the
+# offset K such that ours[i] best matches ref[i + K] by sampling a
+# handful of anchor frames and searching a ±60 frame window.
 python3 - "$SESSION/frames_960x444" "$REF" "$SUMMARY" "$SESSION/diff" "$SESSION/diff.log" <<'PY'
-import os, sys, glob
+import os, sys, glob, statistics
 from PIL import Image, ImageChops
 out_dir, ref_dir, summary_path, diff_dir, diff_log_path = sys.argv[1:6]
 
-out_frames = {os.path.basename(p): p for p in glob.glob(os.path.join(out_dir, "*.png"))}
-ref_frames = {os.path.basename(p): p for p in glob.glob(os.path.join(ref_dir, "*.png"))}
+out_frames = sorted(glob.glob(os.path.join(out_dir, "*.png")))
+ref_frames = sorted(glob.glob(os.path.join(ref_dir, "*.png")))
 
-matched = sorted(set(out_frames) & set(ref_frames))
-only_out = sorted(set(out_frames) - set(ref_frames))
-only_ref = sorted(set(ref_frames) - set(out_frames))
+def idx_of(path):
+    """Extract the 4-digit frame index from frame_NNNN.png."""
+    name = os.path.basename(path).removesuffix(".png").replace("frame_", "")
+    try:
+        return int(name)
+    except ValueError:
+        return -1
 
+def ae(a_path, b_path):
+    a = Image.open(a_path).convert("RGB").resize((320, 148))  # downsample for speed
+    b = Image.open(b_path).convert("RGB").resize((320, 148))
+    d = ImageChops.difference(a, b)
+    # Sum of absolute byte differences — cheaper than counting
+    # nonzero pixels and gives a smoother landscape for argmin.
+    return sum(d.tobytes())
+
+ref_by_idx = {idx_of(p): p for p in ref_frames}
+out_by_idx = {idx_of(p): p for p in out_frames}
+
+# Pick three anchor frames from the middle-ish of our capture to
+# avoid boot-time transients. For each, search reference window
+# [anchor - 60, anchor + 60] for minimum-AE match; the offset
+# difference is our candidate K. Average across anchors.
+out_indices = sorted(out_by_idx.keys())
+n_out = len(out_indices)
+if n_out < 30:
+    offset = 0
+else:
+    anchors = [out_indices[n_out // 4], out_indices[n_out // 2], out_indices[3 * n_out // 4]]
+    offsets = []
+    ref_max = max(ref_by_idx.keys())
+    for anchor_out in anchors:
+        best = None
+        # Widen search to ±400 frames — the `wait N` warmup before
+        # recording starts can easily shift us 75-200 frames relative
+        # to reference, and simulator-speed skew adds more drift over
+        # the capture window.
+        for delta in range(-400, 401):
+            cand = anchor_out + delta
+            if cand < 1 or cand > ref_max:
+                continue
+            if cand not in ref_by_idx:
+                continue
+            score = ae(out_by_idx[anchor_out], ref_by_idx[cand])
+            if best is None or score < best[0]:
+                best = (score, delta)
+        if best is not None:
+            offsets.append(best[1])
+    # Anchors may land at different offsets if the demos drift (ours
+    # running slightly faster/slower than ref); fall back to the
+    # median, report all three for inspection.
+    offset = int(round(statistics.median(offsets))) if offsets else 0
+    print(f"anchor_offsets={offsets} median={offset}", flush=True)
+
+# Apply offset: ours[i] pairs with ref[i + offset].
 total_ae = 0
 per_frame = []
 lines = []
-for name in matched:
-    out_img = Image.open(out_frames[name]).convert("RGB")
-    ref_img = Image.open(ref_frames[name]).convert("RGB")
+matched = 0
+for out_path in out_frames:
+    oi = idx_of(out_path)
+    ri = oi + offset
+    if ri not in ref_by_idx:
+        continue
+    out_img = Image.open(out_path).convert("RGB")
+    ref_img = Image.open(ref_by_idx[ri]).convert("RGB")
     if out_img.size != ref_img.size:
         out_img = out_img.resize(ref_img.size)
     diff = ImageChops.difference(out_img, ref_img)
-    diff.save(os.path.join(diff_dir, name))
-    ae = sum(1 for p in diff.getdata() if p != (0, 0, 0))
-    total_ae += ae
-    per_frame.append(ae)
-    lines.append(f"{name}: AE={ae}")
+    diff.save(os.path.join(diff_dir, os.path.basename(out_path)))
+    frame_ae = sum(1 for p in diff.getdata() if p != (0, 0, 0))
+    total_ae += frame_ae
+    per_frame.append(frame_ae)
+    lines.append(f"{os.path.basename(out_path)} <-> frame_{ri:04d}.png: AE={frame_ae}")
+    matched += 1
 
-lines.append(f"ONLY_OUT={len(only_out)}")
-lines.append(f"ONLY_REF={len(only_ref)}")
 with open(diff_log_path, "w") as f:
     f.write("\n".join(lines) + "\n")
 
 with open(summary_path, "a") as f:
-    f.write(f"MATCHED_FRAMES={len(matched)}\n")
-    f.write(f"ONLY_OUT={len(only_out)}\n")
-    f.write(f"ONLY_REF={len(only_ref)}\n")
+    f.write(f"DETECTED_OFFSET={offset}\n")
+    f.write(f"MATCHED_FRAMES={matched}\n")
     f.write(f"TOTAL_AE={total_ae}\n")
     if per_frame:
         avg = total_ae / len(per_frame)
         f.write(f"AVG_AE_PER_FRAME={avg:.1f}\n")
 
-print(f"MATCHED={len(matched)} TOTAL_AE={total_ae}")
+print(f"OFFSET={offset} MATCHED={matched} TOTAL_AE={total_ae}")
 PY
 
 echo ""
