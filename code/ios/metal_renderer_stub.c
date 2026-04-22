@@ -44,14 +44,16 @@ typedef struct {
                     * the entity shaderRGBA alpha channel. */
     /* Stage 0 rgbGen wave parameters — only meaningful when rgbGen == 3.
      * Copied from the shader-map so the entity fragment can evaluate the
-     * glow wave per frame (RB_CalcWaveColor, GF_SIN scope). */
+     * glow wave per frame. rgbWaveFunc selects the waveform shape
+     * (1=sin, 2=triangle, 3=square, 4=sawtooth, 5=inverse_sawtooth). */
+    int rgbWaveFunc;
     float rgbWaveBase;
     float rgbWaveAmp;
     float rgbWavePhase;
     float rgbWaveFreq;
     /* Stage 0 alphaGen wave parameters — mirrors rgbWave* and is
-     * consumed when alphaGen == 3. Matches RB_CalcWaveAlpha's
-     * EvalWaveFormClamped, GF_SIN scope. */
+     * consumed when alphaGen == 3. */
+    int alphaWaveFunc;
     float alphaWaveBase;
     float alphaWaveAmp;
     float alphaWavePhase;
@@ -759,8 +761,8 @@ static int ShaderMap_GetAlphaFunc(const char *name);
 static int ShaderMap_GetTcGenEnv(const char *name);
 static int ShaderMap_GetRgbGen(const char *name);
 static int ShaderMap_GetAlphaGen(const char *name);
-static void ShaderMap_GetRgbWave(const char *name, float *base, float *amp, float *phase, float *freq);
-static void ShaderMap_GetAlphaWave(const char *name, float *base, float *amp, float *phase, float *freq);
+static void ShaderMap_GetRgbWave(const char *name, int *func, float *base, float *amp, float *phase, float *freq);
+static void ShaderMap_GetAlphaWave(const char *name, int *func, float *base, float *amp, float *phase, float *freq);
 static void ShaderMap_GetTcMods(const char *name, int *outCount, Q3TcMod *outMods);
 static int s_pendingAnimSlot;
 static float s_pendingScrollS;
@@ -974,9 +976,11 @@ static qhandle_t RegisterTexture(const char *name) {
     texture->tcGenEnv = ShaderMap_GetTcGenEnv(name);
     texture->rgbGen = ShaderMap_GetRgbGen(name);
     texture->alphaGen = ShaderMap_GetAlphaGen(name);
-    ShaderMap_GetRgbWave(name, &texture->rgbWaveBase, &texture->rgbWaveAmp,
+    ShaderMap_GetRgbWave(name, &texture->rgbWaveFunc,
+                         &texture->rgbWaveBase, &texture->rgbWaveAmp,
                          &texture->rgbWavePhase, &texture->rgbWaveFreq);
-    ShaderMap_GetAlphaWave(name, &texture->alphaWaveBase, &texture->alphaWaveAmp,
+    ShaderMap_GetAlphaWave(name, &texture->alphaWaveFunc,
+                           &texture->alphaWaveBase, &texture->alphaWaveAmp,
                            &texture->alphaWavePhase, &texture->alphaWaveFreq);
     ShaderMap_GetTcMods(name, &texture->tcModCount, texture->tcMods);
     if (Q_stricmp(name, resolvedName)) {
@@ -2625,9 +2629,10 @@ static int ShaderMap_GetAlphaGen(const char *name) {
  * the entity fragment can evaluate the glow wave per frame when its
  * stage uses rgbGen wave. Zeroed when the shader doesn't specify a
  * wave. */
-static void ShaderMap_GetRgbWave(const char *name, float *base, float *amp,
+static void ShaderMap_GetRgbWave(const char *name, int *func, float *base, float *amp,
                                  float *phase, float *freq) {
     const metalShaderMap_t *entry;
+    if (func) *func = 1; /* default to sin */
     if (base) *base = 0.0f;
     if (amp) *amp = 0.0f;
     if (phase) *phase = 0.0f;
@@ -2635,15 +2640,17 @@ static void ShaderMap_GetRgbWave(const char *name, float *base, float *amp,
     if (name == NULL || name[0] == '\0') return;
     entry = ShaderMap_LookupEntry(name);
     if (entry == NULL || entry->stageCount <= 0) return;
+    if (func)  *func  = entry->stages[0].rgbWaveFunc;
     if (base)  *base  = entry->stages[0].rgbWaveBase;
     if (amp)   *amp   = entry->stages[0].rgbWaveAmp;
     if (phase) *phase = entry->stages[0].rgbWavePhase;
     if (freq)  *freq  = entry->stages[0].rgbWaveFreq;
 }
 
-static void ShaderMap_GetAlphaWave(const char *name, float *base, float *amp,
+static void ShaderMap_GetAlphaWave(const char *name, int *func, float *base, float *amp,
                                    float *phase, float *freq) {
     const metalShaderMap_t *entry;
+    if (func) *func = 1;
     if (base) *base = 0.0f;
     if (amp) *amp = 0.0f;
     if (phase) *phase = 0.0f;
@@ -2651,6 +2658,7 @@ static void ShaderMap_GetAlphaWave(const char *name, float *base, float *amp,
     if (name == NULL || name[0] == '\0') return;
     entry = ShaderMap_LookupEntry(name);
     if (entry == NULL || entry->stageCount <= 0) return;
+    if (func)  *func  = entry->stages[0].alphaWaveFunc;
     if (base)  *base  = entry->stages[0].alphaWaveBase;
     if (amp)   *amp   = entry->stages[0].alphaWaveAmp;
     if (phase) *phase = entry->stages[0].alphaWavePhase;
@@ -5400,10 +5408,12 @@ int Q3MetalRenderer_GetTextureInfo(uint32_t textureHandle, Q3MetalTextureInfo *o
     outInfo->alphaFunc = (uint32_t)texture->alphaFunc;
     outInfo->rgbGen = (uint32_t)texture->rgbGen;
     outInfo->alphaGen = (uint32_t)texture->alphaGen;
+    outInfo->rgbWaveFunc  = (uint32_t)texture->rgbWaveFunc;
     outInfo->rgbWaveBase  = texture->rgbWaveBase;
     outInfo->rgbWaveAmp   = texture->rgbWaveAmp;
     outInfo->rgbWavePhase = texture->rgbWavePhase;
     outInfo->rgbWaveFreq  = texture->rgbWaveFreq;
+    outInfo->alphaWaveFunc  = (uint32_t)texture->alphaWaveFunc;
     outInfo->alphaWaveBase  = texture->alphaWaveBase;
     outInfo->alphaWaveAmp   = texture->alphaWaveAmp;
     outInfo->alphaWavePhase = texture->alphaWavePhase;

@@ -224,16 +224,16 @@ typedef struct {
      * alpha-faded entityColor doesn't leak into stages that want
      * opaque output — matches upstream AGEN_IDENTITY. */
     uint32_t alphaGen;
-    /* Stage 0 rgbGen wave parameters (base, amp, phase, freq). Only
-     * meaningful when rgbGen == 3. GF_SIN only for minimal scope,
-     * matches ioquake3 RB_CalcWaveColor's glow calculation. */
+    /* Stage 0 rgbGen wave parameters (func, base, amp, phase, freq).
+     * Only meaningful when rgbGen == 3. func: 1=sin, 2=triangle,
+     * 3=square, 4=sawtooth, 5=inverse_sawtooth. */
+    uint32_t rgbWaveFunc;
     float rgbWaveBase;
     float rgbWaveAmp;
     float rgbWavePhase;
     float rgbWaveFreq;
-    /* Stage 0 alphaGen wave parameters (base, amp, phase, freq). Only
-     * meaningful when alphaGen == 3. Matches RB_CalcWaveAlpha's
-     * EvalWaveFormClamped, GF_SIN scope. */
+    /* Stage 0 alphaGen wave parameters — parallels rgbWave*. */
+    uint32_t alphaWaveFunc;
     float alphaWaveBase;
     float alphaWaveAmp;
     float alphaWavePhase;

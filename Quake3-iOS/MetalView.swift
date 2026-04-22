@@ -227,12 +227,16 @@ struct MetalView: UIViewRepresentable {
         private static func packEntityRgbGen(handle: UInt32, into uniforms: inout EntityUniforms) {
             uniforms.rgbGenMode = 2 /* default to lightingDiffuse to preserve existing behavior */
             uniforms.alphaGenMode = 1 /* default to vertex alpha so existing entity alpha fades still work */
+            uniforms.rgbWaveFunc = 1
+            uniforms.alphaWaveFunc = 1
             uniforms.rgbGenWaveParams = SIMD4<Float>(0, 0, 0, 0)
             uniforms.alphaGenWaveParams = SIMD4<Float>(0, 0, 0, 0)
             var info = Q3MetalTextureInfo()
             guard Q3MetalRenderer_GetTextureInfo(handle, &info) == 1 else { return }
             uniforms.rgbGenMode = info.rgbGen
             uniforms.alphaGenMode = info.alphaGen
+            uniforms.rgbWaveFunc = max(info.rgbWaveFunc, 1)
+            uniforms.alphaWaveFunc = max(info.alphaWaveFunc, 1)
             uniforms.rgbGenWaveParams = SIMD4<Float>(
                 info.rgbWaveBase, info.rgbWaveAmp, info.rgbWavePhase, info.rgbWaveFreq)
             uniforms.alphaGenWaveParams = SIMD4<Float>(
@@ -279,8 +283,11 @@ struct MetalView: UIViewRepresentable {
             /* 0=identity (force alpha 1.0), 1=vertex, 3=wave.
              * Mirrors AGEN_IDENTITY. */
             var alphaGenMode: UInt32 = 0
-            var _genPad0: UInt32 = 0
-            var _genPad1: UInt32 = 0
+            /* Wave function index for rgbGen wave: 1=sin, 2=triangle,
+             * 3=square, 4=sawtooth, 5=inverseSawtooth (evalWave MSL
+             * helper handles all five). Reuses the former pad slot. */
+            var rgbWaveFunc: UInt32 = 1
+            var alphaWaveFunc: UInt32 = 1
             /* rgbGen wave params (only consulted when rgbGenMode == 3):
              * (base, amp, phase, freq). GF_SIN only for minimal scope —
              * matches ioquake3 RB_CalcWaveColor: glow = clamp(base +
@@ -453,6 +460,34 @@ struct MetalView: UIViewRepresentable {
             float _pad0;
         };
 
+        /* Shared wave-function evaluator. Mirrors ioquake3's TableForFunc
+         * + WAVEVALUE: phase wraps to [0,1), per-wave-shape value in
+         * [-1,1] (sin/square/triangle) or [0,1] (sawtooth variants),
+         * scaled by amplitude and offset by base. func: 1=sin,
+         * 2=triangle, 3=square, 4=sawtooth, 5=inverse_sawtooth;
+         * anything else falls back to sin. */
+        float evalWave(uint func, float base, float amp, float phase, float freq, float timeSeconds) {
+            float t = phase + timeSeconds * freq;
+            float f = fract(t);
+            float w;
+            if (func == 3u) {
+                w = (f < 0.5) ? 1.0 : -1.0;
+            } else if (func == 4u) {
+                w = f;
+            } else if (func == 5u) {
+                w = 1.0 - f;
+            } else if (func == 2u) {
+                /* triangle: 0 → 1 → 0 → -1 → 0 over one period */
+                w = (f < 0.25) ? (4.0 * f)
+                  : (f < 0.5)  ? (2.0 - 4.0 * f)
+                  : (f < 0.75) ? (2.0 - 4.0 * f)
+                               : (4.0 * f - 4.0);
+            } else { /* 1=sin and fallback */
+                w = sin(2.0 * 3.14159265 * f);
+            }
+            return base + w * amp;
+        }
+
         float2 applyTcMod(float2 uv, float3 worldPos, int type, float4 params, float timeSeconds) {
             if (type == 1) {
                 return uv + params.xy * timeSeconds;
@@ -524,8 +559,8 @@ struct MetalView: UIViewRepresentable {
             float4 tcModParams3;
             uint rgbGenMode;
             uint alphaGenMode;
-            uint _genPad0;
-            uint _genPad1;
+            uint rgbWaveFunc;
+            uint alphaWaveFunc;
             float4 rgbGenWaveParams;
             float4 alphaGenWaveParams;
         };
@@ -755,8 +790,7 @@ struct MetalView: UIViewRepresentable {
                 baseRgb = texel.rgb;
             } else if (uniforms.rgbGenMode == 3u) {
                 float4 wp = uniforms.rgbGenWaveParams; /* (base, amp, phase, freq) */
-                float angle = 2.0 * 3.14159265 * (wp.z + uniforms.timeSeconds * wp.w);
-                float glow = clamp(wp.x + sin(angle) * wp.y, 0.0, 1.0);
+                float glow = clamp(evalWave(uniforms.rgbWaveFunc, wp.x, wp.y, wp.z, wp.w, uniforms.timeSeconds), 0.0, 1.0);
                 baseRgb = texel.rgb * glow;
             } else {
                 baseRgb = texel.rgb * in.color.rgb;
@@ -771,8 +805,7 @@ struct MetalView: UIViewRepresentable {
                 baseA = texel.a;
             } else if (uniforms.alphaGenMode == 3u) {
                 float4 ap = uniforms.alphaGenWaveParams;
-                float aAngle = 2.0 * 3.14159265 * (ap.z + uniforms.timeSeconds * ap.w);
-                float aWave = clamp(ap.x + sin(aAngle) * ap.y, 0.0, 1.0);
+                float aWave = clamp(evalWave(uniforms.alphaWaveFunc, ap.x, ap.y, ap.z, ap.w, uniforms.timeSeconds), 0.0, 1.0);
                 baseA = texel.a * aWave;
             } else {
                 baseA = texel.a * in.color.a;
