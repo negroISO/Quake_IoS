@@ -181,6 +181,13 @@ struct MetalView: UIViewRepresentable {
                 case 4: /* scale: params.xy = s/t scale factors, unchanged */
                     types[i] = 4
                     packed[i] = SIMD4(pp.0, pp.1, 0, 0)
+                case 5: /* turb: (amp, freq, phase, _) — NOTE the MSL branch
+                         * uses a UV-space sin perturbation, whereas upstream
+                         * RB_CalcTurbulentTexCoords samples tess.xyz world
+                         * space. Shared parity gap with world path; tracked
+                         * for a follow-up that passes worldPos through. */
+                    types[i] = 5
+                    packed[i] = SIMD4(pp.0, pp.1, pp.2, 0)
                 case 6: /* stretch: (base, amp, phase, freq) straight through */
                     types[i] = 6
                     packed[i] = SIMD4(pp.0, pp.1, pp.2, pp.3)
