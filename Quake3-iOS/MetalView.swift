@@ -181,6 +181,9 @@ struct MetalView: UIViewRepresentable {
                 case 4: /* scale: params.xy = s/t scale factors, unchanged */
                     types[i] = 4
                     packed[i] = SIMD4(pp.0, pp.1, 0, 0)
+                case 6: /* stretch: (base, amp, phase, freq) straight through */
+                    types[i] = 6
+                    packed[i] = SIMD4(pp.0, pp.1, pp.2, pp.3)
                 default:
                     /* outside scope — leave type=0 so applyTcMod no-ops */
                     break
@@ -425,6 +428,19 @@ struct MetalView: UIViewRepresentable {
                 float t = (timeSeconds + phase) * freq * 2.0 * 3.14159265;
                 return uv + float2(sin(t + uv.y * 4.0) * amp,
                                    sin(t + uv.x * 4.0) * amp);
+            } else if (type == 6) {
+                /* stretch: sin-wave zoom about texture center.
+                 * params = (base, amp, phase, freq). Mirrors
+                 * RB_CalcStretchTexCoords: eval = base + sin(2π(phase +
+                 * t*freq)) * amp; p = 1/eval; dst = (uv-0.5)*p + 0.5.
+                 * Guard eval==0 since upstream would divide by zero on
+                 * an ill-configured shader; nudge to 1.0 to keep UVs
+                 * sane and matching identity. */
+                float angle = 2.0 * 3.14159265 * (params.z + timeSeconds * params.w);
+                float eval = params.x + sin(angle) * params.y;
+                if (abs(eval) < 0.0001) eval = 1.0;
+                float p = 1.0 / eval;
+                return (uv - 0.5) * p + 0.5;
             }
             return uv;
         }

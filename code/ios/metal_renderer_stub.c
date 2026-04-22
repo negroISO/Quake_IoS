@@ -2975,10 +2975,26 @@ static void ParseShaderText(const char *text) {
                             cur.tcModCount += 1;
                         }
                     } else if (token[0] && !Q_stricmp(token, "stretch")) {
-                        COM_ParseExt(&p, qfalse);
-                        COM_ParseExt(&p, qfalse);
-                        COM_ParseExt(&p, qfalse);
-                        COM_ParseExt(&p, qfalse);
+                        /* Syntax: tcmod stretch <func> <base> <amp> <phase> <freq>
+                         * Scope is GF_SIN only (the overwhelming common case —
+                         * stretch is used for pulse-zoom on powerups). Type=6
+                         * is our encoding; params = (base, amp, phase, freq).
+                         * Mirrors RB_CalcStretchTexCoords + RB_CalcTransformTexCoords. */
+                        const char *funcTok = COM_ParseExt(&p, qfalse);
+                        const char *baseTok = COM_ParseExt(&p, qfalse);
+                        const char *ampTok  = COM_ParseExt(&p, qfalse);
+                        const char *phaseTok = COM_ParseExt(&p, qfalse);
+                        const char *freqTok = COM_ParseExt(&p, qfalse);
+                        if (funcTok[0] && baseTok[0] && ampTok[0] &&
+                            phaseTok[0] && freqTok[0] &&
+                            cur.tcModCount < Q3_MAX_TCMODS) {
+                            cur.tcMods[cur.tcModCount].type = 6;
+                            cur.tcMods[cur.tcModCount].params[0] = (float)atof(baseTok);
+                            cur.tcMods[cur.tcModCount].params[1] = (float)atof(ampTok);
+                            cur.tcMods[cur.tcModCount].params[2] = (float)atof(phaseTok);
+                            cur.tcMods[cur.tcModCount].params[3] = (float)atof(freqTok);
+                            cur.tcModCount += 1;
+                        }
                     } else if (token[0] && !Q_stricmp(token, "transform")) {
                         COM_ParseExt(&p, qfalse);
                         COM_ParseExt(&p, qfalse);
