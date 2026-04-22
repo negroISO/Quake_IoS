@@ -85,3 +85,14 @@ coordinates.**
 Gemma-4-31B: **YES. The memset to 0xff sets all RGBA components to
 maximum value, resulting in a multiplicative identity for the texture
 color.**
+
+## [VERIFY_SHADER] AGEN_IDENTITY forces opaque alpha
+> In ioquake3 tr_shade.c RB_IterateStagesGeneric, the AGEN_IDENTITY
+> case sets tess.svars.colors[i].rgba[3] = 255 for every vertex —
+> forcing the alpha channel to full 1.0, regardless of whatever alpha
+> was in the vertex color. So a stage declaring `alphaGen identity`
+> outputs fully opaque alpha irrespective of the per-vertex alpha
+> input. YES/NO.
+
+Gemma-4-31B: **YES. The code explicitly assigns 255 to the alpha
+component, overriding any existing vertex alpha data.**
