@@ -144,6 +144,20 @@ struct MetalView: UIViewRepresentable {
 
         struct EntityUniforms {
             var viewProjection: simd_float4x4
+            /* Camera origin in world space — used by q3_entity_fragment
+             * when tcGen>0 to compute the reflection vector for chrome
+             * shaders (quad shell, regen, battlesuit). 16-byte aligned
+             * via SIMD3 (w is padding). */
+            var cameraPos: SIMD3<Float> = SIMD3<Float>(0, 0, 0)
+            /* 1.0 when the current draw's shader has `tcGen environment`.
+             * Set per entity based on Q3_METAL_ENTITY_DRAWFLAG_TCGEN_ENV.
+             * 0.0 otherwise — fragment keeps mesh ST coords. */
+            var tcGen: Float = 0
+            /* Explicit padding to keep the struct 16-byte aligned so
+             * setVertexBytes / setFragmentBytes agree on stride. */
+            var _pad0: Float = 0
+            var _pad1: Float = 0
+            var _pad2: Float = 0
         }
 
         /* Fragment-side dlight block bound at buffer(2) for both world and
@@ -338,6 +352,14 @@ struct MetalView: UIViewRepresentable {
 
         struct EntityUniforms {
             float4x4 viewProjection;
+            /* Mirrors Swift-side struct — MSL packs float3 on 16-byte
+             * boundaries, so the explicit pads keep offsets aligned with
+             * the Swift layout. Read by q3_entity_fragment for tcGen env. */
+            float3 cameraPos;
+            float  tcGen;
+            float  _pad0;
+            float  _pad1;
+            float  _pad2;
         };
 
         struct EntityVertexOut {
@@ -486,10 +508,32 @@ struct MetalView: UIViewRepresentable {
         }
 
         fragment float4 q3_entity_fragment(EntityVertexOut in [[stage_in]],
+                                           constant EntityUniforms &uniforms [[buffer(1)]],
                                            constant DLightBlock &dlights [[buffer(2)]],
                                            texture2d<float> colorTexture [[texture(0)]],
                                            sampler textureSampler [[sampler(0)]]) {
-            float4 texel = colorTexture.sample(textureSampler, in.texCoord);
+            // tcGen environment (chrome / reflective shaders: powerups/
+            // quad, powerups/regen, battleSuit). Mirrors ioquake3's
+            // RB_CalcEnvironmentTexCoords in tr_shade_calc.c exactly:
+            //   viewer = normalize(viewOrigin - vertex)
+            //   d      = dot(normal, viewer)
+            //   refl   = normal*2*d - viewer
+            //   s      = 0.5 + refl.y * 0.5
+            //   t      = 0.5 - refl.z * 0.5
+            // Entity verts carry world-space position but no normal
+            // attribute, so derive a flat face normal via screen-space
+            // derivatives (same technique the world pipeline uses).
+            float2 texCoord = in.texCoord;
+            if (uniforms.tcGen > 0.5) {
+                float3 dx = dfdx(in.worldPos);
+                float3 dy = dfdy(in.worldPos);
+                float3 n = normalize(cross(dx, dy));
+                float3 viewer = normalize(uniforms.cameraPos - in.worldPos);
+                float d = 2.0 * dot(viewer, n);
+                float3 refl = n * d - viewer;
+                texCoord = float2(0.5 + refl.y * 0.5, 0.5 - refl.z * 0.5);
+            }
+            float4 texel = colorTexture.sample(textureSampler, texCoord);
             float4 base = texel * in.color;
             base.rgb = applyDlights(base.rgb, in.worldPos, dlights);
             return base;
@@ -912,13 +956,15 @@ struct MetalView: UIViewRepresentable {
                let entityVertexBuffer = uploadEntityBuffers(device: view.device),
                let entityIndexBuffer {
                 let entityViewProjection = makeWorldViewProjection(sceneView)
-                var entityUniforms = EntityUniforms(viewProjection: entityViewProjection)
+                let cameraPos = SIMD3<Float>(sceneView.viewOrigin.0, sceneView.viewOrigin.1, sceneView.viewOrigin.2)
+                var entityUniforms = EntityUniforms(viewProjection: entityViewProjection, cameraPos: cameraPos, tcGen: 0)
                 encoder.setRenderPipelineState(entityPipelineState)
                 encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
                 encoder.setFrontFacing(.clockwise)
                 encoder.setCullMode(.none)
                 encoder.setVertexBuffer(entityVertexBuffer, offset: 0, index: 0)
                 encoder.setVertexBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
+                encoder.setFragmentBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
                 encoder.setFragmentSamplerState(worldSamplerState, index: 0)
 
                 // Dlights for entities (viewmodel, players, pickups lit by
@@ -940,6 +986,7 @@ struct MetalView: UIViewRepresentable {
                     let additiveBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE)
                     let alphaBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ALPHA)
                     let filterBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_FILTER)
+                    let tcGenEnvBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_TCGEN_ENV)
 
                     // Ordered entity passes:
                     // 0 = opaque, 1 = filter, 2 = alpha, 3 = additive.
@@ -954,6 +1001,13 @@ struct MetalView: UIViewRepresentable {
                             continue
                         }
                         let wantsDepthHack = (draw.flags & depthHackBit) != 0
+                        // Per-draw tcGen flag — rebind EntityUniforms so the
+                        // fragment shader picks up the current reflection-map
+                        // switch. Default is 0 (mesh ST). Quad shell, regen,
+                        // battlesuit carry TCGEN_ENV, sharing a viewProjection
+                        // and cameraPos with the base entity pass.
+                        entityUniforms.tcGen = (draw.flags & tcGenEnvBit) != 0 ? 1.0 : 0.0
+                        encoder.setFragmentBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
                         if drawPass == 3, let entityAdditivePipelineState {
                             encoder.setRenderPipelineState(entityAdditivePipelineState)
                             encoder.setDepthStencilState(ensuredDepthStencilState(additiveEntityDepthStencilState, device: view.device))

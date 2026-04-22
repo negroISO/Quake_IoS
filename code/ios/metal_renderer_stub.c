@@ -29,6 +29,10 @@ typedef struct {
     int blendMode; /* 0=opaque, 1=additive, 2=alpha, 3=filter; propagated
                     * from the shader-map entry that resolved this texture. */
     int alphaFunc; /* 0=none, 1=GT0, 2=GE128, 3=LT128 */
+    int tcGenEnv;  /* 1 if the resolved shader uses `tcGen environment`
+                    * (chrome/reflective like powerups/quad, shell shaders).
+                    * Entity pipeline reads this to switch UV generation
+                    * from mesh ST to the reflection formula. */
 } metalTexture_t;
 
 refimport_t ri;
@@ -933,6 +937,7 @@ static qhandle_t RegisterTexture(const char *name) {
      * this texture. Used by entity draw to decide additive pipeline. */
     texture->blendMode = ShaderMap_GetBlendMode(name);
     texture->alphaFunc = ShaderMap_GetAlphaFunc(name);
+    texture->tcGenEnv = ShaderMap_GetTcGenEnv(name);
     if (Q_stricmp(name, resolvedName)) {
         ri.Printf(PRINT_ALL, "Metal stub: loaded '%s' from '%s' (%dx%d)\n", name, resolvedName, width, height);
     }
@@ -4721,6 +4726,9 @@ static void RE_RenderScene(const refdef_t *fd) {
                                      !Q_stricmpn(n, "gfx/misc/", 9))) {
                                     drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
                                 }
+                            }
+                            if (tex->tcGenEnv) {
+                                drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_TCGEN_ENV;
                             }
                         }
                         /* Diagnostic: first 5 per frame */

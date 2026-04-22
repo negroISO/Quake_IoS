@@ -135,7 +135,11 @@ enum {
     Q3_METAL_ENTITY_DRAWFLAG_NOCULL = 1u << 1,
     Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE = 1u << 2,
     Q3_METAL_ENTITY_DRAWFLAG_ALPHA = 1u << 3,
-    Q3_METAL_ENTITY_DRAWFLAG_FILTER = 1u << 4
+    Q3_METAL_ENTITY_DRAWFLAG_FILTER = 1u << 4,
+    /* Shader's stage uses `tcGen environment` (chrome/reflective — quad
+     * shell, regen, battlesuit). Swift flips the entity fragment's tcGen
+     * path to compute reflection-based UVs instead of mesh ST. */
+    Q3_METAL_ENTITY_DRAWFLAG_TCGEN_ENV = 1u << 5
 };
 
 typedef struct {
