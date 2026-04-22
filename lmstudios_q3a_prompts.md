@@ -109,3 +109,14 @@ component, overriding any existing vertex alpha data.**
 Gemma-4-31B: **YES. The implementation calculates a single scalar
 glow value that is applied uniformly to the red, green, and blue
 components of the vertex color.**
+
+## [VERIFY_SHADER] RB_CalcWaveAlpha uses EvalWaveFormClamped
+> In ioquake3 RB_CalcWaveAlpha (tr_shade_calc.c line 714), glow =
+> EvalWaveFormClamped(wf); v = 255 * glow; then for every vertex
+> dstColors[3] = v. EvalWaveFormClamped is EvalWaveForm clamped to
+> [0,1]. So the output is: alpha = clamp(base + sin(2π*(phase +
+> t*freq)) * amp, 0, 1) for GF_SIN. YES/NO.
+
+Gemma-4-31B: **YES. The function EvalWaveFormClamped applies a clamp
+to the result of EvalWaveForm, ensuring the output is within the
+[0, 1] range.**
