@@ -25,3 +25,17 @@ the texture coordinates over time.**
 
 Gemma-4-31B: **YES. The code adds the calculated scroll offset directly to
 the source texture coordinates.**
+
+## [VERIFY_PIPELINE] alphaFunc pass/fail semantics
+> In ioquake3 tr_backend.c line ~358, the GLS_ATEST_* state bits map to
+> OpenGL alphaFunc calls: GLS_ATEST_GT_0 → qglAlphaFunc(GL_GREATER, 0.0),
+> GLS_ATEST_LT_80 → qglAlphaFunc(GL_LESS, 0.5), GLS_ATEST_GE_80 →
+> qglAlphaFunc(GL_GEQUAL, 0.5). Under GL_GREATER ref=0, a fragment PASSES
+> only when its alpha is strictly greater than 0 (so it is killed when
+> alpha==0). Under GL_LESS ref=0.5, a fragment PASSES only when its alpha
+> is strictly less than 0.5. Is this description of the upstream
+> passing-vs-killed semantics correct? YES/NO.
+
+Gemma-4-31B: **YES. The OpenGL glAlphaFunc specification dictates that
+fragments are passed if they satisfy the specified comparison against the
+reference value and discarded otherwise.**
