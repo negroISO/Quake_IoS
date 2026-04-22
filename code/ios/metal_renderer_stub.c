@@ -3297,8 +3297,15 @@ static void RE_BeginRegistration(glconfig_t *config) {
     EnsureSkyTexture();
     EnsureTimHellBaseTexture();
     EnsureTimHellAddTexture();
-    s_glConfig.vidWidth = 2796;
-    s_glConfig.vidHeight = 1290;
+    /* Don't clobber vidWidth/vidHeight here — Swift's
+     * Q3MetalRenderer_UpdateDrawableSize() is the authoritative source
+     * (driven by MTKView's current drawable size, which the
+     * troubleshooting patch locks to 960x444). Falling back to a sane
+     * default ONLY when the drawable hasn't reported a size yet. */
+    if (s_glConfig.vidWidth <= 0 || s_glConfig.vidHeight <= 0) {
+        s_glConfig.vidWidth = 2796;
+        s_glConfig.vidHeight = 1290;
+    }
     s_glConfig.windowAspect = (float)s_glConfig.vidWidth / (float)s_glConfig.vidHeight;
     s_glConfig.colorBits = 32;
     s_glConfig.depthBits = 24;
