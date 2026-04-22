@@ -14,4 +14,10 @@ void Q3Gamepad_SetButtons(unsigned int buttonMask);
 /* Execute a Q3 console command from Swift (on-screen console overlay). */
 void Q3Exec_Command(const char *cmd);
 
+/* Per-frame video capture hooks (see RE_TakeVideoFrame in metal_renderer_stub.c).
+ * Swift reads CL_VideoRecording() each draw; if true, it reads back the
+ * drawable's BGRA bytes and hands them off via Q3MetalRenderer_StoreVideoFrame. */
+int CL_VideoRecording(void);
+void Q3MetalRenderer_StoreVideoFrame(const unsigned char *bgra, int width, int height);
+
 #endif

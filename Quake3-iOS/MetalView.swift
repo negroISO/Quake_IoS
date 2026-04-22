@@ -1014,6 +1014,9 @@ struct MetalView: UIViewRepresentable {
         }
 
         func draw(in view: MTKView) {
+            // DEBUG VERIFY — temporary troubleshooting patch
+            print("ACTUAL DRAWABLE:", Int(view.drawableSize.width), "x", Int(view.drawableSize.height))
+
             if commandQueue == nil {
                 configureRenderer(for: view)
             }
@@ -1040,6 +1043,16 @@ struct MetalView: UIViewRepresentable {
             guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
                 return
             }
+
+            // FORCE VIEWPORT MATCH — temporary troubleshooting patch
+            encoder.setViewport(MTLViewport(
+                originX: 0,
+                originY: 0,
+                width: Double(view.drawableSize.width),
+                height: Double(view.drawableSize.height),
+                znear: 0.0,
+                zfar: 1.0
+            ))
 
             if snapshot.worldCommandCount > 0,
                let worldPipelineState,
@@ -1495,11 +1508,53 @@ struct MetalView: UIViewRepresentable {
             encoder.endEncoding()
             commandBuffer.present(drawable)
             commandBuffer.commit()
+
+            // Video capture: when the engine is recording an AVI, read
+            // the just-rendered drawable back to CPU and stash the BGRA
+            // bytes in a shared buffer. The engine's per-frame
+            // CL_TakeVideoFrame → RE_TakeVideoFrame hook (in
+            // metal_renderer_stub.c) pulls from that buffer and converts
+            // to the packed RGB layout the AVI muxer expects. Gated by
+            // CL_VideoRecording() so idle runs incur no readback cost.
+            if CL_VideoRecording() != 0 {
+                commandBuffer.waitUntilCompleted()
+                let tex = drawable.texture
+                let w = tex.width
+                let h = tex.height
+                let bytesPerRow = w * 4
+                let byteCount = bytesPerRow * h
+                if videoReadbackBuffer == nil || videoReadbackBuffer!.count < byteCount {
+                    videoReadbackBuffer = [UInt8](repeating: 0, count: byteCount)
+                }
+                videoReadbackBuffer!.withUnsafeMutableBufferPointer { ptr in
+                    tex.getBytes(ptr.baseAddress!,
+                                 bytesPerRow: bytesPerRow,
+                                 from: MTLRegion(origin: MTLOrigin(x: 0, y: 0, z: 0),
+                                                 size: MTLSize(width: w, height: h, depth: 1)),
+                                 mipmapLevel: 0)
+                    Q3MetalRenderer_StoreVideoFrame(ptr.baseAddress, Int32(w), Int32(h))
+                }
+            }
         }
+        /* Reusable BGRA readback buffer sized on first recorded frame. */
+        private var videoReadbackBuffer: [UInt8]?
 
         @MainActor
         private func configureRenderer(for view: MTKView) {
             guard let device = view.device else { return }
+
+            // LOCK RESOLUTION (Quake reference) — temporary troubleshooting
+            // patch. MUST live here (one-shot setup) rather than inside
+            // drawableSizeWillChange, because assigning drawableSize from
+            // within the delegate recursively triggers the delegate again
+            // and blows the stack.
+            view.autoResizeDrawable = false
+            view.contentScaleFactor = 1.0
+            view.drawableSize = CGSize(width: 960, height: 444)
+            // Allow CPU readback of the drawable texture for the `video`
+            // command capture path (RE_TakeVideoFrame). MTKView defaults
+            // to framebufferOnly = true which blocks getBytes().
+            view.framebufferOnly = false
 
             commandQueue = device.makeCommandQueue()
 

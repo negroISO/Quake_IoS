@@ -3307,6 +3307,13 @@ static void RE_BeginRegistration(glconfig_t *config) {
         s_glConfig.vidHeight = 1290;
     }
     s_glConfig.windowAspect = (float)s_glConfig.vidWidth / (float)s_glConfig.vidHeight;
+    /* Keep cls.captureWidth/captureHeight in sync with our drawable so
+     * the AVI video-capture path (cl_avi.c: afd.width = cls.captureWidth)
+     * opens files with a non-zero frame size. Without this the header
+     * records width=0 and no frames can be appended. */
+    if (ri.CL_SetScaling) {
+        ri.CL_SetScaling(1.0f, s_glConfig.vidWidth, s_glConfig.vidHeight);
+    }
     s_glConfig.colorBits = 32;
     s_glConfig.depthBits = 24;
     s_glConfig.stencilBits = 8;
@@ -5375,7 +5382,87 @@ static void RE_RemapShader(const char *oldShader, const char *newShader, const c
 static qboolean RE_GetEntityToken(char *buffer, int size) { return qfalse; }
 static qboolean R_inPVS(const vec3_t p1, const vec3_t p2) { return qfalse; }
 
-static void RE_TakeVideoFrame(int h, int w, byte *captureBuffer, byte *encodeBuffer, qboolean motionJpeg) {}
+/* Video capture shared buffer.
+ *
+ * Swift's draw(in:) reads back the current Metal drawable after each
+ * frame's commit into this buffer (BGRA, width*height*4 bytes) when
+ * CL_VideoRecording() is active. The engine's per-frame
+ * CL_TakeVideoFrame path then invokes RE_TakeVideoFrame below, which
+ * converts the stashed BGRA into the packed RGB layout the AVI muxer
+ * (code/client/cl_avi.c) expects.
+ *
+ * Single-producer (Swift main thread) / single-consumer (engine
+ * thread) — the ready flag is fine as a plain int since misses just
+ * result in the previous frame being reused, which is acceptable for
+ * this diagnostic tool. */
+#define Q3_METAL_VIDEO_MAX_W 1920
+#define Q3_METAL_VIDEO_MAX_H 1080
+static byte  s_videoCaptureBgra[Q3_METAL_VIDEO_MAX_W * Q3_METAL_VIDEO_MAX_H * 4];
+static int   s_videoCaptureWidth;
+static int   s_videoCaptureHeight;
+static int   s_videoCaptureReady;
+
+/* Called by Swift after each drawable readback. Bytes are BGRA (Metal
+ * native). bytesPerRow == width*4 (no padding). */
+void Q3MetalRenderer_StoreVideoFrame(const uint8_t *bgra, int width, int height) {
+    size_t n;
+    if (bgra == NULL || width <= 0 || height <= 0) return;
+    if (width > Q3_METAL_VIDEO_MAX_W || height > Q3_METAL_VIDEO_MAX_H) return;
+    n = (size_t)width * (size_t)height * 4;
+    Com_Memcpy(s_videoCaptureBgra, bgra, n);
+    s_videoCaptureWidth = width;
+    s_videoCaptureHeight = height;
+    s_videoCaptureReady = 1;
+}
+
+/* Called by the engine's CL_TakeVideoFrame path (cl_avi.c) once per
+ * recorded frame. `w`×`h` is the AVI stream dimension (from r_custom*
+ * or glconfig). captureBuffer receives tightly-packed RGB (no row
+ * padding, no alpha). If our Swift-driven readback hasn't produced a
+ * matching frame yet, we leave captureBuffer at zeros — ffprobe will
+ * see a black frame for that entry but the AVI stays valid. */
+static void RE_TakeVideoFrame(int w, int h, byte *captureBuffer,
+                              byte *encodeBuffer, qboolean motionJpeg) {
+    int x, y;
+    const byte *src;
+    byte *dst;
+    size_t rgbSize;
+    if (captureBuffer == NULL || w <= 0 || h <= 0) return;
+    rgbSize = (size_t)w * (size_t)h * 3;
+    if (!s_videoCaptureReady ||
+        s_videoCaptureWidth != w || s_videoCaptureHeight != h) {
+        Com_Memset(captureBuffer, 0, rgbSize);
+    } else {
+        /* Metal textures are upside-down relative to what the AVI
+         * encoder expects (GL convention: origin at bottom-left,
+         * Metal: top-left). Flip Y while we walk the pixels. */
+        for (y = 0; y < h; ++y) {
+            src = &s_videoCaptureBgra[(size_t)(h - 1 - y) * (size_t)w * 4];
+            dst = &captureBuffer[(size_t)y * (size_t)w * 3];
+            for (x = 0; x < w; ++x, src += 4, dst += 3) {
+                dst[0] = src[2]; /* R = BGRA's B-slot (Metal native) */
+                dst[1] = src[1]; /* G */
+                dst[2] = src[0]; /* B = BGRA's R-slot */
+            }
+        }
+        s_videoCaptureReady = 0;
+    }
+    /* Upstream GL renderer uses a two-phase approach: RE_TakeVideoFrame
+     * schedules, RB_TakeVideoFrameCmd writes. Our stub has no backend
+     * phase — do the write synchronously. For motionJpeg we'd call
+     * CL_SaveJPGToBuffer first; for raw we can pass captureBuffer
+     * straight through. AVI muxer is happy with raw 24-bit RGB (BI_RGB
+     * biCompression when motionJpeg=false). */
+    if (ri.CL_WriteAVIVideoFrame) {
+        if (motionJpeg && ri.CL_SaveJPGToBuffer && encodeBuffer) {
+            size_t jpgSize = ri.CL_SaveJPGToBuffer(encodeBuffer, rgbSize,
+                /* quality */ 90, w, h, captureBuffer, /* padding */ 0);
+            ri.CL_WriteAVIVideoFrame(encodeBuffer, (int)jpgSize);
+        } else {
+            ri.CL_WriteAVIVideoFrame(captureBuffer, (int)rgbSize);
+        }
+    }
+}
 static void RE_ThrottleBackend(void) {}
 static void RE_FinishBloom(void) {}
 static void R_SetColorMappings(void) {}
@@ -5394,6 +5481,12 @@ void Q3MetalRenderer_UpdateDrawableSize(int width, int height) {
     s_glConfig.windowAspect = (float)width / (float)height;
     s_frameSnapshot.drawableWidth = (uint32_t)width;
     s_frameSnapshot.drawableHeight = (uint32_t)height;
+    /* Re-sync the client-side capture size each time the drawable
+     * moves. Matters specifically for the `video` command pipeline
+     * (cl_avi.c) which snapshots cls.captureWidth at AVI-open time. */
+    if (ri.CL_SetScaling) {
+        ri.CL_SetScaling(1.0f, width, height);
+    }
 }
 
 const Q3MetalFrameSnapshot *Q3MetalRenderer_GetFrameSnapshot(void) {
