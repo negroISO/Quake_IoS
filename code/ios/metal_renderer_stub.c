@@ -570,6 +570,25 @@ static void AddWorldDrawStage(Q3MetalWorldDrawCmd *draw,
     stage->textureHandle = (uint32_t)textureHandle;
     stage->blendMode = (uint32_t)src->blendMode;
     stage->tcGen = (uint32_t)src->tcGen;
+    /* One-shot world tcGen=env audit: print up to 16 unique tcGen-env
+     * texture handles so we can correlate chrome/reflective surfaces in
+     * captures. Fires only when tcGen==1 (environment). */
+    if (src->tcGen == 1) {
+        static uint32_t s_envHandlesSeen[16];
+        static int s_envHandlesCount = 0;
+        int found = 0;
+        for (int j = 0; j < s_envHandlesCount; ++j) {
+            if (s_envHandlesSeen[j] == (uint32_t)textureHandle) { found = 1; break; }
+        }
+        if (!found && s_envHandlesCount < 16) {
+            const metalTexture_t *t = FindTextureByHandle(textureHandle);
+            s_envHandlesSeen[s_envHandlesCount++] = (uint32_t)textureHandle;
+            ri.Printf(PRINT_ALL, "[world-env-audit] handle=%u name='%s' blend=%u\n",
+                      (unsigned)textureHandle,
+                      t ? t->name : "(no-tex)",
+                      (unsigned)src->blendMode);
+        }
+    }
     count = src->tcModCount;
     if (count < 0) count = 0;
     if (count > Q3_MAX_TCMODS) count = Q3_MAX_TCMODS;
