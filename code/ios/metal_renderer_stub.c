@@ -3906,6 +3906,8 @@ static void ParseShaderText(const char *text) {
                 } else if (!Q_stricmp(token, "rgbGen") || !Q_stricmp(token, "rgbgen")) {
                     token = COM_ParseExt(&p, qfalse);
                     if (!Q_stricmp(token, "vertex")) cur.rgbGen = 1;
+                    else if (!Q_stricmp(token, "exactVertex") ||
+                             !Q_stricmp(token, "exactvertex")) cur.rgbGen = 1;
                     else if (!Q_stricmp(token, "lightingDiffuse") ||
                              !Q_stricmp(token, "lightingdiffuse")) cur.rgbGen = 2;
                     else if (!Q_stricmp(token, "wave")) cur.rgbGen = 3;
@@ -6087,6 +6089,28 @@ static void RE_RenderScene(const refdef_t *fd) {
                         else if (ptex->blendMode == 5) polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE_FULL;
                         /* Unresolved blend = upstream default shader = OPAQUE
                          * (GL_ONE/GL_ZERO). No flag set → opaque pipeline. */
+                    }
+
+                    /* One-shot audit: log the first time each distinct
+                     * poly shader routes through here. Grep the capture
+                     * log for '[decal-audit]' to confirm blood vs
+                     * bullet-mark vs markShadow land on the expected
+                     * blendMode + drawflag combination. */
+                    {
+                        static qhandle_t s_auditSeen[64];
+                        static int s_auditCount = 0;
+                        qboolean isNew = qtrue;
+                        for (int i = 0; i < s_auditCount; i++) {
+                            if (s_auditSeen[i] == poly->shader) { isNew = qfalse; break; }
+                        }
+                        if (isNew && s_auditCount < 64) {
+                            s_auditSeen[s_auditCount++] = poly->shader;
+                            ri.Printf(PRINT_ALL,
+                                "[decal-audit] shader=%d blendMode=%d polyFlags=0x%X\n",
+                                (int)poly->shader,
+                                ptex ? (int)ptex->blendMode : -1,
+                                (unsigned)polyFlags);
+                        }
                     }
 
                     s_entityDraws[entityDrawCursor].firstIndex = firstIndex;

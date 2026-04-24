@@ -151,11 +151,14 @@ enum {
      * shell, regen, battlesuit). Swift flips the entity fragment's tcGen
      * path to compute reflection-based UVs instead of mesh ST. */
     Q3_METAL_ENTITY_DRAWFLAG_TCGEN_ENV = 1u << 5,
-    /* blendFunc GL_ZERO GL_ONE_MINUS_SRC_COLOR — subtractive darkening
-     * used by blood marks (bloodMark), bullet marks (bullet_mrk), burn
-     * marks, and markShadow. `out = dst * (1 - src)`; dark src darkens
-     * the surface. Previously fell through to ADDITIVE which rendered
-     * decals near-invisibly. */
+    /* blendFunc GL_ZERO GL_ONE_MINUS_SRC_COLOR — inverse darken,
+     * `out = dst * (1 - src)`; dark src darkens destination. Used by
+     * bullet marks (gfx/damage/bullet_mrk), burn marks (burn_med_mrk),
+     * wall hole marks (hole_lg_mrk), and markShadow (player foot blob).
+     * bloodMark does NOT use this — it declares
+     * `blendFunc GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA` and routes to
+     * DRAWFLAG_ALPHA (pass 2). Previously fell through to ADDITIVE
+     * which rendered decals near-invisibly. */
     Q3_METAL_ENTITY_DRAWFLAG_SUBTRACT = 1u << 6,
     /* Draw originated from RE_AddPolyToScene (bullet marks, shadow blobs,
      * blood splats, particle sprays). Swift side forces rgbGen=vertex
