@@ -288,11 +288,11 @@ PROTOCOL
 
 #define	OLD_PROTOCOL_VERSION	68
 // new protocol with UDP spoofing protection:
-#define	NEW_PROTOCOL_VERSION	71
+#define	NEW_PROTOCOL_VERSION	73
 // 1.31 - 67
 
-#define DEFAULT_PROTOCOL_VERSION	OLD_PROTOCOL_VERSION
-
+//#define DEFAULT_PROTOCOL_VERSION	OLD_PROTOCOL_VERSION
+#define DEFAULT_PROTOCOL_VERSION 73
 
 // maintain a list of compatible protocols for demo playing
 // NOTE: that stuff only works with two digits protocols

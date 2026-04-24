@@ -10,7 +10,11 @@ struct Quake3_iOSApp: App {
                 MetalView()
                     .ignoresSafeArea()
 
-                ConsoleOverlay()
+                // Console button temporarily disabled so ground-truth
+                // visual diffs don't flag the blue ">_" overlay as a
+                // rendering bug. Re-enable when dev console access is
+                // needed on-device.
+                // ConsoleOverlay()
             }
             .statusBarHidden(true)
             .persistentSystemOverlays(.hidden)
@@ -51,12 +55,17 @@ struct ConsoleOverlay: View {
                 }
             }) {
                 Text(">_")
-                    .font(.system(size: 14, weight: .bold, design: .monospaced))
+                    .font(.system(size: 22, weight: .bold, design: .monospaced))
                     .foregroundColor(.white)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(Color.black.opacity(0.55))
-                    .cornerRadius(6)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(Color(red: 0.12, green: 0.42, blue: 0.86))   // bright blue so
+                    .cornerRadius(8)                                          // it stands out on
+                    .overlay(                                                 // any dark scene
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color.white.opacity(0.9), lineWidth: 1.5)
+                    )
+                    .shadow(color: Color.black.opacity(0.6), radius: 3, x: 0, y: 2)
             }
             .accessibilityLabel("Toggle console")
 

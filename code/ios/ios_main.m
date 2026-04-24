@@ -688,6 +688,10 @@ void Quake3_Init(const char *basePath) {
         "seta cg_draw2D 0; "
         "seta cg_drawGun 1; "
         "seta cg_drawCrosshair 0; "
+        /* Force wall marks ON so blood/bullet/shadow decals submit
+         * via trap_R_AddPolyToScene → RE_AddPolyToScene. */
+        "seta cg_marks 1; "
+        "seta cg_brassTime 2500; "
         "seta r_picmip 0; "
         "seta r_texturebits 32; "
         "seta r_colorbits 32; "
@@ -720,11 +724,9 @@ void Quake3_Init(const char *basePath) {
          * Containers/Data/Application/<UUID>/Documents/baseq3/videos/
          * four.avi. */
         /* Give the demo + map load ~2s of engine time to produce a
-         * rendered scene before video starts (opening instantly
-         * captures the pre-load black clear-color). Then record 12s
-         * at 25fps (300 frames), stop, quit. Bump wait 1500 for full
-         * 60s demo. */
-        "demo four; wait 50; video four; wait 300; stopvideo; quit\n");
+         * rendered scene before video starts. 1500 frames = 60s of
+         * demo at 25fps — full demo four coverage. */
+        "demo four; wait 50; video four; wait 1500; stopvideo; quit\n");
     engine_initialized = qtrue;
 
     Com_Printf("=== Quake3 iOS Engine Initialized ===\n");
