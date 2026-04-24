@@ -3893,10 +3893,20 @@ static void ParseShaderText(const char *text) {
                         tcGenEnv = qtrue;
                     }
                 } else if (!Q_stricmp(token, "blendFunc") || !Q_stricmp(token, "blendfunc")) {
-                    const char *src = COM_ParseExt(&p, qfalse);
+                    /* COM_ParseExt returns a pointer into a shared static
+                     * buffer that the next call overwrites. Capture src
+                     * into a local BEFORE parsing dst — otherwise src and
+                     * dst end up pointing at the same (dst) token and
+                     * BlendModeFromTokens sees (dst,dst). That silently
+                     * mis-routed GL_ZERO/GL_ONE_MINUS_SRC_COLOR decals
+                     * (bullet_mrk, markShadow, burn_med_mrk, hole_lg_mrk)
+                     * to filter instead of subtract. */
+                    char srcCopy[MAX_TOKEN_CHARS];
+                    const char *srcTok = COM_ParseExt(&p, qfalse);
+                    Q_strncpyz(srcCopy, srcTok, sizeof(srcCopy));
                     const char *dst = COM_ParseExt(&p, qfalse);
-                    if (src[0]) {
-                        cur.blendMode = BlendModeFromTokens(src, dst);
+                    if (srcCopy[0]) {
+                        cur.blendMode = BlendModeFromTokens(srcCopy, dst);
                     }
                 } else if (!Q_stricmp(token, "alphaFunc") || !Q_stricmp(token, "alphafunc")) {
                     token = COM_ParseExt(&p, qfalse);
