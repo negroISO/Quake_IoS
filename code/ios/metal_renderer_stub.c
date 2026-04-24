@@ -3923,40 +3923,43 @@ static void ParseShaderText(const char *text) {
                     else if (!Q_stricmp(token, "wave")) cur.rgbGen = 3;
                     else cur.rgbGen = 0;
                     if (!Q_stricmp(token, "wave")) {
-                        const char *funcTok = COM_ParseExt(&p, qfalse);
-                        const char *baseTok = COM_ParseExt(&p, qfalse);
-                        const char *ampTok = COM_ParseExt(&p, qfalse);
-                        const char *phaseTok = COM_ParseExt(&p, qfalse);
-                        const char *freqTok = COM_ParseExt(&p, qfalse);
-                        if (funcTok[0]) {
-                            if (!Q_stricmp(funcTok, "sin")) cur.rgbWaveFunc = 1;
-                            else if (!Q_stricmp(funcTok, "triangle")) cur.rgbWaveFunc = 2;
-                            else if (!Q_stricmp(funcTok, "square")) cur.rgbWaveFunc = 3;
-                            else if (!Q_stricmp(funcTok, "sawtooth")) cur.rgbWaveFunc = 4;
-                            else if (!Q_stricmp(funcTok, "inversesawtooth") ||
-                                     !Q_stricmp(funcTok, "inverseSawtooth")) cur.rgbWaveFunc = 5;
-                            else if (!Q_stricmp(funcTok, "noise")) cur.rgbWaveFunc = 6;
+                        /* Copy tokens to locals — COM_ParseExt returns a
+                         * pointer into a shared static buffer. */
+                        char funcBuf[MAX_TOKEN_CHARS], baseBuf[MAX_TOKEN_CHARS];
+                        char ampBuf[MAX_TOKEN_CHARS], phaseBuf[MAX_TOKEN_CHARS];
+                        char freqBuf[MAX_TOKEN_CHARS];
+                        Q_strncpyz(funcBuf, COM_ParseExt(&p, qfalse), sizeof(funcBuf));
+                        Q_strncpyz(baseBuf, COM_ParseExt(&p, qfalse), sizeof(baseBuf));
+                        Q_strncpyz(ampBuf, COM_ParseExt(&p, qfalse), sizeof(ampBuf));
+                        Q_strncpyz(phaseBuf, COM_ParseExt(&p, qfalse), sizeof(phaseBuf));
+                        Q_strncpyz(freqBuf, COM_ParseExt(&p, qfalse), sizeof(freqBuf));
+                        if (funcBuf[0]) {
+                            if (!Q_stricmp(funcBuf, "sin")) cur.rgbWaveFunc = 1;
+                            else if (!Q_stricmp(funcBuf, "triangle")) cur.rgbWaveFunc = 2;
+                            else if (!Q_stricmp(funcBuf, "square")) cur.rgbWaveFunc = 3;
+                            else if (!Q_stricmp(funcBuf, "sawtooth")) cur.rgbWaveFunc = 4;
+                            else if (!Q_stricmp(funcBuf, "inversesawtooth") ||
+                                     !Q_stricmp(funcBuf, "inverseSawtooth")) cur.rgbWaveFunc = 5;
+                            else if (!Q_stricmp(funcBuf, "noise")) cur.rgbWaveFunc = 6;
                             else cur.rgbWaveFunc = 1;
                         }
-                        if (baseTok[0]) cur.rgbWaveBase = (float)atof(baseTok);
-                        if (ampTok[0]) cur.rgbWaveAmp = (float)atof(ampTok);
-                        if (phaseTok[0]) cur.rgbWavePhase = (float)atof(phaseTok);
-                        if (freqTok[0]) cur.rgbWaveFreq = (float)atof(freqTok);
+                        if (baseBuf[0]) cur.rgbWaveBase = (float)atof(baseBuf);
+                        if (ampBuf[0]) cur.rgbWaveAmp = (float)atof(ampBuf);
+                        if (phaseBuf[0]) cur.rgbWavePhase = (float)atof(phaseBuf);
+                        if (freqBuf[0]) cur.rgbWaveFreq = (float)atof(freqBuf);
                     } else if (!Q_stricmp(token, "const")) {
-                        /* rgbGen const takes a parenthesized vec3:
-                         * '( r g b )' = 5 tokens. Encoded as mode 4 so
-                         * the entity fragment multiplies texel.rgb by
-                         * the constant tint (CGEN_CONST parity). */
-                        const char *openParen = COM_ParseExt(&p, qfalse);
-                        const char *rTok = COM_ParseExt(&p, qfalse);
-                        const char *gTok = COM_ParseExt(&p, qfalse);
-                        const char *bTok = COM_ParseExt(&p, qfalse);
+                        /* rgbGen const ( r g b ). Copy r/g/b to locals so
+                         * the tokens survive subsequent COM_ParseExt calls. */
+                        char rBuf[MAX_TOKEN_CHARS], gBuf[MAX_TOKEN_CHARS], bBuf[MAX_TOKEN_CHARS];
+                        (void)COM_ParseExt(&p, qfalse); /* opening paren */
+                        Q_strncpyz(rBuf, COM_ParseExt(&p, qfalse), sizeof(rBuf));
+                        Q_strncpyz(gBuf, COM_ParseExt(&p, qfalse), sizeof(gBuf));
+                        Q_strncpyz(bBuf, COM_ParseExt(&p, qfalse), sizeof(bBuf));
                         (void)COM_ParseExt(&p, qfalse); /* closing paren */
-                        (void)openParen;
                         cur.rgbGen = 4;
-                        cur.rgbConstColor[0] = (rTok && rTok[0]) ? (float)atof(rTok) : 1.0f;
-                        cur.rgbConstColor[1] = (gTok && gTok[0]) ? (float)atof(gTok) : 1.0f;
-                        cur.rgbConstColor[2] = (bTok && bTok[0]) ? (float)atof(bTok) : 1.0f;
+                        cur.rgbConstColor[0] = rBuf[0] ? (float)atof(rBuf) : 1.0f;
+                        cur.rgbConstColor[1] = gBuf[0] ? (float)atof(gBuf) : 1.0f;
+                        cur.rgbConstColor[2] = bBuf[0] ? (float)atof(bBuf) : 1.0f;
                     }
                     /* exactVertex / exactvertex / identity / vertex /
                      * lightingDiffuse / oneMinusVertex / oneMinusEntity /
@@ -3973,25 +3976,30 @@ static void ParseShaderText(const char *text) {
                     else if (!Q_stricmp(token, "const")) cur.alphaGen = 4;
                     else cur.alphaGen = 0;
                     if (!Q_stricmp(token, "wave")) {
-                        const char *funcTok = COM_ParseExt(&p, qfalse);
-                        const char *baseTok = COM_ParseExt(&p, qfalse);
-                        const char *ampTok = COM_ParseExt(&p, qfalse);
-                        const char *phaseTok = COM_ParseExt(&p, qfalse);
-                        const char *freqTok = COM_ParseExt(&p, qfalse);
-                        if (funcTok[0]) {
-                            if (!Q_stricmp(funcTok, "sin")) cur.alphaWaveFunc = 1;
-                            else if (!Q_stricmp(funcTok, "triangle")) cur.alphaWaveFunc = 2;
-                            else if (!Q_stricmp(funcTok, "square")) cur.alphaWaveFunc = 3;
-                            else if (!Q_stricmp(funcTok, "sawtooth")) cur.alphaWaveFunc = 4;
-                            else if (!Q_stricmp(funcTok, "inversesawtooth") ||
-                                     !Q_stricmp(funcTok, "inverseSawtooth")) cur.alphaWaveFunc = 5;
-                            else if (!Q_stricmp(funcTok, "noise")) cur.alphaWaveFunc = 6;
+                        /* See rgbGen wave: COM_ParseExt aliases into a
+                         * shared static buffer; copy to locals. */
+                        char funcBuf[MAX_TOKEN_CHARS], baseBuf[MAX_TOKEN_CHARS];
+                        char ampBuf[MAX_TOKEN_CHARS], phaseBuf[MAX_TOKEN_CHARS];
+                        char freqBuf[MAX_TOKEN_CHARS];
+                        Q_strncpyz(funcBuf, COM_ParseExt(&p, qfalse), sizeof(funcBuf));
+                        Q_strncpyz(baseBuf, COM_ParseExt(&p, qfalse), sizeof(baseBuf));
+                        Q_strncpyz(ampBuf, COM_ParseExt(&p, qfalse), sizeof(ampBuf));
+                        Q_strncpyz(phaseBuf, COM_ParseExt(&p, qfalse), sizeof(phaseBuf));
+                        Q_strncpyz(freqBuf, COM_ParseExt(&p, qfalse), sizeof(freqBuf));
+                        if (funcBuf[0]) {
+                            if (!Q_stricmp(funcBuf, "sin")) cur.alphaWaveFunc = 1;
+                            else if (!Q_stricmp(funcBuf, "triangle")) cur.alphaWaveFunc = 2;
+                            else if (!Q_stricmp(funcBuf, "square")) cur.alphaWaveFunc = 3;
+                            else if (!Q_stricmp(funcBuf, "sawtooth")) cur.alphaWaveFunc = 4;
+                            else if (!Q_stricmp(funcBuf, "inversesawtooth") ||
+                                     !Q_stricmp(funcBuf, "inverseSawtooth")) cur.alphaWaveFunc = 5;
+                            else if (!Q_stricmp(funcBuf, "noise")) cur.alphaWaveFunc = 6;
                             else cur.alphaWaveFunc = 1;
                         }
-                        if (baseTok[0]) cur.alphaWaveBase = (float)atof(baseTok);
-                        if (ampTok[0]) cur.alphaWaveAmp = (float)atof(ampTok);
-                        if (phaseTok[0]) cur.alphaWavePhase = (float)atof(phaseTok);
-                        if (freqTok[0]) cur.alphaWaveFreq = (float)atof(freqTok);
+                        if (baseBuf[0]) cur.alphaWaveBase = (float)atof(baseBuf);
+                        if (ampBuf[0]) cur.alphaWaveAmp = (float)atof(ampBuf);
+                        if (phaseBuf[0]) cur.alphaWavePhase = (float)atof(phaseBuf);
+                        if (freqBuf[0]) cur.alphaWaveFreq = (float)atof(freqBuf);
                     } else if (!Q_stricmp(token, "const")) {
                         /* alphaGen const <value>: fixed alpha channel. */
                         const char *vTok = COM_ParseExt(&p, qfalse);
@@ -4002,38 +4010,43 @@ static void ParseShaderText(const char *text) {
                 } else if (!Q_stricmp(token, "tcMod") || !Q_stricmp(token, "tcmod")) {
                     token = COM_ParseExt(&p, qfalse);
                     if (token[0] && !Q_stricmp(token, "scroll")) {
-                        const char *sTok = COM_ParseExt(&p, qfalse);
-                        const char *tTok = COM_ParseExt(&p, qfalse);
-                        if (sTok[0] && tTok[0] && cur.tcModCount < Q3_MAX_TCMODS) {
+                        /* Copy tokens — COM_ParseExt aliases its static buffer. */
+                        char sBuf[MAX_TOKEN_CHARS], tBuf[MAX_TOKEN_CHARS];
+                        Q_strncpyz(sBuf, COM_ParseExt(&p, qfalse), sizeof(sBuf));
+                        Q_strncpyz(tBuf, COM_ParseExt(&p, qfalse), sizeof(tBuf));
+                        if (sBuf[0] && tBuf[0] && cur.tcModCount < Q3_MAX_TCMODS) {
                             cur.tcMods[cur.tcModCount].type = 1;
-                            cur.tcMods[cur.tcModCount].params[0] = (float)atof(sTok);
-                            cur.tcMods[cur.tcModCount].params[1] = (float)atof(tTok);
+                            cur.tcMods[cur.tcModCount].params[0] = (float)atof(sBuf);
+                            cur.tcMods[cur.tcModCount].params[1] = (float)atof(tBuf);
                             cur.tcMods[cur.tcModCount].params[2] = 0.0f;
                             cur.tcMods[cur.tcModCount].params[3] = 0.0f;
                             cur.tcModCount += 1;
                         }
                     } else if (token[0] && !Q_stricmp(token, "scale")) {
-                        const char *sTok = COM_ParseExt(&p, qfalse);
-                        const char *tTok = COM_ParseExt(&p, qfalse);
-                        if (sTok[0] && tTok[0] && cur.tcModCount < Q3_MAX_TCMODS) {
+                        char sBuf[MAX_TOKEN_CHARS], tBuf[MAX_TOKEN_CHARS];
+                        Q_strncpyz(sBuf, COM_ParseExt(&p, qfalse), sizeof(sBuf));
+                        Q_strncpyz(tBuf, COM_ParseExt(&p, qfalse), sizeof(tBuf));
+                        if (sBuf[0] && tBuf[0] && cur.tcModCount < Q3_MAX_TCMODS) {
                             cur.tcMods[cur.tcModCount].type = 4;
-                            cur.tcMods[cur.tcModCount].params[0] = (float)atof(sTok);
-                            cur.tcMods[cur.tcModCount].params[1] = (float)atof(tTok);
+                            cur.tcMods[cur.tcModCount].params[0] = (float)atof(sBuf);
+                            cur.tcMods[cur.tcModCount].params[1] = (float)atof(tBuf);
                             cur.tcMods[cur.tcModCount].params[2] = 0.0f;
                             cur.tcMods[cur.tcModCount].params[3] = 0.0f;
                             cur.tcModCount += 1;
                         }
                     } else if (token[0] && !Q_stricmp(token, "turb")) {
-                        const char *baseTok = COM_ParseExt(&p, qfalse);
-                        const char *ampTok = COM_ParseExt(&p, qfalse);
-                        const char *phaseTok = COM_ParseExt(&p, qfalse);
-                        const char *freqTok = COM_ParseExt(&p, qfalse);
-                        (void)baseTok;
-                        if (ampTok[0] && phaseTok[0] && freqTok[0] && cur.tcModCount < Q3_MAX_TCMODS) {
+                        char baseBuf[MAX_TOKEN_CHARS], ampBuf[MAX_TOKEN_CHARS];
+                        char phaseBuf[MAX_TOKEN_CHARS], freqBuf[MAX_TOKEN_CHARS];
+                        Q_strncpyz(baseBuf, COM_ParseExt(&p, qfalse), sizeof(baseBuf));
+                        Q_strncpyz(ampBuf, COM_ParseExt(&p, qfalse), sizeof(ampBuf));
+                        Q_strncpyz(phaseBuf, COM_ParseExt(&p, qfalse), sizeof(phaseBuf));
+                        Q_strncpyz(freqBuf, COM_ParseExt(&p, qfalse), sizeof(freqBuf));
+                        (void)baseBuf;
+                        if (ampBuf[0] && phaseBuf[0] && freqBuf[0] && cur.tcModCount < Q3_MAX_TCMODS) {
                             cur.tcMods[cur.tcModCount].type = 5;
-                            cur.tcMods[cur.tcModCount].params[0] = (float)atof(ampTok);
-                            cur.tcMods[cur.tcModCount].params[1] = (float)atof(freqTok);
-                            cur.tcMods[cur.tcModCount].params[2] = (float)atof(phaseTok);
+                            cur.tcMods[cur.tcModCount].params[0] = (float)atof(ampBuf);
+                            cur.tcMods[cur.tcModCount].params[1] = (float)atof(freqBuf);
+                            cur.tcMods[cur.tcModCount].params[2] = (float)atof(phaseBuf);
                             cur.tcMods[cur.tcModCount].params[3] = 0.0f;
                             cur.tcModCount += 1;
                         }
@@ -4053,19 +4066,23 @@ static void ParseShaderText(const char *text) {
                          * stretch is used for pulse-zoom on powerups). Type=6
                          * is our encoding; params = (base, amp, phase, freq).
                          * Mirrors RB_CalcStretchTexCoords + RB_CalcTransformTexCoords. */
-                        const char *funcTok = COM_ParseExt(&p, qfalse);
-                        const char *baseTok = COM_ParseExt(&p, qfalse);
-                        const char *ampTok  = COM_ParseExt(&p, qfalse);
-                        const char *phaseTok = COM_ParseExt(&p, qfalse);
-                        const char *freqTok = COM_ParseExt(&p, qfalse);
-                        if (funcTok[0] && baseTok[0] && ampTok[0] &&
-                            phaseTok[0] && freqTok[0] &&
+                        char funcBuf[MAX_TOKEN_CHARS], baseBuf[MAX_TOKEN_CHARS];
+                        char ampBuf[MAX_TOKEN_CHARS], phaseBuf[MAX_TOKEN_CHARS];
+                        char freqBuf[MAX_TOKEN_CHARS];
+                        Q_strncpyz(funcBuf, COM_ParseExt(&p, qfalse), sizeof(funcBuf));
+                        Q_strncpyz(baseBuf, COM_ParseExt(&p, qfalse), sizeof(baseBuf));
+                        Q_strncpyz(ampBuf, COM_ParseExt(&p, qfalse), sizeof(ampBuf));
+                        Q_strncpyz(phaseBuf, COM_ParseExt(&p, qfalse), sizeof(phaseBuf));
+                        Q_strncpyz(freqBuf, COM_ParseExt(&p, qfalse), sizeof(freqBuf));
+                        /* GF_SIN only — func token consumed but not encoded. */
+                        if (funcBuf[0] && baseBuf[0] && ampBuf[0] &&
+                            phaseBuf[0] && freqBuf[0] &&
                             cur.tcModCount < Q3_MAX_TCMODS) {
                             cur.tcMods[cur.tcModCount].type = 6;
-                            cur.tcMods[cur.tcModCount].params[0] = (float)atof(baseTok);
-                            cur.tcMods[cur.tcModCount].params[1] = (float)atof(ampTok);
-                            cur.tcMods[cur.tcModCount].params[2] = (float)atof(phaseTok);
-                            cur.tcMods[cur.tcModCount].params[3] = (float)atof(freqTok);
+                            cur.tcMods[cur.tcModCount].params[0] = (float)atof(baseBuf);
+                            cur.tcMods[cur.tcModCount].params[1] = (float)atof(ampBuf);
+                            cur.tcMods[cur.tcModCount].params[2] = (float)atof(phaseBuf);
+                            cur.tcMods[cur.tcModCount].params[3] = (float)atof(freqBuf);
                             cur.tcModCount += 1;
                         }
                     } else if (token[0] && !Q_stricmp(token, "transform")) {
