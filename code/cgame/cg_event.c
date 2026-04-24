@@ -539,6 +539,17 @@ void CG_EntityEvent( centity_t *cent, vec3_t position ) {
 		return;
 	}
 
+	{
+		static int s_evTotal = 0;
+		static int s_evLastLogged = -1;
+		s_evTotal++;
+		if ( s_evTotal == 1 || s_evTotal - s_evLastLogged >= 128 ) {
+			CG_Printf( "[cgame-instr] CG_EntityEvent total=%d last_event=%d ent=%d\n",
+				s_evTotal, event, es->number );
+			s_evLastLogged = s_evTotal;
+		}
+	}
+
 	clientNum = es->clientNum;
 	if ( clientNum < 0 || clientNum >= MAX_CLIENTS ) {
 		clientNum = 0;
@@ -964,18 +975,33 @@ void CG_EntityEvent( centity_t *cent, vec3_t position ) {
 	//
 	case EV_MISSILE_HIT:
 		DEBUGNAME("EV_MISSILE_HIT");
+		{
+			static int s_nMH = 0;
+			if ( ++s_nMH <= 4 || ( s_nMH % 16 ) == 0 )
+				CG_Printf( "[cgame-instr] event EV_MISSILE_HIT n=%d wpn=%d\n", s_nMH, es->weapon );
+		}
 		ByteToDir( es->eventParm, dir );
 		CG_MissileHitPlayer( es->weapon, position, dir, es->otherEntityNum );
 		break;
 
 	case EV_MISSILE_MISS:
 		DEBUGNAME("EV_MISSILE_MISS");
+		{
+			static int s_nMM = 0;
+			if ( ++s_nMM <= 4 || ( s_nMM % 16 ) == 0 )
+				CG_Printf( "[cgame-instr] event EV_MISSILE_MISS n=%d wpn=%d\n", s_nMM, es->weapon );
+		}
 		ByteToDir( es->eventParm, dir );
 		CG_MissileHitWall( es->weapon, 0, position, dir, IMPACTSOUND_DEFAULT );
 		break;
 
 	case EV_MISSILE_MISS_METAL:
 		DEBUGNAME("EV_MISSILE_MISS_METAL");
+		{
+			static int s_nMMm = 0;
+			if ( ++s_nMMm <= 4 || ( s_nMMm % 16 ) == 0 )
+				CG_Printf( "[cgame-instr] event EV_MISSILE_MISS_METAL n=%d wpn=%d\n", s_nMMm, es->weapon );
+		}
 		ByteToDir( es->eventParm, dir );
 		CG_MissileHitWall( es->weapon, 0, position, dir, IMPACTSOUND_METAL );
 		break;
@@ -1003,12 +1029,22 @@ void CG_EntityEvent( centity_t *cent, vec3_t position ) {
 
 	case EV_BULLET_HIT_WALL:
 		DEBUGNAME("EV_BULLET_HIT_WALL");
+		{
+			static int s_nBHW = 0;
+			if ( ++s_nBHW <= 4 || ( s_nBHW % 32 ) == 0 )
+				CG_Printf( "[cgame-instr] event EV_BULLET_HIT_WALL n=%d\n", s_nBHW );
+		}
 		ByteToDir( es->eventParm, dir );
 		CG_Bullet( es->pos.trBase, es->otherEntityNum, dir, qfalse, ENTITYNUM_WORLD );
 		break;
 
 	case EV_BULLET_HIT_FLESH:
 		DEBUGNAME("EV_BULLET_HIT_FLESH");
+		{
+			static int s_nBHF = 0;
+			if ( ++s_nBHF <= 4 || ( s_nBHF % 32 ) == 0 )
+				CG_Printf( "[cgame-instr] event EV_BULLET_HIT_FLESH n=%d\n", s_nBHF );
+		}
 		CG_Bullet( es->pos.trBase, es->otherEntityNum, dir, qtrue, es->eventParm );
 		break;
 

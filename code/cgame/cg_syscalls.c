@@ -259,10 +259,24 @@ void	trap_R_AddRefEntityToScene( const refEntity_t *re ) {
 }
 
 void	trap_R_AddPolyToScene( qhandle_t hShader , int numVerts, const polyVert_t *verts ) {
+	static int s_trapAddPolyCount = 0;
+	static int s_trapAddPolyLastLogged = -1;
+	s_trapAddPolyCount++;
+	if ( s_trapAddPolyCount == 1 || s_trapAddPolyCount - s_trapAddPolyLastLogged >= 64 ) {
+		CG_Printf( "[cgame-instr] trap_R_AddPolyToScene count=%d shader=%d nv=%d\n",
+			s_trapAddPolyCount, (int)hShader, numVerts );
+		s_trapAddPolyLastLogged = s_trapAddPolyCount;
+	}
 	syscall( CG_R_ADDPOLYTOSCENE, hShader, numVerts, verts );
 }
 
 void	trap_R_AddPolysToScene( qhandle_t hShader , int numVerts, const polyVert_t *verts, int num ) {
+	static int s_trapAddPolysCount = 0;
+	s_trapAddPolysCount++;
+	if ( s_trapAddPolysCount == 1 || ( s_trapAddPolysCount % 64 ) == 0 ) {
+		CG_Printf( "[cgame-instr] trap_R_AddPolysToScene count=%d shader=%d nv=%d num=%d\n",
+			s_trapAddPolysCount, (int)hShader, numVerts, num );
+	}
 	syscall( CG_R_ADDPOLYSTOSCENE, hShader, numVerts, verts, num );
 }
 

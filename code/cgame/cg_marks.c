@@ -127,7 +127,7 @@ passed to the renderer.
 #define	MAX_MARK_FRAGMENTS	128
 #define	MAX_MARK_POINTS		384
 
-void CG_ImpactMark( qhandle_t markShader, const vec3_t origin, const vec3_t dir, 
+void CG_ImpactMark( qhandle_t markShader, const vec3_t origin, const vec3_t dir,
 				   float orientation, float red, float green, float blue, float alpha,
 				   qboolean alphaFade, float radius, qboolean temporary ) {
 	vec3_t			axis[3];
@@ -139,9 +139,23 @@ void CG_ImpactMark( qhandle_t markShader, const vec3_t origin, const vec3_t dir,
 	markFragment_t	markFragments[MAX_MARK_FRAGMENTS], *mf;
 	vec3_t			markPoints[MAX_MARK_POINTS];
 	vec3_t			projection;
+	static int		s_impactMarkCount = 0;
+	static int		s_impactMarkGated = 0;
 
 	if ( !cg_addMarks.integer ) {
+		s_impactMarkGated++;
+		if ( s_impactMarkGated == 1 || ( s_impactMarkGated % 32 ) == 0 ) {
+			CG_Printf( "[cgame-instr] CG_ImpactMark GATED cg_addMarks=0 gated=%d\n",
+				s_impactMarkGated );
+		}
 		return;
+	}
+
+	s_impactMarkCount++;
+	if ( s_impactMarkCount <= 4 || ( s_impactMarkCount % 32 ) == 0 ) {
+		CG_Printf( "[cgame-instr] CG_ImpactMark count=%d shader=%d radius=%.1f temp=%d origin=%.0f,%.0f,%.0f\n",
+			s_impactMarkCount, (int)markShader, radius, (int)temporary,
+			origin[0], origin[1], origin[2] );
 	}
 
 	if ( radius <= 0 ) {
@@ -173,6 +187,16 @@ void CG_ImpactMark( qhandle_t markShader, const vec3_t origin, const vec3_t dir,
 	numFragments = trap_CM_MarkFragments( 4, (void *)originalPoints,
 					projection, MAX_MARK_POINTS, markPoints[0],
 					MAX_MARK_FRAGMENTS, markFragments );
+	{
+		static int s_markFragCalls = 0;
+		static int s_markFragZero = 0;
+		s_markFragCalls++;
+		if ( numFragments == 0 ) s_markFragZero++;
+		if ( s_markFragCalls <= 8 || ( s_markFragCalls % 64 ) == 0 ) {
+			CG_Printf( "[cgame-instr] trap_CM_MarkFragments calls=%d zeroRet=%d thisRet=%d radius=%.1f\n",
+				s_markFragCalls, s_markFragZero, numFragments, radius );
+		}
+	}
 
 	colors[0] = red * 255;
 	colors[1] = green * 255;
@@ -238,10 +262,19 @@ void CG_AddMarks( void ) {
 	markPoly_t	*mp, *next;
 	int			t;
 	int			fade;
+	int			marksDrawn = 0;
+	static int	s_addMarksCalls = 0;
+	static int	s_addMarksGated = 0;
 
 	if ( !cg_addMarks.integer ) {
+		s_addMarksGated++;
+		if ( s_addMarksGated == 1 || ( s_addMarksGated % 300 ) == 0 ) {
+			CG_Printf( "[cgame-instr] CG_AddMarks GATED cg_addMarks=0 n=%d\n", s_addMarksGated );
+		}
 		return;
 	}
+
+	s_addMarksCalls++;
 
 	mp = cg_activeMarkPolys.nextMark;
 	for ( ; mp != &cg_activeMarkPolys ; mp = next ) {
@@ -292,5 +325,11 @@ void CG_AddMarks( void ) {
 
 
 		trap_R_AddPolyToScene( mp->markShader, mp->poly.numVerts, mp->verts );
+		marksDrawn++;
+	}
+
+	if ( s_addMarksCalls <= 4 || ( s_addMarksCalls % 60 ) == 0 ) {
+		CG_Printf( "[cgame-instr] CG_AddMarks calls=%d marksDrawn=%d\n",
+			s_addMarksCalls, marksDrawn );
 	}
 }
