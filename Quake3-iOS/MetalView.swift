@@ -1621,6 +1621,13 @@ struct MetalView: UIViewRepresentable {
             }
 
             encoder.endEncoding()
+            // Cache drawable.texture BEFORE present(). Reading
+            // drawable.texture after commandBuffer.present(drawable)
+            // logs "[CAMetalLayerDrawable texture] should not be called
+            // after already presenting this drawable." The MTLTexture
+            // reference itself stays valid post-present — only the
+            // drawable.texture accessor complains.
+            let tex = drawable.texture
             commandBuffer.present(drawable)
             commandBuffer.commit()
 
@@ -1633,7 +1640,6 @@ struct MetalView: UIViewRepresentable {
             // CL_VideoRecording() so idle runs incur no readback cost.
             if CL_VideoRecording() != 0 {
                 commandBuffer.waitUntilCompleted()
-                let tex = drawable.texture
                 let w = tex.width
                 let h = tex.height
                 let bytesPerRow = w * 4
