@@ -6106,9 +6106,11 @@ static void RE_RenderScene(const refdef_t *fd) {
                         if (isNew && s_auditCount < 64) {
                             s_auditSeen[s_auditCount++] = poly->shader;
                             ri.Printf(PRINT_ALL,
-                                "[decal-audit] shader=%d blendMode=%d polyFlags=0x%X\n",
+                                "[decal-audit] shader=%d name='%s' blendMode=%d rgbGen=%d polyFlags=0x%X\n",
                                 (int)poly->shader,
+                                ptex ? ptex->name : "(no-tex)",
                                 ptex ? (int)ptex->blendMode : -1,
+                                ptex ? (int)ptex->rgbGen    : -1,
                                 (unsigned)polyFlags);
                         }
                     }
