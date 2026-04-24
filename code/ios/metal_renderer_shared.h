@@ -133,7 +133,12 @@ enum {
     Q3_METAL_WORLD_DRAWFLAG_ALPHA = 1u << 3,
     Q3_METAL_WORLD_DRAWFLAG_FILTER = 1u << 4,
     Q3_METAL_WORLD_DRAWFLAG_SKY = 1u << 5,
-    Q3_METAL_WORLD_DRAWFLAG_PORTAL = 1u << 6
+    Q3_METAL_WORLD_DRAWFLAG_PORTAL = 1u << 6,
+    /* GL_ONE/GL_ONE — full-intensity additive (ignores alpha). Kept
+     * strictly distinct from DRAWFLAG_ADDITIVE (GL_SRC_ALPHA/GL_ONE,
+     * alpha-modulated). Merging the two caused explosion shaders to
+     * bleed full-screen yellow into the framebuffer. */
+    Q3_METAL_WORLD_DRAWFLAG_ADDITIVE_FULL = 1u << 7
 };
 
 enum {
@@ -151,7 +156,27 @@ enum {
      * marks, and markShadow. `out = dst * (1 - src)`; dark src darkens
      * the surface. Previously fell through to ADDITIVE which rendered
      * decals near-invisibly. */
-    Q3_METAL_ENTITY_DRAWFLAG_SUBTRACT = 1u << 6
+    Q3_METAL_ENTITY_DRAWFLAG_SUBTRACT = 1u << 6,
+    /* Draw originated from RE_AddPolyToScene (bullet marks, shadow blobs,
+     * blood splats, particle sprays). Swift side forces rgbGen=vertex
+     * and alphaGen=vertex for these so the cgame-supplied polyVert_t
+     * modulate color — which carries the CG_AddMarks fade — is respected
+     * instead of falling to texel.a (which would pin alpha to 1.0 for
+     * opaque decal textures). */
+    Q3_METAL_ENTITY_DRAWFLAG_SCENE_POLY = 1u << 7,
+    /* GL_ONE/GL_ONE — full-intensity additive for explosion cores and
+     * similar high-energy shaders. Distinct from DRAWFLAG_ADDITIVE
+     * (GL_SRC_ALPHA/GL_ONE) which modulates by source alpha. */
+    Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE_FULL = 1u << 8,
+    /* Implicit alphaFunc GT0 for the draw: discards texels where
+     * texel.a < 0.004. Applied to RT_SPRITE / billboard emits whose
+     * shader didn't declare alphaFunc but whose blendMode
+     * (additive / additive-full) ignores alpha at the blend stage —
+     * without a discard the dark-but-non-zero JPEG-compressed
+     * borders of rlboom/plasma/muzzle-flash sprites contribute fully
+     * to the framebuffer, producing the hard rectangular explosion
+     * quad visible in close-range combat. */
+    Q3_METAL_ENTITY_DRAWFLAG_ATEST_GT0 = 1u << 9
 };
 
 typedef struct {

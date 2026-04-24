@@ -1034,6 +1034,9 @@ static void PushStretchPicVertex(float x, float y, float s, float t, const float
     CopyColor(vertex->color, rgba);
 }
 
+/* Parallel BSP world (see block below LoadWorldMapData) — forward decl. */
+static void BspFreeWorld(void);
+
 static void FreeWorldMapData(void) {
     /* Preserve generation across the reset so Swift's cachedWorldGeneration
      * check invalidates on every map change. Without this, Com_Memset resets
@@ -1066,6 +1069,9 @@ static void FreeWorldMapData(void) {
     Com_Memset(s_worldFogsPublic, 0, sizeof(s_worldFogsPublic));
     Com_Memset(&s_world, 0, sizeof(s_world));
     s_world.generation = savedGeneration;
+
+    /* Parallel BSP tree cleanup — additive, map-scoped. */
+    BspFreeWorld();
 }
 
 static void FreeEntitySceneData(void) {
@@ -1828,6 +1834,859 @@ static void SetupEntityLighting(const refEntity_t *ent,
     }
 }
 
+/* ==========================================================================
+ * PARALLEL BSP WORLD — strict upstream layout (ioquake3 renderer/)
+ *
+ * These structs + loaders mirror ioq3 tr_local.h/tr_bsp.c/tr_curve.c exactly.
+ * They run alongside the existing Metal draw pipeline without disturbing it:
+ * the Metal pipeline drives on-screen rendering from the flattened
+ * Q3MetalWorldDrawCmd stream; this parallel tree is populated from the same
+ * BSP and exists so R_MarkFragments can BSP-traverse and per-surface clip
+ * impact polygons.
+ *
+ * Struct names are prefixed `bsp*` to avoid colliding with any future port
+ * of the full ioq3 renderer into this translation unit. Layouts MATCH
+ * upstream (see renderer/tr_local.h lines 652..833). All field names and
+ * semantics are preserved for faithful R_MarkFragments port.
+ * ========================================================================== */
+
+#include <limits.h>
+
+#ifndef BSP_VERTEXSIZE
+#define BSP_VERTEXSIZE 8
+#endif
+#define BSP_MAX_FACE_POINTS 1024
+#define BSP_MAX_GRID_SIZE   65
+#define BSP_MAX_PATCH_SIZE  32
+
+typedef enum {
+    BSP_SF_BAD,
+    BSP_SF_SKIP,
+    BSP_SF_FACE,
+    BSP_SF_GRID,
+    BSP_SF_TRIANGLES,
+    BSP_SF_POLY,
+    BSP_SF_MD3,
+    BSP_SF_MDR,
+    BSP_SF_IQM,
+    BSP_SF_FLARE,
+    BSP_SF_ENTITY,
+    BSP_SF_NUM_SURFACE_TYPES,
+    BSP_SF_MAX = 0x7fffffff
+} bspSurfaceType_t;
+
+typedef struct {
+    int surfaceFlags;
+    int contentFlags;
+} bspShader_t;
+
+typedef struct bspMsurface_s {
+    int                 viewCount;
+    bspShader_t         *shader;
+    int                 fogIndex;
+    bspSurfaceType_t    *data;
+} bspMsurface_t;
+
+typedef struct {
+    bspSurfaceType_t    surfaceType;
+    cplane_t            plane;
+    int                 numPoints;
+    int                 numIndices;
+    int                 ofsIndices;
+    float               points[1][BSP_VERTEXSIZE];
+} bspSrfSurfaceFace_t;
+
+typedef struct bspSrfGridMesh_s {
+    bspSurfaceType_t    surfaceType;
+    vec3_t              meshBounds[2];
+    vec3_t              localOrigin;
+    float               meshRadius;
+    vec3_t              lodOrigin;
+    float               lodRadius;
+    int                 lodFixed;
+    int                 lodStitched;
+    int                 width, height;
+    float               *widthLodError;
+    float               *heightLodError;
+    drawVert_t          verts[1];
+} bspSrfGridMesh_t;
+
+typedef struct {
+    bspSurfaceType_t    surfaceType;
+    vec3_t              bounds[2];
+    vec3_t              localOrigin;
+    float               radius;
+    int                 numIndexes;
+    int                 *indexes;
+    int                 numVerts;
+    drawVert_t          *verts;
+} bspSrfTriangles_t;
+
+typedef struct {
+    bspSurfaceType_t    surfaceType;
+    vec3_t              origin;
+    vec3_t              normal;
+    vec3_t              color;
+} bspSrfFlare_t;
+
+typedef struct bspMnode_s {
+    int                 contents;
+    int                 visframe;
+    vec3_t              mins, maxs;
+    struct bspMnode_s   *parent;
+    cplane_t            *plane;
+    struct bspMnode_s   *children[2];
+    int                 cluster;
+    int                 area;
+    bspMsurface_t       **firstmarksurface;
+    int                 nummarksurfaces;
+} bspMnode_t;
+
+static struct {
+    qboolean        loaded;
+    int             numplanes;
+    cplane_t        *planes;
+    int             numnodes;
+    int             numDecisionNodes;
+    bspMnode_t      *nodes;
+    int             numsurfaces;
+    bspMsurface_t   *surfaces;
+    int             nummarksurfaces;
+    bspMsurface_t   **marksurfaces;
+    int             numShaders;
+    bspShader_t     *shaders;
+    /* Linear pool for variable-size surface structs (face/grid/tri payload).
+     * Allocated once, freed once — mirrors ioq3's Hunk_Alloc usage pattern
+     * but on our ri.Malloc heap. */
+    byte            *blobPool;
+    size_t          blobUsed;
+    size_t          blobCap;
+} s_bspWorld;
+
+static int      s_bspViewCount;
+static cvar_t   *r_marksOnTriangleMeshes;
+static cvar_t   *r_subdivisions_bsp;
+
+static void *BspBlobAlloc(size_t bytes) {
+    void *p;
+    bytes = (bytes + 15u) & ~(size_t)15u;
+    if (s_bspWorld.blobUsed + bytes > s_bspWorld.blobCap) return NULL;
+    p = s_bspWorld.blobPool + s_bspWorld.blobUsed;
+    s_bspWorld.blobUsed += bytes;
+    Com_Memset(p, 0, bytes);
+    return p;
+}
+
+static float BspClampDenorm(float v) {
+    if (fabsf(v) > 0.0f && fabsf(v) < 1e-9f) return 0.0f;
+    return v;
+}
+
+/* ---- tr_curve.c port (verbatim from ioquake3 renderer/tr_curve.c) ---- */
+
+static void BspLerpDrawVert(drawVert_t *a, drawVert_t *b, drawVert_t *out) {
+    out->xyz[0] = 0.5f * (a->xyz[0] + b->xyz[0]);
+    out->xyz[1] = 0.5f * (a->xyz[1] + b->xyz[1]);
+    out->xyz[2] = 0.5f * (a->xyz[2] + b->xyz[2]);
+    out->st[0] = 0.5f * (a->st[0] + b->st[0]);
+    out->st[1] = 0.5f * (a->st[1] + b->st[1]);
+    out->lightmap[0] = 0.5f * (a->lightmap[0] + b->lightmap[0]);
+    out->lightmap[1] = 0.5f * (a->lightmap[1] + b->lightmap[1]);
+    out->color.rgba[0] = (a->color.rgba[0] + b->color.rgba[0]) >> 1;
+    out->color.rgba[1] = (a->color.rgba[1] + b->color.rgba[1]) >> 1;
+    out->color.rgba[2] = (a->color.rgba[2] + b->color.rgba[2]) >> 1;
+    out->color.rgba[3] = (a->color.rgba[3] + b->color.rgba[3]) >> 1;
+}
+
+static void BspTranspose(int width, int height, drawVert_t ctrl[BSP_MAX_GRID_SIZE][BSP_MAX_GRID_SIZE]) {
+    int i, j;
+    drawVert_t temp;
+    if (width > height) {
+        for (i = 0; i < height; i++) {
+            for (j = i + 1; j < width; j++) {
+                if (j < height) {
+                    temp = ctrl[j][i];
+                    ctrl[j][i] = ctrl[i][j];
+                    ctrl[i][j] = temp;
+                } else {
+                    ctrl[j][i] = ctrl[i][j];
+                }
+            }
+        }
+    } else {
+        for (i = 0; i < width; i++) {
+            for (j = i + 1; j < height; j++) {
+                if (j < width) {
+                    temp = ctrl[i][j];
+                    ctrl[i][j] = ctrl[j][i];
+                    ctrl[j][i] = temp;
+                } else {
+                    ctrl[i][j] = ctrl[j][i];
+                }
+            }
+        }
+    }
+}
+
+static void BspMakeMeshNormals(int width, int height, drawVert_t ctrl[BSP_MAX_GRID_SIZE][BSP_MAX_GRID_SIZE]) {
+    int i, j, k, dist;
+    vec3_t normal, sum, base, delta;
+    int x, y;
+    drawVert_t *dv;
+    vec3_t around[8], temp;
+    qboolean good[8];
+    qboolean wrapWidth, wrapHeight;
+    float len;
+    static const int neighbors[8][2] = { {0,1},{1,1},{1,0},{1,-1},{0,-1},{-1,-1},{-1,0},{-1,1} };
+
+    wrapWidth = qfalse;
+    for (i = 0; i < height; i++) {
+        VectorSubtract(ctrl[i][0].xyz, ctrl[i][width-1].xyz, delta);
+        len = VectorLengthSquared(delta);
+        if (len > 1.0f) break;
+    }
+    if (i == height) wrapWidth = qtrue;
+
+    wrapHeight = qfalse;
+    for (i = 0; i < width; i++) {
+        VectorSubtract(ctrl[0][i].xyz, ctrl[height-1][i].xyz, delta);
+        len = VectorLengthSquared(delta);
+        if (len > 1.0f) break;
+    }
+    if (i == width) wrapHeight = qtrue;
+
+    for (i = 0; i < width; i++) {
+        for (j = 0; j < height; j++) {
+            dv = &ctrl[j][i];
+            VectorCopy(dv->xyz, base);
+            for (k = 0; k < 8; k++) {
+                VectorClear(around[k]);
+                good[k] = qfalse;
+                for (dist = 1; dist <= 3; dist++) {
+                    x = i + neighbors[k][0] * dist;
+                    y = j + neighbors[k][1] * dist;
+                    if (wrapWidth) {
+                        if (x < 0) x = width - 1 + x;
+                        else if (x >= width) x = 1 + x - width;
+                    }
+                    if (wrapHeight) {
+                        if (y < 0) y = height - 1 + y;
+                        else if (y >= height) y = 1 + y - height;
+                    }
+                    if (x < 0 || x >= width || y < 0 || y >= height) break;
+                    VectorSubtract(ctrl[y][x].xyz, base, temp);
+                    if (VectorNormalize(temp) < 0.001f) continue;
+                    good[k] = qtrue;
+                    VectorCopy(temp, around[k]);
+                    break;
+                }
+            }
+            VectorClear(sum);
+            for (k = 0; k < 8; k++) {
+                if (!good[k] || !good[(k+1)&7]) continue;
+                CrossProduct(around[(k+1)&7], around[k], normal);
+                if (VectorNormalize(normal) < 0.001f) continue;
+                VectorAdd(normal, sum, sum);
+            }
+            VectorNormalize2(sum, dv->normal);
+            for (k = 0; k < 3; k++) dv->normal[k] = BspClampDenorm(dv->normal[k]);
+        }
+    }
+}
+
+static void BspInvertCtrl(int width, int height, drawVert_t ctrl[BSP_MAX_GRID_SIZE][BSP_MAX_GRID_SIZE]) {
+    int i, j;
+    drawVert_t temp;
+    for (i = 0; i < height; i++) {
+        for (j = 0; j < width/2; j++) {
+            temp = ctrl[i][j];
+            ctrl[i][j] = ctrl[i][width-1-j];
+            ctrl[i][width-1-j] = temp;
+        }
+    }
+}
+
+static void BspInvertErrorTable(float errorTable[2][BSP_MAX_GRID_SIZE], int width, int height) {
+    int i;
+    float copy[2][BSP_MAX_GRID_SIZE];
+    Com_Memcpy(copy, errorTable, sizeof(copy));
+    for (i = 0; i < width; i++)  errorTable[1][i] = copy[0][i];
+    for (i = 0; i < height; i++) errorTable[0][i] = copy[1][height-1-i];
+}
+
+static void BspPutPointsOnCurve(drawVert_t ctrl[BSP_MAX_GRID_SIZE][BSP_MAX_GRID_SIZE], int width, int height) {
+    int i, j;
+    drawVert_t prev, next;
+    for (i = 0; i < width; i++) {
+        for (j = 1; j < height; j += 2) {
+            BspLerpDrawVert(&ctrl[j][i], &ctrl[j+1][i], &prev);
+            BspLerpDrawVert(&ctrl[j][i], &ctrl[j-1][i], &next);
+            BspLerpDrawVert(&prev, &next, &ctrl[j][i]);
+        }
+    }
+    for (j = 0; j < height; j++) {
+        for (i = 1; i < width; i += 2) {
+            BspLerpDrawVert(&ctrl[j][i], &ctrl[j][i+1], &prev);
+            BspLerpDrawVert(&ctrl[j][i], &ctrl[j][i-1], &next);
+            BspLerpDrawVert(&prev, &next, &ctrl[j][i]);
+        }
+    }
+}
+
+static bspSrfGridMesh_t *BspCreateSurfaceGridMesh(int width, int height,
+        drawVert_t ctrl[BSP_MAX_GRID_SIZE][BSP_MAX_GRID_SIZE],
+        float errorTable[2][BSP_MAX_GRID_SIZE]) {
+    int i, j, size;
+    drawVert_t *vert;
+    vec3_t tmpVec;
+    bspSrfGridMesh_t *grid;
+
+    size = (width * height - 1) * sizeof(drawVert_t) + sizeof(*grid);
+    grid = (bspSrfGridMesh_t *)BspBlobAlloc(size);
+    if (!grid) return NULL;
+    grid->widthLodError  = (float *)BspBlobAlloc(width * sizeof(float));
+    grid->heightLodError = (float *)BspBlobAlloc(height * sizeof(float));
+    if (grid->widthLodError && grid->heightLodError) {
+        Com_Memcpy(grid->widthLodError,  errorTable[0], width * sizeof(float));
+        Com_Memcpy(grid->heightLodError, errorTable[1], height * sizeof(float));
+    }
+    grid->width = width;
+    grid->height = height;
+    grid->surfaceType = BSP_SF_GRID;
+    ClearBounds(grid->meshBounds[0], grid->meshBounds[1]);
+    for (i = 0; i < width; i++) {
+        for (j = 0; j < height; j++) {
+            vert = &grid->verts[j*width+i];
+            *vert = ctrl[j][i];
+            AddPointToBounds(vert->xyz, grid->meshBounds[0], grid->meshBounds[1]);
+        }
+    }
+    VectorAdd(grid->meshBounds[0], grid->meshBounds[1], grid->localOrigin);
+    VectorScale(grid->localOrigin, 0.5f, grid->localOrigin);
+    VectorSubtract(grid->meshBounds[0], grid->localOrigin, tmpVec);
+    grid->meshRadius = VectorLength(tmpVec);
+    VectorCopy(grid->localOrigin, grid->lodOrigin);
+    grid->lodRadius = grid->meshRadius;
+    return grid;
+}
+
+static bspSrfGridMesh_t *BspSubdividePatchToGrid(int width, int height,
+        drawVert_t points[BSP_MAX_PATCH_SIZE*BSP_MAX_PATCH_SIZE]) {
+    int i, j, k, l, n, t;
+    drawVert_t prev, next, mid;
+    float len, maxLen;
+    drawVert_t ctrl[BSP_MAX_GRID_SIZE][BSP_MAX_GRID_SIZE];
+    float errorTable[2][BSP_MAX_GRID_SIZE];
+    float subdivisionsValue = (r_subdivisions_bsp != NULL) ? r_subdivisions_bsp->value : 4.0f;
+
+    Com_Memset(&prev, 0, sizeof(prev));
+    Com_Memset(&next, 0, sizeof(next));
+    Com_Memset(&mid, 0, sizeof(mid));
+    for (i = 0; i < width; i++)
+        for (j = 0; j < height; j++)
+            ctrl[j][i] = points[j*width+i];
+
+    for (n = 0; n < 2; n++) {
+        for (j = 0; j < BSP_MAX_GRID_SIZE; j++) errorTable[n][j] = 0;
+        for (j = 0; j + 2 < width; j += 2) {
+            maxLen = 0;
+            for (i = 0; i < height; i++) {
+                vec3_t midxyz, midxyz2, dir, projected;
+                float d;
+                for (l = 0; l < 3; l++)
+                    midxyz[l] = (ctrl[i][j].xyz[l] + ctrl[i][j+1].xyz[l] * 2 + ctrl[i][j+2].xyz[l]) * 0.25f;
+                VectorSubtract(midxyz, ctrl[i][j].xyz, midxyz);
+                VectorSubtract(ctrl[i][j+2].xyz, ctrl[i][j].xyz, dir);
+                VectorNormalize(dir);
+                d = DotProduct(midxyz, dir);
+                VectorScale(dir, d, projected);
+                VectorSubtract(midxyz, projected, midxyz2);
+                len = VectorLengthSquared(midxyz2);
+                if (len > maxLen) maxLen = len;
+            }
+            maxLen = sqrtf(maxLen);
+            if (maxLen < 0.1f) { errorTable[n][j+1] = 999; continue; }
+            if (width + 2 > BSP_MAX_GRID_SIZE) { errorTable[n][j+1] = 1.0f/maxLen; continue; }
+            if (maxLen <= subdivisionsValue) { errorTable[n][j+1] = 1.0f/maxLen; continue; }
+            errorTable[n][j+2] = 1.0f/maxLen;
+            width += 2;
+            for (i = 0; i < height; i++) {
+                BspLerpDrawVert(&ctrl[i][j],   &ctrl[i][j+1], &prev);
+                BspLerpDrawVert(&ctrl[i][j+1], &ctrl[i][j+2], &next);
+                BspLerpDrawVert(&prev, &next, &mid);
+                for (k = width - 1; k > j + 3; k--) ctrl[i][k] = ctrl[i][k-2];
+                ctrl[i][j+1] = prev;
+                ctrl[i][j+2] = mid;
+                ctrl[i][j+3] = next;
+            }
+            j -= 2;
+        }
+        BspTranspose(width, height, ctrl);
+        t = width; width = height; height = t;
+    }
+
+    BspPutPointsOnCurve(ctrl, width, height);
+
+    for (i = 1; i < width-1; i++) {
+        if (errorTable[0][i] != 999) continue;
+        for (j = i+1; j < width; j++) {
+            for (k = 0; k < height; k++) ctrl[k][j-1] = ctrl[k][j];
+            errorTable[0][j-1] = errorTable[0][j];
+        }
+        width--;
+    }
+    for (i = 1; i < height-1; i++) {
+        if (errorTable[1][i] != 999) continue;
+        for (j = i+1; j < height; j++) {
+            for (k = 0; k < width; k++) ctrl[j-1][k] = ctrl[j][k];
+            errorTable[1][j-1] = errorTable[1][j];
+        }
+        height--;
+    }
+    if (height > width) {
+        BspTranspose(width, height, ctrl);
+        BspInvertErrorTable(errorTable, width, height);
+        t = width; width = height; height = t;
+        BspInvertCtrl(width, height, ctrl);
+    }
+    BspMakeMeshNormals(width, height, ctrl);
+    return BspCreateSurfaceGridMesh(width, height, ctrl, errorTable);
+}
+
+/* ---- tr_bsp.c Parse* ports ---- */
+
+static void BspParseFace(const dsurface_t *ds, const drawVert_t *verts, int numPoints,
+                         bspMsurface_t *surf, const int *srcIndexes, int numIndexes,
+                         bspShader_t *shaderTab, int numShaders) {
+    int i, j, sfaceSize, ofsIndexes;
+    bspSrfSurfaceFace_t *cv;
+    int *indexes;
+    int shaderNum = LittleLong(ds->shaderNum);
+
+    if (shaderNum >= 0 && shaderNum < numShaders)
+        surf->shader = &shaderTab[shaderNum];
+    else
+        surf->shader = &shaderTab[0];
+
+    if (numPoints > BSP_MAX_FACE_POINTS) numPoints = BSP_MAX_FACE_POINTS;
+
+    sfaceSize = sizeof(*cv) - sizeof(cv->points) + sizeof(cv->points[0]) * numPoints;
+    ofsIndexes = sfaceSize;
+    sfaceSize += sizeof(int) * numIndexes;
+
+    cv = (bspSrfSurfaceFace_t *)BspBlobAlloc(sfaceSize);
+    if (!cv) return;
+    cv->surfaceType = BSP_SF_FACE;
+    cv->numPoints = numPoints;
+    cv->numIndices = numIndexes;
+    cv->ofsIndices = ofsIndexes;
+
+    for (i = 0; i < numPoints; i++) {
+        for (j = 0; j < 3; j++)
+            cv->points[i][j] = LittleFloat(verts[i].xyz[j]);
+        for (j = 0; j < 2; j++) {
+            cv->points[i][3+j] = LittleFloat(verts[i].st[j]);
+            cv->points[i][5+j] = LittleFloat(verts[i].lightmap[j]);
+        }
+        Com_Memcpy((byte *)&cv->points[i][7], verts[i].color.rgba, 4);
+    }
+
+    indexes = (int *)((byte *)cv + cv->ofsIndices);
+    for (i = 0; i < numIndexes; i++) {
+        unsigned num = LittleLong(srcIndexes[i]);
+        if ((int)num >= numPoints) num = 0;
+        indexes[i] = (int)num;
+    }
+
+    for (i = 0; i < 3; i++)
+        cv->plane.normal[i] = LittleFloat(ds->lightmapVecs[2][i]);
+    for (i = 0; i < 3; i++)
+        cv->plane.normal[i] = BspClampDenorm(cv->plane.normal[i]);
+
+    cv->plane.dist = DotProduct(cv->points[0], cv->plane.normal);
+    SetPlaneSignbits(&cv->plane);
+    cv->plane.type = PlaneTypeForNormal(cv->plane.normal);
+
+    surf->data = (bspSurfaceType_t *)cv;
+}
+
+static void BspParseMesh(const dsurface_t *ds, const drawVert_t *verts, int numVerts,
+                         bspMsurface_t *surf,
+                         bspShader_t *shaderTab, int numShaders) {
+    int i, j;
+    unsigned width, height, numPoints;
+    drawVert_t points[BSP_MAX_PATCH_SIZE * BSP_MAX_PATCH_SIZE];
+    vec3_t bounds[2], tmpVec;
+    int shaderNum = LittleLong(ds->shaderNum);
+    bspSrfGridMesh_t *grid;
+    static bspSurfaceType_t skipData = BSP_SF_SKIP;
+
+    if (shaderNum >= 0 && shaderNum < numShaders)
+        surf->shader = &shaderTab[shaderNum];
+    else
+        surf->shader = &shaderTab[0];
+
+    width = (unsigned)LittleLong(ds->patchWidth);
+    height = (unsigned)LittleLong(ds->patchHeight);
+    if (width <= 2 || height <= 2 || !(width & 1) || !(height & 1) ||
+        width > BSP_MAX_PATCH_SIZE || height > BSP_MAX_PATCH_SIZE ||
+        width * height > ARRAY_LEN(points)) {
+        surf->data = &skipData;
+        return;
+    }
+    numPoints = width * height;
+    if (numPoints > (unsigned)numVerts) {
+        surf->data = &skipData;
+        return;
+    }
+    for (i = 0; i < (int)numPoints; i++) {
+        for (j = 0; j < 3; j++) {
+            points[i].xyz[j] = LittleFloat(verts[i].xyz[j]);
+            points[i].normal[j] = BspClampDenorm(LittleFloat(verts[i].normal[j]));
+        }
+        for (j = 0; j < 2; j++) {
+            points[i].st[j] = LittleFloat(verts[i].st[j]);
+            points[i].lightmap[j] = LittleFloat(verts[i].lightmap[j]);
+        }
+        Com_Memcpy(points[i].color.rgba, verts[i].color.rgba, 4);
+    }
+
+    grid = BspSubdividePatchToGrid((int)width, (int)height, points);
+    if (!grid) {
+        surf->data = &skipData;
+        return;
+    }
+    surf->data = (bspSurfaceType_t *)grid;
+
+    for (i = 0; i < 3; i++) {
+        bounds[0][i] = LittleFloat(ds->lightmapVecs[0][i]);
+        bounds[1][i] = LittleFloat(ds->lightmapVecs[1][i]);
+    }
+    VectorAdd(bounds[0], bounds[1], bounds[1]);
+    VectorScale(bounds[1], 0.5f, grid->lodOrigin);
+    VectorSubtract(bounds[0], grid->lodOrigin, tmpVec);
+    grid->lodRadius = VectorLength(tmpVec);
+}
+
+static void BspParseTriSurf(const dsurface_t *ds, const drawVert_t *verts, int numVerts,
+                            bspMsurface_t *surf, const int *srcIndexes, int numIndexes,
+                            bspShader_t *shaderTab, int numShaders) {
+    int i, j;
+    bspSrfTriangles_t *tri;
+    int shaderNum = LittleLong(ds->shaderNum);
+
+    if (shaderNum >= 0 && shaderNum < numShaders)
+        surf->shader = &shaderTab[shaderNum];
+    else
+        surf->shader = &shaderTab[0];
+
+    tri = (bspSrfTriangles_t *)BspBlobAlloc(sizeof(*tri) + numVerts * sizeof(tri->verts[0])
+                                          + numIndexes * sizeof(tri->indexes[0]));
+    if (!tri) return;
+    tri->surfaceType = BSP_SF_TRIANGLES;
+    tri->numVerts = numVerts;
+    tri->numIndexes = numIndexes;
+    tri->verts = (drawVert_t *)(tri + 1);
+    tri->indexes = (int *)(tri->verts + tri->numVerts);
+
+    surf->data = (bspSurfaceType_t *)tri;
+
+    ClearBounds(tri->bounds[0], tri->bounds[1]);
+    for (i = 0; i < numVerts; i++) {
+        for (j = 0; j < 3; j++) {
+            tri->verts[i].xyz[j] = LittleFloat(verts[i].xyz[j]);
+            tri->verts[i].normal[j] = BspClampDenorm(LittleFloat(verts[i].normal[j]));
+        }
+        AddPointToBounds(tri->verts[i].xyz, tri->bounds[0], tri->bounds[1]);
+        for (j = 0; j < 2; j++) {
+            tri->verts[i].st[j] = LittleFloat(verts[i].st[j]);
+            tri->verts[i].lightmap[j] = LittleFloat(verts[i].lightmap[j]);
+        }
+        Com_Memcpy(tri->verts[i].color.rgba, verts[i].color.rgba, 4);
+    }
+    for (i = 0; i < numIndexes; i++) {
+        int v = (int)LittleLong(srcIndexes[i]);
+        if (v < 0 || v >= numVerts) v = 0;
+        tri->indexes[i] = v;
+    }
+}
+
+static void BspParseFlare(const dsurface_t *ds, bspMsurface_t *surf,
+                          bspShader_t *shaderTab, int numShaders) {
+    int i;
+    bspSrfFlare_t *flare;
+    int shaderNum = LittleLong(ds->shaderNum);
+
+    if (shaderNum >= 0 && shaderNum < numShaders)
+        surf->shader = &shaderTab[shaderNum];
+    else
+        surf->shader = &shaderTab[0];
+
+    flare = (bspSrfFlare_t *)BspBlobAlloc(sizeof(*flare));
+    if (!flare) return;
+    flare->surfaceType = BSP_SF_FLARE;
+    surf->data = (bspSurfaceType_t *)flare;
+    for (i = 0; i < 3; i++) {
+        flare->origin[i] = LittleFloat(ds->lightmapOrigin[i]);
+        flare->color[i]  = LittleFloat(ds->lightmapVecs[0][i]);
+        flare->normal[i] = BspClampDenorm(LittleFloat(ds->lightmapVecs[2][i]));
+    }
+}
+
+/* ---- tr_bsp.c Load*() ports ---- */
+
+static void BspLoadShaders(const dheader_t *header, const byte *fileBase,
+                           int *outNumFaces, int *outNumMeshes, int *outNumTris, int *outNumFlares) {
+    const dshader_t *in;
+    int i, count;
+    bspShader_t *out;
+
+    in = (const dshader_t *)(fileBase + LittleLong(header->lumps[LUMP_SHADERS].fileofs));
+    count = LittleLong(header->lumps[LUMP_SHADERS].filelen) / (int)sizeof(*in);
+    out = (bspShader_t *)ri.Malloc(count * sizeof(*out));
+    s_bspWorld.shaders = out;
+    s_bspWorld.numShaders = count;
+    for (i = 0; i < count; i++) {
+        out[i].surfaceFlags = LittleLong(in[i].surfaceFlags);
+        out[i].contentFlags = LittleLong(in[i].contentFlags);
+    }
+    (void)outNumFaces; (void)outNumMeshes; (void)outNumTris; (void)outNumFlares;
+}
+
+static void BspLoadPlanes(const dheader_t *header, const byte *fileBase) {
+    const dplane_t *in;
+    cplane_t *out;
+    int i, j, count, bits;
+
+    in = (const dplane_t *)(fileBase + LittleLong(header->lumps[LUMP_PLANES].fileofs));
+    count = LittleLong(header->lumps[LUMP_PLANES].filelen) / (int)sizeof(*in);
+    out = (cplane_t *)ri.Malloc(count * 2 * sizeof(*out));
+    Com_Memset(out, 0, count * 2 * sizeof(*out));
+    s_bspWorld.planes = out;
+    s_bspWorld.numplanes = count;
+    for (i = 0; i < count; i++, in++, out++) {
+        bits = 0;
+        for (j = 0; j < 3; j++) {
+            out->normal[j] = LittleFloat(in->normal[j]);
+            if (out->normal[j] < 0) bits |= 1 << j;
+        }
+        out->dist = LittleFloat(in->dist);
+        out->type = PlaneTypeForNormal(out->normal);
+        out->signbits = bits;
+    }
+}
+
+static void BspLoadMarksurfaces(const dheader_t *header, const byte *fileBase) {
+    const int *in;
+    int i, count;
+    bspMsurface_t **out;
+
+    in = (const int *)(fileBase + LittleLong(header->lumps[LUMP_LEAFSURFACES].fileofs));
+    count = LittleLong(header->lumps[LUMP_LEAFSURFACES].filelen) / (int)sizeof(*in);
+    out = (bspMsurface_t **)ri.Malloc(count * sizeof(*out));
+    s_bspWorld.marksurfaces = out;
+    s_bspWorld.nummarksurfaces = count;
+    for (i = 0; i < count; i++) {
+        int idx = (int)LittleLong(in[i]);
+        if (idx < 0 || idx >= s_bspWorld.numsurfaces) idx = 0;
+        out[i] = &s_bspWorld.surfaces[idx];
+    }
+}
+
+static void BspSetParent_r(bspMnode_t *node, bspMnode_t *parent) {
+    node->parent = parent;
+    if (node->contents != CONTENTS_NODE) return;
+    BspSetParent_r(node->children[0], node);
+    BspSetParent_r(node->children[1], node);
+}
+
+static void BspLoadNodesAndLeafs(const dheader_t *header, const byte *fileBase) {
+    const dnode_t *in;
+    const dleaf_t *inLeaf;
+    bspMnode_t *out;
+    int i, j, numNodes, numLeafs;
+    unsigned p, firstmarksurface, nummarksurfaces;
+
+    in = (const dnode_t *)(fileBase + LittleLong(header->lumps[LUMP_NODES].fileofs));
+    numNodes = LittleLong(header->lumps[LUMP_NODES].filelen) / (int)sizeof(dnode_t);
+    numLeafs = LittleLong(header->lumps[LUMP_LEAFS].filelen) / (int)sizeof(dleaf_t);
+
+    out = (bspMnode_t *)ri.Malloc((numNodes + numLeafs) * sizeof(*out));
+    Com_Memset(out, 0, (numNodes + numLeafs) * sizeof(*out));
+    s_bspWorld.nodes = out;
+    s_bspWorld.numnodes = numNodes + numLeafs;
+    s_bspWorld.numDecisionNodes = numNodes;
+
+    for (i = 0; i < numNodes; i++, in++, out++) {
+        for (j = 0; j < 3; j++) {
+            out->mins[j] = (float)LittleLong(in->mins[j]);
+            out->maxs[j] = (float)LittleLong(in->maxs[j]);
+        }
+        p = (unsigned)LittleLong(in->planeNum);
+        if ((int)p >= s_bspWorld.numplanes) p = 0;
+        out->plane = s_bspWorld.planes + p;
+        out->contents = CONTENTS_NODE;
+        for (j = 0; j < 2; j++) {
+            p = (unsigned)LittleLong(in->children[j]);
+            if (p & 0x80000000u) {
+                p = ~p;
+                if ((int)p >= numLeafs) p = 0;
+                out->children[j] = s_bspWorld.nodes + numNodes + p;
+            } else {
+                if ((int)p >= numNodes) p = 0;
+                out->children[j] = s_bspWorld.nodes + p;
+            }
+        }
+    }
+
+    inLeaf = (const dleaf_t *)(fileBase + LittleLong(header->lumps[LUMP_LEAFS].fileofs));
+    for (i = 0; i < numLeafs; i++, inLeaf++, out++) {
+        for (j = 0; j < 3; j++) {
+            out->mins[j] = (float)LittleLong(inLeaf->mins[j]);
+            out->maxs[j] = (float)LittleLong(inLeaf->maxs[j]);
+        }
+        out->cluster = LittleLong(inLeaf->cluster);
+        out->area    = LittleLong(inLeaf->area);
+        out->contents = 0; /* !=CONTENTS_NODE — it's a leaf */
+        firstmarksurface = (unsigned)LittleLong(inLeaf->firstLeafSurface);
+        nummarksurfaces  = (unsigned)LittleLong(inLeaf->numLeafSurfaces);
+        if ((int)(firstmarksurface + nummarksurfaces) > s_bspWorld.nummarksurfaces) {
+            firstmarksurface = 0;
+            nummarksurfaces = 0;
+        }
+        out->firstmarksurface = s_bspWorld.marksurfaces + firstmarksurface;
+        out->nummarksurfaces = (int)nummarksurfaces;
+    }
+
+    BspSetParent_r(s_bspWorld.nodes, NULL);
+}
+
+static void BspLoadSurfaces(const dheader_t *header, const byte *fileBase,
+                            const dsurface_t *surfIn, int surfaceCount,
+                            const drawVert_t *dv, int totalVerts,
+                            const int *indexes, int totalIndexes,
+                            int *outFaces, int *outMeshes, int *outTris, int *outFlares) {
+    int i;
+    int numFaces = 0, numMeshes = 0, numTris = 0, numFlares = 0;
+    bspMsurface_t *out;
+    unsigned firstVert = 0, numVerts = 0, firstIndex = 0, numIndexes = 0;
+
+    (void)header;
+    out = (bspMsurface_t *)ri.Malloc(surfaceCount * sizeof(*out));
+    Com_Memset(out, 0, surfaceCount * sizeof(*out));
+    s_bspWorld.surfaces = out;
+    s_bspWorld.numsurfaces = surfaceCount;
+
+    for (i = 0; i < surfaceCount; i++, surfIn++, out++) {
+        unsigned type = (unsigned)LittleLong(surfIn->surfaceType);
+        if (type != MST_FLARE) {
+            firstVert = (unsigned)LittleLong(surfIn->firstVert);
+            if (type == MST_PATCH) numVerts = 0;
+            else numVerts = (unsigned)LittleLong(surfIn->numVerts);
+            if ((int)(firstVert + numVerts) > totalVerts) { firstVert = 0; numVerts = 0; }
+            if (type != MST_PATCH) {
+                firstIndex = (unsigned)LittleLong(surfIn->firstIndex);
+                numIndexes = (unsigned)LittleLong(surfIn->numIndexes);
+                if ((int)(firstIndex + numIndexes) > totalIndexes) { firstIndex = 0; numIndexes = 0; }
+                if (numIndexes % 3) numIndexes -= numIndexes % 3;
+            }
+        }
+        out->fogIndex = LittleLong(surfIn->fogNum) + 1;
+        switch (type) {
+            case MST_PATCH:
+                BspParseMesh(surfIn, dv + firstVert, totalVerts - (int)firstVert,
+                             out, s_bspWorld.shaders, s_bspWorld.numShaders);
+                numMeshes++;
+                break;
+            case MST_TRIANGLE_SOUP:
+                BspParseTriSurf(surfIn, dv + firstVert, (int)numVerts, out,
+                                indexes + firstIndex, (int)numIndexes,
+                                s_bspWorld.shaders, s_bspWorld.numShaders);
+                numTris++;
+                break;
+            case MST_PLANAR:
+                BspParseFace(surfIn, dv + firstVert, (int)numVerts, out,
+                             indexes + firstIndex, (int)numIndexes,
+                             s_bspWorld.shaders, s_bspWorld.numShaders);
+                numFaces++;
+                break;
+            case MST_FLARE:
+                BspParseFlare(surfIn, out, s_bspWorld.shaders, s_bspWorld.numShaders);
+                numFlares++;
+                break;
+            default:
+                break;
+        }
+    }
+    *outFaces  = numFaces;
+    *outMeshes = numMeshes;
+    *outTris   = numTris;
+    *outFlares = numFlares;
+}
+
+static void BspFreeWorld(void) {
+    if (s_bspWorld.shaders)      ri.Free(s_bspWorld.shaders);
+    if (s_bspWorld.planes)       ri.Free(s_bspWorld.planes);
+    if (s_bspWorld.nodes)        ri.Free(s_bspWorld.nodes);
+    if (s_bspWorld.surfaces)     ri.Free(s_bspWorld.surfaces);
+    if (s_bspWorld.marksurfaces) ri.Free(s_bspWorld.marksurfaces);
+    if (s_bspWorld.blobPool)     ri.Free(s_bspWorld.blobPool);
+    Com_Memset(&s_bspWorld, 0, sizeof(s_bspWorld));
+}
+
+static qboolean BspLoad(const dheader_t *header, const byte *fileBase,
+                        const dsurface_t *surfIn, int surfaceCount,
+                        const drawVert_t *dv, int totalVerts,
+                        const int *indexes, int totalIndexes) {
+    int numFaces = 0, numMeshes = 0, numTris = 0, numFlares = 0;
+    size_t blobBudget;
+
+    BspFreeWorld();
+
+    /* Blob pool budget: sized against total BSP geometry + fat-patch overhead.
+     * Faces store (points + indices) inline (~64B per point, 4B per index).
+     * Tri-surfs inline drawVert_t + int[] (~44B per vert). Patches blow up
+     * after subdivision — worst-case roughly 65×65 drawVerts per patch.
+     * Be generous; this is one-time per map load and freed on map change. */
+    blobBudget = (size_t)totalVerts * (sizeof(drawVert_t) + 32)
+               + (size_t)totalIndexes * sizeof(int) * 2
+               + (size_t)surfaceCount * (sizeof(bspSrfGridMesh_t) + BSP_MAX_GRID_SIZE * BSP_MAX_GRID_SIZE * sizeof(drawVert_t))
+               + 1024 * 1024;
+    s_bspWorld.blobPool = (byte *)ri.Malloc(blobBudget);
+    s_bspWorld.blobCap  = blobBudget;
+    s_bspWorld.blobUsed = 0;
+    Com_Memset(s_bspWorld.blobPool, 0, blobBudget);
+
+    if (r_marksOnTriangleMeshes == NULL)
+        r_marksOnTriangleMeshes = ri.Cvar_Get("r_marksOnTriangleMeshes", "0", CVAR_ARCHIVE);
+    if (r_subdivisions_bsp == NULL)
+        r_subdivisions_bsp = ri.Cvar_Get("r_subdivisions", "4", CVAR_ARCHIVE_ND | CVAR_LATCH);
+
+    BspLoadShaders(header, fileBase, &numFaces, &numMeshes, &numTris, &numFlares);
+    BspLoadPlanes(header, fileBase);
+    BspLoadSurfaces(header, fileBase, surfIn, surfaceCount,
+                    dv, totalVerts, indexes, totalIndexes,
+                    &numFaces, &numMeshes, &numTris, &numFlares);
+    BspLoadMarksurfaces(header, fileBase);
+    BspLoadNodesAndLeafs(header, fileBase);
+
+    s_bspWorld.loaded = qtrue;
+
+    /* Validation milestone logs — matches user-specified checklist */
+    ri.Printf(PRINT_ALL, "[BSP] nodes=%d leafs=%d planes=%d\n",
+              s_bspWorld.numDecisionNodes,
+              s_bspWorld.numnodes - s_bspWorld.numDecisionNodes,
+              s_bspWorld.numplanes);
+    ri.Printf(PRINT_ALL, "[BSP] leafsurfaces=%d\n", s_bspWorld.nummarksurfaces);
+    ri.Printf(PRINT_ALL, "[SURF] faces=%d grids=%d tris=%d flares=%d\n",
+              numFaces, numMeshes, numTris, numFlares);
+    ri.Printf(PRINT_ALL, "[BSP] blobUsed=%zu/%zu bytes\n",
+              s_bspWorld.blobUsed, s_bspWorld.blobCap);
+    return qtrue;
+}
+
+/* ========================================================================== */
+
 static qboolean LoadWorldMapData(const char *name) {
     void *fileBuffer = NULL;
     dheader_t *header;
@@ -2345,6 +3204,13 @@ static qboolean LoadWorldMapData(const char *name) {
     s_world.drawCount = drawCursor;
     Q_strncpyz(s_world.name, name, sizeof(s_world.name));
 
+    /* Parallel BSP tree for R_MarkFragments — additive, does not touch
+     * the Metal draw pipeline above. */
+    BspLoad(header, (const byte *)fileBuffer,
+            surfaces, surfaceCount,
+            drawVerts, drawVertCount,
+            drawIndexes, drawIndexCount);
+
     /* Resolve the flare billboard texture once per map. The canonical Q3
      * shader is 'flareShader' mapped to gfx/misc/flare. If the texture is
      * missing we fall back to white — Swift will skip flare rendering when
@@ -2564,26 +3430,33 @@ static int ShaderMap_GetBlendMode(const char *name) {
 
 /* blendMode enum used throughout the stub and the Q3MetalWorldStage:
  *   0 = opaque     (no blend)
- *   1 = additive   (GL_ONE/GL_ONE, GL_SRC_ALPHA/GL_ONE)
+ *   1 = additive   (GL_SRC_ALPHA/GL_ONE — alpha-modulated additive)
  *   2 = alpha      (GL_SRC_ALPHA/GL_ONE_MINUS_SRC_ALPHA)
  *   3 = filter     (GL_DST_COLOR/GL_ZERO and commutative form GL_ZERO/GL_SRC_COLOR)
  *   4 = subtract   (GL_ZERO/GL_ONE_MINUS_SRC_COLOR — blood/bullet/shadow decals)
- * If Q3 supports the blendFunc combo, we must map it. Unrecognized combos
- * fall through to opaque AND log once so missing cases surface without
- * re-introducing stage0/stage2 heuristics. */
+ *   5 = additive-full (GL_ONE/GL_ONE — full-intensity, ignores alpha)
+ *
+ * CRITICAL: 1 and 5 MUST stay distinct. Merging them leaks full-intensity
+ * explosion/glow shaders through an alpha-modulated pipeline (or vice versa),
+ * producing scene-wide yellow/gold blowout when the alpha channel is close
+ * to 1 across the full quad.
+ */
 static int BlendModeFromTokens(const char *src, const char *dst) {
     if (src == NULL || src[0] == '\0') return 0;
 
-    /* Short Q3 aliases — these are dst-independent. */
-    if (!Q_stricmp(src, "add"))    return 1;
+    /* Short Q3 aliases — these are dst-independent. "add" is the
+     * Q3 shorthand for GL_ONE/GL_ONE (full-intensity additive). */
+    if (!Q_stricmp(src, "add"))    return 5;
     if (!Q_stricmp(src, "blend"))  return 2;
     if (!Q_stricmp(src, "filter")) return 3;
 
     if (dst == NULL || dst[0] == '\0') return 0;
 
-    /* Canonical additive. */
-    if (!Q_stricmp(src, "GL_ONE") && !Q_stricmp(dst, "GL_ONE")) return 1;
-    /* Premultiplied additive (flame, glow). */
+    /* Full-intensity additive (GL_ONE/GL_ONE) — explosion cores, muzzle
+     * flash, rail core. Distinct from mode 1 (alpha-modulated). */
+    if (!Q_stricmp(src, "GL_ONE") && !Q_stricmp(dst, "GL_ONE")) return 5;
+    /* Alpha-modulated additive (GL_SRC_ALPHA/GL_ONE) — flame, glow,
+     * particles. Source alpha attenuates the added colour. */
     if (!Q_stricmp(src, "GL_SRC_ALPHA") && !Q_stricmp(dst, "GL_ONE")) return 1;
     /* Alpha blend (transparent decals, glass). */
     if (!Q_stricmp(src, "GL_SRC_ALPHA") && !Q_stricmp(dst, "GL_ONE_MINUS_SRC_ALPHA")) return 2;
@@ -4294,6 +5167,21 @@ static void RE_RenderScene(const refdef_t *fd) {
                     float r, g, b, a;
                     int i;
                     if (radius < 0.5f) radius = 8.0f;  /* sensible default */
+                    /* TASK #3: clamp oversize sprite radii. Stock Q3 rocket
+                     * explosion sprite radius is 64; plasma/rail are 1-16.
+                     * Anything over 256 produces a screen-filling quad
+                     * (the polka-dot plasma artifact seen in debug frames)
+                     * and is almost certainly a corrupted entity field.
+                     * Log the first few for diagnostics. */
+                    if (radius > 256.0f) {
+                        static int s_oversizeLog = 0;
+                        if (++s_oversizeLog <= 8) {
+                            ri.Printf(PRINT_WARNING,
+                                "[metal] RT_SPRITE oversize radius=%.1f shader=%d (clamped to 256)\n",
+                                radius, (int)sceneEntity->entity.customShader);
+                        }
+                        radius = 256.0f;
+                    }
                     VectorScale(axis1, -radius, right);
                     VectorScale(axis2,  radius, up);
                     /* Four billboard corners. CCW order with UV
@@ -4362,20 +5250,38 @@ static void RE_RenderScene(const refdef_t *fd) {
                         uint32_t spriteFlags = Q3_METAL_ENTITY_DRAWFLAG_NOCULL;
                         const metalTexture_t *tex = FindTextureByHandle(
                             (qhandle_t)sceneEntity->entity.customShader);
+                        qboolean isAdditiveLike = qfalse;
+                        qboolean hasExplicitATest = qfalse;
                         if (tex != NULL) {
                             if (tex->blendMode == 1) {
                                 spriteFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                                isAdditiveLike = qtrue;
                             } else if (tex->blendMode == 2) {
                                 spriteFlags |= Q3_METAL_ENTITY_DRAWFLAG_ALPHA;
                             } else if (tex->blendMode == 3) {
                                 spriteFlags |= Q3_METAL_ENTITY_DRAWFLAG_FILTER;
                             } else if (tex->blendMode == 4) {
                                 spriteFlags |= Q3_METAL_ENTITY_DRAWFLAG_SUBTRACT;
+                            } else if (tex->blendMode == 5) {
+                                spriteFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE_FULL;
+                                isAdditiveLike = qtrue;
                             } else {
                                 spriteFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                                isAdditiveLike = qtrue;
                             }
+                            hasExplicitATest = (tex->alphaFunc != 0);
                         } else {
                             spriteFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                            isAdditiveLike = qtrue;
+                        }
+                        /* TASK #1: force implicit alphaFunc GT0 for sprites
+                         * whose shader uses additive blending and doesn't
+                         * set alphaFunc explicitly. Prevents JPEG-compressed
+                         * dark-but-not-black rlboom/plasma/flash borders
+                         * from contributing to GL_ONE/GL_ONE blend
+                         * (classic hard-rectangular explosion quad). */
+                        if (isAdditiveLike && !hasExplicitATest) {
+                            spriteFlags |= Q3_METAL_ENTITY_DRAWFLAG_ATEST_GT0;
                         }
                         s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
                         s_entityDraws[entityDrawCursor].indexCount = 6;
@@ -4966,6 +5872,8 @@ static void RE_RenderScene(const refdef_t *fd) {
                                 drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_FILTER;
                             } else if (tex->blendMode == 4) {
                                 drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_SUBTRACT;
+                            } else if (tex->blendMode == 5) {
+                                drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE_FULL;
                             } else {
                                 /* blendMode==0 for an FX model means its
                                  * shader didn't parse and we loaded the
@@ -5162,26 +6070,23 @@ static void RE_RenderScene(const refdef_t *fd) {
                         s_entityIndices[entityIndexCursor + ti * 3 + 2] = baseVertex + ti + 2;
                     }
 
+                    /* Tag scene-poly draws so Swift entity pass can apply
+                     * scene-poly-specific state (no dlight amplification,
+                     * no ndotl lighting — cgame has already computed the
+                     * vertex modulate). No rgbGen/alphaGen overrides:
+                     * the shader's resolved genMode flows through verbatim
+                     * per TASK PART 3 "use EXACT data from cgame." */
+                    polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_SCENE_POLY;
+
                     ptex = FindTextureByHandle(poly->shader);
                     if (ptex != NULL) {
                         if (ptex->blendMode == 1) polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
                         else if (ptex->blendMode == 2) polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_ALPHA;
                         else if (ptex->blendMode == 3) polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_FILTER;
                         else if (ptex->blendMode == 4) polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_SUBTRACT;
-                        /* Fallback: when the poly's shader didn't resolve a
-                         * blend mode (blendMode==0), default to ADDITIVE not
-                         * ALPHA. Q3's explosion/trail/particle shaders are
-                         * GL_SRC_ALPHA GL_ONE (premult-additive); our parser
-                         * doesn't yet recognize that combo so they arrive
-                         * with blendMode=0. Alpha-blending an opaque JPG
-                         * (explosion textures load as .jpg when the .tga is
-                         * missing, which is the common case) draws a hard
-                         * yellow rectangle over the scene — "square around
-                         * explosion." Additive with a dark-border texture
-                         * renders correctly because black contributes zero. */
-                        else polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
-                    } else {
-                        polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                        else if (ptex->blendMode == 5) polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE_FULL;
+                        /* Unresolved blend = upstream default shader = OPAQUE
+                         * (GL_ONE/GL_ZERO). No flag set → opaque pipeline. */
                     }
 
                     s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
@@ -5336,8 +6241,297 @@ static void RE_EndFrame(int *frontEndMsec, int *backEndMsec) {
     if (backEndMsec) *backEndMsec = 0;
 }
 
+/* =================================================================
+ * R_MarkFragments — verbatim port of ioquake3 renderer/tr_marks.c
+ * Operates against the parallel bspMnode_t/bspMsurface_t tree built
+ * in LoadWorldMapData via BspLoad(). Structure layouts and control
+ * flow match upstream exactly (R_ChopPolyBehindPlane, R_BoxSurfaces_r,
+ * R_AddMarkFragments, R_MarkFragments).
+ * ================================================================= */
+
+#define BSP_MARK_MAX_VERTS_ON_POLY 64
+#define BSP_MARK_SIDE_FRONT 0
+#define BSP_MARK_SIDE_BACK  1
+#define BSP_MARK_SIDE_ON    2
+#define BSP_MARK_MARKER_OFFSET 0
+
+static void BspChopPolyBehindPlane(int numInPoints, vec3_t inPoints[BSP_MARK_MAX_VERTS_ON_POLY],
+                                   int *numOutPoints, vec3_t outPoints[BSP_MARK_MAX_VERTS_ON_POLY],
+                                   vec3_t normal, vec_t dist, vec_t epsilon) {
+    float dists[BSP_MARK_MAX_VERTS_ON_POLY+4];
+    int sides[BSP_MARK_MAX_VERTS_ON_POLY+4];
+    int counts[3];
+    float dot;
+    int i, j;
+    float *p1, *p2, *clip;
+    float d;
+
+    if (numInPoints >= BSP_MARK_MAX_VERTS_ON_POLY - 2) { *numOutPoints = 0; return; }
+
+    counts[0] = counts[1] = counts[2] = 0;
+    dists[0] = 0.0f;
+    sides[0] = 0;
+
+    for (i = 0; i < numInPoints; i++) {
+        dot = DotProduct(inPoints[i], normal);
+        dot -= dist;
+        dists[i] = dot;
+        if (dot > epsilon) sides[i] = BSP_MARK_SIDE_FRONT;
+        else if (dot < -epsilon) sides[i] = BSP_MARK_SIDE_BACK;
+        else sides[i] = BSP_MARK_SIDE_ON;
+        counts[sides[i]]++;
+    }
+    sides[i] = sides[0];
+    dists[i] = dists[0];
+
+    *numOutPoints = 0;
+    if (!counts[0]) return;
+    if (!counts[1]) {
+        *numOutPoints = numInPoints;
+        Com_Memcpy(outPoints, inPoints, numInPoints * sizeof(vec3_t));
+        return;
+    }
+
+    for (i = 0; i < numInPoints; i++) {
+        p1 = inPoints[i];
+        clip = outPoints[*numOutPoints];
+        if (sides[i] == BSP_MARK_SIDE_ON) {
+            VectorCopy(p1, clip);
+            (*numOutPoints)++;
+            continue;
+        }
+        if (sides[i] == BSP_MARK_SIDE_FRONT) {
+            VectorCopy(p1, clip);
+            (*numOutPoints)++;
+            clip = outPoints[*numOutPoints];
+        }
+        if (sides[i+1] == BSP_MARK_SIDE_ON || sides[i+1] == sides[i]) continue;
+        p2 = inPoints[(i+1) % numInPoints];
+        d = dists[i] - dists[i+1];
+        dot = (d == 0) ? 0.0f : (dists[i] / d);
+        for (j = 0; j < 3; j++)
+            clip[j] = p1[j] + dot * (p2[j] - p1[j]);
+        (*numOutPoints)++;
+    }
+}
+
+static void BspBoxSurfaces_r(bspMnode_t *node, vec3_t mins, vec3_t maxs,
+                             bspSurfaceType_t **list, int listsize, int *listlength, vec3_t dir) {
+    int s, c;
+    bspMsurface_t *surf, **mark;
+
+    while (node->contents == CONTENTS_NODE) {
+        s = BoxOnPlaneSide(mins, maxs, node->plane);
+        if (s == 1) {
+            node = node->children[0];
+        } else if (s == 2) {
+            node = node->children[1];
+        } else {
+            BspBoxSurfaces_r(node->children[0], mins, maxs, list, listsize, listlength, dir);
+            node = node->children[1];
+        }
+    }
+
+    mark = node->firstmarksurface;
+    c = node->nummarksurfaces;
+    while (c--) {
+        if (*listlength >= listsize) break;
+        surf = *mark;
+        if (surf->shader &&
+            ((surf->shader->surfaceFlags & (SURF_NOIMPACT | SURF_NOMARKS)) ||
+             (surf->shader->contentFlags & CONTENTS_FOG))) {
+            surf->viewCount = s_bspViewCount;
+        } else if (*(surf->data) == BSP_SF_FACE) {
+            s = BoxOnPlaneSide(mins, maxs, &((bspSrfSurfaceFace_t *)surf->data)->plane);
+            if (s == 1 || s == 2) {
+                surf->viewCount = s_bspViewCount;
+            } else if (DotProduct(((bspSrfSurfaceFace_t *)surf->data)->plane.normal, dir) > -0.5) {
+                surf->viewCount = s_bspViewCount;
+            }
+        } else if (*(bspSurfaceType_t *)(surf->data) != BSP_SF_GRID &&
+                   *(bspSurfaceType_t *)(surf->data) != BSP_SF_TRIANGLES) {
+            surf->viewCount = s_bspViewCount;
+        }
+        if (surf->viewCount != s_bspViewCount) {
+            surf->viewCount = s_bspViewCount;
+            list[*listlength] = (bspSurfaceType_t *)surf->data;
+            (*listlength)++;
+        }
+        mark++;
+    }
+}
+
+static void BspAddMarkFragments(int numClipPoints, vec3_t clipPoints[2][BSP_MARK_MAX_VERTS_ON_POLY],
+                                int numPlanes, vec3_t *normals, float *dists,
+                                int maxPoints, vec3_t pointBuffer,
+                                int maxFragments, markFragment_t *fragmentBuffer,
+                                int *returnedPoints, int *returnedFragments,
+                                vec3_t mins, vec3_t maxs) {
+    int pingPong, i;
+    markFragment_t *mf;
+
+    pingPong = 0;
+    for (i = 0; i < numPlanes; i++) {
+        BspChopPolyBehindPlane(numClipPoints, clipPoints[pingPong],
+                               &numClipPoints, clipPoints[!pingPong],
+                               normals[i], dists[i], 0.5);
+        pingPong ^= 1;
+        if (numClipPoints == 0) break;
+    }
+    if (numClipPoints == 0) return;
+    if (numClipPoints + (*returnedPoints) > maxPoints) return;
+
+    mf = fragmentBuffer + (*returnedFragments);
+    mf->firstPoint = (*returnedPoints);
+    mf->numPoints = numClipPoints;
+    Com_Memcpy(pointBuffer + (*returnedPoints) * 3, clipPoints[pingPong],
+               numClipPoints * sizeof(vec3_t));
+    (*returnedPoints) += numClipPoints;
+    (*returnedFragments)++;
+    (void)mins; (void)maxs;
+}
+
 static int R_MarkFragments(int numPoints, const vec3_t *points, const vec3_t projection,
-                           int maxPoints, vec3_t pointBuffer, int maxFragments, markFragment_t *fragmentBuffer) { return 0; }
+                           int maxPoints, vec3_t pointBuffer, int maxFragments,
+                           markFragment_t *fragmentBuffer) {
+    int numsurfaces, numPlanes;
+    int i, j, k, m, n;
+    bspSurfaceType_t *surfaces[64];
+    vec3_t mins, maxs;
+    int returnedFragments;
+    int returnedPoints;
+    vec3_t normals[BSP_MARK_MAX_VERTS_ON_POLY+2];
+    float dists[BSP_MARK_MAX_VERTS_ON_POLY+2];
+    vec3_t clipPoints[2][BSP_MARK_MAX_VERTS_ON_POLY];
+    int numClipPoints;
+    float *v;
+    bspSrfGridMesh_t *cv;
+    drawVert_t *dv;
+    vec3_t normal;
+    vec3_t projectionDir;
+    vec3_t v1, v2;
+    int *indexes;
+
+    if (numPoints <= 0) return 0;
+    if (!s_bspWorld.loaded || s_bspWorld.nodes == NULL) return 0;
+
+    s_bspViewCount++;
+
+    VectorNormalize2(projection, projectionDir);
+    ClearBounds(mins, maxs);
+    for (i = 0; i < numPoints; i++) {
+        vec3_t temp;
+        AddPointToBounds(points[i], mins, maxs);
+        VectorAdd(points[i], projection, temp);
+        AddPointToBounds(temp, mins, maxs);
+        VectorMA(points[i], -20, projectionDir, temp);
+        AddPointToBounds(temp, mins, maxs);
+    }
+
+    if (numPoints > BSP_MARK_MAX_VERTS_ON_POLY) numPoints = BSP_MARK_MAX_VERTS_ON_POLY;
+    for (i = 0; i < numPoints; i++) {
+        VectorSubtract(points[(i+1)%numPoints], points[i], v1);
+        VectorAdd(points[i], projection, v2);
+        VectorSubtract(points[i], v2, v2);
+        CrossProduct(v1, v2, normals[i]);
+        VectorNormalizeFast(normals[i]);
+        dists[i] = DotProduct(normals[i], points[i]);
+    }
+    VectorCopy(projectionDir, normals[numPoints]);
+    dists[numPoints] = DotProduct(normals[numPoints], points[0]) - 32;
+    VectorCopy(projectionDir, normals[numPoints+1]);
+    VectorInverse(normals[numPoints+1]);
+    dists[numPoints+1] = DotProduct(normals[numPoints+1], points[0]) - 20;
+    numPlanes = numPoints + 2;
+
+    numsurfaces = 0;
+    BspBoxSurfaces_r(s_bspWorld.nodes, mins, maxs, surfaces, 64, &numsurfaces, projectionDir);
+
+    returnedPoints = 0;
+    returnedFragments = 0;
+
+    for (i = 0; i < numsurfaces; i++) {
+        if (*surfaces[i] == BSP_SF_GRID) {
+            cv = (bspSrfGridMesh_t *)surfaces[i];
+            for (m = 0; m < cv->height - 1; m++) {
+                for (n = 0; n < cv->width - 1; n++) {
+                    numClipPoints = 3;
+                    dv = cv->verts + m * cv->width + n;
+
+                    VectorCopy(dv[0].xyz, clipPoints[0][0]);
+                    VectorMA(clipPoints[0][0], BSP_MARK_MARKER_OFFSET, dv[0].normal, clipPoints[0][0]);
+                    VectorCopy(dv[cv->width].xyz, clipPoints[0][1]);
+                    VectorMA(clipPoints[0][1], BSP_MARK_MARKER_OFFSET, dv[cv->width].normal, clipPoints[0][1]);
+                    VectorCopy(dv[1].xyz, clipPoints[0][2]);
+                    VectorMA(clipPoints[0][2], BSP_MARK_MARKER_OFFSET, dv[1].normal, clipPoints[0][2]);
+                    VectorSubtract(clipPoints[0][0], clipPoints[0][1], v1);
+                    VectorSubtract(clipPoints[0][2], clipPoints[0][1], v2);
+                    CrossProduct(v1, v2, normal);
+                    VectorNormalizeFast(normal);
+                    if (DotProduct(normal, projectionDir) < -0.1) {
+                        BspAddMarkFragments(numClipPoints, clipPoints,
+                                            numPlanes, normals, dists,
+                                            maxPoints, pointBuffer,
+                                            maxFragments, fragmentBuffer,
+                                            &returnedPoints, &returnedFragments, mins, maxs);
+                        if (returnedFragments == maxFragments) return returnedFragments;
+                    }
+
+                    VectorCopy(dv[1].xyz, clipPoints[0][0]);
+                    VectorMA(clipPoints[0][0], BSP_MARK_MARKER_OFFSET, dv[1].normal, clipPoints[0][0]);
+                    VectorCopy(dv[cv->width].xyz, clipPoints[0][1]);
+                    VectorMA(clipPoints[0][1], BSP_MARK_MARKER_OFFSET, dv[cv->width].normal, clipPoints[0][1]);
+                    VectorCopy(dv[cv->width+1].xyz, clipPoints[0][2]);
+                    VectorMA(clipPoints[0][2], BSP_MARK_MARKER_OFFSET, dv[cv->width+1].normal, clipPoints[0][2]);
+                    VectorSubtract(clipPoints[0][0], clipPoints[0][1], v1);
+                    VectorSubtract(clipPoints[0][2], clipPoints[0][1], v2);
+                    CrossProduct(v1, v2, normal);
+                    VectorNormalizeFast(normal);
+                    if (DotProduct(normal, projectionDir) < -0.05) {
+                        BspAddMarkFragments(numClipPoints, clipPoints,
+                                            numPlanes, normals, dists,
+                                            maxPoints, pointBuffer,
+                                            maxFragments, fragmentBuffer,
+                                            &returnedPoints, &returnedFragments, mins, maxs);
+                        if (returnedFragments == maxFragments) return returnedFragments;
+                    }
+                }
+            }
+        } else if (*surfaces[i] == BSP_SF_FACE) {
+            bspSrfSurfaceFace_t *surf = (bspSrfSurfaceFace_t *)surfaces[i];
+            if (DotProduct(surf->plane.normal, projectionDir) > -0.5) continue;
+            indexes = (int *)((byte *)surf + surf->ofsIndices);
+            for (k = 0; k < surf->numIndices; k += 3) {
+                for (j = 0; j < 3; j++) {
+                    v = &surf->points[0][0] + BSP_VERTEXSIZE * indexes[k+j];
+                    VectorMA(v, BSP_MARK_MARKER_OFFSET, surf->plane.normal, clipPoints[0][j]);
+                }
+                BspAddMarkFragments(3, clipPoints,
+                                    numPlanes, normals, dists,
+                                    maxPoints, pointBuffer,
+                                    maxFragments, fragmentBuffer,
+                                    &returnedPoints, &returnedFragments, mins, maxs);
+                if (returnedFragments == maxFragments) return returnedFragments;
+            }
+        } else if (*surfaces[i] == BSP_SF_TRIANGLES &&
+                   r_marksOnTriangleMeshes != NULL && r_marksOnTriangleMeshes->integer) {
+            bspSrfTriangles_t *surf = (bspSrfTriangles_t *)surfaces[i];
+            for (k = 0; k < surf->numIndexes; k += 3) {
+                for (j = 0; j < 3; j++) {
+                    v = surf->verts[surf->indexes[k+j]].xyz;
+                    VectorMA(v, BSP_MARK_MARKER_OFFSET, surf->verts[surf->indexes[k+j]].normal, clipPoints[0][j]);
+                }
+                BspAddMarkFragments(3, clipPoints,
+                                    numPlanes, normals, dists,
+                                    maxPoints, pointBuffer,
+                                    maxFragments, fragmentBuffer,
+                                    &returnedPoints, &returnedFragments, mins, maxs);
+                if (returnedFragments == maxFragments) return returnedFragments;
+            }
+        }
+    }
+    return returnedFragments;
+}
 static int R_LerpTag(orientation_t *tag, qhandle_t handle, int startFrame, int endFrame, float frac, const char *tagName) {
     const metalModel_t *model;
     const md3Header_t *hdr;

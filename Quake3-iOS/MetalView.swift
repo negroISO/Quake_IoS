@@ -949,20 +949,36 @@ struct MetalView: UIViewRepresentable {
         private var commandQueue: MTLCommandQueue?
         private var uiPipelineState: MTLRenderPipelineState?
         private var uiOpaquePipelineState: MTLRenderPipelineState?
+        /* Full-intensity additive (GL_ONE/GL_ONE) — blendMode=5. */
         private var uiAdditivePipelineState: MTLRenderPipelineState?
+        private var uiAdditiveFullPipelineState: MTLRenderPipelineState? { uiAdditivePipelineState }
+        /* Alpha-modulated additive (GL_SRC_ALPHA/GL_ONE) — blendMode=1. */
+        private var uiAdditiveAlphaPipelineState: MTLRenderPipelineState?
         private var uiFilterPipelineState: MTLRenderPipelineState?
         private var worldPipelineState: MTLRenderPipelineState?
         private var worldFilterPipelineState: MTLRenderPipelineState?
         private var worldAlphaPipelineState: MTLRenderPipelineState?
+        /* Alpha-modulated additive (GL_SRC_ALPHA/GL_ONE) — blendMode=1. */
         private var worldAdditivePipelineState: MTLRenderPipelineState?
+        /* Full-intensity additive (GL_ONE/GL_ONE) — blendMode=5. NEVER
+         * shared with worldAdditivePipelineState per strict blend-split. */
+        private var worldAdditiveFullPipelineState: MTLRenderPipelineState?
         private var skyPipelineState: MTLRenderPipelineState?
+        /* Full-intensity additive sky stage (GL_ONE/GL_ONE) — blendMode=5. */
         private var skyAdditivePipelineState: MTLRenderPipelineState?
+        private var skyAdditiveFullPipelineState: MTLRenderPipelineState? { skyAdditivePipelineState }
+        /* Alpha-modulated additive sky stage (GL_SRC_ALPHA/GL_ONE) — blendMode=1. */
+        private var skyAdditiveAlphaPipelineState: MTLRenderPipelineState?
         private var skyDepthStencilState: MTLDepthStencilState?
         private var entityPipelineState: MTLRenderPipelineState?
         private var entityFilterPipelineState: MTLRenderPipelineState?
         private var entityAlphaPipelineState: MTLRenderPipelineState?
         private var entitySubtractPipelineState: MTLRenderPipelineState?
         private var entityAdditivePipelineState: MTLRenderPipelineState?
+        /* Full-intensity additive (GL_ONE/GL_ONE) — distinct from
+         * entityAdditivePipelineState (GL_SRC_ALPHA/GL_ONE) per strict
+         * blend-split rule. */
+        private var entityAdditiveFullPipelineState: MTLRenderPipelineState?
         private var additiveEntityDepthStencilState: MTLDepthStencilState?
         /* Always-pass depth state for multi-scene HUD sub-scene rendering.
          * The world pass writes world-scale depth values across the entire
@@ -1041,6 +1057,37 @@ struct MetalView: UIViewRepresentable {
                 blue: Double(snapshot.clearColor.2),
                 alpha: Double(snapshot.clearColor.3)
             )
+            /* Explicit read-modify-write guarantees for GL_DST_COLOR/GL_ZERO
+             * (filter) and GL_ZERO/GL_ONE_MINUS_SRC_COLOR (subtract) decals:
+             *
+             *   - loadAction = .load   → preserves the attachment's current
+             *     contents at encoder begin so destinationColor is well-
+             *     defined for the first blend. The world pass (emitted
+             *     immediately after encoder creation) overwrites every
+             *     visible pixel before any filter/subtract decal draws, so
+             *     there is no visual difference vs .clear for normal frames;
+             *     using .load is the stricter contract required by the
+             *     GL_DST_COLOR/GL_ZERO read-modify-write spec.
+             *
+             *   - storeAction = .store → preserve final pixels for present.
+             *     Never .dontCare, never a resolve-only path.
+             *
+             * Scene polys (bullet marks, shadow blobs, blood decals) render
+             * in the SAME render encoder as the world + entities, so
+             * destinationColor continuity holds across all draws. No blit,
+             * no resolve, no intermediate texture between world and decals. */
+            descriptor.colorAttachments[0].loadAction = .load
+            descriptor.colorAttachments[0].storeAction = .store
+
+            /* Sanity: the drawable texture MUST NOT be memoryless — filter
+             * blending needs a real framebuffer to sample destinationColor
+             * from. MTKView with framebufferOnly=false (set in
+             * configureRenderer) guarantees .private storage, not
+             * .memoryless. Log once if this invariant is ever violated. */
+            if let drawableTexture = descriptor.colorAttachments[0].texture,
+               drawableTexture.storageMode == .memoryless {
+                print("[Metal] FATAL: drawable is memoryless — destinationColor will be undefined. Filter/subtract blends will not work.")
+            }
 
             guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
                 return
@@ -1092,10 +1139,12 @@ struct MetalView: UIViewRepresentable {
                     let skyFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
 
                     // Ordered world passes:
-                    // 0 = opaque, 1 = filter, 2 = alpha, 3 = additive.
+                    // 0 = opaque, 1 = filter, 2 = alpha,
+                    // 3 = additive (GL_SRC_ALPHA/GL_ONE — alpha-modulated),
+                    // 4 = additive-full (GL_ONE/GL_ONE — explosion/glow cores).
                     // Sky draws are handled in pass 0 through the sky pipeline
                     // (view-direction spherical projection, no lightmap).
-                    for worldPass in 0..<4 {
+                    for worldPass in 0..<5 {
                     for draw in worldDraws where draw.indexCount > 0 {
                         let isSky = (draw.flags & skyFlagBit) != 0
                         if isSky {
@@ -1129,8 +1178,18 @@ struct MetalView: UIViewRepresentable {
                                 guard let skyStageTexture = texture(for: stage.textureHandle, device: view.device) else {
                                     continue
                                 }
-                                let isAdditive = (stageIndex > 0) && (Int(stage.blendMode) == 1)
-                                let pipeline = isAdditive ? (skyAdditivePipelineState ?? skyPipelineState) : skyPipelineState
+                                /* Strict blend split — NEVER merge 1 and 5. */
+                                let skyBlend = Int(stage.blendMode)
+                                let isAdditiveAlpha = (stageIndex > 0) && skyBlend == 1
+                                let isAdditiveFull  = (stageIndex > 0) && skyBlend == 5
+                                let pipeline: MTLRenderPipelineState
+                                if isAdditiveFull, let p = skyAdditiveFullPipelineState {
+                                    pipeline = p
+                                } else if isAdditiveAlpha, let p = skyAdditiveAlphaPipelineState {
+                                    pipeline = p
+                                } else {
+                                    pipeline = skyPipelineState
+                                }
                                 encoder.setRenderPipelineState(pipeline)
                                 encoder.setDepthStencilState(skyDepthStencilState)
                                 // Sky shaders commonly specify 'cull disable'
@@ -1175,12 +1234,21 @@ struct MetalView: UIViewRepresentable {
                         for stageIndex in 0..<stageCount {
                             let stage = Self.worldStage(draw, stageIndex)
                             let blendMode = Int(stage.blendMode)
-                            let drawPass = (blendMode == 1) ? 3 : ((blendMode == 2) ? 2 : ((blendMode == 3) ? 1 : 0))
+                            let drawPass = (blendMode == 5) ? 4
+                                         : (blendMode == 1) ? 3
+                                         : (blendMode == 2) ? 2
+                                         : (blendMode == 3) ? 1
+                                         : 0
                             guard drawPass == worldPass else { continue }
                             guard let baseTexture = texture(for: stage.textureHandle, device: view.device) else {
                                 continue
                             }
-                            if drawPass == 3, let worldAdditivePipelineState {
+                            if drawPass == 4, let worldAdditiveFullPipelineState {
+                                /* GL_ONE/GL_ONE — distinct pipeline from
+                                 * alpha-modulated additive. */
+                                encoder.setRenderPipelineState(worldAdditiveFullPipelineState)
+                                encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
+                            } else if drawPass == 3, let worldAdditivePipelineState {
                                 encoder.setRenderPipelineState(worldAdditivePipelineState)
                                 encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
                             } else if drawPass == 2, let worldAlphaPipelineState {
@@ -1297,21 +1365,28 @@ struct MetalView: UIViewRepresentable {
                     let entityDraws = UnsafeBufferPointer(start: entityDrawsPointer, count: mainEntityCount)
                     let depthHackBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_DEPTHHACK)
                     let additiveBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE)
+                    let additiveFullBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE_FULL)
                     let alphaBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ALPHA)
                     let filterBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_FILTER)
                     let subtractBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_SUBTRACT)
                     let tcGenEnvBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_TCGEN_ENV)
+                    let scenePolyBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_SCENE_POLY)
+                    let aTestGT0Bit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ATEST_GT0)
 
                     // Ordered entity passes:
-                    // 0 = opaque, 1 = filter, 2 = alpha, 3 = additive,
-                    // 4 = subtract (blood/bullet/shadow decals).
-                    for entityPass in 0..<5 {
+                    // 0 = opaque, 1 = filter, 2 = alpha,
+                    // 3 = additive (GL_SRC_ALPHA/GL_ONE — alpha-modulated),
+                    // 4 = subtract (blood/bullet/shadow decals),
+                    // 5 = additive-full (GL_ONE/GL_ONE — explosion cores).
+                    for entityPass in 0..<6 {
                     for draw in entityDraws where draw.indexCount > 0 {
                         let isEntityAdditive = (draw.flags & additiveBit) != 0
+                        let isEntityAdditiveFull = (draw.flags & additiveFullBit) != 0
                         let isEntityAlpha = (draw.flags & alphaBit) != 0
                         let isEntityFilter = (draw.flags & filterBit) != 0
                         let isEntitySubtract = (draw.flags & subtractBit) != 0
-                        let drawPass = isEntitySubtract ? 4
+                        let drawPass = isEntityAdditiveFull ? 5
+                                     : isEntitySubtract ? 4
                                      : isEntityAdditive ? 3
                                      : isEntityAlpha ? 2
                                      : isEntityFilter ? 1
@@ -1330,8 +1405,26 @@ struct MetalView: UIViewRepresentable {
                         Self.packEntityTcMods(handle: draw.textureHandle, into: &entityUniforms)
                         Self.packEntityAlphaFunc(handle: draw.textureHandle, into: &entityUniforms)
                         Self.packEntityRgbGen(handle: draw.textureHandle, into: &entityUniforms)
+                        /* Per TASK PART 3: no rgbGen/alphaGen override for
+                         * scene polys — the shader's resolved genMode
+                         * flows through verbatim from packEntityRgbGen. */
+                        let isScenePoly = (draw.flags & scenePolyBit) != 0
+                        /* Implicit alphaFunc GT0 for sprite billboards whose
+                         * additive shader didn't declare alphaFunc. Matches
+                         * upstream Q3 intent: dark / transparent regions of
+                         * rlboom/plasma/flash JPEGs must not contribute to
+                         * GL_ONE/GL_ONE blending. Threshold 0.004 (GT0). */
+                        if (draw.flags & aTestGT0Bit) != 0,
+                           entityUniforms.alphaTestThreshold == 0 {
+                            entityUniforms.alphaTestThreshold = 0.004
+                        }
                         encoder.setFragmentBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
-                        if drawPass == 4, let entitySubtractPipelineState {
+                        if drawPass == 5, let entityAdditiveFullPipelineState {
+                            /* GL_ONE/GL_ONE — NEVER shared with the alpha-
+                             * modulated additive pipeline per strict spec. */
+                            encoder.setRenderPipelineState(entityAdditiveFullPipelineState)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveEntityDepthStencilState, device: view.device))
+                        } else if drawPass == 4, let entitySubtractPipelineState {
                             encoder.setRenderPipelineState(entitySubtractPipelineState)
                             encoder.setDepthStencilState(ensuredDepthStencilState(additiveEntityDepthStencilState, device: view.device))
                         } else if drawPass == 3, let entityAdditivePipelineState {
@@ -1345,7 +1438,12 @@ struct MetalView: UIViewRepresentable {
                             encoder.setDepthStencilState(ensuredDepthStencilState(additiveEntityDepthStencilState, device: view.device))
                         } else {
                             encoder.setRenderPipelineState(entityPipelineState)
-                            let state = wantsDepthHack ? depthHackDepthStencilState : depthStencilState
+                            /* Scene polys never write depth regardless of
+                             * pass — emulates upstream Q3 decal
+                             * `polygonOffset` behaviour so decals can't
+                             * z-fight with the surface they sit on. */
+                            let state = isScenePoly ? additiveEntityDepthStencilState
+                                      : (wantsDepthHack ? depthHackDepthStencilState : depthStencilState)
                             encoder.setDepthStencilState(ensuredDepthStencilState(state, device: view.device))
                         }
                         encoder.setFragmentTexture(texture, index: 0)
@@ -1489,25 +1587,30 @@ struct MetalView: UIViewRepresentable {
 
                 if let drawCommandsPointer = Q3MetalRenderer_GetDrawCommands() {
                     let drawCommands = UnsafeBufferPointer(start: drawCommandsPointer, count: Int(snapshot.commandCount))
-                    var currentPipelineMode: UInt32 = UInt32.max
                     for draw in drawCommands {
-                        if draw.blendMode != currentPipelineMode {
-                            let pipeline: MTLRenderPipelineState? = {
-                                switch draw.blendMode {
-                                /* blendMode 0 (opaque) falls through to alpha-over:
-                                 * Q3 2D content is universally alpha-transparent
-                                 * (bigchars font atlas, HUD icons), and disabling
-                                 * blending turns transparent pixels into solid
-                                 * white boxes on map-load / waiting-for-players. */
-                                case 1: return uiAdditivePipelineState ?? uiPipelineState
-                                case 3: return uiFilterPipelineState ?? uiPipelineState
-                                default: return uiPipelineState
-                                }
-                            }()
-                            if let pipeline {
-                                encoder.setRenderPipelineState(pipeline)
+                        /* Per-draw pipeline bind — no cross-draw reuse.
+                         * Pipelines themselves are cached by (srcFactor,
+                         * dstFactor) as distinct MTLRenderPipelineState
+                         * objects built once in configureRenderer. The
+                         * binding call below is always issued before the
+                         * draw so a GL_ONE/GL_ONE additive state cannot
+                         * leak into a subsequent GL_DST_COLOR/GL_ZERO
+                         * filter draw. */
+                        let pipeline: MTLRenderPipelineState? = {
+                            switch draw.blendMode {
+                            /* Strict blend split — blendMode 1 and 5 MUST
+                             * use distinct pipelines. GL_ONE/GL_ONE must
+                             * never route through a .sourceAlpha pipeline
+                             * and GL_SRC_ALPHA/GL_ONE must never route
+                             * through a .one/.one pipeline. */
+                            case 1: return uiAdditiveAlphaPipelineState ?? uiPipelineState
+                            case 5: return uiAdditiveFullPipelineState ?? uiPipelineState
+                            case 3: return uiFilterPipelineState ?? uiPipelineState
+                            default: return uiPipelineState
                             }
-                            currentPipelineMode = draw.blendMode
+                        }()
+                        if let pipeline {
+                            encoder.setRenderPipelineState(pipeline)
                         }
                         if let texture = texture(for: draw.textureHandle, device: view.device) {
                             encoder.setFragmentTexture(texture, index: 0)
@@ -1632,6 +1735,30 @@ struct MetalView: UIViewRepresentable {
                 print("[Metal] Failed to create UI additive pipeline: \\(error)")
             }
 
+            /* UI alpha-modulated additive (GL_SRC_ALPHA/GL_ONE) — blendMode=1.
+             * Strictly distinct from the full-additive pipeline above per
+             * blend-split rule: GL_ONE/GL_ONE MUST NEVER use a pipeline
+             * with sourceAlpha, and GL_SRC_ALPHA/GL_ONE MUST NEVER use
+             * one/one. */
+            let uiAdditiveAlphaDesc = MTLRenderPipelineDescriptor()
+            uiAdditiveAlphaDesc.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            uiAdditiveAlphaDesc.depthAttachmentPixelFormat = view.depthStencilPixelFormat
+            uiAdditiveAlphaDesc.vertexFunction = library.makeFunction(name: "q3_ui_vertex")
+            uiAdditiveAlphaDesc.fragmentFunction = library.makeFunction(name: "q3_ui_fragment")
+            uiAdditiveAlphaDesc.colorAttachments[0].isBlendingEnabled = true
+            uiAdditiveAlphaDesc.colorAttachments[0].writeMask = .all
+            uiAdditiveAlphaDesc.colorAttachments[0].rgbBlendOperation = .add
+            uiAdditiveAlphaDesc.colorAttachments[0].alphaBlendOperation = .add
+            uiAdditiveAlphaDesc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+            uiAdditiveAlphaDesc.colorAttachments[0].sourceAlphaBlendFactor = .one
+            uiAdditiveAlphaDesc.colorAttachments[0].destinationRGBBlendFactor = .one
+            uiAdditiveAlphaDesc.colorAttachments[0].destinationAlphaBlendFactor = .one
+            do {
+                uiAdditiveAlphaPipelineState = try device.makeRenderPipelineState(descriptor: uiAdditiveAlphaDesc)
+            } catch {
+                print("[Metal] Failed to create UI additive-alpha pipeline: \\(error)")
+            }
+
             let uiFilterDesc = MTLRenderPipelineDescriptor()
             uiFilterDesc.colorAttachments[0].pixelFormat = view.colorPixelFormat
             uiFilterDesc.depthAttachmentPixelFormat = view.depthStencilPixelFormat
@@ -1690,19 +1817,37 @@ struct MetalView: UIViewRepresentable {
                 print("[Metal] Failed to create alpha world pipeline: \\(error)")
             }
 
+            /* Alpha-modulated additive (blendMode=1): GL_SRC_ALPHA/GL_ONE. */
             let worldAdditivePipelineDescriptor = worldPipelineDescriptor.copy() as! MTLRenderPipelineDescriptor
             worldAdditivePipelineDescriptor.colorAttachments[0].isBlendingEnabled = true
+            worldAdditivePipelineDescriptor.colorAttachments[0].writeMask = .all
             worldAdditivePipelineDescriptor.colorAttachments[0].rgbBlendOperation = .add
             worldAdditivePipelineDescriptor.colorAttachments[0].alphaBlendOperation = .add
-            worldAdditivePipelineDescriptor.colorAttachments[0].sourceRGBBlendFactor = .one
+            worldAdditivePipelineDescriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
             worldAdditivePipelineDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
             worldAdditivePipelineDescriptor.colorAttachments[0].destinationRGBBlendFactor = .one
             worldAdditivePipelineDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .one
-
             do {
                 worldAdditivePipelineState = try device.makeRenderPipelineState(descriptor: worldAdditivePipelineDescriptor)
             } catch {
                 print("[Metal] Failed to create additive world pipeline: \\(error)")
+            }
+
+            /* Full-intensity additive (blendMode=5): GL_ONE/GL_ONE. Distinct
+             * pipeline from worldAdditivePipelineState per strict spec. */
+            let worldAdditiveFullDescriptor = worldPipelineDescriptor.copy() as! MTLRenderPipelineDescriptor
+            worldAdditiveFullDescriptor.colorAttachments[0].isBlendingEnabled = true
+            worldAdditiveFullDescriptor.colorAttachments[0].writeMask = .all
+            worldAdditiveFullDescriptor.colorAttachments[0].rgbBlendOperation = .add
+            worldAdditiveFullDescriptor.colorAttachments[0].alphaBlendOperation = .add
+            worldAdditiveFullDescriptor.colorAttachments[0].sourceRGBBlendFactor = .one
+            worldAdditiveFullDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
+            worldAdditiveFullDescriptor.colorAttachments[0].destinationRGBBlendFactor = .one
+            worldAdditiveFullDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .one
+            do {
+                worldAdditiveFullPipelineState = try device.makeRenderPipelineState(descriptor: worldAdditiveFullDescriptor)
+            } catch {
+                print("[Metal] Failed to create additive-full world pipeline: \\(error)")
             }
 
             // Sky pipeline: view-direction spherical projection. No blending,
@@ -1720,10 +1865,11 @@ struct MetalView: UIViewRepresentable {
                 print("[Metal] Failed to create sky pipeline: \\(error)")
             }
 
-            // Additive sky pipeline for stage 1+ cloud layers (killsky_2
-            // over killsky_1). src=ONE, dst=ONE.
+            /* Full-intensity additive sky stage (blendMode=5, GL_ONE/GL_ONE).
+             * Stock Q3 cloud overlays (killsky_2 over killsky_1). */
             let skyAdditiveDescriptor = skyPipelineDescriptor.copy() as! MTLRenderPipelineDescriptor
             skyAdditiveDescriptor.colorAttachments[0].isBlendingEnabled = true
+            skyAdditiveDescriptor.colorAttachments[0].writeMask = .all
             skyAdditiveDescriptor.colorAttachments[0].rgbBlendOperation = .add
             skyAdditiveDescriptor.colorAttachments[0].alphaBlendOperation = .add
             skyAdditiveDescriptor.colorAttachments[0].sourceRGBBlendFactor = .one
@@ -1734,6 +1880,23 @@ struct MetalView: UIViewRepresentable {
                 skyAdditivePipelineState = try device.makeRenderPipelineState(descriptor: skyAdditiveDescriptor)
             } catch {
                 print("[Metal] Failed to create additive sky pipeline: \\(error)")
+            }
+
+            /* Alpha-modulated additive sky stage (blendMode=1, GL_SRC_ALPHA/GL_ONE).
+             * Distinct pipeline — NEVER shared with skyAdditivePipelineState. */
+            let skyAdditiveAlphaDesc = skyPipelineDescriptor.copy() as! MTLRenderPipelineDescriptor
+            skyAdditiveAlphaDesc.colorAttachments[0].isBlendingEnabled = true
+            skyAdditiveAlphaDesc.colorAttachments[0].writeMask = .all
+            skyAdditiveAlphaDesc.colorAttachments[0].rgbBlendOperation = .add
+            skyAdditiveAlphaDesc.colorAttachments[0].alphaBlendOperation = .add
+            skyAdditiveAlphaDesc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+            skyAdditiveAlphaDesc.colorAttachments[0].sourceAlphaBlendFactor = .one
+            skyAdditiveAlphaDesc.colorAttachments[0].destinationRGBBlendFactor = .one
+            skyAdditiveAlphaDesc.colorAttachments[0].destinationAlphaBlendFactor = .one
+            do {
+                skyAdditiveAlphaPipelineState = try device.makeRenderPipelineState(descriptor: skyAdditiveAlphaDesc)
+            } catch {
+                print("[Metal] Failed to create additive-alpha sky pipeline: \\(error)")
             }
 
             let skyDepthDescriptor = MTLDepthStencilDescriptor()
@@ -1753,19 +1916,16 @@ struct MetalView: UIViewRepresentable {
                 print("[Metal] Failed to create entity pipeline: \\(error)")
             }
 
-            // Additive entity pipeline (flames, health orb glow, muzzle
-            // flashes, explosion sprites). Q3's shader parser accepts
-            // BOTH `GL_ONE, GL_ONE` (true additive) AND `GL_SRC_ALPHA,
-            // GL_ONE` (alpha-weighted additive). Our parser folds both
-            // into blendMode=1. Binding GL_SRC_ALPHA/GL_ONE here is
-            // strictly better: sprites with alpha=1 (pure additive)
-            // behave identically (src*1+dst=src+dst), while sprites
-            // with alpha<1 (muzzle flashes, explosion particles) now
-            // get correctly weighted instead of saturating the frame
-            // yellow from stacked unweighted additions.
+            /* Alpha-modulated additive (blendMode=1): GL_SRC_ALPHA/GL_ONE.
+             * Particles, flame, muzzle-flash fringes. Source alpha
+             * attenuates the added colour so transparent texels don't
+             * brighten the framebuffer. */
             let entityAdditiveDesc = MTLRenderPipelineDescriptor()
             entityAdditiveDesc.colorAttachments[0].pixelFormat = view.colorPixelFormat
             entityAdditiveDesc.colorAttachments[0].isBlendingEnabled = true
+            entityAdditiveDesc.colorAttachments[0].writeMask = .all
+            entityAdditiveDesc.colorAttachments[0].rgbBlendOperation = .add
+            entityAdditiveDesc.colorAttachments[0].alphaBlendOperation = .add
             entityAdditiveDesc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
             entityAdditiveDesc.colorAttachments[0].destinationRGBBlendFactor = .one
             entityAdditiveDesc.colorAttachments[0].sourceAlphaBlendFactor = .one
@@ -1777,6 +1937,31 @@ struct MetalView: UIViewRepresentable {
                 entityAdditivePipelineState = try device.makeRenderPipelineState(descriptor: entityAdditiveDesc)
             } catch {
                 print("[Metal] Failed to create additive entity pipeline: \\(error)")
+            }
+
+            /* Full-intensity additive (blendMode=5): GL_ONE/GL_ONE.
+             * Explosion cores, rail cores, high-energy effects. Source
+             * alpha is IGNORED — whatever the fragment outputs is added
+             * verbatim to the framebuffer. Kept strictly separate from
+             * the alpha-modulated additive pipeline above per task spec:
+             * "NO FALLBACK / NO MERGE / NO SHARING". */
+            let entityAdditiveFullDesc = MTLRenderPipelineDescriptor()
+            entityAdditiveFullDesc.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            entityAdditiveFullDesc.colorAttachments[0].isBlendingEnabled = true
+            entityAdditiveFullDesc.colorAttachments[0].writeMask = .all
+            entityAdditiveFullDesc.colorAttachments[0].rgbBlendOperation = .add
+            entityAdditiveFullDesc.colorAttachments[0].alphaBlendOperation = .add
+            entityAdditiveFullDesc.colorAttachments[0].sourceRGBBlendFactor = .one
+            entityAdditiveFullDesc.colorAttachments[0].destinationRGBBlendFactor = .one
+            entityAdditiveFullDesc.colorAttachments[0].sourceAlphaBlendFactor = .one
+            entityAdditiveFullDesc.colorAttachments[0].destinationAlphaBlendFactor = .one
+            entityAdditiveFullDesc.depthAttachmentPixelFormat = view.depthStencilPixelFormat
+            entityAdditiveFullDesc.vertexFunction = library.makeFunction(name: "q3_entity_vertex")
+            entityAdditiveFullDesc.fragmentFunction = library.makeFunction(name: "q3_entity_fragment")
+            do {
+                entityAdditiveFullPipelineState = try device.makeRenderPipelineState(descriptor: entityAdditiveFullDesc)
+            } catch {
+                print("[Metal] Failed to create additive-full entity pipeline: \\(error)")
             }
 
             let entityAlphaDesc = MTLRenderPipelineDescriptor()
@@ -1798,6 +1983,9 @@ struct MetalView: UIViewRepresentable {
             let entityFilterDesc = MTLRenderPipelineDescriptor()
             entityFilterDesc.colorAttachments[0].pixelFormat = view.colorPixelFormat
             entityFilterDesc.colorAttachments[0].isBlendingEnabled = true
+            entityFilterDesc.colorAttachments[0].writeMask = .all
+            entityFilterDesc.colorAttachments[0].rgbBlendOperation = .add
+            entityFilterDesc.colorAttachments[0].alphaBlendOperation = .add
             entityFilterDesc.colorAttachments[0].sourceRGBBlendFactor = .destinationColor
             entityFilterDesc.colorAttachments[0].destinationRGBBlendFactor = .zero
             entityFilterDesc.colorAttachments[0].sourceAlphaBlendFactor = .one
@@ -1820,10 +2008,16 @@ struct MetalView: UIViewRepresentable {
             let entitySubtractDesc = MTLRenderPipelineDescriptor()
             entitySubtractDesc.colorAttachments[0].pixelFormat = view.colorPixelFormat
             entitySubtractDesc.colorAttachments[0].isBlendingEnabled = true
+            entitySubtractDesc.colorAttachments[0].writeMask = .all
+            entitySubtractDesc.colorAttachments[0].rgbBlendOperation = .add
+            entitySubtractDesc.colorAttachments[0].alphaBlendOperation = .add
             entitySubtractDesc.colorAttachments[0].sourceRGBBlendFactor = .zero
             entitySubtractDesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceColor
-            entitySubtractDesc.colorAttachments[0].sourceAlphaBlendFactor = .zero
-            entitySubtractDesc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            /* Alpha: write source alpha straight through (one/zero).
+             * Previously used oneMinusSourceAlpha which is a
+             * premultiplied-alpha idiom — inappropriate here. */
+            entitySubtractDesc.colorAttachments[0].sourceAlphaBlendFactor = .one
+            entitySubtractDesc.colorAttachments[0].destinationAlphaBlendFactor = .zero
             entitySubtractDesc.depthAttachmentPixelFormat = view.depthStencilPixelFormat
             entitySubtractDesc.vertexFunction = library.makeFunction(name: "q3_entity_vertex")
             entitySubtractDesc.fragmentFunction = library.makeFunction(name: "q3_entity_fragment")
