@@ -10,3 +10,8 @@ DerivedData/
 
 # Build
 build/
+
+# Local-only (never pushed)
+CLAUDE.md
+brain.db
+.claude/auto-memory/
