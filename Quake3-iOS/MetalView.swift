@@ -339,6 +339,13 @@ struct MetalView: UIViewRepresentable {
              * .w when alphaGenMode == 4. Defaults to (1,1,1,1) so
              * a no-op for shaders that don't opt in. */
             var rgbConstColor: SIMD4<Float> = SIMD4<Float>(1, 1, 1, 1)
+            /* refEntity_t.shader.rgba in [0,1]. Read by the entity
+             * fragment for rgbGen=entity (mode 5) / oneMinusEntity (6)
+             * and alphaGen=entity (5) / oneMinusEntity (6). Distinct
+             * from the per-vertex `color` path because that has Lambert
+             * diffuse already baked in by the C entity build loop;
+             * this carries the un-Lambert'd, raw entity color. */
+            var entityColor: SIMD4<Float> = SIMD4<Float>(1, 1, 1, 1)
         }
 
         /* Fragment-side dlight block bound at buffer(2) for both world and
@@ -613,6 +620,7 @@ struct MetalView: UIViewRepresentable {
             float4 rgbGenWaveParams;
             float4 alphaGenWaveParams;
             float4 rgbConstColor;
+            float4 entityColor;
         };
 
         struct EntityVertexOut {
@@ -876,6 +884,16 @@ struct MetalView: UIViewRepresentable {
                  * color4ub_t from pStage->constantColor and writes it
                  * to every vertex color. */
                 baseRgb = texel.rgb * uniforms.rgbConstColor.rgb;
+            } else if (uniforms.rgbGenMode == 5u) {
+                /* CGEN_ENTITY: refEntity_t.shaderRGBA driven directly,
+                 * NOT modulated by per-vertex Lambert. Used by pickup
+                 * glow + a few weapon viewmodel stages where cgame
+                 * sets shaderRGBA each frame to drive the tint. */
+                baseRgb = texel.rgb * uniforms.entityColor.rgb;
+            } else if (uniforms.rgbGenMode == 6u) {
+                /* CGEN_ONE_MINUS_ENTITY: 1 - shaderRGBA. Inverse-tint
+                 * fade used by some teleport / disintegrate shaders. */
+                baseRgb = texel.rgb * (float3(1.0) - uniforms.entityColor.rgb);
             } else {
                 baseRgb = texel.rgb * in.color.rgb;
             }
@@ -896,6 +914,16 @@ struct MetalView: UIViewRepresentable {
                  * rgbConstColor.w (unused pad of the rgbGen const
                  * SIMD4). */
                 baseA = texel.a * uniforms.rgbConstColor.w;
+            } else if (uniforms.alphaGenMode == 5u) {
+                /* AGEN_ENTITY: refEntity_t.shaderRGBA[3]. Drives
+                 * fade-out animations on rocket explosions, gibs,
+                 * plasma trails — cgame ramps this down each frame. */
+                baseA = texel.a * uniforms.entityColor.a;
+            } else if (uniforms.alphaGenMode == 6u) {
+                /* AGEN_ONE_MINUS_ENTITY: 1 - shaderRGBA[3]. Inverse-fade
+                 * for stages that should be visible only as the entity
+                 * fades in/out the opposite direction. */
+                baseA = texel.a * (1.0 - uniforms.entityColor.a);
             } else {
                 baseA = texel.a * in.color.a;
             }
@@ -1479,6 +1507,11 @@ struct MetalView: UIViewRepresentable {
                         Self.packEntityTcMods(handle: draw.textureHandle, into: &entityUniforms)
                         Self.packEntityAlphaFunc(handle: draw.textureHandle, into: &entityUniforms)
                         Self.packEntityRgbGen(handle: draw.textureHandle, into: &entityUniforms)
+                        /* Per-draw refEntity_t.shaderRGBA fed through to MSL
+                         * for rgbGen=entity / oneMinusEntity (5/6) and
+                         * alphaGen=entity / oneMinusEntity (5/6). */
+                        let ec = draw.entityColor
+                        entityUniforms.entityColor = SIMD4<Float>(ec.0, ec.1, ec.2, ec.3)
                         /* Per TASK PART 3: no rgbGen/alphaGen override for
                          * scene polys — the shader's resolved genMode
                          * flows through verbatim from packEntityRgbGen. */

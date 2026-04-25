@@ -651,6 +651,25 @@ static void AddWorldDrawStageSimple(Q3MetalWorldDrawCmd *draw,
     AddWorldDrawStage(draw, textureHandle, &tmp);
 }
 
+/* Copy refEntity_t.shader.rgba into the per-draw entityColor slot so
+ * MSL rgbGen=entity / alphaGen=entity / oneMinusEntity branches can
+ * reach it without fishing it back out of the per-vertex color (which
+ * has Lambert diffuse already baked in). Mirrors the shader.rgba[3]==0
+ * → default-white convention used by the per-vertex color path. */
+static void SetEntityDrawColor(uint32_t cursor, const refEntity_t *e) {
+    if (e != NULL && e->shader.rgba[3] != 0) {
+        s_entityDraws[cursor].entityColor[0] = (float)e->shader.rgba[0] / 255.0f;
+        s_entityDraws[cursor].entityColor[1] = (float)e->shader.rgba[1] / 255.0f;
+        s_entityDraws[cursor].entityColor[2] = (float)e->shader.rgba[2] / 255.0f;
+        s_entityDraws[cursor].entityColor[3] = (float)e->shader.rgba[3] / 255.0f;
+    } else {
+        s_entityDraws[cursor].entityColor[0] = 1.0f;
+        s_entityDraws[cursor].entityColor[1] = 1.0f;
+        s_entityDraws[cursor].entityColor[2] = 1.0f;
+        s_entityDraws[cursor].entityColor[3] = 1.0f;
+    }
+}
+
 /* Heuristic: should alpha be synthesized when a JPG fallback is loaded
  * for this texture? Stock Q3's FX sprites (plasma bolts, explosions,
  * blood splats, flares) ship as .tga with alpha; when the .tga is
@@ -4097,6 +4116,15 @@ static void ParseShaderText(const char *text) {
                     else if (!Q_stricmp(token, "lightingDiffuse") ||
                              !Q_stricmp(token, "lightingdiffuse")) cur.rgbGen = 2;
                     else if (!Q_stricmp(token, "wave")) cur.rgbGen = 3;
+                    /* entity: refEntity_t.shaderRGBA → fragment multiplies
+                     * texel.rgb by uniforms.entityColor.rgb (un-Lambert'd
+                     * — distinct from the per-vertex color path which has
+                     * Lambert diffuse already baked in). */
+                    else if (!Q_stricmp(token, "entity")) cur.rgbGen = 5;
+                    /* oneMinusEntity: 1.0 - entity rgba. Used by some
+                     * fade-in / inverse-tint stages (e.g. teleport flicker). */
+                    else if (!Q_stricmp(token, "oneMinusEntity") ||
+                             !Q_stricmp(token, "oneminusentity")) cur.rgbGen = 6;
                     else cur.rgbGen = 0;
                     if (!Q_stricmp(token, "wave")) {
                         /* Copy tokens to locals — COM_ParseExt returns a
@@ -4150,6 +4178,12 @@ static void ParseShaderText(const char *text) {
                     if (!Q_stricmp(token, "vertex")) cur.alphaGen = 1;
                     else if (!Q_stricmp(token, "wave")) cur.alphaGen = 3;
                     else if (!Q_stricmp(token, "const")) cur.alphaGen = 4;
+                    /* entity: use refEntity_t.shaderRGBA[3] directly — drives
+                     * fade animations on gibs, rocket explosions, plasma
+                     * trails (cgame ramps the alpha down each frame). */
+                    else if (!Q_stricmp(token, "entity")) cur.alphaGen = 5;
+                    else if (!Q_stricmp(token, "oneMinusEntity") ||
+                             !Q_stricmp(token, "oneminusentity")) cur.alphaGen = 6;
                     else cur.alphaGen = 0;
                     if (!Q_stricmp(token, "wave")) {
                         /* See rgbGen wave: COM_ParseExt aliases into a
@@ -5356,6 +5390,7 @@ static void RE_RenderScene(const refdef_t *fd) {
                         s_entityDraws[entityDrawCursor].indexCount = 6;
                         s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)sceneEntity->entity.customShader;
                         s_entityDraws[entityDrawCursor].flags = spriteFlags;
+                        SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity);
                     }
                     entityDrawCursor += 1;
                     continue;
@@ -5468,6 +5503,7 @@ static void RE_RenderScene(const refdef_t *fd) {
                     s_entityDraws[entityDrawCursor].flags =
                         Q3_METAL_ENTITY_DRAWFLAG_NOCULL |
                         Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                    SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity);
                     entityDrawCursor += 1;
                     continue;
                 }
@@ -5551,6 +5587,7 @@ static void RE_RenderScene(const refdef_t *fd) {
                     s_entityDraws[entityDrawCursor].flags =
                         Q3_METAL_ENTITY_DRAWFLAG_NOCULL |
                         Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                    SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity);
                     entityDrawCursor += 1;
                     continue;
                 }
@@ -5631,6 +5668,7 @@ static void RE_RenderScene(const refdef_t *fd) {
                     s_entityDraws[entityDrawCursor].flags =
                         Q3_METAL_ENTITY_DRAWFLAG_NOCULL |
                         Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                    SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity);
                     entityDrawCursor += 1;
                     continue;
                 }
@@ -5749,6 +5787,7 @@ static void RE_RenderScene(const refdef_t *fd) {
                     s_entityDraws[entityDrawCursor].flags =
                         Q3_METAL_ENTITY_DRAWFLAG_NOCULL |
                         Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                    SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity);
                     entityDrawCursor += 1;
                     continue;
                 }
@@ -6022,6 +6061,7 @@ static void RE_RenderScene(const refdef_t *fd) {
                     s_entityDraws[entityDrawCursor].indexCount = entityIndexCursor - firstIndex;
                     s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)textureHandle;
                     s_entityDraws[entityDrawCursor].flags = drawFlags;
+                    SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity);
                     entityDrawCursor += 1;
 
                     surface = (const md3Surface_t *)((const byte *)surface + surface->ofsEnd);
@@ -6116,6 +6156,12 @@ static void RE_RenderScene(const refdef_t *fd) {
                     s_entityDraws[entityDrawCursor].indexCount = (uint32_t)((nv - 2) * 3);
                     s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)poly->shader;
                     s_entityDraws[entityDrawCursor].flags = polyFlags;
+                    /* Scene polys (RE_AddPolyToScene) carry per-vertex
+                     * polyVert_t.modulate already; rgbGen=entity isn't a
+                     * concept here. Default the per-draw entityColor to
+                     * white so any oneMinusEntity/entity stage on the
+                     * shader returns identity. */
+                    SetEntityDrawColor(entityDrawCursor, NULL);
 
                     entityVertexCursor += (uint32_t)nv;
                     entityIndexCursor += (uint32_t)((nv - 2) * 3);

@@ -142,6 +142,12 @@ typedef struct {
     uint32_t indexCount;
     uint32_t textureHandle;
     uint32_t flags;
+    /* refEntity_t.shader.rgba normalized to [0,1] floats. Read by the
+     * MSL entity fragment for rgbGen=entity / oneMinusEntity and
+     * alphaGen=entity / oneMinusEntity (modes 5 and 6). The
+     * un-Lambert'd entity color — distinct from per-vertex `color`
+     * which has Lambert diffuse already baked in by the C build loop. */
+    float entityColor[4];
 } Q3MetalEntityDrawCmd;
 
 enum {
