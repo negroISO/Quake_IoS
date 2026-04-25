@@ -21,6 +21,7 @@ targets:
           - "*.swift"
       - path: Quake3-iOS/Quake3-iOS-Bridging-Header.h
         buildPhase: none
+      - path: Quake3-iOS/Assets.xcassets
       - path: code/ios
         type: group
       - path: code/qcommon

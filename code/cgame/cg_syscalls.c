@@ -73,6 +73,12 @@ void trap_Cvar_VariableStringBuffer( const char *var_name, char *buffer, int buf
 	syscall( CG_CVAR_VARIABLESTRINGBUFFER, var_name, buffer, bufsize );
 }
 
+qboolean CG_MetalInstrEnabled( void ) {
+	char value[16];
+	trap_Cvar_VariableStringBuffer( "metal_cgame_instr", value, sizeof( value ) );
+	return atoi( value ) != 0;
+}
+
 int		trap_Argc( void ) {
 	return syscall( CG_ARGC );
 }
@@ -262,7 +268,7 @@ void	trap_R_AddPolyToScene( qhandle_t hShader , int numVerts, const polyVert_t *
 	static int s_trapAddPolyCount = 0;
 	static int s_trapAddPolyLastLogged = -1;
 	s_trapAddPolyCount++;
-	if ( s_trapAddPolyCount == 1 || s_trapAddPolyCount - s_trapAddPolyLastLogged >= 64 ) {
+	if ( CG_MetalInstrEnabled() && ( s_trapAddPolyCount == 1 || s_trapAddPolyCount - s_trapAddPolyLastLogged >= 64 ) ) {
 		CG_Printf( "[cgame-instr] trap_R_AddPolyToScene count=%d shader=%d nv=%d\n",
 			s_trapAddPolyCount, (int)hShader, numVerts );
 		s_trapAddPolyLastLogged = s_trapAddPolyCount;
@@ -273,7 +279,7 @@ void	trap_R_AddPolyToScene( qhandle_t hShader , int numVerts, const polyVert_t *
 void	trap_R_AddPolysToScene( qhandle_t hShader , int numVerts, const polyVert_t *verts, int num ) {
 	static int s_trapAddPolysCount = 0;
 	s_trapAddPolysCount++;
-	if ( s_trapAddPolysCount == 1 || ( s_trapAddPolysCount % 64 ) == 0 ) {
+	if ( CG_MetalInstrEnabled() && ( s_trapAddPolysCount == 1 || ( s_trapAddPolysCount % 64 ) == 0 ) ) {
 		CG_Printf( "[cgame-instr] trap_R_AddPolysToScene count=%d shader=%d nv=%d num=%d\n",
 			s_trapAddPolysCount, (int)hShader, numVerts, num );
 	}

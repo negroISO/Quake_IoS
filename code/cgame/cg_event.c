@@ -543,7 +543,7 @@ void CG_EntityEvent( centity_t *cent, vec3_t position ) {
 		static int s_evTotal = 0;
 		static int s_evLastLogged = -1;
 		s_evTotal++;
-		if ( s_evTotal == 1 || s_evTotal - s_evLastLogged >= 128 ) {
+		if ( CG_MetalInstrEnabled() && ( s_evTotal == 1 || s_evTotal - s_evLastLogged >= 128 ) ) {
 			CG_Printf( "[cgame-instr] CG_EntityEvent total=%d last_event=%d ent=%d\n",
 				s_evTotal, event, es->number );
 			s_evLastLogged = s_evTotal;
@@ -977,7 +977,7 @@ void CG_EntityEvent( centity_t *cent, vec3_t position ) {
 		DEBUGNAME("EV_MISSILE_HIT");
 		{
 			static int s_nMH = 0;
-			if ( ++s_nMH <= 4 || ( s_nMH % 16 ) == 0 )
+			if ( CG_MetalInstrEnabled() && ( ++s_nMH <= 4 || ( s_nMH % 16 ) == 0 ) )
 				CG_Printf( "[cgame-instr] event EV_MISSILE_HIT n=%d wpn=%d\n", s_nMH, es->weapon );
 		}
 		ByteToDir( es->eventParm, dir );
@@ -988,7 +988,7 @@ void CG_EntityEvent( centity_t *cent, vec3_t position ) {
 		DEBUGNAME("EV_MISSILE_MISS");
 		{
 			static int s_nMM = 0;
-			if ( ++s_nMM <= 4 || ( s_nMM % 16 ) == 0 )
+			if ( CG_MetalInstrEnabled() && ( ++s_nMM <= 4 || ( s_nMM % 16 ) == 0 ) )
 				CG_Printf( "[cgame-instr] event EV_MISSILE_MISS n=%d wpn=%d\n", s_nMM, es->weapon );
 		}
 		ByteToDir( es->eventParm, dir );
@@ -999,7 +999,7 @@ void CG_EntityEvent( centity_t *cent, vec3_t position ) {
 		DEBUGNAME("EV_MISSILE_MISS_METAL");
 		{
 			static int s_nMMm = 0;
-			if ( ++s_nMMm <= 4 || ( s_nMMm % 16 ) == 0 )
+			if ( CG_MetalInstrEnabled() && ( ++s_nMMm <= 4 || ( s_nMMm % 16 ) == 0 ) )
 				CG_Printf( "[cgame-instr] event EV_MISSILE_MISS_METAL n=%d wpn=%d\n", s_nMMm, es->weapon );
 		}
 		ByteToDir( es->eventParm, dir );
@@ -1031,7 +1031,7 @@ void CG_EntityEvent( centity_t *cent, vec3_t position ) {
 		DEBUGNAME("EV_BULLET_HIT_WALL");
 		{
 			static int s_nBHW = 0;
-			if ( ++s_nBHW <= 4 || ( s_nBHW % 32 ) == 0 )
+			if ( CG_MetalInstrEnabled() && ( ++s_nBHW <= 4 || ( s_nBHW % 32 ) == 0 ) )
 				CG_Printf( "[cgame-instr] event EV_BULLET_HIT_WALL n=%d\n", s_nBHW );
 		}
 		ByteToDir( es->eventParm, dir );
@@ -1042,7 +1042,7 @@ void CG_EntityEvent( centity_t *cent, vec3_t position ) {
 		DEBUGNAME("EV_BULLET_HIT_FLESH");
 		{
 			static int s_nBHF = 0;
-			if ( ++s_nBHF <= 4 || ( s_nBHF % 32 ) == 0 )
+			if ( CG_MetalInstrEnabled() && ( ++s_nBHF <= 4 || ( s_nBHF % 32 ) == 0 ) )
 				CG_Printf( "[cgame-instr] event EV_BULLET_HIT_FLESH n=%d\n", s_nBHF );
 		}
 		CG_Bullet( es->pos.trBase, es->otherEntityNum, dir, qtrue, es->eventParm );
@@ -1315,4 +1315,3 @@ void CG_CheckEvents( centity_t *cent ) {
 
 	CG_EntityEvent( cent, cent->lerpOrigin );
 }
-

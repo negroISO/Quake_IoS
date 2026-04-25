@@ -92,6 +92,10 @@ static qhandle_t s_timHellAddTextureHandle;
 static qhandle_t *s_worldLightmapHandles;
 static int s_worldLightmapCount;
 
+static qboolean MetalRenderAuditEnabled(void) {
+    return ri.Cvar_VariableIntegerValue("metal_render_audit") != 0;
+}
+
 /* Per-map fog LUT (cycle F1 of fog rendering). LUMP_FOGS in the BSP
  * holds one dfog_t per fog volume; each one names a shader whose
  * fogparms directive we parsed earlier into
@@ -3039,6 +3043,16 @@ static qboolean LoadWorldMapData(const char *name) {
             skippedNoDrawSurfaces += 1;
             continue;
         }
+        /* First-pass counterpart of the fog-volume skip in the emit
+         * loop below. Keep buffer sizing exactly aligned with what we
+         * end up emitting. */
+        {
+            const metalShaderMap_t *_fe = ShaderMap_LookupEntry(shaders[shaderNum].shader);
+            if (_fe != NULL && _fe->hasFog) {
+                skippedNoDrawSurfaces += 1;
+                continue;
+            }
+        }
 
         if (surfaceType == MST_PATCH) {
             patchWidth = LittleLong(surface->patchWidth);
@@ -3143,6 +3157,23 @@ static qboolean LoadWorldMapData(const char *name) {
         }
         if (!IsDrawableWorldShader(&shaders[shaderNum])) {
             continue;
+        }
+        /* Skip fog-volume brushes. Q3 fog shaders (e.g.
+         * `textures/sfx/fog_q3dm4`, `proto_hellfog`) typically declare
+         * only `surfaceparm fog` + `fogparms` and have NO `map`
+         * directive — meaning our shader-map entry has empty mapPath
+         * and stageCount=0. Without this skip, the brush's visible
+         * face renders via the white-fallback path, producing a solid
+         * white plane covering the floor wherever the player stands
+         * inside the fog volume (visible on q3dm4). The actual fog
+         * tinting (per-fragment exp(-distance) blend) is consumed by
+         * the BSP fogNum + LUMP_FOGS pipeline already; the brush face
+         * itself is supposed to be invisible. */
+        {
+            const metalShaderMap_t *_fe = ShaderMap_LookupEntry(shaders[shaderNum].shader);
+            if (_fe != NULL && _fe->hasFog) {
+                continue;
+            }
         }
 
         if (IsSkyShaderName(shaders[shaderNum].shader)) {
@@ -4188,8 +4219,15 @@ static void ParseShaderText(const char *text) {
                 } else if (!Q_stricmp(token, "surfaceparm")) {
                     /* surfaceparm <keyword>. We only care about `sky`
                      * right now — everything else (trans, nolightmap,
-                     * nomarks, noimpact, etc.) is ignored but we must
-                     * still consume its argument so the parser advances. */
+                     * nomarks, noimpact, fog, etc.) is ignored but we
+                     * still consume the argument so the parser
+                     * advances. NOTE: `surfaceparm fog` is NOT used
+                     * here to mark a fog volume — q3dm6 and other
+                     * pak0 shaders use it on regular floor brushes
+                     * where `surfaceparm` is a content tag rather
+                     * than a "this brush is a fog volume" signal.
+                     * The reliable fog-volume marker is `fogparms`,
+                     * which only true fog volumes declare. */
                     token = COM_ParseExt(&p, qfalse);
                     if (token[0] && !Q_stricmp(token, "sky")) {
                         gotSky = qtrue;
@@ -5270,6 +5308,31 @@ static void RE_AddPolyToScene(qhandle_t hShader, int numVerts, const polyVert_t 
         for (vi = 0; vi < numVerts; ++vi) {
             s_scenePolyVerts[s_scenePolyVertCount + vi] = verts[polyIdx * numVerts + vi];
         }
+        if (MetalRenderAuditEnabled()) {
+            static int s_polyAuditCount = 0;
+            if (s_polyAuditCount < 64) {
+                int aMin = 255;
+                int aMax = 0;
+                float sMin = 9999.0f;
+                float sMax = -9999.0f;
+                float tMin = 9999.0f;
+                float tMax = -9999.0f;
+                for (vi = 0; vi < numVerts; ++vi) {
+                    const polyVert_t *pv = &verts[polyIdx * numVerts + vi];
+                    int a = pv->modulate.rgba[3];
+                    if (a < aMin) aMin = a;
+                    if (a > aMax) aMax = a;
+                    if (pv->st[0] < sMin) sMin = pv->st[0];
+                    if (pv->st[0] > sMax) sMax = pv->st[0];
+                    if (pv->st[1] < tMin) tMin = pv->st[1];
+                    if (pv->st[1] > tMax) tMax = pv->st[1];
+                }
+                ri.Printf(PRINT_DEVELOPER,
+                    "[scene-poly-submit] shader=%d verts=%d alpha=%d..%d st=(%.2f..%.2f,%.2f..%.2f)\n",
+                    (int)hShader, numVerts, aMin, aMax, sMin, sMax, tMin, tMax);
+                s_polyAuditCount++;
+            }
+        }
         s_scenePolyVertCount += numVerts;
         s_scenePolyCount += 1;
     }
@@ -5399,7 +5462,7 @@ static void RE_RenderScene(const refdef_t *fd) {
     }
 
     s_sceneLogCounter += 1;
-    if ((s_sceneLogCounter % 60) == 0) {
+    if (MetalRenderAuditEnabled() && (s_sceneLogCounter % 60) == 0) {
         ri.Printf(
             PRINT_ALL,
             "Metal debug refdef[%u]: vieworg=(%.2f %.2f %.2f) axis0=(%.3f %.3f %.3f) "
@@ -5746,6 +5809,22 @@ static void RE_RenderScene(const refdef_t *fd) {
                          * (classic hard-rectangular explosion quad). */
                         if (isAdditiveLike && !hasExplicitATest) {
                             spriteFlags |= Q3_METAL_ENTITY_DRAWFLAG_ATEST_GT0;
+                        }
+                        if (MetalRenderAuditEnabled()) {
+                            static int s_spriteAuditCount = 0;
+                            if (s_spriteAuditCount < 64) {
+                                ri.Printf(PRINT_DEVELOPER,
+                                    "[sprite-audit] shader=%d tex='%s' radius=%.1f rgba=%.2f,%.2f,%.2f,%.2f blend=%d alphaFunc=%d rgbGen=%d alphaGen=%d flags=0x%x\n",
+                                    (int)sceneEntity->entity.customShader,
+                                    tex ? tex->name : "(no-tex)",
+                                    radius, r, g, b, a,
+                                    tex ? tex->blendMode : -1,
+                                    tex ? tex->alphaFunc : -1,
+                                    tex ? tex->rgbGen : -1,
+                                    tex ? tex->alphaGen : -1,
+                                    (unsigned)spriteFlags);
+                                s_spriteAuditCount++;
+                            }
                         }
                         s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
                         s_entityDraws[entityDrawCursor].indexCount = 6;
@@ -6298,10 +6377,10 @@ static void RE_RenderScene(const refdef_t *fd) {
                             }
                         }
                         /* Diagnostic: first 5 per frame */
-                        {
+                        if (MetalRenderAuditEnabled()) {
                             static int s_entityBlendLog = 0;
                             if (s_entityBlendLog < 5 && tex != NULL) {
-                                ri.Printf(PRINT_ALL, "Metal entity blend: tex='%s' bm=%d flags=0x%x\n",
+                                ri.Printf(PRINT_DEVELOPER, "Metal entity blend: tex='%s' bm=%d flags=0x%x\n",
                                           tex->name, tex->blendMode, drawFlags);
                                 s_entityBlendLog++;
                             }
@@ -6584,7 +6663,7 @@ static void RE_RenderScene(const refdef_t *fd) {
     s_frameSnapshot.entityCommandCount = s_entityDrawCount;
     s_frameSnapshot.lightCount = s_frameLightCount;
     s_frameSnapshot.sceneCount = s_sceneSnapshotCount;
-    if ((s_sceneLogCounter % 60) == 0) {
+    if (MetalRenderAuditEnabled() && (s_sceneLogCounter % 60) == 0) {
         uint32_t i;
         ri.Printf(PRINT_ALL,
             "Metal scene frame: scenes=%u totalEntCmds=%u totalLights=%u\n",

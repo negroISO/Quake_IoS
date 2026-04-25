@@ -22,6 +22,7 @@
 #include <math.h>
 
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 
 #include "../qcommon/q_shared.h"
 #include "../qcommon/qcommon.h"
@@ -645,12 +646,35 @@ static qboolean engine_initialized = qfalse;
 void Quake3_Init(const char *basePath) {
     if (engine_initialized) return;
 
+    /* Disable C-side stdio buffering so Com_Printf and any other
+     * stdout/stderr writes flush immediately. Without this, on
+     * device captures via devicectl --console can lose the last
+     * 4-8KB of output when the app is SIGKILL'd, hiding the actual
+     * crash signature. */
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
+    NSLog(@"[Q3-INIT] entered Quake3_Init basePath=%s", basePath ? basePath : "(null)");
+
     if (basePath && basePath[0]) {
         Q_strncpyz(installPath, basePath, sizeof(installPath));
     }
 
-    char cmdline[256] = "";
+    /* Force the QVM bytecode interpreter (vm_* = 1) instead of the
+     * JIT compiler (vm_* = 2). On Apple Silicon iPad (M-series) the
+     * JIT path's W^X enforcement is stricter than on A-series iPhone:
+     * Quake3e's vm_aarch64.c writes JIT pages without calling
+     * pthread_jit_write_protect_np(), and iPad SIGKILLs the app the
+     * first time it tries to execute JITted code (right after
+     * "ui loaded" prints, which is when CL_InitGUI calls
+     * vmMain(UI_GETAPIVERSION)). Bytecode interpretation is plenty
+     * fast for UI/cgame on modern hardware. cgame uses native VM
+     * registry (in-binary, not QVM), so vm_cgame doesn't really
+     * matter, but we set it for symmetry. */
+    char cmdline[256] = "+set vm_ui 1 +set vm_game 1 +set vm_cgame 1";
+    NSLog(@"[Q3-INIT] calling Com_Init cmdline='%s'", cmdline);
     Com_Init(cmdline);
+    NSLog(@"[Q3-INIT] Com_Init returned");
     Cvar_Set("com_maxfps", "120");
     Cvar_Set("com_maxfpsUnfocused", "120");
 
@@ -659,11 +683,13 @@ void Quake3_Init(const char *basePath) {
      * instead of loading baseq3/pak8.pk3's cgame.qvm. Kills the QVM
      * ABI mismatch that's been driving every workaround commit (head
      * hide, weapons2 hide, fallback camera, synthetic viewmodel). */
+    NSLog(@"[Q3-INIT] registering native cgame");
     {
         extern vmMainFunc_t CG_Native_GetEntryPoint(void);
         extern dllEntry_t   CG_Native_GetDllEntry(void);
         VM_RegisterNative("cgame", CG_Native_GetEntryPoint(), CG_Native_GetDllEntry());
     }
+    NSLog(@"[Q3-INIT] cgame registered; calling IN_Init");
 
     /* Q3's stock client (sdl_input.c / linux_glimp.c) is NOT linked on
      * iOS — only our ios_main.m defines IN_Init, and nothing in the
@@ -672,15 +698,24 @@ void Quake3_Init(const char *basePath) {
      * Call it explicitly here, after Com_Init so the cvar and command
      * subsystems are up. */
     IN_Init();
-    /* TEMPORARY TROUBLESHOOTING cvar block — paired with the MetalView
-     * drawable-lock patch. Locks resolution at 960x444, disables 2D HUD
-     * (keeps gun+no crosshair), sets max texture quality, standard
-     * overbright, vsync off, 60fps cap. REVERT once the rendering
-     * investigation is complete. */
+    NSLog(@"[Q3-INIT] IN_Init returned; queuing boot cbuf");
+    /* Per-device resolution. iPhone stays at 960x444 (matches the
+     * reference AVI dimensions used by the demo-four capture +
+     * vision-LLM diff pipeline). iPad uses 1280x960 — exact 4:3,
+     * matching iPad Pro 13"'s native 2752x2064 (also 4:3) so the
+     * Metal layer scales 1280x960 → native without aspect
+     * distortion. 1280x1024 (5:4) caused the visible squish/
+     * letterbox. Q3's renderer + FOV math were also built around
+     * 4:3, so this keeps yfov honest. Detected at runtime via
+     * UIUserInterfaceIdiom so a single binary handles both. */
+    BOOL isPad = ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad);
+    const char *resCmds = isPad
+        ? "seta r_customwidth 1280; seta r_customheight 960; "
+        : "seta r_customwidth 960; seta r_customheight 444; ";
+    NSLog(@"[Q3-INIT] resolution: %s", isPad ? "iPad 1280x960 (4:3)" : "iPhone 960x444");
+    Cbuf_AddText(resCmds);
     Cbuf_AddText(
         "seta r_mode -1; "
-        "seta r_customwidth 960; "
-        "seta r_customheight 444; "
         "seta r_fullscreen 0; "
         /* Match the reference capture's HUD state: obituary kill-feed
          * visible (via default con_notifytime), no bottom HUD numbers
@@ -699,6 +734,8 @@ void Quake3_Init(const char *basePath) {
         "seta r_overBrightBits 1; "
         "seta r_mapOverBrightBits 2; "
         "seta r_dynamiclight 1; "
+        "seta metal_render_audit 0; "
+        "seta metal_cgame_instr 0; "
         /* com_maxfps 25 matches the reference AVI frame rate so demo
          * replay advances deterministically frame-for-frame with
          * reference — no warmup alignment skew. */
@@ -731,9 +768,17 @@ void Quake3_Init(const char *basePath) {
          * cover the menu-render path that the demo path skips. Cheap
          * (~50 RegisterShader calls); does not affect the demo
          * playback or AVI capture. */
-        "test_menu_assets; "
-        "demo four; wait 50; video four; wait 1500; stopvideo; quit\n");
+        "test_menu_assets\n");
+    /* The actual launch command (e.g. "demo four", "map q3dm6", or
+     * a custom demo from the SwiftUI launch menu) is queued from the
+     * Swift app shell after Quake3_Init returns, via Q3Exec_Command.
+     * That keeps Scope-A demo selection menu-driven without a recompile
+     * for each demo. q3dev_run.sh capture flow can still record a demo
+     * by tapping the matching button in the launch menu (or by issuing
+     * `demo four; wait 50; video four; wait 1500; stopvideo; quit`
+     * via Q3Exec_Command directly during a CI capture). */
     engine_initialized = qtrue;
+    NSLog(@"[Q3-INIT] engine_initialized = qtrue; returning from Quake3_Init");
 
     Com_Printf("=== Quake3 iOS Engine Initialized ===\n");
 }
@@ -761,4 +806,33 @@ void Q3Exec_Command(const char *cmd) {
     buf[len] = '\0';
     Cbuf_AddText(buf);
     Cbuf_Execute();
+}
+
+/* Hardware keyboard / trackpad input bridges. Called from
+ * Q3InputView (MetalView.swift) on the main thread; Sys_QueEvent's
+ * ring buffer is single-thread-safe and Com_Frame drains it during
+ * the next MTKView draw tick — no extra synchronization needed. */
+void Q3Sys_KeyEvent(int q3Key, int down) {
+    if (!engine_initialized) return;
+    Sys_QueEvent(0, SE_KEY, q3Key, down ? qtrue : qfalse, 0, NULL);
+}
+
+void Q3Sys_MouseMove(int dx, int dy) {
+    if (!engine_initialized) return;
+    if (dx == 0 && dy == 0) return;
+    Sys_QueEvent(0, SE_MOUSE, dx, dy, 0, NULL);
+}
+
+/* Console / menu text-input bridge. Q3 has TWO event paths for the
+ * keyboard: SE_KEY drives bind execution and editing controls
+ * (arrows/backspace/enter/esc); SE_CHAR drives the actual character
+ * insertion into the console line, player-name field, cvar-value
+ * field, etc. Without SE_CHAR, the user can press W/A/S/D and walk
+ * around but can't type their name or a cvar value. We still need
+ * SE_KEY for the same physical keypress (so bind 'a' "+moveleft"
+ * keeps working); fire both. */
+void Q3Sys_CharEvent(int ch) {
+    if (!engine_initialized) return;
+    if (ch <= 0) return;
+    Sys_QueEvent(0, SE_CHAR, ch, 0, 0, NULL);
 }

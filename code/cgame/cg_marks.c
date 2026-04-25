@@ -144,7 +144,7 @@ void CG_ImpactMark( qhandle_t markShader, const vec3_t origin, const vec3_t dir,
 
 	if ( !cg_addMarks.integer ) {
 		s_impactMarkGated++;
-		if ( s_impactMarkGated == 1 || ( s_impactMarkGated % 32 ) == 0 ) {
+		if ( CG_MetalInstrEnabled() && ( s_impactMarkGated == 1 || ( s_impactMarkGated % 32 ) == 0 ) ) {
 			CG_Printf( "[cgame-instr] CG_ImpactMark GATED cg_addMarks=0 gated=%d\n",
 				s_impactMarkGated );
 		}
@@ -152,7 +152,7 @@ void CG_ImpactMark( qhandle_t markShader, const vec3_t origin, const vec3_t dir,
 	}
 
 	s_impactMarkCount++;
-	if ( s_impactMarkCount <= 4 || ( s_impactMarkCount % 32 ) == 0 ) {
+	if ( CG_MetalInstrEnabled() && ( s_impactMarkCount <= 4 || ( s_impactMarkCount % 32 ) == 0 ) ) {
 		CG_Printf( "[cgame-instr] CG_ImpactMark count=%d shader=%d radius=%.1f temp=%d origin=%.0f,%.0f,%.0f\n",
 			s_impactMarkCount, (int)markShader, radius, (int)temporary,
 			origin[0], origin[1], origin[2] );
@@ -192,7 +192,7 @@ void CG_ImpactMark( qhandle_t markShader, const vec3_t origin, const vec3_t dir,
 		static int s_markFragZero = 0;
 		s_markFragCalls++;
 		if ( numFragments == 0 ) s_markFragZero++;
-		if ( s_markFragCalls <= 8 || ( s_markFragCalls % 64 ) == 0 ) {
+		if ( CG_MetalInstrEnabled() && ( s_markFragCalls <= 8 || ( s_markFragCalls % 64 ) == 0 ) ) {
 			CG_Printf( "[cgame-instr] trap_CM_MarkFragments calls=%d zeroRet=%d thisRet=%d radius=%.1f\n",
 				s_markFragCalls, s_markFragZero, numFragments, radius );
 		}
@@ -268,7 +268,7 @@ void CG_AddMarks( void ) {
 
 	if ( !cg_addMarks.integer ) {
 		s_addMarksGated++;
-		if ( s_addMarksGated == 1 || ( s_addMarksGated % 300 ) == 0 ) {
+		if ( CG_MetalInstrEnabled() && ( s_addMarksGated == 1 || ( s_addMarksGated % 300 ) == 0 ) ) {
 			CG_Printf( "[cgame-instr] CG_AddMarks GATED cg_addMarks=0 n=%d\n", s_addMarksGated );
 		}
 		return;
@@ -328,7 +328,7 @@ void CG_AddMarks( void ) {
 		marksDrawn++;
 	}
 
-	if ( s_addMarksCalls <= 4 || ( s_addMarksCalls % 60 ) == 0 ) {
+	if ( CG_MetalInstrEnabled() && ( s_addMarksCalls <= 4 || ( s_addMarksCalls % 60 ) == 0 ) ) {
 		CG_Printf( "[cgame-instr] CG_AddMarks calls=%d marksDrawn=%d\n",
 			s_addMarksCalls, marksDrawn );
 	}

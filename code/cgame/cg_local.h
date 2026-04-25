@@ -1544,6 +1544,7 @@ void		trap_Cvar_Register( vmCvar_t *vmCvar, const char *varName, const char *def
 void		trap_Cvar_Update( vmCvar_t *vmCvar );
 void		trap_Cvar_Set( const char *var_name, const char *value );
 void		trap_Cvar_VariableStringBuffer( const char *var_name, char *buffer, int bufsize );
+qboolean	CG_MetalInstrEnabled( void );
 
 // ServerCommand and ConsoleCommand parameter access
 int			trap_Argc( void );
@@ -1736,5 +1737,4 @@ void	CG_ParticleMisc (qhandle_t pshader, vec3_t origin, int size, int duration, 
 void	CG_ParticleExplosion (char *animStr, vec3_t origin, vec3_t vel, int duration, int sizeStart, int sizeEnd);
 extern qboolean		initparticles;
 int CG_NewParticleArea ( int num );
-
 

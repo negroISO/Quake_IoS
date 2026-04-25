@@ -1,121 +1,118 @@
 import SwiftUI
+import os
 
 @main
 struct Quake3_iOSApp: App {
+    static let log = OSLog(subsystem: "com.quake3ios.app", category: "boot")
+    init() {
+        // Disable stdout buffering so [Swift] print()s land in
+        // devicectl --console immediately rather than getting eaten
+        // by USB line-buffering when the app crashes mid-init.
+        setbuf(stdout, nil)
+        NSLog("[Q3-BOOT] App init")
+    }
+    /// nil = launch menu visible. Non-nil = engine should boot and
+    /// queue this Q3 console command (e.g. "demo four", "map q3dm6").
+    @State private var launchCommand: String? = nil
     @State private var engineStarted = false
+    /// True while `Quake3_Init` is running. Drives the "Loading…" overlay
+    /// so the user gets feedback during the synchronous (~5–30s) engine
+    /// init instead of staring at a black MetalView while the main thread
+    /// is blocked.
+    @State private var engineLoading = false
 
     var body: some Scene {
         WindowGroup {
             ZStack(alignment: .topLeading) {
-                MetalView()
-                    .ignoresSafeArea()
+                if launchCommand == nil {
+                    LaunchMenuView(launchCommand: $launchCommand)
+                } else {
+                    MetalView()
+                        .ignoresSafeArea()
+                        .task {
+                            NSLog("[Q3-BOOT] .task entered (engineStarted=%d)", engineStarted ? 1 : 0)
+                            guard !engineStarted else { return }
+                            engineStarted = true
+                            engineLoading = true
+                            NSLog("[Q3-BOOT] yielding 200ms for LoadingOverlay paint")
+                            try? await Task.sleep(nanoseconds: 200_000_000)
+                            NSLog("[Q3-BOOT] starting GameControllerBridge")
+                            GameControllerBridge.shared.start()
+                            let basePath = Bundle.main.resourcePath ?? ""
+                            NSLog("[Q3-BOOT] dispatching Quake3_Init to background queue")
+                            print("[Swift] Starting Quake3 engine, basePath: \(basePath)")
+                            // Run Quake3_Init on a background queue so the
+                            // main thread stays responsive. iOS will SIGKILL
+                            // a foreground app whose main thread blocks long
+                            // enough that no drawables get presented (~20s
+                            // on iPad with its 2752×2064 drawable + cold
+                            // Metal shader cache; iPhone init is faster and
+                            // squeaks under the threshold). Engine init is
+                            // pure C state setup — no UIKit/Metal main-thread
+                            // requirements until rendering begins. The
+                            // MTKView's draw(in:) keeps rendering the
+                            // LoadingOverlay while we wait.
+                            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                                DispatchQueue.global(qos: .userInitiated).async {
+                                    NSLog("[Q3-BOOT] (bg) calling Quake3_Init")
+                                    Quake3_Init(basePath)
+                                    NSLog("[Q3-BOOT] (bg) Quake3_Init returned")
+                                    cont.resume()
+                                }
+                            }
+                            NSLog("[Q3-BOOT] back on main; engine ready")
+                            print("[Swift] Engine initialized")
+                            if let cmd = launchCommand {
+                                let line = cmd + "\n"
+                                NSLog("[Q3-BOOT] queuing command: %@", cmd)
+                                line.withCString { Q3Exec_Command($0) }
+                                print("[Swift] Queued: \(cmd)")
+                            }
+                            engineLoading = false
+                            NSLog("[Q3-BOOT] engineLoading=false; SwiftUI should hide overlay")
+                        }
 
-                // Console button temporarily disabled so ground-truth
-                // visual diffs don't flag the blue ">_" overlay as a
-                // rendering bug. Re-enable when dev console access is
-                // needed on-device.
-                // ConsoleOverlay()
+                    if engineLoading {
+                        LoadingOverlay(target: launchCommand ?? "")
+                    }
+                }
             }
             .statusBarHidden(true)
             .persistentSystemOverlays(.hidden)
-            .task {
-                guard !engineStarted else { return }
-                engineStarted = true
-
-                GameControllerBridge.shared.start()
-
-                let basePath = Bundle.main.resourcePath ?? ""
-                print("[Swift] Starting Quake3 engine, basePath: \(basePath)")
-                Quake3_Init(basePath)
-                print("[Swift] Engine initialized")
-            }
         }
     }
 }
 
-/// Minimal on-screen console for iOS when no physical keyboard is attached.
-/// Small corner tap-target opens a centered text field that routes commands
-/// into the Q3 command buffer via `Q3Exec_Command`. Press Return (or tap
-/// the × button) to dismiss. Both `cvar value` and plain `command arg`
-/// forms work — same syntax as the normal Q3 console.
-struct ConsoleOverlay: View {
-    @State private var isOpen: Bool = false
-    @State private var text: String = ""
-    @FocusState private var fieldFocused: Bool
+/// Full-screen translucent black overlay shown while `Quake3_Init` runs.
+/// `Quake3_Init` is synchronous and blocks the main thread for several
+/// seconds (~5s iPhone, can be 30s+ on a fresh iPad install while the
+/// Metal shader cache warms). Without this overlay the user only sees a
+/// black MetalView with no indication progress is happening; on slower
+/// devices that can look like a hang. The overlay is replaced as soon as
+/// the engine finishes init and SwiftUI re-renders.
+private struct LoadingOverlay: View {
+    let target: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            // Small always-visible toggle in the upper-left corner.
-            Button(action: {
-                isOpen.toggle()
-                if isOpen {
-                    // Focus on the next run-loop tick so the TextField
-                    // has been added to the hierarchy before we focus it.
-                    DispatchQueue.main.async { fieldFocused = true }
-                }
-            }) {
-                Text(">_")
-                    .font(.system(size: 22, weight: .bold, design: .monospaced))
+        ZStack {
+            Color.black.opacity(0.85)
+                .ignoresSafeArea()
+            VStack(spacing: 18) {
+                Text("LOADING")
+                    .font(.system(size: 36, weight: .black, design: .serif))
                     .foregroundColor(.white)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                    .background(Color(red: 0.12, green: 0.42, blue: 0.86))   // bright blue so
-                    .cornerRadius(8)                                          // it stands out on
-                    .overlay(                                                 // any dark scene
-                        RoundedRectangle(cornerRadius: 8)
-                            .stroke(Color.white.opacity(0.9), lineWidth: 1.5)
-                    )
-                    .shadow(color: Color.black.opacity(0.6), radius: 3, x: 0, y: 2)
-            }
-            .accessibilityLabel("Toggle console")
-
-            if isOpen {
-                HStack(spacing: 6) {
-                    TextField("cvar or command", text: $text)
-                        .font(.system(size: 14, design: .monospaced))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 6)
-                        .background(Color.black.opacity(0.75))
-                        .foregroundColor(.white)
-                        .cornerRadius(4)
-                        .focused($fieldFocused)
-                        .autocorrectionDisabled(true)
-                        .textInputAutocapitalization(.never)
-                        .submitLabel(.send)
-                        .onSubmit { submit() }
-                        .frame(minWidth: 220, idealWidth: 320, maxWidth: 480)
-
-                    Button(action: submit) {
-                        Text("run")
-                            .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
-                            .background(Color.blue.opacity(0.8))
-                            .cornerRadius(4)
-                    }
-
-                    Button(action: { isOpen = false; fieldFocused = false }) {
-                        Text("×")
-                            .font(.system(size: 16, weight: .bold))
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
-                            .background(Color.red.opacity(0.7))
-                            .cornerRadius(4)
-                    }
-                }
+                    .tracking(8)
+                    .shadow(color: .red.opacity(0.7), radius: 6)
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .tint(.white)
+                Text(target.isEmpty ? "Initializing engine…" : "→ \(target)")
+                    .font(.system(size: 14, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.7))
+                Text("First launch may take up to 30 seconds")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.4))
             }
         }
-        .padding(.top, 12)
-        .padding(.leading, 12)
-    }
-
-    private func submit() {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        trimmed.withCString { Q3Exec_Command($0) }
-        text = ""
-        // Keep focus so the user can chain commands without re-tapping.
     }
 }

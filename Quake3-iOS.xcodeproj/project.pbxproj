@@ -19,6 +19,7 @@
 		10056CC3CA4DA3BEB26CD947 /* jdcolor.c in Sources */ = {isa = PBXBuildFile; fileRef = 04C0AF4A2179C34C4CB66388 /* jdcolor.c */; };
 		12D256A571BB4AA400FBAFB5 /* jidctint.c in Sources */ = {isa = PBXBuildFile; fileRef = 8C6BD9FF39B00D775F18805C /* jidctint.c */; };
 		1311809BC661959BF7D5586B /* q_shared.c in Sources */ = {isa = PBXBuildFile; fileRef = 9E611987187BCA05F44E4A7A /* q_shared.c */; };
+		13E1EBA63D1082D3878C8049 /* LaunchMenuView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2C8B120A0EBCD9CEE983C412 /* LaunchMenuView.swift */; };
 		1429DF2DC476DAEBF90E2FF1 /* cg_event.c in Sources */ = {isa = PBXBuildFile; fileRef = 7C694BCD32A1D89049E56E48 /* cg_event.c */; settings = {COMPILER_FLAGS = "-DCGAME_NATIVE=1 -Wno-strict-prototypes -Wno-pointer-sign"; }; };
 		189F78E68999E48A5EB95A61 /* vm_interpreted.c in Sources */ = {isa = PBXBuildFile; fileRef = B9471CE7E302A923A3EA032A /* vm_interpreted.c */; };
 		18AF63312B61A58C6A3811D3 /* sv_init.c in Sources */ = {isa = PBXBuildFile; fileRef = FDBD6A962C53CFD96CB442B7 /* sv_init.c */; };
@@ -171,6 +172,7 @@
 		DFFCB375E6B9577A9095DD33 /* sv_client.c in Sources */ = {isa = PBXBuildFile; fileRef = D6AF5E22AAFC4447C871CC1B /* sv_client.c */; };
 		E14D8103BDA6083C9749289B /* jdmarker.c in Sources */ = {isa = PBXBuildFile; fileRef = D221A50CC4679D4846251C2E /* jdmarker.c */; };
 		E190610DDCAA7C679FA042D6 /* cg_native.c in Sources */ = {isa = PBXBuildFile; fileRef = 3C113194B38D0C1AF76A7716 /* cg_native.c */; settings = {COMPILER_FLAGS = "-DCGAME_NATIVE=1 -Wno-strict-prototypes -Wno-pointer-sign"; }; };
+		E23FEAA66683DB07F14EC67F /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 821B19B90747068CAC27A35B /* Assets.xcassets */; };
 		E2660E961B7AC7C73AA8A65D /* jutils.c in Sources */ = {isa = PBXBuildFile; fileRef = FD80ECBE43648BFF67BA5108 /* jutils.c */; };
 		E2F0EF901E6C980C0133EB84 /* sv_snapshot.c in Sources */ = {isa = PBXBuildFile; fileRef = 171EF12724EED24A9334AC45 /* sv_snapshot.c */; };
 		E3301C8FF826F31AAE728780 /* unzip.c in Sources */ = {isa = PBXBuildFile; fileRef = DDCF230BF6F753AF26F46234 /* unzip.c */; };
@@ -264,6 +266,7 @@
 		2BA0DD3637BE28795A641837 /* sv_ccmds.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = sv_ccmds.c; sourceTree = "<group>"; };
 		2BAEBF1BD00157496D23138E /* l_script.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = l_script.c; sourceTree = "<group>"; };
 		2C87540B2341A77172F0D916 /* jcdctmgr.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = jcdctmgr.c; sourceTree = "<group>"; };
+		2C8B120A0EBCD9CEE983C412 /* LaunchMenuView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LaunchMenuView.swift; sourceTree = "<group>"; };
 		2D1709001F8D3DB27DEA385A /* net_ip.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = net_ip.c; sourceTree = "<group>"; };
 		2D82BA36AF52F1835056F4AE /* l_precomp.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = l_precomp.h; sourceTree = "<group>"; };
 		2E65CB39B6EA7BCF21A2E634 /* lpc.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = lpc.c; sourceTree = "<group>"; };
@@ -373,6 +376,7 @@
 		7FDEC2A92591501D8BCAF027 /* snd_public.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = snd_public.h; sourceTree = "<group>"; };
 		8031135609F0627086D7DEEA /* jcprepct.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = jcprepct.c; sourceTree = "<group>"; };
 		810D7EE3AE68ACFD6E7A89C1 /* jcomapi.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = jcomapi.c; sourceTree = "<group>"; };
+		821B19B90747068CAC27A35B /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		831C81C745E0FD31796B8F68 /* jcapistd.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = jcapistd.c; sourceTree = "<group>"; };
 		8377D1CE786A2D058EA357C9 /* bitwise.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = bitwise.c; sourceTree = "<group>"; };
 		845B9A6D492A3524D211E5AD /* cg_public.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = cg_public.h; sourceTree = "<group>"; };
@@ -1051,6 +1055,8 @@
 		FDC1DED2D65B4193CB6E9993 /* Quake3-iOS */ = {
 			isa = PBXGroup;
 			children = (
+				821B19B90747068CAC27A35B /* Assets.xcassets */,
+				2C8B120A0EBCD9CEE983C412 /* LaunchMenuView.swift */,
 				88E516AF1355E11FE7A7FD28 /* MetalView.swift */,
 				12703A83024DC702F9413C41 /* Quake3_iOSApp.swift */,
 				6AF21139679F9E7FC929A172 /* Quake3-iOS-Bridging-Header.h */,
@@ -1118,6 +1124,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				E23FEAA66683DB07F14EC67F /* Assets.xcassets in Resources */,
 				4DF2C23178D78E857E30EF88 /* libjpeg-changes.diff in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -1129,6 +1136,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				13E1EBA63D1082D3878C8049 /* LaunchMenuView.swift in Sources */,
 				4665DA1B2C281DE4C038DB06 /* MetalView.swift in Sources */,
 				FAE1E11980EB55CB99AC1EFC /* Quake3_iOSApp.swift in Sources */,
 				D38C90BB2B1D4064FE9E7C4C /* analysis.c in Sources */,

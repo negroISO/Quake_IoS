@@ -5,9 +5,8 @@ import QuartzCore
 import simd
 
 struct MetalView: UIViewRepresentable {
-    func makeUIView(context: Context) -> MTKView {
-        let view = MTKView()
-        view.device = MTLCreateSystemDefaultDevice()
+    func makeUIView(context: Context) -> Q3InputView {
+        let view = Q3InputView(frame: .zero, device: MTLCreateSystemDefaultDevice())
         view.colorPixelFormat = .bgra8Unorm
         view.depthStencilPixelFormat = .depth32Float
         view.delegate = context.coordinator
@@ -19,14 +18,6 @@ struct MetalView: UIViewRepresentable {
         view.preferredFramesPerSecond = maxFPS
         view.enableSetNeedsDisplay = false
         view.isPaused = false
-        // Suppress iOS's developer Metal Performance HUD (the translucent
-        // top-right "Metal: ... Available: ... Compiled: ..." overlay).
-        // The system composites it onto our drawable after we render, so
-        // it gets baked into the demo-four AVI capture and the vision-LLM
-        // diff can mistake the HUD glyphs for engine output. Apps can
-        // override the user's Settings → Developer → Metal HUD toggle by
-        // setting this dict explicitly. Stats remain available via the
-        // engine's own logs (PRINT_DEVELOPER + r_speeds).
         if let metalLayer = view.layer as? CAMetalLayer {
             if #available(iOS 16.0, visionOS 1.0, *) {
                 metalLayer.developerHUDProperties = ["mode": "hidden"]
@@ -35,7 +26,7 @@ struct MetalView: UIViewRepresentable {
         return view
     }
 
-    func updateUIView(_ uiView: MTKView, context: Context) {}
+    func updateUIView(_ uiView: Q3InputView, context: Context) {}
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -166,7 +157,11 @@ struct MetalView: UIViewRepresentable {
             case 0: return draw.stages.0
             case 1: return draw.stages.1
             case 2: return draw.stages.2
-            default: return draw.stages.3
+            case 3: return draw.stages.3
+            case 4: return draw.stages.4
+            case 5: return draw.stages.5
+            case 6: return draw.stages.6
+            default: return draw.stages.7
             }
         }
 
@@ -2974,5 +2969,189 @@ final class GameControllerBridge {
         let name = controller.vendorName ?? "Unknown"
         let profile = controller.extendedGamepad != nil ? "extended" : "non-extended"
         return "\(name) profile=\(profile)"
+    }
+}
+
+/// MTKView subclass that adds hardware-keyboard + trackpad input on
+/// iPad's Magic Keyboard (and any BT keyboard/mouse on iPhone). Bridges
+/// to Q3 via Q3Sys_KeyEvent / Q3Sys_MouseMove (declared in the bridging
+/// header).
+///
+/// - Keyboard: `pressesBegan/Ended` → maps `UIKey.keyCode` to Q3 keycodes
+///   (defined in code/client/keycodes.h: ASCII for letters/digits, K_*
+///   constants for arrows/modifiers/F-keys).
+/// - Trackpad: `UIPanGestureRecognizer` with `.allowedScrollTypesMask =
+///   .all` captures both two-finger trackpad pan AND mouse drag deltas.
+///   Translation is fed as raw mouse delta (drag-to-look).
+/// - Trackpad click: `UITapGestureRecognizer` with `allowedTouchTypes =
+///   [.indirectPointer]` fires K_MOUSE1 (a standard click — bound by
+///   default.cfg to `+attack`). Direct touch is excluded so on-screen
+///   touches (HUD/joystick zones) don't double-fire.
+///
+/// Coexists cleanly with `GameControllerBridge`: both push events into
+/// the same Q3 event queue (Sys_QueEvent), and Q3's bind system dispatches
+/// based on the keycode regardless of source device. Whichever input
+/// the user prefers (controller, keyboard, trackpad) just works.
+final class Q3InputView: MTKView {
+    override var canBecomeFirstResponder: Bool { true }
+
+    override init(frame frameRect: CGRect, device: MTLDevice?) {
+        super.init(frame: frameRect, device: device)
+        setupInput()
+    }
+
+    required init(coder: NSCoder) {
+        super.init(coder: coder)
+        setupInput()
+    }
+
+    private func setupInput() {
+        let pan = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
+        if #available(iOS 13.4, *) {
+            pan.allowedScrollTypesMask = .all
+        }
+        addGestureRecognizer(pan)
+
+        let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
+        if #available(iOS 13.4, *) {
+            tap.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
+        }
+        addGestureRecognizer(tap)
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        // Become first responder once SwiftUI has finished mounting.
+        // Direct call during view installation is sometimes ignored
+        // mid-layout; deferring one runloop tick is reliable.
+        if window != nil {
+            DispatchQueue.main.async { [weak self] in
+                _ = self?.becomeFirstResponder()
+            }
+        }
+    }
+
+    @objc private func handlePan(_ g: UIPanGestureRecognizer) {
+        switch g.state {
+        case .began, .changed:
+            let t = g.translation(in: self)
+            let dx = Int32(t.x.rounded())
+            let dy = Int32(t.y.rounded())
+            if dx != 0 || dy != 0 {
+                Q3Sys_MouseMove(dx, dy)
+                // Reset translation so each call is a fresh delta
+                // rather than cumulative.
+                g.setTranslation(.zero, in: self)
+            }
+        default:
+            break
+        }
+    }
+
+    @objc private func handleTap(_ g: UITapGestureRecognizer) {
+        guard g.state == .recognized else { return }
+        // K_MOUSE1 = 178 (code/client/keycodes.h). Q3 binds run on
+        // key-down; pulse down→up so the bind fires once per click.
+        Q3Sys_KeyEvent(178, 1)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            Q3Sys_KeyEvent(178, 0)
+        }
+    }
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        var handled = false
+        for press in presses {
+            guard let key = press.key else { continue }
+            if let q3 = Q3InputView.q3Keycode(for: key) {
+                Q3Sys_KeyEvent(q3, 1)
+                handled = true
+            }
+            // Fire SE_CHAR for printable characters so console / cvar
+            // value / player-name fields receive actual text. Use
+            // `characters` (NOT charactersIgnoringModifiers) so shift
+            // produces capitals and shifted symbols ("A", "!", "@", …).
+            // ASCII printable range only; arrows/F-keys/modifiers
+            // produce empty or non-printable .characters and are
+            // skipped by the bounds check.
+            for ch in key.characters.unicodeScalars {
+                let v = ch.value
+                if v >= 32 && v < 127 {
+                    Q3Sys_CharEvent(Int32(v))
+                }
+            }
+        }
+        if !handled { super.pressesBegan(presses, with: event) }
+    }
+
+    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        var handled = false
+        for press in presses {
+            if let key = press.key, let q3 = Q3InputView.q3Keycode(for: key) {
+                Q3Sys_KeyEvent(q3, 0)
+                handled = true
+            }
+        }
+        if !handled { super.pressesEnded(presses, with: event) }
+    }
+
+    /// Map iOS `UIKey` to a Q3 keycode. Values mirror
+    /// `code/client/keycodes.h`:
+    /// - ASCII for letters/digits/punctuation (Q3's K_A..K_Z = 'a'..'z')
+    /// - 9 K_TAB, 13 K_ENTER, 27 K_ESCAPE, 32 K_SPACE, 96 ` (toggleconsole)
+    /// - 127 K_BACKSPACE
+    /// - 132–135 arrow keys, 136 K_ALT, 137 K_CTRL, 138 K_SHIFT
+    /// - 145–156 K_F1..K_F12
+    static func q3Keycode(for key: UIKey) -> Int32? {
+        switch key.keyCode {
+        case .keyboardEscape: return 27
+        case .keyboardReturnOrEnter, .keypadEnter: return 13
+        case .keyboardSpacebar: return 32
+        case .keyboardTab: return 9
+        case .keyboardDeleteOrBackspace: return 127
+        // iPad Magic Keyboard's only "delete" key is keyboardDeleteOrBackspace
+        // above. Some external keyboards / Fn-Delete combos report
+        // keyboardDeleteForward — Q3 has no separate forward-delete; map
+        // it to the same K_BACKSPACE so the user's expectation of "delete
+        // removes a character" holds in both cases.
+        case .keyboardDeleteForward: return 127
+        case .keyboardLeftArrow: return 134
+        case .keyboardRightArrow: return 135
+        case .keyboardUpArrow: return 132
+        case .keyboardDownArrow: return 133
+        case .keyboardLeftShift, .keyboardRightShift: return 138
+        case .keyboardLeftControl, .keyboardRightControl: return 137
+        case .keyboardLeftAlt, .keyboardRightAlt: return 136
+        case .keyboardF1: return 145
+        case .keyboardF2: return 146
+        case .keyboardF3: return 147
+        case .keyboardF4: return 148
+        case .keyboardF5: return 149
+        case .keyboardF6: return 150
+        case .keyboardF7: return 151
+        case .keyboardF8: return 152
+        case .keyboardF9: return 153
+        case .keyboardF10: return 154
+        case .keyboardF11: return 155
+        case .keyboardF12: return 156
+        case .keyboardGraveAccentAndTilde: return 96
+        default:
+            // Fallback: trust the produced character. Some keyboard
+            // layouts route DEL/BS through a keyCode that doesn't
+            // match `.keyboardDeleteOrBackspace` — catch the actual
+            // 0x7F (DEL) or 0x08 (BS) character and route both to
+            // K_BACKSPACE.
+            if let ch = key.charactersIgnoringModifiers.first,
+               let asc = ch.asciiValue {
+                if asc == 0x7F || asc == 0x08 { return 127 }
+                if asc >= 32 && asc < 127 {
+                    // Printable ASCII — Q3 uses lowercase for letter keys.
+                    if let lower = String(ch).lowercased().first?.asciiValue {
+                        return Int32(lower)
+                    }
+                    return Int32(asc)
+                }
+            }
+            return nil
+        }
     }
 }
