@@ -127,18 +127,18 @@ struct MetalView: UIViewRepresentable {
                                     p2: SIMD4<Float>, p3: SIMD4<Float>,
                                     count: Int32)
 
-        /* Read the two tcGen vector basis floats out of the C-bridge
-         * stage and pack as SIMD4 for the WorldDrawUniforms fields.
-         * Stage's tcGenVectors[2][3] comes through to Swift as a
-         * nested tuple ((Float, Float, Float), (Float, Float, Float)).
-         * Only meaningful when stage.tcGen == 2; safe to call always
-         * (returns zero vectors otherwise). */
+        /* Read the two tcGen basis vectors out of the C-bridge stage
+         * and pack as SIMD4 for the WorldDrawUniforms fields. Each
+         * basis comes through as `tcGenVec0: (Float,Float,Float,Float)`
+         * (a flat 4-tuple — the C side stores them as `float[4]`
+         * with .w pre-padded to 0). Only meaningful when stage.tcGen
+         * == 2; safe to call always (returns zero vectors otherwise). */
         private static func tcGenVectors(_ stage: Q3MetalWorldStage) -> (SIMD4<Float>, SIMD4<Float>) {
-            let v0 = stage.tcGenVectors.0
-            let v1 = stage.tcGenVectors.1
+            let v0 = stage.tcGenVec0
+            let v1 = stage.tcGenVec1
             return (
-                SIMD4<Float>(v0.0, v0.1, v0.2, 0),
-                SIMD4<Float>(v1.0, v1.1, v1.2, 0)
+                SIMD4<Float>(v0.0, v0.1, v0.2, v0.3),
+                SIMD4<Float>(v1.0, v1.1, v1.2, v1.3)
             )
         }
 
@@ -805,7 +805,13 @@ struct MetalView: UIViewRepresentable {
             // attribute, so derive a flat face normal via screen-space
             // derivatives (same technique the world pipeline uses).
             float2 texCoord = in.texCoord;
-            if (uniforms.tcGen > 0.5) {
+            /* Entity tcGen modes: only mode 1 (environment) is meaningful
+             * here — entity shaders that declare `tcGen vector` would route
+             * to the world pipeline rather than the entity pipeline. Use an
+             * exact integer compare rather than `tcGen > 0.5` so a tcGen=2
+             * value (if it ever leaks through) doesn't masquerade as env. */
+            int entTcGenMode = int(uniforms.tcGen + 0.5);
+            if (entTcGenMode == 1) {
                 /* Prefer the per-vertex normal supplied by the MD3 emit
                  * path; fall back to a flat face normal via dfdx/dfdy of
                  * worldPos when none was supplied (sprites, beams,

@@ -250,9 +250,12 @@ typedef struct {
     int alphaGen;
     int alphaFunc;
     int tcGen;
-    /* tcGen vector basis: two world-space vec3. Only consulted when
-     * tcGen == 2 (vector). Parsed from `tcGen vector ( x y z ) ( x y z )`. */
-    float tcGenVectors[2][3];
+    /* tcGen vector basis: two world-space vectors. Only consulted when
+     * tcGen == 2 (vector). Parsed from `tcGen vector ( x y z ) ( x y z )`.
+     * Stored padded as float[4] (xyz + 0) for Swift bridge stability —
+     * mirrors Q3MetalWorldStage.tcGenVec0/1 layout. */
+    float tcGenVec0[4];
+    float tcGenVec1[4];
     Q3TcMod tcMods[Q3_MAX_TCMODS];
     int tcModCount;
     int rgbWaveFunc;
@@ -575,12 +578,10 @@ static void AddWorldDrawStage(Q3MetalWorldDrawCmd *draw,
     /* tcGen vector basis (only meaningful when tcGen == 2). Always copy
      * regardless of mode so stale values don't leak into a later
      * vector-mode stage if the destination slot is reused. */
-    stage->tcGenVectors[0][0] = src->tcGenVectors[0][0];
-    stage->tcGenVectors[0][1] = src->tcGenVectors[0][1];
-    stage->tcGenVectors[0][2] = src->tcGenVectors[0][2];
-    stage->tcGenVectors[1][0] = src->tcGenVectors[1][0];
-    stage->tcGenVectors[1][1] = src->tcGenVectors[1][1];
-    stage->tcGenVectors[1][2] = src->tcGenVectors[1][2];
+    for (int k = 0; k < 4; ++k) {
+        stage->tcGenVec0[k] = src->tcGenVec0[k];
+        stage->tcGenVec1[k] = src->tcGenVec1[k];
+    }
     /* One-shot world tcGen=env audit: print up to 16 unique tcGen-env
      * texture handles so we can correlate chrome/reflective surfaces in
      * captures. Fires only when tcGen==1 (environment). */
@@ -3930,21 +3931,65 @@ static void ParseShaderText(const char *text) {
                         tcGenEnv = qtrue;
                     } else if (modeBuf[0] && !Q_stricmp(modeBuf, "vector")) {
                         /* Syntax: tcGen vector ( x y z ) ( x y z )
-                         * 8 tokens after 'vector': '(' x y z ')' '(' x y z ')'
+                         * 10 tokens after 'vector': '(' x y z ')' '(' x y z ')'.
                          * Copy each numeric token before parsing the next
-                         * because COM_ParseExt aliases its static buffer. */
-                        int vec, comp;
-                        for (vec = 0; vec < 2; ++vec) {
-                            (void)COM_ParseExt(&p, qfalse); /* opening '(' */
-                            for (comp = 0; comp < 3; ++comp) {
+                         * because COM_ParseExt aliases its static buffer.
+                         * Validate paren tokens; if a paren is missing the
+                         * shader is malformed — bail without committing the
+                         * mode so we don't desync the parser stream. */
+                        float vecs[2][3] = {{0}};
+                        qboolean ok = qtrue;
+                        for (int vec = 0; ok && vec < 2; ++vec) {
+                            char openBuf[MAX_TOKEN_CHARS];
+                            Q_strncpyz(openBuf, COM_ParseExt(&p, qfalse), sizeof(openBuf));
+                            if (openBuf[0] != '(') { ok = qfalse; break; }
+                            for (int comp = 0; ok && comp < 3; ++comp) {
                                 char numBuf[MAX_TOKEN_CHARS];
                                 Q_strncpyz(numBuf, COM_ParseExt(&p, qfalse), sizeof(numBuf));
-                                cur.tcGenVectors[vec][comp] =
-                                    numBuf[0] ? (float)atof(numBuf) : 0.0f;
+                                if (!numBuf[0] || numBuf[0] == '(' || numBuf[0] == ')') {
+                                    ok = qfalse; break;
+                                }
+                                vecs[vec][comp] = (float)atof(numBuf);
                             }
-                            (void)COM_ParseExt(&p, qfalse); /* closing ')' */
+                            if (!ok) break;
+                            char closeBuf[MAX_TOKEN_CHARS];
+                            Q_strncpyz(closeBuf, COM_ParseExt(&p, qfalse), sizeof(closeBuf));
+                            if (closeBuf[0] != ')') { ok = qfalse; break; }
                         }
-                        cur.tcGen = 2;
+                        if (ok) {
+                            cur.tcGenVec0[0] = vecs[0][0];
+                            cur.tcGenVec0[1] = vecs[0][1];
+                            cur.tcGenVec0[2] = vecs[0][2];
+                            cur.tcGenVec0[3] = 0.0f;
+                            cur.tcGenVec1[0] = vecs[1][0];
+                            cur.tcGenVec1[1] = vecs[1][1];
+                            cur.tcGenVec1[2] = vecs[1][2];
+                            cur.tcGenVec1[3] = 0.0f;
+                            cur.tcGen = 2;
+                            /* One-shot per-shader audit so we know which
+                             * surfaces actually exercise the vector path
+                             * in a capture run. Bounded to 16 unique
+                             * shader names. */
+                            static char s_tcGenVecSeen[16][MAX_QPATH];
+                            static int s_tcGenVecCount = 0;
+                            int dup = 0;
+                            for (int j = 0; j < s_tcGenVecCount; ++j) {
+                                if (!Q_stricmp(s_tcGenVecSeen[j], shaderName)) { dup = 1; break; }
+                            }
+                            if (!dup && s_tcGenVecCount < 16) {
+                                Q_strncpyz(s_tcGenVecSeen[s_tcGenVecCount++],
+                                           shaderName, sizeof(s_tcGenVecSeen[0]));
+                                ri.Printf(PRINT_ALL,
+                                    "[tcgen-vec] '%s' v0=(%g %g %g) v1=(%g %g %g)\n",
+                                    shaderName,
+                                    vecs[0][0], vecs[0][1], vecs[0][2],
+                                    vecs[1][0], vecs[1][1], vecs[1][2]);
+                            }
+                        } else {
+                            ri.Printf(PRINT_WARNING,
+                                "Metal shader: malformed tcGen vector in '%s' — skipping\n",
+                                shaderName);
+                        }
                     }
                 } else if (!Q_stricmp(token, "blendFunc") || !Q_stricmp(token, "blendfunc")) {
                     /* COM_ParseExt returns a pointer into a shared static

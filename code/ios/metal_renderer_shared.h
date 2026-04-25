@@ -65,16 +65,16 @@ typedef struct {
     uint32_t tcModCount;
     /* tcGen vector ( x y z ) ( x y z ): two world-space basis vectors
      * used when tcGen == 2. Per-fragment UV is
-     *   s = dot(worldPos, tcGenVectors[0])
-     *   t = dot(worldPos, tcGenVectors[1])
+     *   s = dot(worldPos, tcGenVec0.xyz)
+     *   t = dot(worldPos, tcGenVec1.xyz)
      * Matches ioq3 RB_CalcTexCoords TCGEN_VECTOR (renderergl1/tr_shade.c)
      * and Quake3e's renderervk equivalent. tcMod chain is applied AFTER
-     * tcGen per Q3 ordering. */
-    float tcGenVectors[2][3];
-    /* Pad to 16-byte alignment so Swift/MSL sees a clean float4-style
-     * layout when SIMD-loading. C side reads as flat float[3] pairs;
-     * Swift packs into SIMD4 with .w ignored. */
-    float _tcGenPad[2];
+     * tcGen per Q3 ordering. Stored as flat float[4] (xyz + 0 pad)
+     * rather than a nested float[2][3] so Swift's bridge sees a
+     * straightforward (Float, Float, Float, Float) tuple per vector
+     * instead of nested ((Float,Float,Float),(Float,Float,Float)). */
+    float tcGenVec0[4];
+    float tcGenVec1[4];
     uint32_t rgbGen;      /* 0=identity,1=vertex,2=lightingDiffuse,3=wave */
     uint32_t alphaGen;    /* 0=identity,1=vertex,3=wave */
     uint32_t alphaFunc;   /* 0=none, 1=GT0, 2=GE128, 3=LT128 */
