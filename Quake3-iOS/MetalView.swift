@@ -55,6 +55,12 @@ struct MetalView: UIViewRepresentable {
              * "not an autosprite vertex" — pass-through. Filled by
              * the BSP load post-pass in metal_renderer_stub.c. */
             var autospriteCenter: SIMD4<Float>
+            /* Per-quad long-axis unit vector for autoSprite2 surfaces
+             * only. xyz = direction of the quad's long edge pair (the
+             * axis the deform must preserve); .w pad. Zero for non-
+             * autoSprite2 verts. Mode 2 vertex shader projects camera
+             * basis perpendicular to this axis to build the billboard. */
+            var autospriteLongAxis: SIMD4<Float>
         }
 
         struct WorldUniforms {
@@ -457,6 +463,7 @@ struct MetalView: UIViewRepresentable {
             float3 normal;
             float4 color;
             float4 autospriteCenter;
+            float4 autospriteLongAxis;
         };
 
         struct WorldUniforms {
@@ -722,10 +729,7 @@ struct MetalView: UIViewRepresentable {
              * substituted into RB_AutospriteDeform's per-quad emit step.
              *
              * Skip when autospriteCenter is zero (vertex is not part of
-             * an autosprite quad — center bake at BSP load left it 0).
-             *
-             * Mode 2 (autoSprite2) is tag-only for now; transform
-             * follows in a separate commit. */
+             * an autosprite quad — center bake at BSP load left it 0). */
             if (drawUniforms.autospriteMode == 1u
                 && length(inVertex.autospriteCenter.xyz) > 1e-4) {
                 float3 center = inVertex.autospriteCenter.xyz;
@@ -738,6 +742,51 @@ struct MetalView: UIViewRepresentable {
                 worldPos = center
                          + float3(uniforms.cameraRight) * (lSign * radius)
                          + float3(uniforms.cameraUp)    * (uSign * radius);
+            }
+            /* deformVertexes autoSprite2 (mode 2): elongated billboard.
+             * Preserves the quad's authored long axis; only the
+             * perpendicular short axis is camera-aligned. Used by lamp
+             * wires, chains, exhaust trails, jets — geometry whose
+             * long-axis orientation is meaningful and must not collapse.
+             * Mirrors ioq3 RB_Autosprite2Deform (tr_shade_calc.c).
+             *
+             *   along       = dot(offset, longAxis)
+             *   perpOffset  = offset − longAxis * along
+             *   perpAxis    = normalize(cameraRight − longAxis * dot(R, L))
+             *               (or cameraUp if R is nearly parallel to L)
+             *   perpSign    = sign(dot(perpOffset, perpAxis))
+             *   newPos      = center + longAxis * along
+             *                        + perpAxis * (perpSign * |perpOffset|)
+             *
+             * Skip when long axis is zero (vertex not part of an
+             * autoSprite2 quad). */
+            if (drawUniforms.autospriteMode == 2u
+                && length(inVertex.autospriteCenter.xyz) > 1e-4
+                && length(inVertex.autospriteLongAxis.xyz) > 1e-4) {
+                float3 center   = inVertex.autospriteCenter.xyz;
+                float3 longAxis = inVertex.autospriteLongAxis.xyz;
+                float3 offset   = worldPos - center;
+                float  along    = dot(offset, longAxis);
+                float3 perpOffset = offset - longAxis * along;
+                float  perpLen  = length(perpOffset);
+                float3 cR = float3(uniforms.cameraRight);
+                float3 perpFromR = cR - longAxis * dot(cR, longAxis);
+                float  perpFromR_len = length(perpFromR);
+                float3 perpAxis;
+                if (perpFromR_len > 1e-3) {
+                    perpAxis = perpFromR / perpFromR_len;
+                } else {
+                    float3 cU = float3(uniforms.cameraUp);
+                    float3 perpFromU = cU - longAxis * dot(cU, longAxis);
+                    float perpFromU_len = length(perpFromU);
+                    perpAxis = perpFromU_len > 1e-3
+                             ? perpFromU / perpFromU_len
+                             : float3(0.0, 0.0, 1.0);
+                }
+                float perpSign = dot(perpOffset, perpAxis) >= 0.0 ? 1.0 : -1.0;
+                worldPos = center
+                         + longAxis * along
+                         + perpAxis * (perpSign * perpLen);
             }
             out.position = uniforms.viewProjection * float4(worldPos, 1.0);
             out.texCoord = inVertex.texCoord;
@@ -2376,7 +2425,12 @@ struct MetalView: UIViewRepresentable {
                                 vertex.autospriteCenter.0,
                                 vertex.autospriteCenter.1,
                                 vertex.autospriteCenter.2,
-                                vertex.autospriteCenter.3)
+                                vertex.autospriteCenter.3),
+                            autospriteLongAxis: SIMD4<Float>(
+                                vertex.autospriteLongAxis.0,
+                                vertex.autospriteLongAxis.1,
+                                vertex.autospriteLongAxis.2,
+                                vertex.autospriteLongAxis.3)
                         )
                     )
                 }

@@ -1432,6 +1432,10 @@ static void EmitWorldVertex(Q3MetalWorldVertex *dest, const drawVert_t *source) 
     dest->autospriteCenter[1] = 0.0f;
     dest->autospriteCenter[2] = 0.0f;
     dest->autospriteCenter[3] = 0.0f;
+    dest->autospriteLongAxis[0] = 0.0f;
+    dest->autospriteLongAxis[1] = 0.0f;
+    dest->autospriteLongAxis[2] = 0.0f;
+    dest->autospriteLongAxis[3] = 0.0f;
 }
 
 static void LoadWorldLightmaps(const dheader_t *header, const char *mapName) {
@@ -3453,6 +3457,60 @@ static qboolean LoadWorldMapData(const char *name) {
                     s_world.vertices[uniq[u]].autospriteCenter[1] = cy;
                     s_world.vertices[uniq[u]].autospriteCenter[2] = cz;
                     s_world.vertices[uniq[u]].autospriteCenter[3] = 0.0f;
+                }
+                /* For autoSprite2 only, also bake the long-axis direction.
+                 * Mirrors ioq3 RB_Autosprite2Deform: find the two shortest
+                 * of the 6 candidate edges among 4 corners; long axis is
+                 * the unit vector from midpoint(short1) → midpoint(short2).
+                 * Independent of perimeter order, so robust to any q3map2
+                 * quad emission convention. */
+                if ((d->flags & Q3_METAL_WORLD_DRAWFLAG_AUTOSPRITE2) != 0) {
+                    static const int edgePairs[6][2] = {
+                        {0,1},{0,2},{0,3},{1,2},{1,3},{2,3}
+                    };
+                    float lenSq[6];
+                    for (int e = 0; e < 6; ++e) {
+                        const float *p1 = s_world.vertices[uniq[edgePairs[e][0]]].position;
+                        const float *p2 = s_world.vertices[uniq[edgePairs[e][1]]].position;
+                        float dx = p1[0] - p2[0];
+                        float dy = p1[1] - p2[1];
+                        float dz = p1[2] - p2[2];
+                        lenSq[e] = dx*dx + dy*dy + dz*dz;
+                    }
+                    int s1 = 0, s2 = 0;
+                    float l1 = 1e30f, l2 = 1e30f;
+                    for (int e = 0; e < 6; ++e) {
+                        if (lenSq[e] < l1) {
+                            l2 = l1; s2 = s1;
+                            l1 = lenSq[e]; s1 = e;
+                        } else if (lenSq[e] < l2) {
+                            l2 = lenSq[e]; s2 = e;
+                        }
+                    }
+                    const float *a1 = s_world.vertices[uniq[edgePairs[s1][0]]].position;
+                    const float *b1 = s_world.vertices[uniq[edgePairs[s1][1]]].position;
+                    const float *a2 = s_world.vertices[uniq[edgePairs[s2][0]]].position;
+                    const float *b2 = s_world.vertices[uniq[edgePairs[s2][1]]].position;
+                    float m1x = 0.5f * (a1[0] + b1[0]);
+                    float m1y = 0.5f * (a1[1] + b1[1]);
+                    float m1z = 0.5f * (a1[2] + b1[2]);
+                    float m2x = 0.5f * (a2[0] + b2[0]);
+                    float m2y = 0.5f * (a2[1] + b2[1]);
+                    float m2z = 0.5f * (a2[2] + b2[2]);
+                    float ax = m2x - m1x;
+                    float ay = m2y - m1y;
+                    float az = m2z - m1z;
+                    float alen = sqrtf(ax*ax + ay*ay + az*az);
+                    if (alen > 1e-4f) {
+                        float inv = 1.0f / alen;
+                        ax *= inv; ay *= inv; az *= inv;
+                        for (int u = 0; u < 4; ++u) {
+                            s_world.vertices[uniq[u]].autospriteLongAxis[0] = ax;
+                            s_world.vertices[uniq[u]].autospriteLongAxis[1] = ay;
+                            s_world.vertices[uniq[u]].autospriteLongAxis[2] = az;
+                            s_world.vertices[uniq[u]].autospriteLongAxis[3] = 0.0f;
+                        }
+                    }
                 }
             }
         }

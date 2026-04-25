@@ -31,6 +31,14 @@ typedef struct {
      * skips the billboard transform. Baked at BSP load by
      * `BakeAutospriteCenters` in metal_renderer_stub.c. */
     float autospriteCenter[4];
+    /* Per-quad long-axis unit vector for `deformVertexes autoSprite2`
+     * surfaces only. xyz = unit direction of the quad's longest edge
+     * pair (the axis the deform must preserve); w unused. Zero for
+     * autosprite (mode 1) and non-autosprite verts. Baked alongside
+     * autospriteCenter at BSP load — the bake routine identifies the
+     * quad's two long edges by picking the pair-of-pairs split with
+     * maximum total length, then takes the mean direction. */
+    float autospriteLongAxis[4];
 } Q3MetalWorldVertex;
 
 typedef struct {
