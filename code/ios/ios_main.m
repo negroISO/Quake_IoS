@@ -726,6 +726,12 @@ void Quake3_Init(const char *basePath) {
         /* Give the demo + map load ~2s of engine time to produce a
          * rendered scene before video starts. 1500 frames = 60s of
          * demo at 25fps — full demo four coverage. */
+        /* `test_menu_assets` exercises a curated list of known menu/UI/
+         * HUD shaders BEFORE the demo runs so [asset-miss] captures
+         * cover the menu-render path that the demo path skips. Cheap
+         * (~50 RegisterShader calls); does not affect the demo
+         * playback or AVI capture. */
+        "test_menu_assets; "
         "demo four; wait 50; video four; wait 1500; stopvideo; quit\n");
     engine_initialized = qtrue;
 

@@ -4403,6 +4403,55 @@ static void LoadAllShaders(void) {
         s_shaderMapCount, numFiles);
 }
 
+/* `test_menu_assets` console command. Registers a curated list of
+ * known menu / UI / HUD shaders so the structured `[asset-miss]`
+ * diagnostic captures the menu-render path even when the boot cbuf
+ * runs straight to demo (which skips main-menu rendering). The list
+ * is harvested from prior wedged-run miss logs so each entry is one
+ * known-failing or known-curious asset. Idempotent across calls.
+ *
+ * Diagnostic only — no rendering side effect (RegisterShader returns
+ * a handle but the menu draw path doesn't run during `demo four`).
+ * Remove after menu asset misses are classified and fixed. */
+static void TestMenuAssets_f(void) {
+    static const char *names[] = {
+        /* Main-menu chrome / level previews */
+        "menuback", "menubacknologo", "lagometer", "console", "disconnected",
+        "levelShotDetail", "levelshots/q3dm1.tga",
+        /* Medal awards */
+        "medal_assist", "medal_capture", "medal_defend",
+        "medal_excellent", "medal_gauntlet", "medal_impressive",
+        /* Powerup overlays (gameplay HUD) */
+        "powerups/battleSuit", "powerups/battleWeapon", "powerups/invisibility",
+        "powerups/quad", "powerups/quadWeapon", "powerups/regen",
+        /* Deferred-load icons (the `_df` suffix our strip fallback handles) */
+        "icons/icona_machinegun_df", "icons/icona_plasma_df", "icons/icona_shotgun_df",
+        "icons/iconh_red_df", "icons/iconh_yellow_df",
+        "icons/iconr_red_df", "icons/iconr_shard_df",
+        "icons/iconw_gauntlet_df", "icons/iconw_machinegun_df",
+        "icons/iconw_plasma_df", "icons/iconw_rocket_df", "icons/iconw_shotgun_df",
+        /* FX shaders that resolve via shader-map walk */
+        "bloodMark", "bloodTrail", "bloodExplosion", "bulletExplosion",
+        "markShadow", "wake", "viewBloodBlend", "waterBubble",
+        "gfx/misc/tracer", "hasteSmokePuff", "shotgunSmokePuff",
+        "smokePuff", "smokePuffRagePro",
+        "plasmaExplosion", "rocketExplosion", "teleportEffect", "railDisc",
+        "sprites/balloon3", "sprites/plasma1",
+        /* explode animMap (single representative) */
+        "explode11",
+        /* 2D HUD primitives */
+        "gfx/2d/backtile", "gfx/2d/bigchars", "gfx/2d/colorbar",
+        "gfx/2d/select", "gfx/2d/defer.tga",
+    };
+    int i;
+    int n = (int)(sizeof(names) / sizeof(names[0]));
+    ri.Printf(PRINT_ALL, "[test_menu_assets] registering %d curated shaders\n", n);
+    for (i = 0; i < n; ++i) {
+        (void)RE_RegisterShader(names[i]);
+    }
+    ri.Printf(PRINT_ALL, "[test_menu_assets] done — grep '\\[asset-miss\\]' for misses\n");
+}
+
 static void RE_BeginRegistration(glconfig_t *config) {
     ri.Printf(PRINT_ALL, "RE_BeginRegistration: Metal stub\n");
     LoadAllShaders();
@@ -4410,6 +4459,10 @@ static void RE_BeginRegistration(glconfig_t *config) {
     EnsureSkyTexture();
     EnsureTimHellBaseTexture();
     EnsureTimHellAddTexture();
+    /* Register the menu-asset audit command once. Cmd_AddCommand is
+     * idempotent for repeated registrations — RE_BeginRegistration may
+     * fire again on vid_restart; the engine drops the duplicate. */
+    ri.Cmd_AddCommand("test_menu_assets", TestMenuAssets_f);
     /* Don't clobber vidWidth/vidHeight here — Swift's
      * Q3MetalRenderer_UpdateDrawableSize() is the authoritative source
      * (driven by MTKView's current drawable size, which the
