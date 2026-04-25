@@ -1526,20 +1526,34 @@ struct MetalView: UIViewRepresentable {
                             guard let baseTexture = texture(for: stage.textureHandle, device: view.device) else {
                                 continue
                             }
+                            // Per-stage depth-write override. Q3 shaders
+                            // can carry an explicit `depthwrite` keyword
+                            // even on a blended stage (e.g. q3dm6's
+                            // blocks17gwater), which ioq3 maps to
+                            // GLS_DEPTHMASK_TRUE. Without honoring this
+                            // bit, blended water/grate floors that author
+                            // depthwrite to occlude correctly leak the
+                            // chamber below through the surface.
+                            // Pick the depth-write-ON state for blended
+                            // stages with depthWrite=1; depth-read-only
+                            // (additiveDepthStencilState) otherwise.
+                            let blendedDepthState = stage.depthWrite != 0
+                                ? depthStencilState
+                                : additiveDepthStencilState
                             if drawPass == 4, let worldAdditiveFullPipelineState {
                                 /* GL_ONE/GL_ONE — distinct pipeline from
                                  * alpha-modulated additive. */
                                 encoder.setRenderPipelineState(worldAdditiveFullPipelineState)
-                                encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
+                                encoder.setDepthStencilState(ensuredDepthStencilState(blendedDepthState, device: view.device))
                             } else if drawPass == 3, let worldAdditivePipelineState {
                                 encoder.setRenderPipelineState(worldAdditivePipelineState)
-                                encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
+                                encoder.setDepthStencilState(ensuredDepthStencilState(blendedDepthState, device: view.device))
                             } else if drawPass == 2, let worldAlphaPipelineState {
                                 encoder.setRenderPipelineState(worldAlphaPipelineState)
-                                encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
+                                encoder.setDepthStencilState(ensuredDepthStencilState(blendedDepthState, device: view.device))
                             } else if drawPass == 1, let worldFilterPipelineState {
                                 encoder.setRenderPipelineState(worldFilterPipelineState)
-                                encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
+                                encoder.setDepthStencilState(ensuredDepthStencilState(blendedDepthState, device: view.device))
                             } else {
                                 encoder.setRenderPipelineState(worldPipelineState)
                                 encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))

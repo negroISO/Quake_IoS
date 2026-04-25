@@ -239,7 +239,7 @@ static uint32_t s_entityRejectedModelThisFrame;
 
 #define MAX_SHADER_MAP_ENTRIES 4096
 #define METAL_ANIMMAP_MAX_FRAMES 16
-#define Q3_MAX_STAGES 4
+#define Q3_MAX_STAGES 8
 /* Q3_MAX_TCMODS and Q3TcMod live in metal_renderer_shared.h so both the
  * stub and Swift bindings share the exact same tcMod chain layout. */
 
@@ -295,6 +295,12 @@ typedef struct {
      * makes AddWorldDrawStage's single pointer carry all the data
      * Swift needs to pick a pipeline cull state. */
     int cullMode;
+    /* Explicit `depthwrite` keyword on the stage, OR opaque (no
+     * blendFunc / blendFunc 0). ioq3 sets depthMaskBits=0 for any
+     * blendFunc'd stage UNLESS this bit is set. Without it, blended
+     * water/grate floors that author `depthwrite` to occlude correctly
+     * (e.g. blocks17gwater) leak the chamber below through the surface. */
+    int depthWrite;
 } Q3MetalStage;
 
 enum {
@@ -679,6 +685,13 @@ static void AddWorldDrawStage(Q3MetalWorldDrawCmd *draw,
      * this directly when picking setCullMode per draw. */
     stage->cullMode = (uint32_t)src->cullMode;
     stage->useLightmap = (uint32_t)src->useLightmap;
+    /* Explicit `depthwrite` keyword OR opaque base stage. ioq3 sets
+     * GLS_DEPTHMASK_TRUE for these; we forward the bit so Swift can
+     * pick a depth-write-ON state even on a filter/alpha/additive
+     * pass. Opaque stages (blendMode==0) implicitly get depth-write
+     * via the opaque pipeline anyway, so this bit only matters for
+     * blended stages. */
+    stage->depthWrite = (uint32_t)src->depthWrite;
     stage->rgbWaveFunc = (uint32_t)src->rgbWaveFunc;
     stage->rgbWaveBase = src->rgbWaveBase;
     stage->rgbWaveAmp = src->rgbWaveAmp;
@@ -4397,6 +4410,15 @@ static void ParseShaderText(const char *text) {
                     if (!Q_stricmp(token, "GT0")) cur.alphaFunc = 1;
                     else if (!Q_stricmp(token, "GE128")) cur.alphaFunc = 2;
                     else if (!Q_stricmp(token, "LT128")) cur.alphaFunc = 3;
+                } else if (!Q_stricmp(token, "depthWrite") || !Q_stricmp(token, "depthwrite")) {
+                    /* Explicit Q3 keyword that overrides the default
+                     * depth-mask-off behavior for blended stages. ioq3
+                     * tr_shader.c sets GLS_DEPTHMASK_TRUE here; Quake3e
+                     * propagates as `depthWriteEnable = (state_bits &
+                     * GLS_DEPTHMASK_TRUE) != 0`. Our renderer uses this
+                     * flag to pick a depth-write-ON depth-stencil state
+                     * even on filter/alpha/additive passes. No arg. */
+                    cur.depthWrite = 1;
                 } else if (!Q_stricmp(token, "rgbGen") || !Q_stricmp(token, "rgbgen")) {
                     token = COM_ParseExt(&p, qfalse);
                     if (!Q_stricmp(token, "vertex")) cur.rgbGen = 1;
@@ -4642,6 +4664,46 @@ static void ParseShaderText(const char *text) {
                 last->hasFog = gotFog;
                 last->hasFlare = gotFlare;
                 last->isSky = gotSky;
+                /* [multi-stage-audit] one-shot print for any shader with
+                 * stageCount >= 2. Bounded to first 32 unique shaders
+                 * (deduped by shaderName). Lets us see exactly which
+                 * world surfaces are multi-stage and what stages[]
+                 * the parser captured for each — diagnostic for
+                 * see-through floor / grate / lightmap-modulate cases. */
+                /* One-shot diagnostic for any multi-stage shader.
+                 * Bounded to 256 unique entries via dedupe seen-table —
+                 * pak0 produces ~150 multi-stage shaders so the bound
+                 * holds. Fires PRINT_DEVELOPER so default captures stay
+                 * quiet; toggle with `\developer 1` to enable. Per-stage
+                 * line includes mapPath/lm/blend/alpha/rgb/tcMods/depthW
+                 * so future "is this shader parsed correctly?" questions
+                 * can be answered from a log grep instead of a code dive. */
+                if (last->stageCount >= 2) {
+                    static char s_msaSeen[256][MAX_QPATH];
+                    static int s_msaCount = 0;
+                    int j, dup = 0;
+                    for (j = 0; j < s_msaCount; ++j) {
+                        if (!Q_stricmp(s_msaSeen[j], shaderName)) { dup = 1; break; }
+                    }
+                    if (!dup && s_msaCount < (int)(sizeof(s_msaSeen) / sizeof(s_msaSeen[0]))) {
+                        Q_strncpyz(s_msaSeen[s_msaCount++], shaderName, MAX_QPATH);
+                        ri.Printf(PRINT_DEVELOPER,
+                            "[multi-stage-audit] '%s' stages=%d cull=%d\n",
+                            shaderName, last->stageCount, (int)cullMode);
+                        for (s = 0; s < last->stageCount; ++s) {
+                            ri.Printf(PRINT_DEVELOPER,
+                                "  s%d: map='%s' lm=%d blend=%d alpha=%d rgb=%d tcMods=%d depthW=%d\n",
+                                s,
+                                last->stages[s].mapPath[0] ? last->stages[s].mapPath : "(empty)",
+                                (int)last->stages[s].useLightmap,
+                                (int)last->stages[s].blendMode,
+                                (int)last->stages[s].alphaFunc,
+                                (int)last->stages[s].rgbGen,
+                                (int)last->stages[s].tcModCount,
+                                (int)last->stages[s].depthWrite);
+                        }
+                    }
+                }
                 if (gotFog) {
                     last->fogColor[0] = fogColor[0];
                     last->fogColor[1] = fogColor[1];

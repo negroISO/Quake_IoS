@@ -118,6 +118,15 @@ typedef struct {
     uint32_t alphaFunc;   /* 0=none, 1=GT0, 2=GE128, 3=LT128 */
     uint32_t cullMode;    /* 0=back,1=none,2=front */
     uint32_t useLightmap; /* 1 if stage sourced map from $lightmap */
+    /* Stage explicitly declared `depthwrite` (or is opaque/no blendFunc).
+     * ioq3 sets `depthMaskBits = 0` for any blendFunc'd stage UNLESS
+     * `depthwrite` is explicit; Quake3e maps that into pipeline depth-write
+     * enable. Without this bit, blended water/grate floors that author
+     * `depthwrite` to occlude correctly leak background pixels (q3dm6
+     * blocks17gwater style — chamber below visible through the surface).
+     * 1 = write depth, 0 = depth-read-only. Swift selects depth-stencil
+     * state per stage based on this. */
+    uint32_t depthWrite;
     uint32_t rgbWaveFunc;
     float rgbWaveBase;
     float rgbWaveAmp;
@@ -130,7 +139,7 @@ typedef struct {
     float alphaWaveFreq;
 } Q3MetalWorldStage;
 
-#define Q3_METAL_MAX_STAGES 4
+#define Q3_METAL_MAX_STAGES 8
 
 #define Q3_METAL_MAX_LIGHTS 32
 
