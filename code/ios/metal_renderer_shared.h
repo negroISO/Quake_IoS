@@ -24,6 +24,13 @@ typedef struct {
      * to a dfdx/dfdy face normal of worldPos. */
     float normal[3];
     float color[4];
+    /* Per-quad center for `deformVertexes autosprite` surfaces. xyz =
+     * the 4-vert quad's center (mean of the 4 corner positions); w
+     * is unused (alignment pad). Zero (length(xyz) ~= 0) means
+     * "this vertex is not part of an autosprite quad" — vertex shader
+     * skips the billboard transform. Baked at BSP load by
+     * `BakeAutospriteCenters` in metal_renderer_stub.c. */
+    float autospriteCenter[4];
 } Q3MetalWorldVertex;
 
 typedef struct {

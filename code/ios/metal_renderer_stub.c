@@ -1425,6 +1425,13 @@ static void EmitWorldVertex(Q3MetalWorldVertex *dest, const drawVert_t *source) 
     dest->color[1] = ByteToVisibleColor(source->color.rgba[1]);
     dest->color[2] = ByteToVisibleColor(source->color.rgba[2]);
     dest->color[3] = 1.0f;
+    /* Default to zero — `BakeAutospriteCenters` overwrites for the
+     * subset of vertices belonging to autosprite quads. Vertex shader
+     * detects "no autosprite" via length(autospriteCenter.xyz) ≈ 0. */
+    dest->autospriteCenter[0] = 0.0f;
+    dest->autospriteCenter[1] = 0.0f;
+    dest->autospriteCenter[2] = 0.0f;
+    dest->autospriteCenter[3] = 0.0f;
 }
 
 static void LoadWorldLightmaps(const dheader_t *header, const char *mapName) {
@@ -3393,6 +3400,63 @@ static qboolean LoadWorldMapData(const char *name) {
     s_world.indexCount = indexCursor;
     s_world.drawCount = drawCursor;
     Q_strncpyz(s_world.name, name, sizeof(s_world.name));
+
+    /* Post-load: bake per-quad center into autospriteCenter for every
+     * vertex that belongs to an autosprite-flagged draw. Q3 emits
+     * autosprite surfaces as N quads of 4 verts each, indexed as
+     * (i*4+0, i*4+1, i*4+2, i*4+0, i*4+2, i*4+3). The 4 corners share
+     * a center; the vertex shader uses that center + `cameraRight/Up`
+     * to emit a camera-aligned billboard. Mirrors ioq3
+     * RB_AutospriteDeform's per-quad center step (tr_shade_calc.c).
+     *
+     * Only fires for AUTOSPRITE / AUTOSPRITE2 draws — non-autosprite
+     * vertices stay zero (vertex shader detects via length(center)≈0). */
+    {
+        uint32_t di;
+        for (di = 0; di < s_world.drawCount; ++di) {
+            const Q3MetalWorldDrawCmd *d = &s_world.draws[di];
+            if ((d->flags & (Q3_METAL_WORLD_DRAWFLAG_AUTOSPRITE
+                           | Q3_METAL_WORLD_DRAWFLAG_AUTOSPRITE2)) == 0) {
+                continue;
+            }
+            /* Walk the index buffer in 6-index quad chunks. q3map2
+             * emits autosprite quads as exactly two triangles sharing
+             * indices (i, i+1, i+2, i, i+2, i+3). Group every 6
+             * contiguous indices, dedup to the 4 unique vertex
+             * indices, average their positions. */
+            uint32_t firstIdx = d->firstIndex;
+            uint32_t idxCount = d->indexCount;
+            if (idxCount < 6 || (idxCount % 6) != 0) continue;
+            for (uint32_t q = 0; q < idxCount; q += 6) {
+                /* Six index slots → four unique verts. Use a sorted
+                 * dedup so we don't double-count. */
+                uint32_t idxs[6];
+                for (int k = 0; k < 6; ++k) idxs[k] = s_world.indices[firstIdx + q + k];
+                uint32_t uniq[4]; int nUniq = 0;
+                for (int k = 0; k < 6 && nUniq < 4; ++k) {
+                    int seen = 0;
+                    for (int u = 0; u < nUniq; ++u) {
+                        if (uniq[u] == idxs[k]) { seen = 1; break; }
+                    }
+                    if (!seen) uniq[nUniq++] = idxs[k];
+                }
+                if (nUniq != 4) continue;
+                float cx = 0.0f, cy = 0.0f, cz = 0.0f;
+                for (int u = 0; u < 4; ++u) {
+                    cx += s_world.vertices[uniq[u]].position[0];
+                    cy += s_world.vertices[uniq[u]].position[1];
+                    cz += s_world.vertices[uniq[u]].position[2];
+                }
+                cx *= 0.25f; cy *= 0.25f; cz *= 0.25f;
+                for (int u = 0; u < 4; ++u) {
+                    s_world.vertices[uniq[u]].autospriteCenter[0] = cx;
+                    s_world.vertices[uniq[u]].autospriteCenter[1] = cy;
+                    s_world.vertices[uniq[u]].autospriteCenter[2] = cz;
+                    s_world.vertices[uniq[u]].autospriteCenter[3] = 0.0f;
+                }
+            }
+        }
+    }
 
     /* Parallel BSP tree for R_MarkFragments — additive, does not touch
      * the Metal draw pipeline above. */

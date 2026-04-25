@@ -49,12 +49,26 @@ struct MetalView: UIViewRepresentable {
              * faceted. Zero lets the fragment dfdx/dfdy fallback fire. */
             var normal: SIMD3<Float>
             var color: SIMD4<Float>
+            /* Per-quad center for autosprite surfaces; vertex shader
+             * uses center + cameraRight/Up to emit a camera-aligned
+             * billboard. xyz used, .w pad. Zero (length≈0) means
+             * "not an autosprite vertex" — pass-through. Filled by
+             * the BSP load post-pass in metal_renderer_stub.c. */
+            var autospriteCenter: SIMD4<Float>
         }
 
         struct WorldUniforms {
             var viewProjection: simd_float4x4
             var cameraPos: SIMD3<Float>    // for sky sphere-mapping
             var _pad: Float = 0            // pad to 16-byte alignment
+            /* Camera basis for autosprite billboard transform —
+             * cameraRight = sceneView.viewAxis[1] (Q3 "left" → negate
+             * to get screen-right; we store the right vector here),
+             * cameraUp = viewAxis[2]. .xyz used, .w pad. */
+            var cameraRight: SIMD3<Float> = SIMD3<Float>(1, 0, 0)
+            var _padR: Float = 0
+            var cameraUp: SIMD3<Float> = SIMD3<Float>(0, 0, 1)
+            var _padU: Float = 0
         }
 
         struct WorldDrawUniforms {
@@ -87,8 +101,11 @@ struct MetalView: UIViewRepresentable {
             var deformWaveAmp: Float = 0
             var deformWavePhase: Float = 0
             var deformWaveFreq: Float = 0
+            // deformVertexes autosprite/autoSprite2 mode. 0 = none,
+            // 1 = autosprite (full billboard), 2 = autoSprite2
+            // (elongated; transform pending).
+            var autospriteMode: UInt32 = 0
             var _deformPad0: Float = 0
-            var _deformPad1: Float = 0
             var debugMode: Float
             var forceWhiteVertColor: Float
             var alphaTestThreshold: Float
@@ -439,12 +456,17 @@ struct MetalView: UIViewRepresentable {
             float2 lightmapTexCoord;
             float3 normal;
             float4 color;
+            float4 autospriteCenter;
         };
 
         struct WorldUniforms {
             float4x4 viewProjection;
             packed_float3 cameraPos;
             float _pad;
+            packed_float3 cameraRight;
+            float _padR;
+            packed_float3 cameraUp;
+            float _padU;
         };
 
         struct WorldVertexOut {
@@ -529,8 +551,10 @@ struct MetalView: UIViewRepresentable {
             float deformWaveAmp;
             float deformWavePhase;
             float deformWaveFreq;
+            // deformVertexes autosprite mode (1=autosprite, 2=autoSprite2,
+            // 0=none).
+            uint  autospriteMode;
             float _deformPad0;
-            float _deformPad1;
             float debugMode;
             float forceWhiteVertColor;
             float alphaTestThreshold;
@@ -688,6 +712,32 @@ struct MetalView: UIViewRepresentable {
                                            drawUniforms.timeSeconds);
                     worldPos += n * scale;
                 }
+            }
+            /* deformVertexes autosprite (mode 1): camera-aligned
+             * billboard. Replaces the authored corner position with
+             *   newPos = center + cameraRight * radius * sign(dot(offset, R))
+             *                   + cameraUp    * radius * sign(dot(offset, U))
+             * where offset = position - center and radius =
+             * length(offset) * sqrt(2)/2. Matches ioq3 RB_AddQuadStampExt
+             * substituted into RB_AutospriteDeform's per-quad emit step.
+             *
+             * Skip when autospriteCenter is zero (vertex is not part of
+             * an autosprite quad — center bake at BSP load left it 0).
+             *
+             * Mode 2 (autoSprite2) is tag-only for now; transform
+             * follows in a separate commit. */
+            if (drawUniforms.autospriteMode == 1u
+                && length(inVertex.autospriteCenter.xyz) > 1e-4) {
+                float3 center = inVertex.autospriteCenter.xyz;
+                float3 offset = worldPos - center;
+                float  radius = length(offset) * 0.7071068;
+                float  lProj  = dot(offset, float3(uniforms.cameraRight));
+                float  uProj  = dot(offset, float3(uniforms.cameraUp));
+                float  lSign  = lProj >= 0.0 ?  1.0 : -1.0;
+                float  uSign  = uProj >= 0.0 ?  1.0 : -1.0;
+                worldPos = center
+                         + float3(uniforms.cameraRight) * (lSign * radius)
+                         + float3(uniforms.cameraUp)    * (uSign * radius);
             }
             out.position = uniforms.viewProjection * float4(worldPos, 1.0);
             out.texCoord = inVertex.texCoord;
@@ -1254,7 +1304,23 @@ struct MetalView: UIViewRepresentable {
                let worldIndexBuffer {
                 let viewProjection = makeWorldViewProjection(sceneView)
                 let cameraPos = SIMD3<Float>(sceneView.viewOrigin.0, sceneView.viewOrigin.1, sceneView.viewOrigin.2)
-                var worldUniforms = WorldUniforms(viewProjection: viewProjection, cameraPos: cameraPos)
+                /* sceneView.viewAxis is a row-major 3x3 in Q3 axis
+                 * convention: axis[0]=forward, axis[1]=left,
+                 * axis[2]=up. For a screen-right billboard basis we
+                 * negate axis[1] to get camera-right. */
+                let camRight = SIMD3<Float>(
+                    -sceneView.viewAxis.3,
+                    -sceneView.viewAxis.4,
+                    -sceneView.viewAxis.5)
+                let camUp = SIMD3<Float>(
+                    sceneView.viewAxis.6,
+                    sceneView.viewAxis.7,
+                    sceneView.viewAxis.8)
+                var worldUniforms = WorldUniforms(
+                    viewProjection: viewProjection,
+                    cameraPos: cameraPos,
+                    cameraRight: camRight,
+                    cameraUp: camUp)
                 encoder.setRenderPipelineState(worldPipelineState)
                 encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
                 encoder.setFrontFacing(.clockwise)
@@ -1449,6 +1515,7 @@ struct MetalView: UIViewRepresentable {
                                 deformWaveAmp: stage.deformWaveAmp,
                                 deformWavePhase: stage.deformWavePhase,
                                 deformWaveFreq: stage.deformWaveFreq,
+                                autospriteMode: stage.autospriteMode,
                                 debugMode: Coordinator.worldDebugMode,
                                 forceWhiteVertColor: (blendMode == 1) ? 1.0 : 0.0,
                                 alphaTestThreshold: alphaTest,
@@ -2304,7 +2371,12 @@ struct MetalView: UIViewRepresentable {
                             texCoord: SIMD2<Float>(vertex.texCoord.0, vertex.texCoord.1),
                             lightmapTexCoord: SIMD2<Float>(vertex.lightmapTexCoord.0, vertex.lightmapTexCoord.1),
                             normal: SIMD3<Float>(vertex.normal.0, vertex.normal.1, vertex.normal.2),
-                            color: SIMD4<Float>(vertex.color.0, vertex.color.1, vertex.color.2, vertex.color.3)
+                            color: SIMD4<Float>(vertex.color.0, vertex.color.1, vertex.color.2, vertex.color.3),
+                            autospriteCenter: SIMD4<Float>(
+                                vertex.autospriteCenter.0,
+                                vertex.autospriteCenter.1,
+                                vertex.autospriteCenter.2,
+                                vertex.autospriteCenter.3)
                         )
                     )
                 }
