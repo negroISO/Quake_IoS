@@ -135,7 +135,6 @@ typedef struct {
 typedef struct {
     refEntity_t entity;
     qboolean mirrored;
-    qboolean isSynthetic;  /* set by SynthesizeViewmodelEntity; cgame entities clear */
 } metalSceneEntity_t;
 
 typedef struct {
@@ -4709,171 +4708,6 @@ static void RE_AddLinearLightToScene(const vec3_t start, const vec3_t end, float
 
 const Q3MetalLight *Q3MetalRenderer_GetLights(void) { return s_frameLights; }
 const Q3MetalSceneSnapshot *Q3MetalRenderer_GetSceneSnapshots(void) { return s_sceneSnapshots; }
-/*
- * Synthetic first-person viewmodel.
- *
- * The bundled cgame.qvm only submits one entity per frame (its scene-build
- * loop appears to abort after the first add, probably due to a refEntity_t
- * ABI mismatch), so we cannot rely on it for a stable viewmodel. Instead we
- * inject our own viewmodel entity each frame using the live client state
- * (cl.snap.ps.weapon) and the camera transform. The cgame-submitted
- * entity, whatever it is, renders normally through the standard path.
- */
-static qhandle_t s_viewmodelHandles[16];  /* WP_NUM_WEAPONS is 11; pad for safety */
-
-static qhandle_t RE_RegisterModel(const char *name);
-
-static qhandle_t GetViewmodelHandle(int weapon) {
-    static const char *names[] = {
-        NULL,                                         /* WP_NONE */
-        "models/weapons2/gauntlet/gauntlet.md3",      /* WP_GAUNTLET */
-        "models/weapons2/machinegun/machinegun.md3",  /* WP_MACHINEGUN */
-        "models/weapons2/shotgun/shotgun.md3",        /* WP_SHOTGUN */
-        "models/weapons2/grenadel/grenadel.md3",      /* WP_GRENADE_LAUNCHER */
-        "models/weapons2/rocketl/rocketl.md3",        /* WP_ROCKET_LAUNCHER */
-        "models/weapons2/lightning/lightning.md3",    /* WP_LIGHTNING */
-        "models/weapons2/railgun/railgun.md3",        /* WP_RAILGUN */
-        "models/weapons2/plasma/plasma.md3",          /* WP_PLASMAGUN */
-        "models/weapons2/bfg/bfg.md3",                /* WP_BFG */
-        "models/weapons2/grapple/grapple.md3"         /* WP_GRAPPLING_HOOK */
-    };
-    if (weapon <= 0 || weapon >= (int)(sizeof(names) / sizeof(names[0])) || names[weapon] == NULL) {
-        return 0;
-    }
-    if (s_viewmodelHandles[weapon] == 0) {
-        s_viewmodelHandles[weapon] = RE_RegisterModel(names[weapon]);
-    }
-    return s_viewmodelHandles[weapon];
-}
-
-static cvar_t *s_cvarVmForward = NULL;
-static cvar_t *s_cvarVmRight = NULL;
-static cvar_t *s_cvarVmUp = NULL;
-static cvar_t *s_cvarVmScale = NULL;
-static cvar_t *s_cvarVmSwayAmp = NULL;
-
-static void EnsureViewmodelCvars(void) {
-    if (s_cvarVmForward == NULL) {
-        /* Live-tunable placement. Adjust from console without a rebuild:
-         *   \metal_vm_forward 10
-         *   \metal_vm_right -5
-         *   \metal_vm_up -6
-         *   \metal_vm_scale 1.0
-         *   \metal_vm_sway 0.4
-         * Defaults below are a tighter second guess than the prior
-         * (70, -18, -24, 0.7) — log coords suggested world scale is
-         * smaller than stock Q3, so large offsets pushed the model off-
-         * screen and scale 0.7 still felt oversized. */
-        /* Sign convention: origin formula uses `-kRight * axis1`, and
-         * axis1 is Q3 "left". Positive kRight → subtract left → move
-         * right (screen). Previous default of -4 placed the model 4
-         * units LEFT of center; screenshots confirmed wrong-side bug. */
-        s_cvarVmForward = ri.Cvar_Get("metal_vm_forward", "6",   CVAR_ARCHIVE);
-        s_cvarVmRight   = ri.Cvar_Get("metal_vm_right",   "5",   CVAR_ARCHIVE);
-        s_cvarVmUp      = ri.Cvar_Get("metal_vm_up",      "-4",  CVAR_ARCHIVE);
-        s_cvarVmScale   = ri.Cvar_Get("metal_vm_scale",   "0.3", CVAR_ARCHIVE);
-        s_cvarVmSwayAmp = ri.Cvar_Get("metal_vm_sway",    "0.4", CVAR_ARCHIVE);
-    }
-}
-
-static void SynthesizeViewmodelEntity(const vec3_t vieworg,
-                                      const vec3_t axis0,
-                                      const vec3_t axis1,
-                                      const vec3_t axis2) {
-    metalSceneEntity_t *slot;
-    refEntity_t *e;
-    qhandle_t hModel;
-    int weapon;
-    vec3_t origin;
-    float t, swayRight, swayUp, swayAmp;
-    float kForward, kRight, kUp, kScale;
-
-    EnsureViewmodelCvars();
-    kForward = s_cvarVmForward->value;
-    kRight   = s_cvarVmRight->value;
-    kUp      = s_cvarVmUp->value;
-    kScale   = s_cvarVmScale->value;
-    swayAmp  = s_cvarVmSwayAmp->value;
-    if (kScale <= 0.0f) {
-        kScale = 0.6f;
-    }
-
-    if (s_sceneEntityCount >= Q3_METAL_MAX_REFENTITIES) {
-        return;
-    }
-    if (!s_world.loaded) {
-        return;
-    }
-
-    weapon = cl.snap.ps.weapon;
-    hModel = GetViewmodelHandle(weapon);
-    if (hModel == 0) {
-        return;
-    }
-
-    slot = &s_sceneEntities[s_sceneEntityCount];
-    Com_Memset(slot, 0, sizeof(*slot));
-    e = &slot->entity;
-    e->reType = RT_MODEL;
-    e->hModel = hModel;
-    e->renderfx = RF_DEPTHHACK;
-    e->shader.rgba[0] = 255;
-    e->shader.rgba[1] = 255;
-    e->shader.rgba[2] = 255;
-    e->shader.rgba[3] = 255;
-
-    /* Build origin in view space. axis1 is Q3 "left" → subtract for right. */
-    origin[0] = vieworg[0] + kForward * axis0[0] - kRight * axis1[0] + kUp * axis2[0];
-    origin[1] = vieworg[1] + kForward * axis0[1] - kRight * axis1[1] + kUp * axis2[1];
-    origin[2] = vieworg[2] + kForward * axis0[2] - kRight * axis1[2] + kUp * axis2[2];
-
-    /* Idle sway using engine-side time (cls.realtime is in ms). Subtle. */
-    t = (float)cls.realtime * 0.002f;
-    swayRight = sinf(t) * swayAmp;
-    swayUp    = cosf(t) * (swayAmp * 0.6f);
-    origin[0] += (-axis1[0] * swayRight) + (axis2[0] * swayUp);
-    origin[1] += (-axis1[1] * swayRight) + (axis2[1] * swayUp);
-    origin[2] += (-axis1[2] * swayRight) + (axis2[2] * swayUp);
-
-    VectorCopy(origin, e->origin);
-
-    /* Copy camera axes, then uniformly scale them to fake MD3 scale. */
-    VectorCopy(axis0, e->axis[0]);
-    VectorCopy(axis1, e->axis[1]);
-    VectorCopy(axis2, e->axis[2]);
-    VectorScale(e->axis[0], kScale, e->axis[0]);
-    VectorScale(e->axis[1], kScale, e->axis[1]);
-    VectorScale(e->axis[2], kScale, e->axis[2]);
-
-    slot->mirrored = qfalse;
-    slot->isSynthetic = qtrue;
-    s_sceneEntityCount += 1;
-    s_entityAcceptedThisFrame += 1;
-
-    /* Quad Damage overlay: Q3's cgame CG_AddPlayerWeapon submits the gun
-     * twice when ps.powerups[PW_QUAD] is active — once normally, once with
-     * customShader=quadWeaponShader. The bundled cgame.qvm's broken
-     * syscall ABI drops the second call. Replicate it engine-side so the
-     * blue additive quad shell appears on our viewmodel regardless of
-     * cgame's accept rate. The quad shader is registered lazily on first
-     * use so we don't pay for it on maps where the player never picks
-     * up the powerup. */
-    if (cl.snap.ps.powerups[PW_QUAD] > cl.snap.ps.commandTime) {
-        static qhandle_t s_quadShader = 0;
-        if (s_quadShader == 0) {
-            s_quadShader = RegisterTexture("powerups/quad");
-        }
-        if (s_quadShader != 0 && s_sceneEntityCount < Q3_METAL_MAX_REFENTITIES) {
-            metalSceneEntity_t *shellSlot = &s_sceneEntities[s_sceneEntityCount];
-            refEntity_t *shell;
-            *shellSlot = *slot;           /* copy geometry + origin/axis */
-            shell = &shellSlot->entity;
-            shell->customShader = s_quadShader;
-            s_sceneEntityCount += 1;
-            s_entityAcceptedThisFrame += 1;
-        }
-    }
-}
 
 static void RE_RenderScene(const refdef_t *fd) {
     vec3_t vieworg;
@@ -4958,27 +4792,6 @@ static void RE_RenderScene(const refdef_t *fd) {
         s_sceneView.viewAxis[8] = axis2[2];
     }
 
-    /* Synthetic viewmodel injection — disabled by default now that
-     * native cgame runs and CG_AddViewWeapon submits the real viewmodel
-     * at the correct tag_weapon position with correct animations and
-     * muzzle flash. Toggle via console to fall back if cgame's output
-     * looks wrong:
-     *   \metal_synth_viewmodel 1
-     *
-     * This was a QVM-ABI-mismatch workaround; commit 5977485 made it
-     * obsolete by switching cgame to native. Leaving the code path in
-     * place (behind the cvar) as a safety net during the native cgame
-     * shakedown period. */
-    {
-        static cvar_t *s_cvarSynthVm;
-        if (s_cvarSynthVm == NULL) {
-            s_cvarSynthVm = ri.Cvar_Get("metal_synth_viewmodel", "0", CVAR_ARCHIVE);
-        }
-        if (s_cvarSynthVm->integer) {
-            SynthesizeViewmodelEntity(vieworg, axis0, axis1, axis2);
-        }
-    }
-
     s_sceneLogCounter += 1;
     if ((s_sceneLogCounter % 60) == 0) {
         ri.Printf(
@@ -5013,17 +4826,14 @@ static void RE_RenderScene(const refdef_t *fd) {
         s_rawEntryCount = 0;
         if (s_sceneEntityCount > 0) {
             uint32_t logIdx;
-            uint32_t loggedNonSynth = 0;
-            for (logIdx = 0; logIdx < s_sceneEntityCount && loggedNonSynth < 10; ++logIdx) {
+            uint32_t logged = 0;
+            for (logIdx = 0; logIdx < s_sceneEntityCount && logged < 10; ++logIdx) {
                 const metalSceneEntity_t *se = &s_sceneEntities[logIdx];
                 const metalModel_t *mdl;
                 const char *name;
                 vec3_t firstVertWorld;
                 qboolean haveFirstVert = qfalse;
                 int depthHack;
-                if (se->isSynthetic) {
-                    continue;
-                }
                 mdl = FindModelByHandle(se->entity.hModel);
                 name = (mdl && mdl->inUse) ? mdl->name : "<unknown>";
                 depthHack = (se->entity.renderfx & RF_DEPTHHACK) ? 1 : 0;
@@ -5078,7 +4888,7 @@ static void RE_RenderScene(const refdef_t *fd) {
                         depthHack
                     );
                 }
-                loggedNonSynth += 1;
+                logged += 1;
             }
         }
     }
@@ -5737,72 +5547,6 @@ static void RE_RenderScene(const refdef_t *fd) {
                     continue;
                 }
 
-                /* Hide local-player entities that cgame submits with
-                 * broken transforms (QVM ABI bug — renderfx bits land
-                 * in the wrong field, see brain.db msg 172). Three
-                 * classes of near-camera models get filtered:
-                 *
-                 *   /players/.../{head,upper,lower}.md3
-                 *     — the body parts; without suppression, looking
-                 *       down shows your own torso.
-                 *
-                 *   /weapons2/...
-                 *     — cgame's first-person viewmodel (CG_AddViewWeapon
-                 *       submits the weapon + flash + barrel + hand
-                 *       tag chain). With ABI breakage these render at
-                 *       garbage origins; user screenshots showed a
-                 *       ghost shotgun floating on the left and red
-                 *       polygon slashes when turning. Our own synthetic
-                 *       viewmodel (isSynthetic == qtrue) stays since
-                 *       it's correctly placed in view space.
-                 *
-                 * Proximity: 40 world units (sqrt(1600)). Distant
-                 * players + their weapons (other clients, bots) still
-                 * render normally. */
-                /* Legacy proximity filter — gated behind cvar now that
-                 * native cgame places body parts + weapons correctly
-                 * via RF_THIRD_PERSON. Toggle back if cgame somehow
-                 * still exhibits the ABI artifacts:
-                 *   \metal_hide_nearby 1  (re-enable filter) */
-                static cvar_t *s_cvarHideNearby = NULL;
-                if (s_cvarHideNearby == NULL) {
-                    s_cvarHideNearby = ri.Cvar_Get("metal_hide_nearby", "0", CVAR_ARCHIVE);
-                }
-                if (s_cvarHideNearby->integer && !sceneEntity->isSynthetic && model->inUse) {
-                    const char *mname = model->name;
-                    qboolean isLocalPart = qfalse;
-                    if (mname) {
-                        size_t mlen = strlen(mname);
-                        if (strstr(mname, "/players/") != NULL) {
-                            if (mlen >= 9  && strcmp(mname + mlen - 9,  "/head.md3")  == 0) isLocalPart = qtrue;
-                            if (mlen >= 10 && strcmp(mname + mlen - 10, "/upper.md3") == 0) isLocalPart = qtrue;
-                            if (mlen >= 10 && strcmp(mname + mlen - 10, "/lower.md3") == 0) isLocalPart = qtrue;
-                        }
-                        if (strstr(mname, "/weapons2/") != NULL) {
-                            /* Suppress cgame's first-person weapon chain
-                             * with one exception: *_flash.md3 muzzle
-                             * flashes. They're transient (one frame per
-                             * shot), submitted via tag_flash on fire,
-                             * and even mispositioned they give useful
-                             * 'weapon is firing' feedback. Without this
-                             * exemption the machinegun/plasma/rail look
-                             * dead when you pull the trigger. */
-                            if (!(mlen >= 10 && strcmp(mname + mlen - 10, "_flash.md3") == 0)) {
-                                isLocalPart = qtrue;
-                            }
-                        }
-                    }
-                    if (isLocalPart) {
-                        float dx = sceneEntity->entity.origin[0] - s_sceneView.viewOrigin[0];
-                        float dy = sceneEntity->entity.origin[1] - s_sceneView.viewOrigin[1];
-                        float dz = sceneEntity->entity.origin[2] - s_sceneView.viewOrigin[2];
-                        float distSq = dx*dx + dy*dy + dz*dz;
-                        if (distSq < 1600.0f) {
-                            continue;
-                        }
-                    }
-                }
-
                 /* Q3 renderfx visibility filtering.
                  * RF_THIRD_PERSON: body parts of local player — skip in
                  *   first-person view (render only in mirrors / third-
@@ -5854,11 +5598,7 @@ static void RE_RenderScene(const refdef_t *fd) {
                 vec3_t entityAmbient, entityDirected, entityLightDir;
                 SetupEntityLighting(&sceneEntity->entity, entityAmbient, entityDirected, entityLightDir);
 
-                /* Use the entity transform as submitted. The synthetic
-                 * viewmodel path (SynthesizeViewmodelEntity) appends its own
-                 * entity with correct camera-relative origin/axis; cgame-
-                 * submitted entities (pickups, etc.) use their world
-                 * placement. */
+                /* Use the entity transform as submitted by cgame. */
                 VectorCopy(sceneEntity->entity.origin, effectiveOrigin);
                 VectorCopy(sceneEntity->entity.axis[0], effectiveAxis[0]);
                 VectorCopy(sceneEntity->entity.axis[1], effectiveAxis[1]);
