@@ -60,9 +60,21 @@ typedef struct {
 typedef struct {
     uint32_t textureHandle;
     uint32_t blendMode;   /* 0=opaque,1=add,2=alpha,3=filter */
-    uint32_t tcGen;       /* 0=base,1=environment */
+    uint32_t tcGen;       /* 0=base, 1=environment, 2=vector */
     Q3TcMod tcMods[Q3_MAX_TCMODS];
     uint32_t tcModCount;
+    /* tcGen vector ( x y z ) ( x y z ): two world-space basis vectors
+     * used when tcGen == 2. Per-fragment UV is
+     *   s = dot(worldPos, tcGenVectors[0])
+     *   t = dot(worldPos, tcGenVectors[1])
+     * Matches ioq3 RB_CalcTexCoords TCGEN_VECTOR (renderergl1/tr_shade.c)
+     * and Quake3e's renderervk equivalent. tcMod chain is applied AFTER
+     * tcGen per Q3 ordering. */
+    float tcGenVectors[2][3];
+    /* Pad to 16-byte alignment so Swift/MSL sees a clean float4-style
+     * layout when SIMD-loading. C side reads as flat float[3] pairs;
+     * Swift packs into SIMD4 with .w ignored. */
+    float _tcGenPad[2];
     uint32_t rgbGen;      /* 0=identity,1=vertex,2=lightingDiffuse,3=wave */
     uint32_t alphaGen;    /* 0=identity,1=vertex,3=wave */
     uint32_t alphaFunc;   /* 0=none, 1=GT0, 2=GE128, 3=LT128 */

@@ -71,6 +71,12 @@ struct MetalView: UIViewRepresentable {
             // (units of world space). w == 0 ⇒ no fog, fragment skips the
             // mix entirely. Populated per-draw from s_worldFogs[fogIndex].
             var fogColorDistance: SIMD4<Float>
+            // tcGen vector basis. Only consulted when tcGen == 2. .xyz =
+            // world-space basis vector, .w padding (ignored). UV is
+            // (dot(worldPos, .xyz0), dot(worldPos, .xyz1)). Matches ioq3
+            // RB_CalcTexCoords TCGEN_VECTOR.
+            var tcGenVec0: SIMD4<Float> = SIMD4(0, 0, 0, 0)
+            var tcGenVec1: SIMD4<Float> = SIMD4(0, 0, 0, 0)
             var debugMode: Float
             var forceWhiteVertColor: Float
             var alphaTestThreshold: Float
@@ -120,6 +126,21 @@ struct MetalView: UIViewRepresentable {
                                     p0: SIMD4<Float>, p1: SIMD4<Float>,
                                     p2: SIMD4<Float>, p3: SIMD4<Float>,
                                     count: Int32)
+
+        /* Read the two tcGen vector basis floats out of the C-bridge
+         * stage and pack as SIMD4 for the WorldDrawUniforms fields.
+         * Stage's tcGenVectors[2][3] comes through to Swift as a
+         * nested tuple ((Float, Float, Float), (Float, Float, Float)).
+         * Only meaningful when stage.tcGen == 2; safe to call always
+         * (returns zero vectors otherwise). */
+        private static func tcGenVectors(_ stage: Q3MetalWorldStage) -> (SIMD4<Float>, SIMD4<Float>) {
+            let v0 = stage.tcGenVectors.0
+            let v1 = stage.tcGenVectors.1
+            return (
+                SIMD4<Float>(v0.0, v0.1, v0.2, 0),
+                SIMD4<Float>(v1.0, v1.1, v1.2, 0)
+            )
+        }
 
         private static func fillTcMods(_ stage: Q3MetalWorldStage) -> TcModChainPack {
             var types = SIMD4<Float>(0, 0, 0, 0)
@@ -478,6 +499,10 @@ struct MetalView: UIViewRepresentable {
             // Fog: xyz = color, w = distance (world units). w == 0 ⇒
             // no fog applies to this draw, fragment skips the mix.
             float4 fogColorDistance;
+            // tcGen vector basis. Only consulted when tcGen == 2.
+            // s = dot(worldPos, tcGenVec0.xyz), t = dot(worldPos, tcGenVec1.xyz).
+            float4 tcGenVec0;
+            float4 tcGenVec1;
             float debugMode;
             float forceWhiteVertColor;
             float alphaTestThreshold;
@@ -632,16 +657,22 @@ struct MetalView: UIViewRepresentable {
                                           sampler textureSampler [[sampler(0)]]) {
             float2 texCoord = in.texCoord;
             int rgbGen = int(drawUniforms.rgbGen + 0.5);
-            /* tcGen environment: chrome/reflective surfaces. Compute a
-             * reflection vector and project to UVs per Q3's
-             * RB_CalcEnvironmentTexCoords (s = 0.5 + refl.y*0.5,
-             * t = 0.5 - refl.z*0.5). Prefer the smooth per-vertex
-             * normal (drawVert_t.normal interpolated by the rasterizer);
-             * fall back to the dfdx/dfdy face normal of worldPos when
-             * the vertex normal is zero (legacy paths that don't fill
-             * it). The smooth path makes bezier-patch chrome stop
-             * looking faceted. */
-            if (drawUniforms.tcGen > 0.5) {
+            /* tcGen modes:
+             *   0 (default) — base UVs, mesh ST as authored.
+             *   1 (environment) — chrome/reflective surfaces. Compute
+             *       reflection vector and project per RB_CalcEnvironmentTexCoords
+             *       (s = 0.5 + refl.y*0.5, t = 0.5 - refl.z*0.5). Prefer the
+             *       smooth per-vertex normal (drawVert_t.normal interpolated
+             *       by the rasterizer); fall back to dfdx/dfdy face normal of
+             *       worldPos when the vertex normal is zero. Smooth path makes
+             *       bezier-patch chrome stop looking faceted.
+             *   2 (vector) — basis-projection. Per RB_CalcTexCoords TCGEN_VECTOR:
+             *       s = dot(worldPos, tcGenVec0.xyz)
+             *       t = dot(worldPos, tcGenVec1.xyz)
+             *       Used by lava/water surfaces and a handful of parametric
+             *       shaders. tcMod chain still applies AFTER. */
+            int tcGenMode = int(drawUniforms.tcGen + 0.5);
+            if (tcGenMode == 1) {
                 float3 n;
                 float nLen = length(in.worldNormal);
                 if (nLen > 1e-4) {
@@ -655,6 +686,11 @@ struct MetalView: UIViewRepresentable {
                 float d = 2.0 * dot(viewer, n);
                 float3 refl = n * d - viewer;
                 texCoord = float2(0.5 + refl.y * 0.5, 0.5 - refl.z * 0.5);
+            } else if (tcGenMode == 2) {
+                texCoord = float2(
+                    dot(in.worldPos, drawUniforms.tcGenVec0.xyz),
+                    dot(in.worldPos, drawUniforms.tcGenVec1.xyz)
+                );
             }
             // tcMod chain — apply in order. Q3 shaders stack mods (e.g. scale
             // then scroll); order matters and cannot be reduced to one slot.
@@ -1223,6 +1259,7 @@ struct MetalView: UIViewRepresentable {
                                 // per-stage cullMode just like world stages.
                                 encoder.setCullMode(Self.metalCullMode(for: stage.cullMode))
                                 let skyChain = Self.fillTcMods(stage)
+                                let (skyTV0, skyTV1) = Self.tcGenVectors(stage)
                                 // Sky never receives fog — fogColorDistance=0.
                                 var skyDrawUniforms = WorldDrawUniforms(
                                     tcGen: Float(stage.tcGen),
@@ -1235,6 +1272,8 @@ struct MetalView: UIViewRepresentable {
                                     tcModParams2: skyChain.p2,
                                     tcModParams3: skyChain.p3,
                                     fogColorDistance: SIMD4<Float>(0, 0, 0, 0),
+                                    tcGenVec0: skyTV0,
+                                    tcGenVec1: skyTV1,
                                     debugMode: 0,
                                     forceWhiteVertColor: 0,
                                     alphaTestThreshold: 0,
@@ -1307,6 +1346,7 @@ struct MetalView: UIViewRepresentable {
                                     fogCD = SIMD4(f.color.0, f.color.1, f.color.2, f.distance)
                                 }
                             }
+                            let (tv0, tv1) = Self.tcGenVectors(stage)
                             var drawUniforms = WorldDrawUniforms(
                                 tcGen: Float(stage.tcGen),
                                 tcModCount: chain.count,
@@ -1318,6 +1358,8 @@ struct MetalView: UIViewRepresentable {
                                 tcModParams2: chain.p2,
                                 tcModParams3: chain.p3,
                                 fogColorDistance: fogCD,
+                                tcGenVec0: tv0,
+                                tcGenVec1: tv1,
                                 debugMode: Coordinator.worldDebugMode,
                                 forceWhiteVertColor: (blendMode == 1) ? 1.0 : 0.0,
                                 alphaTestThreshold: alphaTest,

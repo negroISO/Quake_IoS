@@ -250,6 +250,9 @@ typedef struct {
     int alphaGen;
     int alphaFunc;
     int tcGen;
+    /* tcGen vector basis: two world-space vec3. Only consulted when
+     * tcGen == 2 (vector). Parsed from `tcGen vector ( x y z ) ( x y z )`. */
+    float tcGenVectors[2][3];
     Q3TcMod tcMods[Q3_MAX_TCMODS];
     int tcModCount;
     int rgbWaveFunc;
@@ -569,6 +572,15 @@ static void AddWorldDrawStage(Q3MetalWorldDrawCmd *draw,
     stage->textureHandle = (uint32_t)textureHandle;
     stage->blendMode = (uint32_t)src->blendMode;
     stage->tcGen = (uint32_t)src->tcGen;
+    /* tcGen vector basis (only meaningful when tcGen == 2). Always copy
+     * regardless of mode so stale values don't leak into a later
+     * vector-mode stage if the destination slot is reused. */
+    stage->tcGenVectors[0][0] = src->tcGenVectors[0][0];
+    stage->tcGenVectors[0][1] = src->tcGenVectors[0][1];
+    stage->tcGenVectors[0][2] = src->tcGenVectors[0][2];
+    stage->tcGenVectors[1][0] = src->tcGenVectors[1][0];
+    stage->tcGenVectors[1][1] = src->tcGenVectors[1][1];
+    stage->tcGenVectors[1][2] = src->tcGenVectors[1][2];
     /* One-shot world tcGen=env audit: print up to 16 unique tcGen-env
      * texture handles so we can correlate chrome/reflective surfaces in
      * captures. Fires only when tcGen==1 (environment). */
@@ -3904,18 +3916,35 @@ static void ParseShaderText(const char *text) {
                         gotAnim = qtrue;
                     }
                 } else if (!Q_stricmp(token, "tcGen") || !Q_stricmp(token, "tcgen")) {
-                    token = COM_ParseExt(&p, qfalse);
-                    /* STEP 5: per-stage tcGen. Only the stage that declares
-                     * 'tcGen environment' gets the env flag; sibling stages
-                     * stay at base UVs. Keeping the legacy shader-level
-                     * tcGenEnv in sync so Q3MetalStage's tcGen (consumed by
-                     * AddWorldDrawStage → MSL) still reflects the actual
-                     * intent during this transition — but readers should
-                     * prefer stages[i].tcGen over the shader-level bool. */
-                    if (token[0] && (!Q_stricmp(token, "environment") ||
-                                     !Q_stricmp(token, "env"))) {
+                    /* Per-stage tcGen. Only the stage that declares the
+                     * directive gets the flag; sibling stages stay at base.
+                     * Modes: 0=base (default), 1=environment, 2=vector.
+                     * Vector takes two parenthesized vec3 arguments and
+                     * computes UV per-fragment as dot(worldPos, vec[0..1]).
+                     * Matches ioq3 ParseStage / RB_CalcTexCoords TCGEN_VECTOR. */
+                    char modeBuf[MAX_TOKEN_CHARS];
+                    Q_strncpyz(modeBuf, COM_ParseExt(&p, qfalse), sizeof(modeBuf));
+                    if (modeBuf[0] && (!Q_stricmp(modeBuf, "environment") ||
+                                       !Q_stricmp(modeBuf, "env"))) {
                         cur.tcGen = 1;
                         tcGenEnv = qtrue;
+                    } else if (modeBuf[0] && !Q_stricmp(modeBuf, "vector")) {
+                        /* Syntax: tcGen vector ( x y z ) ( x y z )
+                         * 8 tokens after 'vector': '(' x y z ')' '(' x y z ')'
+                         * Copy each numeric token before parsing the next
+                         * because COM_ParseExt aliases its static buffer. */
+                        int vec, comp;
+                        for (vec = 0; vec < 2; ++vec) {
+                            (void)COM_ParseExt(&p, qfalse); /* opening '(' */
+                            for (comp = 0; comp < 3; ++comp) {
+                                char numBuf[MAX_TOKEN_CHARS];
+                                Q_strncpyz(numBuf, COM_ParseExt(&p, qfalse), sizeof(numBuf));
+                                cur.tcGenVectors[vec][comp] =
+                                    numBuf[0] ? (float)atof(numBuf) : 0.0f;
+                            }
+                            (void)COM_ParseExt(&p, qfalse); /* closing ')' */
+                        }
+                        cur.tcGen = 2;
                     }
                 } else if (!Q_stricmp(token, "blendFunc") || !Q_stricmp(token, "blendfunc")) {
                     /* COM_ParseExt returns a pointer into a shared static
