@@ -43,6 +43,11 @@ struct MetalView: UIViewRepresentable {
             var position: SIMD3<Float>
             var texCoord: SIMD2<Float>
             var lightmapTexCoord: SIMD2<Float>
+            /* World-space vertex normal from drawVert_t.normal. Smooth-
+             * interpolated by the rasterizer; the fragment uses it for
+             * env-map reflections so curved patches stop looking
+             * faceted. Zero lets the fragment dfdx/dfdy fallback fire. */
+            var normal: SIMD3<Float>
             var color: SIMD4<Float>
         }
 
@@ -392,6 +397,7 @@ struct MetalView: UIViewRepresentable {
             float3 position;
             float2 texCoord;
             float2 lightmapTexCoord;
+            float3 normal;
             float4 color;
         };
 
@@ -410,6 +416,10 @@ struct MetalView: UIViewRepresentable {
             // compute linear view distance for fog. Interpolated with
             // perspective correction automatically.
             float3 worldPos;
+            // World-space vertex normal (smooth-interpolated). Zero
+            // when the source path didn't supply normals — fragment
+            // detects that and falls back to dfdx/dfdy face derivation.
+            float3 worldNormal;
         };
 
         /* Dynamic point light, matches C Q3MetalLight. */
@@ -606,6 +616,10 @@ struct MetalView: UIViewRepresentable {
             // calculation in the fragment. Cheap; perspective-correct
             // interpolation is what we want for linear fog.
             out.worldPos = inVertex.position;
+            // Smooth per-vertex normal. Pre-normalized at parse time
+            // (drawVert_t.normal); after rasterizer interpolation the
+            // fragment renormalizes before reflection math.
+            out.worldNormal = inVertex.normal;
             return out;
         }
 
@@ -618,17 +632,25 @@ struct MetalView: UIViewRepresentable {
                                           sampler textureSampler [[sampler(0)]]) {
             float2 texCoord = in.texCoord;
             int rgbGen = int(drawUniforms.rgbGen + 0.5);
-            /* tcGen environment: chrome/reflective surfaces. Instead of
-             * sampling by mesh UVs, compute the reflection vector off
-             * the face normal and use its y/z as texture coords.
-             * Per-fragment normal is derived from screen-space derivatives
-             * of worldPos — yields a flat face normal without requiring
-             * vertex normals in the pipeline. Matches Q3's RB_CalcEnvironmentTexCoords
-             * formula: s = 0.5 + reflected.y * 0.5, t = 0.5 - reflected.z * 0.5. */
+            /* tcGen environment: chrome/reflective surfaces. Compute a
+             * reflection vector and project to UVs per Q3's
+             * RB_CalcEnvironmentTexCoords (s = 0.5 + refl.y*0.5,
+             * t = 0.5 - refl.z*0.5). Prefer the smooth per-vertex
+             * normal (drawVert_t.normal interpolated by the rasterizer);
+             * fall back to the dfdx/dfdy face normal of worldPos when
+             * the vertex normal is zero (legacy paths that don't fill
+             * it). The smooth path makes bezier-patch chrome stop
+             * looking faceted. */
             if (drawUniforms.tcGen > 0.5) {
-                float3 dx = dfdx(in.worldPos);
-                float3 dy = dfdy(in.worldPos);
-                float3 n = normalize(cross(dx, dy));
+                float3 n;
+                float nLen = length(in.worldNormal);
+                if (nLen > 1e-4) {
+                    n = in.worldNormal / nLen;
+                } else {
+                    float3 dx = dfdx(in.worldPos);
+                    float3 dy = dfdy(in.worldPos);
+                    n = normalize(cross(dx, dy));
+                }
                 float3 viewer = normalize(uniforms.cameraPos - in.worldPos);
                 float d = 2.0 * dot(viewer, n);
                 float3 refl = n * d - viewer;
@@ -2140,6 +2162,7 @@ struct MetalView: UIViewRepresentable {
                             position: SIMD3<Float>(vertex.position.0, vertex.position.1, vertex.position.2),
                             texCoord: SIMD2<Float>(vertex.texCoord.0, vertex.texCoord.1),
                             lightmapTexCoord: SIMD2<Float>(vertex.lightmapTexCoord.0, vertex.lightmapTexCoord.1),
+                            normal: SIMD3<Float>(vertex.normal.0, vertex.normal.1, vertex.normal.2),
                             color: SIMD4<Float>(vertex.color.0, vertex.color.1, vertex.color.2, vertex.color.3)
                         )
                     )

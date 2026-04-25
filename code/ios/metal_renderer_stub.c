@@ -1249,6 +1249,13 @@ static void EmitWorldVertex(Q3MetalWorldVertex *dest, const drawVert_t *source) 
     dest->texCoord[1] = LittleFloat(source->st[1]);
     dest->lightmapTexCoord[0] = LittleFloat(source->lightmap[0]);
     dest->lightmapTexCoord[1] = LittleFloat(source->lightmap[1]);
+    /* drawVert_t.normal is filled by q3map2 for face/trisurf and by
+     * BspMakeMeshNormals for grid patches. Copy through verbatim so the
+     * fragment shader can do smooth env-map reflections on curved
+     * surfaces. */
+    dest->normal[0] = LittleFloat(source->normal[0]);
+    dest->normal[1] = LittleFloat(source->normal[1]);
+    dest->normal[2] = LittleFloat(source->normal[2]);
     dest->color[0] = ByteToVisibleColor(source->color.rgba[0]);
     dest->color[1] = ByteToVisibleColor(source->color.rgba[1]);
     dest->color[2] = ByteToVisibleColor(source->color.rgba[2]);

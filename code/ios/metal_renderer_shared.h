@@ -17,6 +17,12 @@ typedef struct {
     float position[3];
     float texCoord[2];
     float lightmapTexCoord[2];
+    /* World-space vertex normal from drawVert_t.normal. Smooth-
+     * interpolated to per-fragment normal so env-map reflections
+     * track curved patches without faceting. Zero (e.g. on legacy
+     * paths that don't fill it) lets the fragment shader fall back
+     * to a dfdx/dfdy face normal of worldPos. */
+    float normal[3];
     float color[4];
 } Q3MetalWorldVertex;
 
