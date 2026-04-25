@@ -11,7 +11,11 @@ struct MetalView: UIViewRepresentable {
         view.colorPixelFormat = .bgra8Unorm
         view.depthStencilPixelFormat = .depth32Float
         view.delegate = context.coordinator
+        #if os(visionOS)
+        let maxFPS = 90
+        #else
         let maxFPS = UIScreen.main.maximumFramesPerSecond
+        #endif
         view.preferredFramesPerSecond = maxFPS
         view.enableSetNeedsDisplay = false
         view.isPaused = false
