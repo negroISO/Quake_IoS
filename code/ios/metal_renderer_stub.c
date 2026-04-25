@@ -256,6 +256,14 @@ typedef struct {
      * mirrors Q3MetalWorldStage.tcGenVec0/1 layout. */
     float tcGenVec0[4];
     float tcGenVec1[4];
+    /* deformVertexes wave: parsed at shader level, stamped onto every
+     * stage on shader close. func=0 means no deform. */
+    int deformWaveFunc;
+    float deformWaveDiv;
+    float deformWaveBase;
+    float deformWaveAmp;
+    float deformWavePhase;
+    float deformWaveFreq;
     Q3TcMod tcMods[Q3_MAX_TCMODS];
     int tcModCount;
     int rgbWaveFunc;
@@ -582,6 +590,15 @@ static void AddWorldDrawStage(Q3MetalWorldDrawCmd *draw,
         stage->tcGenVec0[k] = src->tcGenVec0[k];
         stage->tcGenVec1[k] = src->tcGenVec1[k];
     }
+    /* deformVertexes wave (shader-level, stamped onto every stage by
+     * the parser on shader close). func=0 means no deform. */
+    stage->deformWaveFunc  = (uint32_t)src->deformWaveFunc;
+    stage->deformWaveDiv   = src->deformWaveDiv;
+    stage->deformWaveBase  = src->deformWaveBase;
+    stage->deformWaveAmp   = src->deformWaveAmp;
+    stage->deformWavePhase = src->deformWavePhase;
+    stage->deformWaveFreq  = src->deformWaveFreq;
+    /* leave _deformPad untouched — Swift never reads it. */
     /* One-shot world tcGen=env audit: print up to 16 unique tcGen-env
      * texture handles so we can correlate chrome/reflective surfaces in
      * captures. Fires only when tcGen==1 (environment). */
@@ -3860,6 +3877,15 @@ static void ParseShaderText(const char *text) {
         qboolean gotAnim;
         qboolean tcGenEnv;
         int cullMode;
+        /* Top-level deformVertexes wave: parsed at depth==1, stamped
+         * onto every stage on shader close (same pattern as cullMode).
+         * func=0 means the shader has no deform. */
+        int deformWaveFunc;
+        float deformWaveDiv;
+        float deformWaveBase;
+        float deformWaveAmp;
+        float deformWavePhase;
+        float deformWaveFreq;
         char skyBoxBase[MAX_QPATH];
         qboolean gotSkyParms;
         qboolean gotPortal;
@@ -3886,6 +3912,12 @@ static void ParseShaderText(const char *text) {
         gotAnim = qfalse;
         tcGenEnv = qfalse;
         cullMode = METAL_SHADER_CULL_BACK;
+        deformWaveFunc = 0;
+        deformWaveDiv = 1.0f;
+        deformWaveBase = 0.0f;
+        deformWaveAmp = 0.0f;
+        deformWavePhase = 0.0f;
+        deformWaveFreq = 0.0f;
         skyBoxBase[0] = '\0';
         gotSkyParms = qfalse;
         gotPortal = qfalse;
@@ -3963,6 +3995,57 @@ static void ParseShaderText(const char *text) {
                     } else {
                         cullMode = METAL_SHADER_CULL_BACK;
                     }
+                } else if (!Q_stricmp(token, "deformVertexes") ||
+                           !Q_stricmp(token, "deformvertexes")) {
+                    /* Top-level shader directive — applies to all
+                     * stages. We implement `wave`; other variants are
+                     * parsed-and-discarded so the token stream stays in
+                     * sync. Wave syntax:
+                     *   deformVertexes wave <div> <func> <base> <amp> <phase> <freq>
+                     * func is sin/triangle/square/sawtooth/inversesawtooth.
+                     * COM_ParseExt aliases its static buffer; copy each
+                     * token to a local before parsing the next. */
+                    char modeBuf[MAX_TOKEN_CHARS];
+                    Q_strncpyz(modeBuf, COM_ParseExt(&p, qfalse), sizeof(modeBuf));
+                    if (!Q_stricmp(modeBuf, "wave")) {
+                        char divBuf[MAX_TOKEN_CHARS], funcBuf[MAX_TOKEN_CHARS];
+                        char baseBuf[MAX_TOKEN_CHARS], ampBuf[MAX_TOKEN_CHARS];
+                        char phaseBuf[MAX_TOKEN_CHARS], freqBuf[MAX_TOKEN_CHARS];
+                        Q_strncpyz(divBuf,   COM_ParseExt(&p, qfalse), sizeof(divBuf));
+                        Q_strncpyz(funcBuf,  COM_ParseExt(&p, qfalse), sizeof(funcBuf));
+                        Q_strncpyz(baseBuf,  COM_ParseExt(&p, qfalse), sizeof(baseBuf));
+                        Q_strncpyz(ampBuf,   COM_ParseExt(&p, qfalse), sizeof(ampBuf));
+                        Q_strncpyz(phaseBuf, COM_ParseExt(&p, qfalse), sizeof(phaseBuf));
+                        Q_strncpyz(freqBuf,  COM_ParseExt(&p, qfalse), sizeof(freqBuf));
+                        int fn = 1; /* default sin */
+                        if (!Q_stricmp(funcBuf, "sin")) fn = 1;
+                        else if (!Q_stricmp(funcBuf, "triangle")) fn = 2;
+                        else if (!Q_stricmp(funcBuf, "square")) fn = 3;
+                        else if (!Q_stricmp(funcBuf, "sawtooth")) fn = 4;
+                        else if (!Q_stricmp(funcBuf, "inversesawtooth") ||
+                                 !Q_stricmp(funcBuf, "inverseSawtooth")) fn = 5;
+                        deformWaveFunc  = fn;
+                        deformWaveDiv   = (float)atof(divBuf);
+                        if (deformWaveDiv == 0.0f) deformWaveDiv = 1.0f;
+                        deformWaveBase  = (float)atof(baseBuf);
+                        deformWaveAmp   = (float)atof(ampBuf);
+                        deformWavePhase = (float)atof(phaseBuf);
+                        deformWaveFreq  = (float)atof(freqBuf);
+                    } else if (!Q_stricmp(modeBuf, "bulge")) {
+                        /* `bulge <bulgewidth> <bulgeheight> <bulgespeed>` — 3 args. Skip. */
+                        (void)COM_ParseExt(&p, qfalse);
+                        (void)COM_ParseExt(&p, qfalse);
+                        (void)COM_ParseExt(&p, qfalse);
+                    } else if (!Q_stricmp(modeBuf, "move")) {
+                        /* `move <x> <y> <z> <fn> <base> <amp> <phase> <freq>` — 8 args. Skip. */
+                        for (int dm = 0; dm < 8; ++dm) (void)COM_ParseExt(&p, qfalse);
+                    } else if (!Q_stricmp(modeBuf, "normal")) {
+                        /* `normal <amplitude> <frequency>` — 2 args. Skip. */
+                        (void)COM_ParseExt(&p, qfalse);
+                        (void)COM_ParseExt(&p, qfalse);
+                    }
+                    /* `autosprite` / `autoSprite2` / `projectionShadow` /
+                     * `text0..text7` take 0 args — nothing to consume. */
                 } else if (!Q_stricmp(token, "q3map_flare")) {
                     /* Syntax: q3map_flare <shader>. Stock Q3 uses this
                      * as a compile-time hint for the map compiler, which
@@ -4335,9 +4418,18 @@ static void ParseShaderText(const char *text) {
                 last->cullMode = cullMode;
                 /* STEP 6: stamp the shader's cullMode onto every stage
                  * so AddWorldDrawStage's single-pointer copy carries
-                 * everything Swift needs to choose a cull state. */
+                 * everything Swift needs to choose a cull state. Same
+                 * for the top-level deformVertexes wave parameters —
+                 * deform is shader-wide in Q3 but our pipeline reads
+                 * per-stage. */
                 for (s = 0; s < last->stageCount; ++s) {
                     last->stages[s].cullMode = cullMode;
+                    last->stages[s].deformWaveFunc  = deformWaveFunc;
+                    last->stages[s].deformWaveDiv   = deformWaveDiv;
+                    last->stages[s].deformWaveBase  = deformWaveBase;
+                    last->stages[s].deformWaveAmp   = deformWaveAmp;
+                    last->stages[s].deformWavePhase = deformWavePhase;
+                    last->stages[s].deformWaveFreq  = deformWaveFreq;
                 }
                 last->isPortal = gotPortal;
                 last->hasFog = gotFog;

@@ -77,6 +77,18 @@ struct MetalView: UIViewRepresentable {
             // RB_CalcTexCoords TCGEN_VECTOR.
             var tcGenVec0: SIMD4<Float> = SIMD4(0, 0, 0, 0)
             var tcGenVec1: SIMD4<Float> = SIMD4(0, 0, 0, 0)
+            // deformVertexes wave parameters. Read by the world VERTEX
+            // shader: func 0 = no deform; otherwise scale = wave(func,
+            // base, amp, phase + (xyz.x+y+z)/div, freq, time); pos +=
+            // normal * scale. Matches ioq3 DeformVertex_Wave.
+            var deformWaveFunc: UInt32 = 0
+            var deformWaveDiv: Float = 1.0
+            var deformWaveBase: Float = 0
+            var deformWaveAmp: Float = 0
+            var deformWavePhase: Float = 0
+            var deformWaveFreq: Float = 0
+            var _deformPad0: Float = 0
+            var _deformPad1: Float = 0
             var debugMode: Float
             var forceWhiteVertColor: Float
             var alphaTestThreshold: Float
@@ -510,6 +522,15 @@ struct MetalView: UIViewRepresentable {
             // s = dot(worldPos, tcGenVec0.xyz), t = dot(worldPos, tcGenVec1.xyz).
             float4 tcGenVec0;
             float4 tcGenVec1;
+            // deformVertexes wave (shader-level). func 0 = no deform.
+            uint  deformWaveFunc;
+            float deformWaveDiv;
+            float deformWaveBase;
+            float deformWaveAmp;
+            float deformWavePhase;
+            float deformWaveFreq;
+            float _deformPad0;
+            float _deformPad1;
             float debugMode;
             float forceWhiteVertColor;
             float alphaTestThreshold;
@@ -638,17 +659,44 @@ struct MetalView: UIViewRepresentable {
 
         vertex WorldVertexOut q3_world_vertex(const device WorldVertexIn *vertices [[buffer(0)]],
                                               constant WorldUniforms &uniforms [[buffer(1)]],
+                                              constant WorldDrawUniforms &drawUniforms [[buffer(2)]],
                                               uint vertexID [[vertex_id]]) {
             WorldVertexOut out;
             WorldVertexIn inVertex = vertices[vertexID];
-            out.position = uniforms.viewProjection * float4(inVertex.position, 1.0);
+            float3 worldPos = inVertex.position;
+            /* deformVertexes wave: shader-level position deform.
+             *   spread = 1 / div
+             *   off    = (xyz.x + xyz.y + xyz.z) * spread
+             *   scale  = wave(func, base, amp, phase + off, freq, time)
+             *   pos   += normal * scale
+             * Mirrors ioq3 DeformVertex_Wave (tr_shade_calc.c). func == 0
+             * means no deform — common path branchless on most vertices
+             * because the uniform value is constant per draw.
+             *
+             * Skip when length(normal) is near zero (legacy verts that
+             * didn't fill the normal slot) to avoid a NaN axis. */
+            if (drawUniforms.deformWaveFunc != 0u) {
+                float3 n = inVertex.normal;
+                if (length(n) > 1e-4) {
+                    float spread = 1.0 / drawUniforms.deformWaveDiv;
+                    float off = (worldPos.x + worldPos.y + worldPos.z) * spread;
+                    float scale = evalWave(drawUniforms.deformWaveFunc,
+                                           drawUniforms.deformWaveBase,
+                                           drawUniforms.deformWaveAmp,
+                                           drawUniforms.deformWavePhase + off,
+                                           drawUniforms.deformWaveFreq,
+                                           drawUniforms.timeSeconds);
+                    worldPos += n * scale;
+                }
+            }
+            out.position = uniforms.viewProjection * float4(worldPos, 1.0);
             out.texCoord = inVertex.texCoord;
             out.lightmapTexCoord = inVertex.lightmapTexCoord;
             out.color = inVertex.color;
             // Pass through world-space position for the fog distance
             // calculation in the fragment. Cheap; perspective-correct
             // interpolation is what we want for linear fog.
-            out.worldPos = inVertex.position;
+            out.worldPos = worldPos;
             // Smooth per-vertex normal. Pre-normalized at parse time
             // (drawVert_t.normal); after rasterizer interpolation the
             // fragment renormalizes before reflection math.
@@ -1394,6 +1442,13 @@ struct MetalView: UIViewRepresentable {
                                 fogColorDistance: fogCD,
                                 tcGenVec0: tv0,
                                 tcGenVec1: tv1,
+                                deformWaveFunc: stage.deformWaveFunc,
+                                deformWaveDiv: stage.deformWaveDiv != 0
+                                    ? stage.deformWaveDiv : 1.0,
+                                deformWaveBase: stage.deformWaveBase,
+                                deformWaveAmp: stage.deformWaveAmp,
+                                deformWavePhase: stage.deformWavePhase,
+                                deformWaveFreq: stage.deformWaveFreq,
                                 debugMode: Coordinator.worldDebugMode,
                                 forceWhiteVertColor: (blendMode == 1) ? 1.0 : 0.0,
                                 alphaTestThreshold: alphaTest,
@@ -1402,6 +1457,11 @@ struct MetalView: UIViewRepresentable {
                             encoder.setFragmentTexture(baseTexture, index: 0)
                             encoder.setFragmentTexture(lightmapTexture, index: 1)
                             encoder.setFragmentBytes(&drawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 0)
+                            // Vertex shader reads deformWave + timeSeconds
+                            // from WorldDrawUniforms. Bound at vertex
+                            // buffer index 2 (0 = vertex buffer,
+                            // 1 = WorldUniforms).
+                            encoder.setVertexBytes(&drawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 2)
                             encoder.drawIndexedPrimitives(
                                 type: .triangle,
                                 indexCount: Int(draw.indexCount),

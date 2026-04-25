@@ -75,6 +75,21 @@ typedef struct {
      * instead of nested ((Float,Float,Float),(Float,Float,Float)). */
     float tcGenVec0[4];
     float tcGenVec1[4];
+    /* deformVertexes wave (shader-level, stamped onto every stage):
+     *   spread = 1 / div
+     *   off    = (xyz.x + xyz.y + xyz.z) * spread
+     *   scale  = wave(func, base, amp, phase + off, freq, time)
+     *   pos   += normal * scale
+     * Mirrors ioq3 DeformVertex_Wave (tr_shade_calc.c).
+     * deformWaveFunc 0 = no deform; 1=sin / 2=triangle / 3=square /
+     * 4=sawtooth / 5=inverseSawtooth (matches `evalWave` index space). */
+    uint32_t deformWaveFunc;
+    float    deformWaveDiv;
+    float    deformWaveBase;
+    float    deformWaveAmp;
+    float    deformWavePhase;
+    float    deformWaveFreq;
+    float    _deformPad[2];
     uint32_t rgbGen;      /* 0=identity,1=vertex,2=lightingDiffuse,3=wave */
     uint32_t alphaGen;    /* 0=identity,1=vertex,3=wave */
     uint32_t alphaFunc;   /* 0=none, 1=GT0, 2=GE128, 3=LT128 */
