@@ -89,7 +89,15 @@ typedef struct {
     float    deformWaveAmp;
     float    deformWavePhase;
     float    deformWaveFreq;
-    float    _deformPad[2];
+    /* deformVertexes autosprite / autoSprite2 (shader-level). Tag-only
+     * for the moment — the camera-aligned billboard transform that
+     * matches ioq3 RB_AutospriteDeform / RB_Autosprite2Deform is a
+     * follow-up commit that will introduce per-vertex quad centers
+     * and a camera basis uniform. Until then surfaces render as
+     * authored quads.
+     * 0 = none, 1 = autosprite, 2 = autoSprite2. */
+    uint32_t autospriteMode;
+    float    _deformPad[1];
     uint32_t rgbGen;      /* 0=identity,1=vertex,2=lightingDiffuse,3=wave */
     uint32_t alphaGen;    /* 0=identity,1=vertex,3=wave */
     uint32_t alphaFunc;   /* 0=none, 1=GT0, 2=GE128, 3=LT128 */
@@ -177,7 +185,17 @@ enum {
      * strictly distinct from DRAWFLAG_ADDITIVE (GL_SRC_ALPHA/GL_ONE,
      * alpha-modulated). Merging the two caused explosion shaders to
      * bleed full-screen yellow into the framebuffer. */
-    Q3_METAL_WORLD_DRAWFLAG_ADDITIVE_FULL = 1u << 7
+    Q3_METAL_WORLD_DRAWFLAG_ADDITIVE_FULL = 1u << 7,
+    /* Shader uses `deformVertexes autosprite` — quads should be
+     * camera-aligned billboards. Pipeline tag only at present;
+     * the actual GPU transform is a follow-up commit. Useful now
+     * for `[autosprite-audit]` logging + future regression detection. */
+    Q3_METAL_WORLD_DRAWFLAG_AUTOSPRITE = 1u << 8,
+    /* Shader uses `deformVertexes autoSprite2` — elongated billboard
+     * (preserves long axis, only one axis camera-aligned). Used by
+     * lamp wires, chains, jet exhaust, flame sprites. Pipeline tag
+     * only; transform is the follow-up to AUTOSPRITE. */
+    Q3_METAL_WORLD_DRAWFLAG_AUTOSPRITE2 = 1u << 9
 };
 
 enum {

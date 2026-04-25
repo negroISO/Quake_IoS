@@ -264,6 +264,11 @@ typedef struct {
     float deformWaveAmp;
     float deformWavePhase;
     float deformWaveFreq;
+    /* deformVertexes autosprite (1) / autoSprite2 (2). Tag-only for
+     * the moment — pipeline awareness lands here so a follow-up
+     * commit can wire the camera-aligned transform without touching
+     * the parser surface. */
+    int autospriteMode;
     Q3TcMod tcMods[Q3_MAX_TCMODS];
     int tcModCount;
     int rgbWaveFunc;
@@ -598,7 +603,41 @@ static void AddWorldDrawStage(Q3MetalWorldDrawCmd *draw,
     stage->deformWaveAmp   = src->deformWaveAmp;
     stage->deformWavePhase = src->deformWavePhase;
     stage->deformWaveFreq  = src->deformWaveFreq;
-    /* leave _deformPad untouched — Swift never reads it. */
+    /* deformVertexes autosprite/autoSprite2 mode. Tag-only — propagated
+     * to a draw flag below so Swift can route to a future autosprite
+     * vertex shader path. The actual camera-aligned billboard transform
+     * is a follow-up commit. */
+    stage->autospriteMode  = (uint32_t)src->autospriteMode;
+    /* OR the matching draw-cmd flag bit so Swift / future audits can
+     * see which draws are autosprite-shaded without walking stages.
+     * Only stage 0's mode counts — Q3 deformVertexes is shader-wide. */
+    if (draw->stageCount == 1) {
+        if (src->autospriteMode == 1) {
+            draw->flags |= Q3_METAL_WORLD_DRAWFLAG_AUTOSPRITE;
+        } else if (src->autospriteMode == 2) {
+            draw->flags |= Q3_METAL_WORLD_DRAWFLAG_AUTOSPRITE2;
+        }
+    }
+    /* One-shot audit so we can grep '[autosprite-audit]' to see which
+     * shaders actually exercise this path on a given map. Bounded to
+     * 16 unique handles. */
+    if (src->autospriteMode != 0) {
+        static uint32_t s_autoSeen[16];
+        static int s_autoCount = 0;
+        int dup = 0;
+        for (int j = 0; j < s_autoCount; ++j) {
+            if (s_autoSeen[j] == (uint32_t)textureHandle) { dup = 1; break; }
+        }
+        if (!dup && s_autoCount < 16) {
+            const metalTexture_t *t = FindTextureByHandle(textureHandle);
+            s_autoSeen[s_autoCount++] = (uint32_t)textureHandle;
+            ri.Printf(PRINT_ALL,
+                "[autosprite-audit] handle=%u name='%s' mode=%d (1=autosprite, 2=autoSprite2)\n",
+                (unsigned)textureHandle,
+                t ? t->name : "(no-tex)",
+                (int)src->autospriteMode);
+        }
+    }
     /* One-shot world tcGen=env audit: print up to 16 unique tcGen-env
      * texture handles so we can correlate chrome/reflective surfaces in
      * captures. Fires only when tcGen==1 (environment). */
@@ -3886,6 +3925,8 @@ static void ParseShaderText(const char *text) {
         float deformWaveAmp;
         float deformWavePhase;
         float deformWaveFreq;
+        /* deformVertexes autosprite/autoSprite2 (1/2). 0 = no autosprite. */
+        int topAutospriteMode;
         char skyBoxBase[MAX_QPATH];
         qboolean gotSkyParms;
         qboolean gotPortal;
@@ -3918,6 +3959,7 @@ static void ParseShaderText(const char *text) {
         deformWaveAmp = 0.0f;
         deformWavePhase = 0.0f;
         deformWaveFreq = 0.0f;
+        topAutospriteMode = 0;
         skyBoxBase[0] = '\0';
         gotSkyParms = qfalse;
         gotPortal = qfalse;
@@ -4043,9 +4085,15 @@ static void ParseShaderText(const char *text) {
                         /* `normal <amplitude> <frequency>` — 2 args. Skip. */
                         (void)COM_ParseExt(&p, qfalse);
                         (void)COM_ParseExt(&p, qfalse);
+                    } else if (!Q_stricmp(modeBuf, "autosprite")) {
+                        /* 0 args. Tag the shader; transform deferred. */
+                        topAutospriteMode = 1;
+                    } else if (!Q_stricmp(modeBuf, "autoSprite2") ||
+                               !Q_stricmp(modeBuf, "autosprite2")) {
+                        /* 0 args. Tag the shader; transform deferred. */
+                        topAutospriteMode = 2;
                     }
-                    /* `autosprite` / `autoSprite2` / `projectionShadow` /
-                     * `text0..text7` take 0 args — nothing to consume. */
+                    /* `projectionShadow` / `text0..text7` take 0 args. */
                 } else if (!Q_stricmp(token, "q3map_flare")) {
                     /* Syntax: q3map_flare <shader>. Stock Q3 uses this
                      * as a compile-time hint for the map compiler, which
@@ -4430,6 +4478,7 @@ static void ParseShaderText(const char *text) {
                     last->stages[s].deformWaveAmp   = deformWaveAmp;
                     last->stages[s].deformWavePhase = deformWavePhase;
                     last->stages[s].deformWaveFreq  = deformWaveFreq;
+                    last->stages[s].autospriteMode  = topAutospriteMode;
                 }
                 last->isPortal = gotPortal;
                 last->hasFog = gotFog;
