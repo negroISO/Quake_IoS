@@ -25,8 +25,17 @@ set -euo pipefail
 BUNDLE_ID="com.quake3ios.app"
 RUN_SECS="${RUN_SECS:-90}"
 DERIVED="${DERIVED:-$HOME/Library/Developer/Xcode/DerivedData}"
+# Multiple DerivedData hashes can coexist (one per Xcode-detected workspace
+# location); old ones don't get cleaned up. Picking the alphabetical first
+# match, like a naive `find … | head -1`, has bitten us with stale April-14
+# binaries on April-25 — symptoms: boot cbuf edits don't take effect, builds
+# silently use a different binary than xcodebuild produced. Pick by NEWEST
+# mtime instead, and skip Index.noindex (Xcode's source-indexer build, not
+# the actual install product).
 APP=$(/usr/bin/find "$DERIVED" -maxdepth 6 -type d -name "Quake3-iOS.app" \
-        -path "*Debug-iphoneos*" 2>/dev/null | head -1)
+        -path "*Debug-iphoneos*" -not -path "*Index.noindex*" 2>/dev/null \
+        | while read -r p; do echo "$(/usr/bin/stat -f '%m' "$p") $p"; done \
+        | sort -rn | head -1 | cut -d' ' -f2-)
 [[ -z "$APP" ]] && { echo "ERR: Debug-iphoneos .app not found — build for device first" >&2; exit 1; }
 
 if [[ -z "${DEVICE:-}" ]]; then
