@@ -22,8 +22,6 @@
 	<true/>
 	<key>GCSupportsGameMode</key>
 	<true/>
-	<key>LSRequiresIPhoneOS</key>
-	<true/>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>
@@ -31,8 +29,6 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
-	<key>UIRequiresFullScreen</key>
-	<true/>
 	<key>UIFileSharingEnabled</key>
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>

@@ -94,7 +94,13 @@ targets:
         CURRENT_PROJECT_VERSION: "1"
         GENERATE_INFOPLIST_FILE: YES
         SWIFT_OBJC_BRIDGING_HEADER: Quake3-iOS/Quake3-iOS-Bridging-Header.h
-        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTED_PLATFORMS: "iphoneos iphonesimulator xros xrsimulator"
+        TARGETED_DEVICE_FAMILY: "1,2,7"
+        XROS_DEPLOYMENT_TARGET: "26.4"
+        INFOPLIST_KEY_LSRequiresIPhoneOS[sdk=iphoneos*]: YES
+        INFOPLIST_KEY_LSRequiresIPhoneOS[sdk=iphonesimulator*]: YES
+        INFOPLIST_KEY_UIRequiresFullScreen[sdk=iphoneos*]: YES
+        INFOPLIST_KEY_UIRequiresFullScreen[sdk=iphonesimulator*]: YES
         # Apple Development signing team. Pinned in project.yml so
         # xcodegen regen doesn't strip the setting Xcode added when
         # the user originally configured signing. Value recovered from
