@@ -686,6 +686,14 @@ static qboolean TextureNeedsLuminanceAlpha(const char *path) {
     if (!Q_stricmpn(path, "gfx/2d/", 7)) return qtrue;
     if (!Q_stricmpn(path, "powerups/", 9)) return qtrue;
     if (!Q_stricmpn(path, "menu/art/", 9)) return qtrue;
+    /* Menu medals are circular alpha-masked badges authored as TGAs
+     * (menu/medals/medal_assist.tga etc., pak4/pak5). If the .tga is
+     * absent and we land on a JPG fallback, synthesize alpha so the
+     * badge doesn't render as an opaque rectangle. */
+    if (!Q_stricmpn(path, "menu/medals/", 12)) return qtrue;
+    /* HUD icons (weapon, ammo, health, armor) are alpha-masked sprites
+     * with transparent backgrounds. Same JPG-fallback risk. */
+    if (!Q_stricmpn(path, "icons/", 6)) return qtrue;
     return qfalse;
 }
 
@@ -753,11 +761,40 @@ static void SynthesizeAlphaFromLuminance(byte *rgba, int width, int height) {
     }
 }
 
-static qboolean TryLoadImageRGBA(const char *name, byte **rgba, int *width, int *height, char *resolvedName, size_t resolvedNameSize) {
+/* Try loading <base><ext> for ext in {.tga, .jpg, .jpeg}. Returns true
+ * on first success, populates rgba/width/height and resolvedName. */
+static qboolean TryLoadExtChain(const char *origName, const char *base,
+                                byte **rgba, int *width, int *height,
+                                char *resolvedName, size_t resolvedNameSize) {
     static const char *extensions[] = { ".tga", ".jpg", ".jpeg" };
+    int i;
+    for (i = 0; i < (int)ARRAY_LEN(extensions); ++i) {
+        char candidate[MAX_QPATH];
+        qboolean isJpg = Q_stricmp(extensions[i], ".tga") != 0;
+        Com_sprintf(candidate, sizeof(candidate), "%s%s", base, extensions[i]);
+        if (!isJpg) {
+            R_LoadTGA(candidate, rgba, width, height);
+        } else {
+            R_LoadJPG(candidate, rgba, width, height);
+        }
+        if (*rgba != NULL && *width > 0 && *height > 0) {
+            /* JPG has no alpha — R_LoadJPG fills it with 255. For FX
+             * paths that expected the .tga's alpha mask, synthesize
+             * one from the RGB luminance so the bright core draws and
+             * the dark background is masked out. */
+            if (isJpg && TextureNeedsLuminanceAlpha(origName)) {
+                SynthesizeAlphaFromLuminance(*rgba, *width, *height);
+            }
+            Q_strncpyz(resolvedName, candidate, resolvedNameSize);
+            return qtrue;
+        }
+    }
+    return qfalse;
+}
+
+static qboolean TryLoadImageRGBA(const char *name, byte **rgba, int *width, int *height, char *resolvedName, size_t resolvedNameSize) {
     char base[MAX_QPATH];
     const char *ext;
-    int i;
 
     *rgba = NULL;
     *width = 0;
@@ -769,26 +806,44 @@ static qboolean TryLoadImageRGBA(const char *name, byte **rgba, int *width, int 
         COM_StripExtension(base, base, sizeof(base));
     }
 
-    for (i = 0; i < ARRAY_LEN(extensions); ++i) {
-        char candidate[MAX_QPATH];
-        qboolean isJpg = Q_stricmp(extensions[i], ".tga") != 0;
-        Com_sprintf(candidate, sizeof(candidate), "%s%s", base, extensions[i]);
-        if (!isJpg) {
-            R_LoadTGA(candidate, rgba, width, height);
-        } else {
-            R_LoadJPG(candidate, rgba, width, height);
-        }
+    /* (1) requested-case extension chain. */
+    if (TryLoadExtChain(name, base, rgba, width, height, resolvedName, resolvedNameSize)) {
+        return qtrue;
+    }
 
-        if (*rgba != NULL && *width > 0 && *height > 0) {
-            /* JPG has no alpha — R_LoadJPG fills it with 255. For FX
-             * paths that expected the .tga's alpha mask, synthesize
-             * one from the RGB luminance so the bright core draws and
-             * the dark background is masked out. */
-            if (isJpg && TextureNeedsLuminanceAlpha(name)) {
-                SynthesizeAlphaFromLuminance(*rgba, *width, *height);
+    /* (2) Case-folded basename retry. iOS pak files (zip) are
+     * case-sensitive but stock Q3 ships levelshots and a handful of
+     * other paths with uppercase basenames (`levelshots/Q3DM1.jpg`,
+     * etc.) that the UI requests in lowercase. Try uppercasing just
+     * the filename portion (preserve directory case so `MENU/ART/`
+     * isn't generated). */
+    {
+        char upperBase[MAX_QPATH];
+        Q_strncpyz(upperBase, base, sizeof(upperBase));
+        char *fname = strrchr(upperBase, '/');
+        fname = fname ? (fname + 1) : upperBase;
+        Q_strupr(fname);
+        if (Q_stricmp(upperBase, base) != 0) {
+            if (TryLoadExtChain(name, upperBase, rgba, width, height, resolvedName, resolvedNameSize)) {
+                return qtrue;
             }
-            Q_strncpyz(resolvedName, candidate, resolvedNameSize);
-            return qtrue;
+        }
+    }
+
+    /* (3) `_df` (deferred icon) strip fallback. Stock Q3 has
+     * `icons/iconw_machinegun.tga` but cgame's UI code requests
+     * the deferred-load variant `icons/iconw_machinegun_df` which
+     * was never shipped. Drop the suffix and retry rather than
+     * fall through to white. */
+    {
+        size_t blen = strlen(base);
+        if (blen > 3 && !Q_stricmp(base + blen - 3, "_df")) {
+            char stripped[MAX_QPATH];
+            Q_strncpyz(stripped, base, sizeof(stripped));
+            stripped[blen - 3] = '\0';
+            if (TryLoadExtChain(name, stripped, rgba, width, height, resolvedName, resolvedNameSize)) {
+                return qtrue;
+            }
         }
     }
 
@@ -851,7 +906,10 @@ static qhandle_t RegisterTexture(const char *name) {
         }
         if (!alreadySeen && seenCount < 256) {
             Q_strncpyz(seen[seenCount++], name, MAX_QPATH);
-            ri.Printf(PRINT_ALL, "Metal asset request: '%s'\n", name);
+            /* Demoted to DEVELOPER — PRINT_ALL drowned out actual
+             * diagnostics. Use `\developer 1` from the console to
+             * re-enable per-asset request tracing. */
+            ri.Printf(PRINT_DEVELOPER, "Metal asset request: '%s'\n", name);
         }
     }
 
@@ -986,7 +1044,9 @@ static qhandle_t RegisterTexture(const char *name) {
         if (!resolved) {
             /* Remember the miss so subsequent lookups skip the shader-map
              * walk and don't re-spam the warning. Finite cap, dedup by
-             * name. The returned handle is the shared white texture. */
+             * name. The returned handle is the shared white texture.
+             * Structured `[asset-miss]` log lets future agents grep by
+             * category and see the resolution path that was tried. */
             static char s_missSeen[1024][MAX_QPATH];
             static int s_missSeenCount = 0;
             int mi;
@@ -998,7 +1058,24 @@ static qhandle_t RegisterTexture(const char *name) {
                 if (s_missSeenCount < (int)(sizeof(s_missSeen) / sizeof(s_missSeen[0]))) {
                     Q_strncpyz(s_missSeen[s_missSeenCount++], name, MAX_QPATH);
                 }
-                ri.Printf(PRINT_WARNING, "Metal stub: failed to load UI texture '%s', falling back to white\n", name);
+                /* Categorize by leading path so the user can quickly
+                 * triage which subsystem to investigate. */
+                const char *cat = "other";
+                if      (!Q_stricmpn(name, "menu/",        5))  cat = "menu";
+                else if (!Q_stricmpn(name, "ui/",          3))  cat = "ui";
+                else if (!Q_stricmpn(name, "levelshots/", 11)) cat = "levelshot";
+                else if (!Q_stricmpn(name, "icons/",       6))  cat = "icon";
+                else if (!Q_stricmpn(name, "powerups/",    9))  cat = "powerup";
+                else if (!Q_stricmpn(name, "sprites/",     8))  cat = "sprite";
+                else if (!Q_stricmpn(name, "gfx/",         4))  cat = "gfx";
+                else if (!Q_stricmpn(name, "models/",      7))  cat = "model";
+                else if (!Q_stricmpn(name, "textures/",    9))  cat = "world";
+                ri.Printf(PRINT_WARNING,
+                    "[asset-miss] cat=%s name='%s' shader=%s mapPath='%s' stages=%d\n",
+                    cat, name,
+                    entry ? "found" : "notfound",
+                    (entry && entry->mapPath[0]) ? entry->mapPath : "(empty)",
+                    entry ? entry->stageCount : 0);
             }
             return EnsureWhiteTexture();
         }
