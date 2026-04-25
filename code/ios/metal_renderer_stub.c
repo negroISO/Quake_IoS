@@ -3810,8 +3810,39 @@ static int BlendModeFromTokens(const char *src, const char *dst) {
     /* (1-src) * (src + dst). Inverse-color filter, still modulative. */
     if (!Q_stricmp(src, "GL_ONE_MINUS_SRC_COLOR") && !Q_stricmp(dst, "GL_ONE_MINUS_SRC_COLOR")) return 3;
 
-    /* Unknown combo: warn once. Adding here is cheaper than bisecting
-     * visuals weeks later. */
+    /* GL_DST_COLOR / X family — all read the framebuffer as a multiplier
+     * (read-modify-write). Q3 uses these for floor / portal / lightmap
+     * stages. ALL must route to filter so depth-write stays off; otherwise
+     * the stage corrupts the depth buffer and surfaces behind it leak
+     * through (q3dm6 floor → lit-walls / lava bleed-through, demo four
+     * 0:33–0:35). Mirrors ioq3 `depthMaskBits = 0` rule for any blend. */
+    if (!Q_stricmp(src, "GL_DST_COLOR") && !Q_stricmp(dst, "GL_ONE_MINUS_SRC_ALPHA")) return 3;
+    if (!Q_stricmp(src, "GL_DST_COLOR") && !Q_stricmp(dst, "GL_ONE_MINUS_SRC_COLOR")) return 3;
+    if (!Q_stricmp(src, "GL_DST_COLOR") && !Q_stricmp(dst, "GL_ONE"))                  return 3;
+    if (!Q_stricmp(src, "GL_DST_COLOR") && !Q_stricmp(dst, "GL_SRC_ALPHA"))            return 3;
+    if (!Q_stricmp(src, "GL_DST_COLOR") && !Q_stricmp(dst, "GL_SRC_COLOR"))            return 3;
+    /* (1-dst.color)*src — invert-multiply. Filter-class (depth-read-only). */
+    if (!Q_stricmp(src, "GL_ONE_MINUS_DST_COLOR") && !Q_stricmp(dst, "GL_ZERO"))               return 3;
+    if (!Q_stricmp(src, "GL_ONE_MINUS_DST_COLOR") && !Q_stricmp(dst, "GL_ONE_MINUS_SRC_ALPHA")) return 2;
+    /* GL_ZERO / X family — source contributes nothing; result is purely a
+     * destination scale. Pass-through / dst-alpha-multiply / etc. All
+     * filter-class. */
+    if (!Q_stricmp(src, "GL_ZERO") && !Q_stricmp(dst, "GL_ONE"))       return 3;
+    if (!Q_stricmp(src, "GL_ZERO") && !Q_stricmp(dst, "GL_SRC_ALPHA")) return 3;
+    /* GL_ONE / X additive variants. Premultiplied alpha + alpha-modulated
+     * additive — closest to alpha (mode 2, depth-read-only).  */
+    if (!Q_stricmp(src, "GL_ONE") && !Q_stricmp(dst, "GL_ONE_MINUS_SRC_ALPHA")) return 2;
+    if (!Q_stricmp(src, "GL_ONE") && !Q_stricmp(dst, "GL_ONE_MINUS_SRC_COLOR")) return 2;
+    if (!Q_stricmp(src, "GL_ONE") && !Q_stricmp(dst, "GL_SRC_ALPHA"))            return 2;
+    if (!Q_stricmp(src, "GL_ONE") && !Q_stricmp(dst, "GL_SRC_COLOR"))            return 3;
+    /* (1-src.a)*src + dst*src.a — inverted alpha (decal trick). Alpha-class. */
+    if (!Q_stricmp(src, "GL_ONE_MINUS_SRC_ALPHA") && !Q_stricmp(dst, "GL_SRC_ALPHA")) return 2;
+
+    /* Unknown combo: warn once and fall back to filter (depth-read-only).
+     * Routing the unclassified default to filter instead of opaque
+     * mirrors ioq3 tr_shader.c's `depthMaskBits = 0 if blendFunc set`
+     * invariant — losing precise blend math is far less visible than the
+     * depth-corruption that comes from running with depth-write ON. */
     {
         static char s_unknownSeen[64][64];
         static int s_unknownCount = 0;
@@ -3824,10 +3855,10 @@ static int BlendModeFromTokens(const char *src, const char *dst) {
         }
         if (!seen && s_unknownCount < (int)(sizeof(s_unknownSeen) / sizeof(s_unknownSeen[0]))) {
             Q_strncpyz(s_unknownSeen[s_unknownCount++], combo, sizeof(s_unknownSeen[0]));
-            ri.Printf(PRINT_WARNING, "Metal shader: unrecognized blendFunc '%s %s' → opaque\n", src, dst);
+            ri.Printf(PRINT_WARNING, "Metal shader: unrecognized blendFunc '%s %s' → filter (depth-write off)\n", src, dst);
         }
     }
-    return 0;
+    return 3;
 }
 
 static int ShaderMap_GetAlphaFunc(const char *name) {
