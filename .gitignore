@@ -1,5 +1,10 @@
 # Game data (too large for git — must be provided locally)
+# Ignores any baseq3/ directory (the user's local pak0..pak8a /
+# q3wpak* drop, ~600MB) — but explicit !Resources/baseq3/ exception
+# keeps small bundle-side assets git-tracked (demos, custom shaders)
+# so q3dev_run.sh can seed them onto the device sandbox.
 baseq3/
+!Resources/baseq3/
 *.pk3
 
 # Xcode

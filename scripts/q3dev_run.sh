@@ -60,6 +60,24 @@ echo "→ runtime: ${RUN_SECS}s"
 xcrun devicectl device install app --device "$DEVICE" "$APP" >/dev/null 2>&1
 echo "→ installed"
 
+# Seed any local demos onto the device. The .app bundle does NOT
+# carry baseq3 resources (pk3s ship via Files-app sharing into
+# Documents/baseq3/), so demos do too. We push every .dm_68 found
+# under Resources/baseq3/demos/ to Documents/baseq3/demos/. Cheap
+# and idempotent: devicectl copy-to overwrites in place. On a
+# device that already has all demos this is ~free per file.
+DEMO_DIR="Resources/baseq3/demos"
+if [[ -d "$DEMO_DIR" ]]; then
+    for d in "$DEMO_DIR"/*.dm_68(N); do
+        [[ -f "$d" ]] || continue
+        xcrun devicectl device copy to --device "$DEVICE" \
+            --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
+            --source "$d" \
+            --destination "Documents/baseq3/demos/${d:t}" >/dev/null 2>&1 \
+            && echo "→ demo:    pushed ${d:t}"
+    done
+fi
+
 # Launch with --console so the app's stdout streams back over USB.
 # We background the launch wrapper and SIGTERM it after RUN_SECS;
 # the on-device process keeps running until iOS reaps it (which
