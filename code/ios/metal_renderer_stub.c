@@ -3774,6 +3774,11 @@ static int BlendModeFromTokens(const char *src, const char *dst) {
     if (!Q_stricmp(src, "GL_SRC_ALPHA") && !Q_stricmp(dst, "GL_ONE_MINUS_SRC_ALPHA")) return 2;
     /* Filter / modulate (lightmap pass, dark overlay). */
     if (!Q_stricmp(src, "GL_DST_COLOR") && !Q_stricmp(dst, "GL_ZERO")) return 3;
+    /* Q3 floor/portal shaders commonly use this for their final lightmap
+     * modulation stage. The default framebuffer alpha is effectively 1, so
+     * the RGB result is the same read-modify-write filter path, not an
+     * opaque depth-writing pass. */
+    if (!Q_stricmp(src, "GL_DST_COLOR") && !Q_stricmp(dst, "GL_ONE_MINUS_DST_ALPHA")) return 3;
     /* Filter (commutative factor ordering — some shaders author this form). */
     if (!Q_stricmp(src, "GL_ZERO") && !Q_stricmp(dst, "GL_SRC_COLOR")) return 3;
     /* Subtractive darkening for decals (blood marks, bullet marks,

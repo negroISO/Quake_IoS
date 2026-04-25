@@ -1,0 +1,7 @@
+anchor=four_frame_155
+type=WORLD_PRECISION
+demo=four
+frame_index=155
+ref_source=/Users/targus/Documents/Quake_IoS/reference/four/frames/frame_0155.png
+out_source=/Users/targus/Desktop/q3sim_sessions/20260422_211247_anchor/frames_960x444/frame_0155.png
+captured_at=20260422_211247

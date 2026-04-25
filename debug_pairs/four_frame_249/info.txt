@@ -1,0 +1,7 @@
+anchor=four_frame_249
+type=ADDITIVE_EFFECTS
+demo=four
+frame_index=249
+ref_source=/Users/targus/Documents/Quake_IoS/reference/four/frames/frame_0249.png
+out_source=/Users/targus/Desktop/q3sim_sessions/20260422_211247_anchor/frames_960x444/frame_0249.png
+captured_at=20260422_211247

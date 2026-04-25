@@ -1,0 +1,10 @@
+# anchor=four_frame_155 type=WORLD_PRECISION
+ANCHOR: four_frame_155
+MATCH: FAIL
+DIFF_TYPE: ENTITY
+OBSERVATIONS:
+- View model is completely different (axe vs railgun)
+- Player position and camera angle are mismatched
+- World geometry visibility differs significantly
+ROOT_CAUSE: rgbGen
+CONFIDENCE: HIGH

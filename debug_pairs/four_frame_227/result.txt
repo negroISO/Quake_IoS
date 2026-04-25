@@ -1,0 +1,9 @@
+# anchor=four_frame_227 type=BLEND_FAILURE_EXTREME
+ANCHOR: four_frame_227
+MATCH: FAIL
+DIFF_TYPE: BLEND
+OBSERVATIONS:
+- Blood decals are completely missing from walls and floor in Metal output
+- Scene lacks red splatter elements present in reference
+ROOT_CAUSE: blendFunc
+CONFIDENCE: HIGH

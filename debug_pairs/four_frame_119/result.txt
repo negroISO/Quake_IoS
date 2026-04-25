@@ -1,0 +1,10 @@
+# anchor=four_frame_119 type=ENTITY_LIGHTING
+ANCHOR: four_frame_119
+MATCH: FAIL
+DIFF_TYPE: BLEND
+OBSERVATIONS:
+- Massive yellow additive overlay covering majority of screen
+- Reference image shows clear entity and world geometry without color tint
+- Overdraw/blend state failure causing full-screen saturation
+ROOT_CAUSE: blendFunc
+CONFIDENCE: HIGH

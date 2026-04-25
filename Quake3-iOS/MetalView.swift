@@ -19,6 +19,19 @@ struct MetalView: UIViewRepresentable {
         view.preferredFramesPerSecond = maxFPS
         view.enableSetNeedsDisplay = false
         view.isPaused = false
+        // Suppress iOS's developer Metal Performance HUD (the translucent
+        // top-right "Metal: ... Available: ... Compiled: ..." overlay).
+        // The system composites it onto our drawable after we render, so
+        // it gets baked into the demo-four AVI capture and the vision-LLM
+        // diff can mistake the HUD glyphs for engine output. Apps can
+        // override the user's Settings → Developer → Metal HUD toggle by
+        // setting this dict explicitly. Stats remain available via the
+        // engine's own logs (PRINT_DEVELOPER + r_speeds).
+        if let metalLayer = view.layer as? CAMetalLayer {
+            if #available(iOS 16.0, visionOS 1.0, *) {
+                metalLayer.developerHUDProperties = ["mode": "hidden"]
+            }
+        }
         return view
     }
 
@@ -381,6 +394,11 @@ struct MetalView: UIViewRepresentable {
              * diffuse already baked in by the C entity build loop;
              * this carries the un-Lambert'd, raw entity color. */
             var entityColor: SIMD4<Float> = SIMD4<Float>(1, 1, 1, 1)
+            /* 1 for GL_ONE/GL_ONE entity draws. These shaders are already
+             * authored as full-bright additive effects; applying dynamic
+             * lights to the source texture itself double-brightens muzzle
+             * flashes and projectile cores. */
+            var suppressDlights: UInt32 = 0
         }
 
         /* Fragment-side dlight block bound at buffer(2) for both world and
@@ -673,6 +691,7 @@ struct MetalView: UIViewRepresentable {
             float4 alphaGenWaveParams;
             float4 rgbConstColor;
             float4 entityColor;
+            uint suppressDlights;
         };
 
         struct EntityVertexOut {
@@ -1075,7 +1094,9 @@ struct MetalView: UIViewRepresentable {
                 baseA = texel.a * in.color.a;
             }
             float4 base = float4(baseRgb, baseA);
-            base.rgb = applyDlights(base.rgb, in.worldPos, dlights);
+            if (uniforms.suppressDlights == 0u) {
+                base.rgb = applyDlights(base.rgb, in.worldPos, dlights);
+            }
             return base;
         }
 
@@ -1688,6 +1709,7 @@ struct MetalView: UIViewRepresentable {
                          * alphaGen=entity / oneMinusEntity (5/6). */
                         let ec = draw.entityColor
                         entityUniforms.entityColor = SIMD4<Float>(ec.0, ec.1, ec.2, ec.3)
+                        entityUniforms.suppressDlights = (drawPass == 5) ? 1 : 0
                         /* Per TASK PART 3: no rgbGen/alphaGen override for
                          * scene polys — the shader's resolved genMode
                          * flows through verbatim from packEntityRgbGen. */
