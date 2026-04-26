@@ -13,7 +13,7 @@ struct Quake3_iOSApp: App {
     }
     /// nil = launch menu visible. Non-nil = engine should boot and
     /// queue this Q3 console command (e.g. "demo four", "map q3dm6").
-    @State private var launchCommand: String? = nil
+    @State private var launchCommand: String? = ProcessInfo.processInfo.environment["Q3_LAUNCH_COMMAND"]
     @State private var engineStarted = false
     /// True while `Quake3_Init` is running. Drives the "Loading…" overlay
     /// so the user gets feedback during the synchronous (~5–30s) engine

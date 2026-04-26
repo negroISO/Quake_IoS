@@ -3,7 +3,8 @@ ANCHOR: four_frame_235
 MATCH: FAIL
 DIFF_TYPE: BLEND
 OBSERVATIONS:
-- Blood decals are completely missing from the walls and floor in the Metal output.
-- Reference image shows multiple red splatter entities on geometry.
+- Blood decals on walls and floor are missing or significantly faded in Metal output
+- Reference image shows high-contrast, saturated red blood splatters
+- Decal alpha blending is not matching ground truth intensity
 ROOT_CAUSE: blendFunc
 CONFIDENCE: HIGH

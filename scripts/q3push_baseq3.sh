@@ -10,7 +10,12 @@
 # get it.
 #
 # Usage:
-#   ./scripts/q3push_baseq3.sh
+#   ./scripts/q3push_baseq3.sh                       # default bundle
+#   ./scripts/q3push_baseq3.sh --bundle <bundle.id>  # custom bundle
+#
+# Examples:
+#   ./scripts/q3push_baseq3.sh --bundle com.quake3ios.app             # our Metal build
+#   ./scripts/q3push_baseq3.sh --bundle com.tomkiddcog.Quake3-iOS     # Tom Kidd's port
 #
 # Notes:
 # - "Reachable" means devicectl can talk to it RIGHT NOW. WiFi pairing
@@ -19,8 +24,9 @@
 #   reachable whenever it's on the same network.
 # - Skips .DS_Store. No other filtering — every other file under
 #   Resources/baseq3/ is pushed.
-# - Bundle ID is hardcoded to com.quake3ios.app (the app's
-#   PRODUCT_BUNDLE_IDENTIFIER per project.yml).
+# - Default bundle is com.quake3ios.app (our Metal renderer build,
+#   matches PRODUCT_BUNDLE_IDENTIFIER in project.yml). Override with
+#   --bundle for any other Q3 iOS app installed on the same device.
 
 set -euo pipefail
 
@@ -28,6 +34,26 @@ SCRIPT_DIR="${0:A:h}"
 REPO_ROOT="${SCRIPT_DIR:h}"
 SRC="$REPO_ROOT/Resources/baseq3"
 BUNDLE="com.quake3ios.app"
+
+# --bundle <id> override
+while (( $# > 0 )); do
+  case "$1" in
+    --bundle)
+      shift
+      [[ -n "${1-}" ]] || { echo "ERROR: --bundle requires a bundle identifier" >&2; exit 2; }
+      BUNDLE="$1"
+      shift
+      ;;
+    -h|--help)
+      sed -n '2,/^$/p' "${0:A}" | sed 's/^# *//'
+      exit 0
+      ;;
+    *)
+      echo "ERROR: unrecognized argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
 
 if [[ ! -d "$SRC" ]]; then
   echo "ERROR: source folder not found: $SRC" >&2
@@ -73,6 +99,7 @@ while IFS= read -r line; do
 done < <(xcrun devicectl list devices 2>/dev/null)
 
 echo "Source: $SRC"
+echo "Bundle: $BUNDLE"
 echo "Reachable devices: ${#DEVICES}"
 for udid in "${DEVICES[@]}"; do
   printf "  • %s  [%s]\n" "${NAMES[$udid]:-<unnamed>}" "$udid"

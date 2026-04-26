@@ -195,6 +195,7 @@ typedef struct {
      * un-Lambert'd entity color — distinct from per-vertex `color`
      * which has Lambert diffuse already baked in by the C build loop. */
     float entityColor[4];
+    float shaderTime;
 } Q3MetalEntityDrawCmd;
 
 enum {

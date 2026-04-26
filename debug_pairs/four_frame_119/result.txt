@@ -3,8 +3,8 @@ ANCHOR: four_frame_119
 MATCH: FAIL
 DIFF_TYPE: BLEND
 OBSERVATIONS:
-- Massive yellow additive overlay covering majority of screen
-- Reference image shows clear entity and world geometry without color tint
-- Overdraw/blend state failure causing full-screen saturation
+- Entire scene is heavily tinted yellow/green
+- Explosions and effects are overblown and glowing
+- World geometry colors do not match reference
 ROOT_CAUSE: blendFunc
 CONFIDENCE: HIGH

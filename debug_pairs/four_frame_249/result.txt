@@ -3,8 +3,8 @@ ANCHOR: four_frame_249
 MATCH: FAIL
 DIFF_TYPE: BLEND
 OBSERVATIONS:
-- Blood decals on walls and floor are missing or severely diminished in intensity
-- Red additive streaks present in Metal output are not found in reference
-- Overall scene saturation differs due to missing decal layers
+- Blood decals on walls and floor are missing or significantly faded in Metal output
+- Red additive particle effects/streaks present in Metal output are absent in reference
+- Overall scene saturation is shifted toward yellow/brown compared to the deep reds of the reference
 ROOT_CAUSE: blendFunc
 CONFIDENCE: HIGH

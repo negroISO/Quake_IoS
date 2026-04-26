@@ -3,8 +3,8 @@ ANCHOR: four_frame_247
 MATCH: FAIL
 DIFF_TYPE: BLEND
 OBSERVATIONS:
-- Entire scene is heavily tinted yellow/gold
-- Reference image shows natural textures and red decals
-- Metal output lacks distinct material colors and blood splatters
+- Entire scene is heavily tinted yellow/white
+- Blood decals on walls and floor are missing or washed out
+- Lighting intensity is blown out compared to reference
 ROOT_CAUSE: blendFunc
 CONFIDENCE: HIGH

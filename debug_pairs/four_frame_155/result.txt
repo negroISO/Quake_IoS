@@ -1,10 +1,10 @@
 # anchor=four_frame_155 type=WORLD_PRECISION
 ANCHOR: four_frame_155
 MATCH: FAIL
-DIFF_TYPE: ENTITY
+DIFF_TYPE: WORLD
 OBSERVATIONS:
-- View model is completely different (axe vs railgun)
-- Player position and camera angle are mismatched
-- World geometry visibility differs significantly
-ROOT_CAUSE: rgbGen
+- Complete mismatch of scene geometry and environment
+- Reference image shows a metallic industrial corridor with large arches
+- Metal output shows a stone circular room with stairs and a ceiling fixture
+ROOT_CAUSE: tcMod
 CONFIDENCE: HIGH

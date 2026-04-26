@@ -3,7 +3,8 @@ ANCHOR: four_frame_227
 MATCH: FAIL
 DIFF_TYPE: BLEND
 OBSERVATIONS:
-- Blood decals are completely missing from walls and floor in Metal output
-- Scene lacks red splatter elements present in reference
+- Massive discrepancy in scene composition and framing
+- Blood decals on floor and walls are missing or incorrectly placed
+- Reference image shows extreme close-up of entity/blood that is absent in Metal output
 ROOT_CAUSE: blendFunc
 CONFIDENCE: HIGH

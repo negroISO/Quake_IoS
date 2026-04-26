@@ -741,6 +741,8 @@ static void SetEntityDrawColor(uint32_t cursor, const refEntity_t *e) {
         s_entityDraws[cursor].entityColor[2] = 1.0f;
         s_entityDraws[cursor].entityColor[3] = 1.0f;
     }
+    s_entityDraws[cursor].shaderTime =
+        (float)cls.realtime * 0.001f - (e != NULL ? e->shaderTime.f : 0.0f);
 }
 
 /* Heuristic: should alpha be synthesized when a JPG fallback is loaded
@@ -1021,14 +1023,20 @@ static qhandle_t RegisterTexture(const char *name) {
              * propagation, additive flames render opaque. */
             metalTexture_t *animTex = FindTextureByHandle(animHandle);
             if (animTex != NULL) {
-                if (animTex->blendMode == 0) {
-                    int parentBM = ShaderMap_GetBlendMode(name);
-                    if (parentBM != 0) animTex->blendMode = parentBM;
-                }
-                if (animTex->alphaFunc == 0) {
-                    int parentAF = ShaderMap_GetAlphaFunc(name);
-                    if (parentAF != 0) animTex->alphaFunc = parentAF;
-                }
+                animTex->blendMode = ShaderMap_GetBlendMode(name);
+                animTex->alphaFunc = ShaderMap_GetAlphaFunc(name);
+                animTex->tcGenEnv = ShaderMap_GetTcGenEnv(name);
+                animTex->rgbGen = ShaderMap_GetRgbGen(name);
+                animTex->alphaGen = ShaderMap_GetAlphaGen(name);
+                ShaderMap_GetRgbWave(name, &animTex->rgbWaveFunc,
+                                     &animTex->rgbWaveBase, &animTex->rgbWaveAmp,
+                                     &animTex->rgbWavePhase, &animTex->rgbWaveFreq);
+                ShaderMap_GetAlphaWave(name, &animTex->alphaWaveFunc,
+                                       &animTex->alphaWaveBase, &animTex->alphaWaveAmp,
+                                       &animTex->alphaWavePhase, &animTex->alphaWaveFreq);
+                ShaderMap_GetRgbConst(name, animTex->rgbConstColor);
+                animTex->alphaConst = ShaderMap_GetAlphaConst(name);
+                ShaderMap_GetTcMods(name, &animTex->tcModCount, animTex->tcMods);
             }
             return animHandle;
         }
@@ -2862,14 +2870,28 @@ static qboolean BspLoad(const dheader_t *header, const byte *fileBase,
     BspFreeWorld();
 
     /* Blob pool budget: sized against total BSP geometry + fat-patch overhead.
-     * Faces store (points + indices) inline (~64B per point, 4B per index).
-     * Tri-surfs inline drawVert_t + int[] (~44B per vert). Patches blow up
-     * after subdivision — worst-case roughly 65×65 drawVerts per patch.
-     * Be generous; this is one-time per map load and freed on map change. */
-    blobBudget = (size_t)totalVerts * (sizeof(drawVert_t) + 32)
-               + (size_t)totalIndexes * sizeof(int) * 2
-               + (size_t)surfaceCount * (sizeof(bspSrfGridMesh_t) + BSP_MAX_GRID_SIZE * BSP_MAX_GRID_SIZE * sizeof(drawVert_t))
-               + 1024 * 1024;
+     * Faces store (points + indices) inline; the totalVerts/totalIndexes
+     * terms cover them. Tri-surfs inline drawVert_t + int[] — also covered
+     * by totalVerts. Patches are the ONLY surface kind that blows up after
+     * subdivision, worst-case roughly 65×65 drawVerts per patch. So the
+     * fat-patch term must multiply by patchCount, NOT surfaceCount —
+     * otherwise complex maps (nv15 has ~29k surfaces but maybe <500 are
+     * patches) over-allocate by ~60× and trip Z_TagMalloc's INT_MAX guard
+     * with a 5.3GB request. Count patches in a quick first pass. */
+    {
+        int patchCount = 0;
+        for (int s = 0; s < surfaceCount; s++) {
+            if (LittleLong(surfIn[s].surfaceType) == MST_PATCH) {
+                patchCount++;
+            }
+        }
+        blobBudget = (size_t)totalVerts * (sizeof(drawVert_t) + 32)
+                   + (size_t)totalIndexes * sizeof(int) * 2
+                   + (size_t)patchCount * (sizeof(bspSrfGridMesh_t) + BSP_MAX_GRID_SIZE * BSP_MAX_GRID_SIZE * sizeof(drawVert_t))
+                   + 1024 * 1024;
+        ri.Printf(PRINT_DEVELOPER, "[BSP] blobBudget surfaces=%d patches=%d → %zu bytes\n",
+                  surfaceCount, patchCount, blobBudget);
+    }
     s_bspWorld.blobPool = (byte *)ri.Malloc(blobBudget);
     s_bspWorld.blobCap  = blobBudget;
     s_bspWorld.blobUsed = 0;

@@ -1,6 +1,6 @@
 #!/usr/bin/env zsh
-# Run the Quake3-iOS app on the connected physical iPhone, capture
-# stdout via devicectl --console, and pull baseq3/videos/four.avi
+# Run the Quake3-iOS app on a connected physical device, capture
+# stdout via devicectl --console, and pull baseq3/videos/<demo>.avi
 # out of the app sandbox at the end. Output lands under
 # ~/Desktop/q3sim_sessions/<timestamp>__<shortSha>_<slug>/
 # alongside what q3sim_run.sh produces — same directory layout so
@@ -15,15 +15,17 @@
 #
 # Override slug:    q3dev_run.sh my-label
 # Override device:  DEVICE=<UUID> q3dev_run.sh my-label
+# Override demo:    DEMO=q3dm4 q3dev_run.sh q3dm4-ipad
+# Override video:   VIDEO_NAME=q3dm4 q3dev_run.sh q3dm4-ipad
 # Override runtime: RUN_SECS=120 q3dev_run.sh
-#                   The boot cbuf records ~75s of demo-four; default
-#                   90s gives the demo a chance to finish before we
-#                   SIGTERM the launch wrapper.
 
 set -euo pipefail
 
 BUNDLE_ID="com.quake3ios.app"
 RUN_SECS="${RUN_SECS:-90}"
+DEMO="${DEMO:-four}"
+VIDEO_NAME="${VIDEO_NAME:-$DEMO}"
+LAUNCH_COMMAND="${LAUNCH_COMMAND:-demo $DEMO; wait 50; video $VIDEO_NAME; wait 1500; stopvideo; quit}"
 DERIVED="${DERIVED:-$HOME/Library/Developer/Xcode/DerivedData}"
 # Multiple DerivedData hashes can coexist (one per Xcode-detected workspace
 # location); old ones don't get cleaned up. Picking the alphabetical first
@@ -40,15 +42,15 @@ APP=$(/usr/bin/find "$DERIVED" -maxdepth 6 -type d -name "Quake3-iOS.app" \
 
 if [[ -z "${DEVICE:-}" ]]; then
     # Match lines like:
-    #   Yd-Mubarak MajMaj  Yd-Mubarak-MajMaj.coredevice.local  <UUID>  connected  iPhone 17 Pro Max (iPhone18,2)
+    #   Oled  Oled.coredevice.local  <UUID>  connected  iPad Pro 13-inch ...
     # Device names contain spaces so positional awk doesn't work — pull
-    # the 36-char UUID with grep -oE instead, gated on "connected" + "iPhone".
+    # the 36-char UUID with grep -oE instead, gated on "connected" + iOS device.
     DEVICE=$(xcrun devicectl list devices 2>&1 \
-              | grep -E 'connected.*iPhone' \
+              | grep -E 'connected.*(iPhone|iPad)' \
               | grep -oE '[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}' \
               | head -1)
 fi
-[[ -z "$DEVICE" ]] && { echo "ERR: no connected iPhone; plug in via USB" >&2; exit 1; }
+[[ -z "$DEVICE" ]] && { echo "ERR: no connected iPhone/iPad; plug in via USB" >&2; exit 1; }
 
 cd "${0:a:h}/.."                                # repo root
 SHA=$(git rev-parse --short HEAD)
@@ -63,6 +65,7 @@ mkdir -p "$OUTDIR"
 echo "→ logs:   $OUTDIR"
 echo "→ device: $DEVICE"
 echo "→ runtime: ${RUN_SECS}s"
+echo "→ command: $LAUNCH_COMMAND"
 
 # Reinstall to flush any prior crash state. devicectl install is
 # idempotent and atomic; on second run it overwrites in place.
@@ -93,6 +96,7 @@ fi
 # happens within a couple of seconds of the wrapper closing).
 xcrun devicectl device process launch \
     --device "$DEVICE" \
+    --environment-variables "{\"Q3_LAUNCH_COMMAND\":\"$LAUNCH_COMMAND\"}" \
     --console com.quake3ios.app \
     > "$OUTDIR/stdout.log" 2>&1 &
 LAUNCH_PID=$!
@@ -107,8 +111,8 @@ sleep 2
 LINES=$(wc -l < "$OUTDIR/stdout.log")
 echo "→ stdout: $LINES lines"
 
-# Pull four.avi out of the app sandbox via devicectl. Path is
-# Documents/baseq3/videos/four.avi inside appDataContainer.
+# Pull the AVI out of the app sandbox via devicectl. Path is
+# Documents/baseq3/videos/<video>.avi inside appDataContainer.
 # Same gates as the sim path: skip if no AVI / wedged run.
 if [[ $LINES -lt 2000 ]]; then
     echo "→ avi:    SKIPPED (only $LINES stdout lines — looks like a wedged or short run)"
@@ -116,12 +120,12 @@ else
     if xcrun devicectl device copy from \
         --device "$DEVICE" \
         --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
-        --source Documents/baseq3/videos/four.avi \
-        --destination "$OUTDIR/four.avi" >/dev/null 2>&1; then
-        AVI_SIZE=$(/usr/bin/stat -f '%z' "$OUTDIR/four.avi")
+        --source "Documents/baseq3/videos/${VIDEO_NAME}.avi" \
+        --destination "$OUTDIR/${VIDEO_NAME}.avi" >/dev/null 2>&1; then
+        AVI_SIZE=$(/usr/bin/stat -f '%z' "$OUTDIR/${VIDEO_NAME}.avi")
         AVI_MB=$((AVI_SIZE / 1024 / 1024))
-        echo "→ avi:    $OUTDIR/four.avi (${AVI_MB} MB)"
+        echo "→ avi:    $OUTDIR/${VIDEO_NAME}.avi (${AVI_MB} MB)"
     else
-        echo "→ avi:    FAILED to pull (no four.avi on device — video cbuf disabled?)"
+        echo "→ avi:    FAILED to pull (no ${VIDEO_NAME}.avi on device — video cbuf disabled?)"
     fi
 fi

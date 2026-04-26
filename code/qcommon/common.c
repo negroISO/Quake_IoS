@@ -28,6 +28,9 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include <netinet/in.h>
 #include <sys/stat.h> // umask
 #include <sys/time.h>
+#ifdef __APPLE__
+#include <execinfo.h>  /* backtrace() for Z_TagMalloc crash diagnostic */
+#endif
 #else
 #include <winsock.h>
 #if defined(_DEBUG)
@@ -1427,6 +1430,25 @@ void *Z_TagMalloc( size_t size, memtag_t tag ) {
 	size_t		extra;
 
 	if ( size > INT_MAX ) {
+#ifdef __APPLE__
+		/* Print the C call-stack so we can identify which callsite
+		 * passed the bogus size. Without this the FATAL message just
+		 * tells us the size, not WHO requested it. Triggered specifically
+		 * by nv15's BSP/server-init path producing a 5.3GB request that
+		 * looks like an iOS userland pointer (top byte 0x14...). */
+		void *bt[16];
+		int btn = backtrace(bt, 16);
+		char **syms = backtrace_symbols(bt, btn);
+		fprintf(stderr, "[Z_TagMalloc CRASH] size=%llu tag=%d\n",
+		        (unsigned long long)size, (int)tag);
+		if (syms) {
+			for (int i = 0; i < btn; i++) {
+				fprintf(stderr, "  #%d %s\n", i, syms[i]);
+			}
+			free(syms);
+		}
+		fflush(stderr);
+#endif
 		Com_Error( ERR_FATAL, "Z_TagMalloc: %"PRIz"u > INT_MAX", size );
 	}
 

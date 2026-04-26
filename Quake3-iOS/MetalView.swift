@@ -1718,6 +1718,7 @@ struct MetalView: UIViewRepresentable {
                          * alphaGen=entity / oneMinusEntity (5/6). */
                         let ec = draw.entityColor
                         entityUniforms.entityColor = SIMD4<Float>(ec.0, ec.1, ec.2, ec.3)
+                        entityUniforms.timeSeconds = draw.shaderTime
                         entityUniforms.suppressDlights = (drawPass == 5) ? 1 : 0
                         /* Per TASK PART 3: no rgbGen/alphaGen override for
                          * scene polys — the shader's resolved genMode
