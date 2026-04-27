@@ -1040,13 +1040,31 @@ struct MetalView: UIViewRepresentable {
                 float4 ap = drawUniforms.alphaWaveParams;
                 va *= clamp(evalWave(drawUniforms.alphaWaveFunc, ap.x, ap.y, ap.z, ap.w, drawUniforms.timeSeconds), 0.0, 1.0);
             }
-            float3 lm = (drawUniforms.stageUsesLightmap > 0.5 ||
-                         drawUniforms.drawHasLightmapStage > 0.5 ||
-                         rgbGen == 1 ||
-                         rgbGen == 7 ||
-                         additiveStage)
-                      ? float3(1.0)
-                      : saturate(lightmap.rgb * 2.0);
+            // Overbright handling for the three render paths:
+            //   stageUsesLightmap=1   → THIS draw is the lightmap stage. Stock Q3
+            //                           writes the lightmap × 2 to the framebuffer
+            //                           so the next FILTER stage's `dst=src*dst`
+            //                           multiplies texture by the boosted lightmap.
+            //                           Without the 2× here, multi-pass shaders
+            //                           render at half brightness.
+            //   drawHasLightmapStage  → THIS draw is a diffuse stage in a multi-
+            //                           pass shader; lightmap was already written
+            //                           (boosted) by an earlier pass. Just output
+            //                           texel × vc and let the FILTER blend modulate.
+            //   neither               → single-pass shader; sample the lightmap
+            //                           binding directly and apply the 2× boost
+            //                           inline (existing behavior).
+            float3 lm;
+            if (drawUniforms.stageUsesLightmap > 0.5) {
+                lm = float3(2.0);
+            } else if (drawUniforms.drawHasLightmapStage > 0.5 ||
+                       rgbGen == 1 ||
+                       rgbGen == 7 ||
+                       additiveStage) {
+                lm = float3(1.0);
+            } else {
+                lm = saturate(lightmap.rgb * 2.0);
+            }
             float3 lit = texel.rgb * lm * vc;
             // Dynamic lights (muzzle flashes, rocket/plasma glow, lightning
             // halos). Applied BEFORE fog so distant explosions still fog
