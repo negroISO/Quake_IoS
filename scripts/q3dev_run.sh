@@ -72,6 +72,18 @@ echo "→ command: $LAUNCH_COMMAND"
 xcrun devicectl device install app --device "$DEVICE" "$APP" >/dev/null 2>&1
 echo "→ installed"
 
+# Push autoexec.cfg if present. Forces logfile=2/developer=1 so
+# qconsole.log captures the boot/shader trace for cross-engine diff
+# against q3dev_run_ioq3.sh runs.
+AUTOEXEC="Resources/baseq3/autoexec.cfg"
+if [[ -f "$AUTOEXEC" ]]; then
+    xcrun devicectl device copy to --device "$DEVICE" \
+        --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
+        --source "$AUTOEXEC" \
+        --destination "Documents/baseq3/autoexec.cfg" >/dev/null 2>&1 \
+        && echo "→ cfg:    pushed autoexec.cfg"
+fi
+
 # Seed any local demos onto the device. The .app bundle does NOT
 # carry baseq3 resources (pk3s ship via Files-app sharing into
 # Documents/baseq3/), so demos do too. We push every .dm_68 found
@@ -110,6 +122,20 @@ sleep 2
 
 LINES=$(wc -l < "$OUTDIR/stdout.log")
 echo "→ stdout: $LINES lines"
+
+# Pull qconsole.log first — small, near-zero risk, the whole point of
+# pairing this runner with q3dev_run_ioq3.sh for cross-engine diffing.
+# Pulled even on wedged runs (truncated log still tells us how far we got).
+if xcrun devicectl device copy from \
+    --device "$DEVICE" \
+    --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
+    --source "Documents/baseq3/qconsole.log" \
+    --destination "$OUTDIR/qconsole.log" >/dev/null 2>&1; then
+    QC_LINES=$(wc -l < "$OUTDIR/qconsole.log" 2>/dev/null || echo 0)
+    echo "→ qlog:   $OUTDIR/qconsole.log ($QC_LINES lines)"
+else
+    echo "→ qlog:   FAILED to pull (autoexec.cfg pushed? logfile cvar live?)"
+fi
 
 # Pull the AVI out of the app sandbox via devicectl. Path is
 # Documents/baseq3/videos/<video>.avi inside appDataContainer.

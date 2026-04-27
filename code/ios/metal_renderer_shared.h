@@ -113,10 +113,11 @@ typedef struct {
      * 0 = none, 1 = autosprite, 2 = autoSprite2. */
     uint32_t autospriteMode;
     float    _deformPad[1];
-    uint32_t rgbGen;      /* 0=identity,1=vertex,2=lightingDiffuse,3=wave */
+    uint32_t rgbGen;      /* 0=identity,1=vertex,2=lightingDiffuse,3=wave,
+                           * 7=identityLighting */
     uint32_t alphaGen;    /* 0=identity,1=vertex,3=wave */
     uint32_t alphaFunc;   /* 0=none, 1=GT0, 2=GE128, 3=LT128 */
-    uint32_t cullMode;    /* 0=back,1=none,2=front */
+    uint32_t cullMode;    /* 0=none,1=back,2=front */
     uint32_t useLightmap; /* 1 if stage sourced map from $lightmap */
     /* Stage explicitly declared `depthwrite` (or is opaque/no blendFunc).
      * ioq3 sets `depthMaskBits = 0` for any blendFunc'd stage UNLESS
@@ -220,7 +221,12 @@ enum {
      * (preserves long axis, only one axis camera-aligned). Used by
      * lamp wires, chains, jet exhaust, flame sprites. Pipeline tag
      * only; transform is the follow-up to AUTOSPRITE. */
-    Q3_METAL_WORLD_DRAWFLAG_AUTOSPRITE2 = 1u << 9
+    Q3_METAL_WORLD_DRAWFLAG_AUTOSPRITE2 = 1u << 9,
+    /* This draw owns the post-stage fog overlay for its original BSP
+     * surface. Split multi-stage draws still carry fogIndex on every
+     * stage for per-pass attenuation, but only one draw should emit the
+     * final fog pass. */
+    Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY = 1u << 10
 };
 
 enum {
@@ -283,6 +289,7 @@ typedef struct {
      * exposed by Q3MetalRenderer_GetSceneSnapshots. Swift iterates
      * scenes[0..sceneCount] and renders each with its own viewport. */
     uint32_t sceneCount;
+    float shaderTime;
     float clearColor[4];
 } Q3MetalFrameSnapshot;
 
@@ -382,6 +389,9 @@ const Q3MetalWorldDrawCmd *Q3MetalRenderer_GetWorldDrawCommands(void);
 typedef struct {
     float color[3];
     float distance;
+    float tcScale;
+    uint32_t hasSurface;
+    float surface[4];
 } Q3MetalWorldFog;
 int Q3MetalRenderer_GetWorldFogCount(void);
 const Q3MetalWorldFog *Q3MetalRenderer_GetWorldFogs(void);

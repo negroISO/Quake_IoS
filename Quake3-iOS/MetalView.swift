@@ -18,6 +18,21 @@ struct MetalView: UIViewRepresentable {
         view.preferredFramesPerSecond = maxFPS
         view.enableSetNeedsDisplay = false
         view.isPaused = false
+        // Lock the MTKView's drawable to the engine's logical render
+        // resolution so the AVI muxer captures pixels at exactly the
+        // resolution Q3's r_customwidth/r_customheight set. Without
+        // this, MTKView auto-sizes drawableSize to bounds *
+        // contentScaleFactor (Retina), which on iPad's SwiftUI layout
+        // resolves to ~592×720 — wrong size AND wrong aspect (5:6 vs
+        // engine's 4:3). All AVI parity diffs against Vulkan refs at
+        // 1280×960 then become invalid resize-distorted comparisons.
+        // contentScaleFactor=1.0 disables Retina doubling so
+        // drawableSize equals the explicit value below.
+        // Drawable lock applied lazily in drawableSizeWillChange (the
+        // view doesn't have valid bounds yet here; setting drawableSize
+        // pre-window produces a NaN drawable). We only mark the
+        // intent here — the delegate enforces it on every resize.
+        view.autoResizeDrawable = false
         if let metalLayer = view.layer as? CAMetalLayer {
             if #available(iOS 16.0, visionOS 1.0, *) {
                 metalLayer.developerHUDProperties = ["mode": "hidden"]
@@ -85,16 +100,27 @@ struct MetalView: UIViewRepresentable {
             var tcGen: Float
             var tcModCount: Int32
             var rgbGen: Float
+            var alphaGen: Float = 0
+            var blendMode: Float = 0
             var timeSeconds: Float
+            var rgbWaveFunc: UInt32 = 0
+            var alphaWaveFunc: UInt32 = 0
+            var _wavePad: UInt32 = 0
             var tcModType: SIMD4<Float>
             var tcModParams0: SIMD4<Float>
             var tcModParams1: SIMD4<Float>
             var tcModParams2: SIMD4<Float>
             var tcModParams3: SIMD4<Float>
+            var rgbWaveParams: SIMD4<Float> = SIMD4(0, 0, 0, 0)
+            var alphaWaveParams: SIMD4<Float> = SIMD4(0, 0, 0, 0)
             // Fog for this draw. xyz = linear fog color, w = fog distance
             // (units of world space). w == 0 ⇒ no fog, fragment skips the
             // mix entirely. Populated per-draw from s_worldFogs[fogIndex].
             var fogColorDistance: SIMD4<Float>
+            // x = ioq3 fog tcScale (1 / (fogDistance * 8)), y = has surface
+            // plane. fogSurface is ioq3's fog.surface[4].
+            var fogParams: SIMD4<Float> = SIMD4(0, 0, 0, 0)
+            var fogSurface: SIMD4<Float> = SIMD4(0, 0, 0, 0)
             // tcGen vector basis. Only consulted when tcGen == 2. .xyz =
             // world-space basis vector, .w padding (ignored). UV is
             // (dot(worldPos, .xyz0), dot(worldPos, .xyz1)). Matches ioq3
@@ -119,6 +145,9 @@ struct MetalView: UIViewRepresentable {
             var debugMode: Float
             var forceWhiteVertColor: Float
             var alphaTestThreshold: Float
+            var fogOnly: Float = 0
+            var stageUsesLightmap: Float = 0
+            var drawHasLightmapStage: Float = 0
             var _pad0: Float = 0
         }
 
@@ -135,9 +164,9 @@ struct MetalView: UIViewRepresentable {
         private var skyStagesLogged: Bool = false
 
         private static func metalCullMode(for stageCullMode: UInt32) -> MTLCullMode {
-            // Matches C side METAL_SHADER_CULL_*: 0=back, 1=disable, 2=front.
+            // Matches C side METAL_SHADER_CULL_*: 0=disable, 1=back, 2=front.
             switch stageCullMode {
-            case 1: return .none
+            case 0: return .none
             case 2: return .front
             default: return .back
             }
@@ -197,7 +226,12 @@ struct MetalView: UIViewRepresentable {
                 let m = chain[i]
                 types[i] = Float(m.type)
                 let pp = m.params
-                let v = SIMD4<Float>(pp.0, pp.1, pp.2, pp.3)
+                let v: SIMD4<Float>
+                if m.type == 3 {
+                    v = SIMD4<Float>(-pp.0 * .pi / 180.0, 0, 0, 0)
+                } else {
+                    v = SIMD4<Float>(pp.0, pp.1, pp.2, pp.3)
+                }
                 switch i {
                 case 0: p0 = v
                 case 1: p1 = v
@@ -551,15 +585,25 @@ struct MetalView: UIViewRepresentable {
             float tcGen;
             int tcModCount;
             float rgbGen;
+            float alphaGen;
+            float blendMode;
             float timeSeconds;
+            uint rgbWaveFunc;
+            uint alphaWaveFunc;
+            uint _wavePad;
             float4 tcModType;
             float4 tcModParams0;
             float4 tcModParams1;
             float4 tcModParams2;
             float4 tcModParams3;
+            float4 rgbWaveParams;
+            float4 alphaWaveParams;
             // Fog: xyz = color, w = distance (world units). w == 0 ⇒
             // no fog applies to this draw, fragment skips the mix.
             float4 fogColorDistance;
+            // x = tcScale, y = has fog boundary surface.
+            float4 fogParams;
+            float4 fogSurface;
             // tcGen vector basis. Only consulted when tcGen == 2.
             // s = dot(worldPos, tcGenVec0.xyz), t = dot(worldPos, tcGenVec1.xyz).
             float4 tcGenVec0;
@@ -578,6 +622,9 @@ struct MetalView: UIViewRepresentable {
             float debugMode;
             float forceWhiteVertColor;
             float alphaTestThreshold;
+            float fogOnly;
+            float stageUsesLightmap;
+            float drawHasLightmapStage;
             float _pad0;
         };
 
@@ -611,12 +658,12 @@ struct MetalView: UIViewRepresentable {
 
         float2 applyTcMod(float2 uv, float3 worldPos, int type, float4 params, float timeSeconds) {
             if (type == 1) {
-                return uv + params.xy * timeSeconds;
+                return uv + fract(params.xy * timeSeconds);
             } else if (type == 2) {
                 float s = sin(timeSeconds * params.w) * params.y;
                 return uv + float2(s, s);
             } else if (type == 3) {
-                float a = params.x * timeSeconds;
+                float a = fmod(params.x * timeSeconds, 2.0 * 3.14159265);
                 float c = cos(a);
                 float s = sin(a);
                 float2 p = uv - 0.5;
@@ -633,7 +680,7 @@ struct MetalView: UIViewRepresentable {
                 float amp = params.x;
                 float freq = params.y;
                 float phase = params.z;
-                float now = phase + timeSeconds * freq;
+                float now = fract(phase + timeSeconds * freq);
                 float kX = (worldPos.x + worldPos.z) * (1.0 / 1024.0) + now;
                 float kY = worldPos.y * (1.0 / 1024.0) + now;
                 float twoPi = 2.0 * 3.14159265;
@@ -654,6 +701,45 @@ struct MetalView: UIViewRepresentable {
                 return (uv - 0.5) * p + 0.5;
             }
             return uv;
+        }
+
+        float q3FogFactor(float3 worldPos,
+                          constant WorldUniforms &uniforms,
+                          constant WorldDrawUniforms &drawUniforms) {
+            if (drawUniforms.fogColorDistance.w <= 0.0 ||
+                drawUniforms.fogParams.x <= 0.0) {
+                return 0.0;
+            }
+
+            float3 forward = normalize(cross(float3(uniforms.cameraUp),
+                                             float3(uniforms.cameraRight)));
+            float s = dot(worldPos - float3(uniforms.cameraPos), forward) *
+                      drawUniforms.fogParams.x;
+            float t = 31.0 / 32.0;
+
+            if (drawUniforms.fogParams.y > 0.5) {
+                float4 surface = drawUniforms.fogSurface;
+                t = dot(worldPos, surface.xyz) + surface.w;
+                float eyeT = dot(float3(uniforms.cameraPos), surface.xyz) + surface.w;
+                if (eyeT < 0.0) {
+                    if (t < 1.0) {
+                        t = 1.0 / 32.0;
+                    } else {
+                        t = 1.0 / 32.0 + (30.0 / 32.0 * t) / (t - eyeT);
+                    }
+                } else {
+                    t = (t < 0.0) ? (1.0 / 32.0) : (31.0 / 32.0);
+                }
+            }
+
+            if (s < 0.0 || t < (1.0 / 32.0)) {
+                return 0.0;
+            }
+            if (t < (31.0 / 32.0)) {
+                s *= (t - 1.0 / 32.0) / (30.0 / 32.0);
+            }
+            s *= 8.0;
+            return sqrt(saturate(s));
         }
 
         struct EntityVertexIn {
@@ -722,7 +808,9 @@ struct MetalView: UIViewRepresentable {
              * didn't fill the normal slot) to avoid a NaN axis. */
             if (drawUniforms.deformWaveFunc != 0u) {
                 float3 n = inVertex.normal;
-                if (length(n) > 1e-4) {
+                float nLen = length(n);
+                if (nLen > 1e-4) {
+                    n /= nLen;
                     float spread = 1.0 / drawUniforms.deformWaveDiv;
                     float off = (worldPos.x + worldPos.y + worldPos.z) * spread;
                     float scale = evalWave(drawUniforms.deformWaveFunc,
@@ -826,6 +914,9 @@ struct MetalView: UIViewRepresentable {
                                           sampler textureSampler [[sampler(0)]]) {
             float2 texCoord = in.texCoord;
             int rgbGen = int(drawUniforms.rgbGen + 0.5);
+            int alphaGen = int(drawUniforms.alphaGen + 0.5);
+            int blendMode = int(drawUniforms.blendMode + 0.5);
+            bool additiveStage = (blendMode == 1 || blendMode == 5);
             /* tcGen modes:
              *   0 (default) — base UVs, mesh ST as authored.
              *   1 (environment) — chrome/reflective surfaces. Compute
@@ -868,8 +959,10 @@ struct MetalView: UIViewRepresentable {
             if (modCount > 1) texCoord = applyTcMod(texCoord, in.worldPos, int(drawUniforms.tcModType.y + 0.5), drawUniforms.tcModParams1, drawUniforms.timeSeconds);
             if (modCount > 2) texCoord = applyTcMod(texCoord, in.worldPos, int(drawUniforms.tcModType.z + 0.5), drawUniforms.tcModParams2, drawUniforms.timeSeconds);
             if (modCount > 3) texCoord = applyTcMod(texCoord, in.worldPos, int(drawUniforms.tcModType.w + 0.5), drawUniforms.tcModParams3, drawUniforms.timeSeconds);
-            float4 texel = colorTexture.sample(textureSampler, texCoord);
             float4 lightmap = lightmapTexture.sample(textureSampler, in.lightmapTexCoord);
+            float4 texel = drawUniforms.stageUsesLightmap > 0.5
+                          ? lightmap
+                          : colorTexture.sample(textureSampler, texCoord);
             int mode = int(drawUniforms.debugMode + 0.5);
             if (mode == 1) {
                 return float4(texel.rgb, 1.0);
@@ -883,6 +976,14 @@ struct MetalView: UIViewRepresentable {
             if (mode == 4) {
                 return float4(in.color.rgb, 1.0);
             }
+            if (drawUniforms.fogOnly > 0.5) {
+                if (drawUniforms.fogColorDistance.w <= 0.0) {
+                    discard_fragment();
+                }
+                float f = q3FogFactor(in.worldPos, uniforms, drawUniforms);
+                return float4(drawUniforms.fogColorDistance.xyz, f);
+            }
+
             // NOTE: No unconditional alpha-test discard here.
             //
             // ef21f24 introduced `if (result.a < 0.01) discard_fragment();` to
@@ -920,26 +1021,48 @@ struct MetalView: UIViewRepresentable {
             // washed-out punch that matches the reference PC build.
             // Without it the whole world renders ~50% too dark.
             // saturate() clamps to [0,1] so highlights don't wrap.
-            float3 vertexColor = (rgbGen == 1) ? in.color.rgb : float3(1.0);
+            float3 vertexColor = float3(1.0);
+            if (rgbGen == 1) {
+                vertexColor = in.color.rgb;
+            } else if (rgbGen == 7) {
+                vertexColor = float3(1.0);
+            }
+            if (rgbGen == 3) {
+                float4 wp = drawUniforms.rgbWaveParams;
+                vertexColor *= clamp(evalWave(drawUniforms.rgbWaveFunc, wp.x, wp.y, wp.z, wp.w, drawUniforms.timeSeconds), 0.0, 1.0);
+            }
+            if (additiveStage && rgbGen == 1) {
+                vertexColor = float3(1.0);
+            }
             float3 vc = mix(vertexColor, float3(1.0), drawUniforms.forceWhiteVertColor);
             float  va = mix(in.color.a,   1.0,          drawUniforms.forceWhiteVertColor);
-            float3 lit = texel.rgb * saturate(lightmap.rgb * 2.0) * vc;
+            if (alphaGen == 3) {
+                float4 ap = drawUniforms.alphaWaveParams;
+                va *= clamp(evalWave(drawUniforms.alphaWaveFunc, ap.x, ap.y, ap.z, ap.w, drawUniforms.timeSeconds), 0.0, 1.0);
+            }
+            float3 lm = (drawUniforms.stageUsesLightmap > 0.5 ||
+                         drawUniforms.drawHasLightmapStage > 0.5 ||
+                         rgbGen == 1 ||
+                         rgbGen == 7 ||
+                         additiveStage)
+                      ? float3(1.0)
+                      : saturate(lightmap.rgb * 2.0);
+            float3 lit = texel.rgb * lm * vc;
             // Dynamic lights (muzzle flashes, rocket/plasma glow, lightning
             // halos). Applied BEFORE fog so distant explosions still fog
             // correctly. For filter/multiply stages the blend is source*dest
             // so contribution flips meaning, but the visual impact is small
             // and the per-draw blendMode isn't currently in WorldDrawUniforms.
-            lit = applyDlights(lit, in.worldPos, dlights);
-            // Fog pass (F3). drawUniforms.fogColorDistance is:
-            //   .xyz = linear fog color, .w = fog distance (world units).
-            // .w == 0 means "no fog" (every surface outside any volume on
-            // q3dm6 hits this branch — effectively free). Otherwise mix
-            // toward fog color by saturated linear distance. Exponential
-            // falloff can replace the linear ramp later if needed.
+            if (!additiveStage) {
+                lit = applyDlights(lit, in.worldPos, dlights);
+            }
             if (drawUniforms.fogColorDistance.w > 0.0) {
-                float dist = length(in.worldPos - uniforms.cameraPos);
-                float f = saturate(dist / drawUniforms.fogColorDistance.w);
-                lit = mix(lit, drawUniforms.fogColorDistance.xyz, f);
+                float f = q3FogFactor(in.worldPos, uniforms, drawUniforms);
+                if (additiveStage) {
+                    lit *= (1.0 - f);
+                } else {
+                    lit = mix(lit, drawUniforms.fogColorDistance.xyz, f);
+                }
             }
             return float4(lit, texel.a * va);
         }
@@ -1250,6 +1373,7 @@ struct MetalView: UIViewRepresentable {
         private var worldSamplerState: MTLSamplerState?
         private var depthStencilState: MTLDepthStencilState?
         private var additiveDepthStencilState: MTLDepthStencilState?
+        private var additiveLessDepthStencilState: MTLDepthStencilState?
         private var depthHackDepthStencilState: MTLDepthStencilState?
         private var fallbackDepthStencilState: MTLDepthStencilState?
 
@@ -1286,14 +1410,32 @@ struct MetalView: UIViewRepresentable {
         }
 
         func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
-            print("[Metal] Drawable size: \(size)")
+            // Persistent drawable lock to engine's logical render
+            // resolution so the AVI muxer captures pixels at the
+            // declared r_customwidth/r_customheight (1280×960 iPad /
+            // 960×444 iPhone). SwiftUI's natural layout produces
+            // ~592×720 on iPad which is wrong aspect (5:6 vs 4:3) and
+            // invalidates every Vulkan parity diff. Re-apply on every
+            // resize event — when we set view.drawableSize=target, the
+            // delegate fires again with size==target and the early
+            // return below handles it (no recursion).
+            let isPad = (UIDevice.current.userInterfaceIdiom == .pad)
+            let target = CGSize(width: isPad ? 1280 : 960,
+                                height: isPad ? 960 : 444)
+            print("[Metal] Drawable size: \(size) (target \(target))")
+            if size.width.isFinite && size.height.isFinite
+                && size.width > 0 && size.height > 0
+                && (Int(size.width) != Int(target.width) ||
+                    Int(size.height) != Int(target.height)) {
+                view.drawableSize = target
+                print("[Metal] Drawable forced to \(target) (was \(size))")
+                Q3MetalRenderer_UpdateDrawableSize(Int32(target.width), Int32(target.height))
+                return
+            }
             Q3MetalRenderer_UpdateDrawableSize(Int32(size.width), Int32(size.height))
         }
 
         func draw(in view: MTKView) {
-            // DEBUG VERIFY — temporary troubleshooting patch
-            print("ACTUAL DRAWABLE:", Int(view.drawableSize.width), "x", Int(view.drawableSize.height))
-
             if commandQueue == nil {
                 configureRenderer(for: view)
             }
@@ -1409,17 +1551,19 @@ struct MetalView: UIViewRepresentable {
                    let indicesPointer = Q3MetalRenderer_GetWorldIndices() {
                     let _ = indicesPointer
                     let worldDraws = UnsafeBufferPointer(start: worldDrawsPointer, count: Int(snapshot.worldCommandCount))
-                    let timeSeconds = Float(CACurrentMediaTime() - frameTimeOrigin)
+                    let timeSeconds = snapshot.shaderTime
 
                     let skyFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
+                    let fogOverlayBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY)
 
                     // Ordered world passes:
                     // 0 = opaque, 1 = filter, 2 = alpha,
                     // 3 = additive (GL_SRC_ALPHA/GL_ONE — alpha-modulated),
-                    // 4 = additive-full (GL_ONE/GL_ONE — explosion/glow cores).
+                    // 4 = additive-full (GL_ONE/GL_ONE — explosion/glow cores),
+                    // 5 = fog overlay pass (post-stage alpha fog).
                     // Sky draws are handled in pass 0 through the sky pipeline
                     // (view-direction spherical projection, no lightmap).
-                    for worldPass in 0..<5 {
+                    for worldPass in 0..<6 {
                     for draw in worldDraws where draw.indexCount > 0 {
                         let isSky = (draw.flags & skyFlagBit) != 0
                         if isSky {
@@ -1455,8 +1599,8 @@ struct MetalView: UIViewRepresentable {
                                 }
                                 /* Strict blend split — NEVER merge 1 and 5. */
                                 let skyBlend = Int(stage.blendMode)
-                                let isAdditiveAlpha = (stageIndex > 0) && skyBlend == 1
-                                let isAdditiveFull  = (stageIndex > 0) && skyBlend == 5
+                                let isAdditiveAlpha = skyBlend == 1
+                                let isAdditiveFull  = skyBlend == 5
                                 let pipeline: MTLRenderPipelineState
                                 if isAdditiveFull, let p = skyAdditiveFullPipelineState {
                                     pipeline = p
@@ -1478,12 +1622,18 @@ struct MetalView: UIViewRepresentable {
                                     tcGen: Float(stage.tcGen),
                                     tcModCount: skyChain.count,
                                     rgbGen: Float(stage.rgbGen),
+                                    alphaGen: Float(stage.alphaGen),
+                                    blendMode: Float(stage.blendMode),
                                     timeSeconds: timeSeconds,
+                                    rgbWaveFunc: stage.rgbWaveFunc,
+                                    alphaWaveFunc: stage.alphaWaveFunc,
                                     tcModType: skyChain.types,
                                     tcModParams0: skyChain.p0,
                                     tcModParams1: skyChain.p1,
                                     tcModParams2: skyChain.p2,
                                     tcModParams3: skyChain.p3,
+                                    rgbWaveParams: SIMD4(stage.rgbWaveBase, stage.rgbWaveAmp, stage.rgbWavePhase, stage.rgbWaveFreq),
+                                    alphaWaveParams: SIMD4(stage.alphaWaveBase, stage.alphaWaveAmp, stage.alphaWavePhase, stage.alphaWaveFreq),
                                     fogColorDistance: SIMD4<Float>(0, 0, 0, 0),
                                     tcGenVec0: skyTV0,
                                     tcGenVec1: skyTV1,
@@ -1509,6 +1659,81 @@ struct MetalView: UIViewRepresentable {
                         }
                         let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
                         guard stageCount > 0 else { continue }
+                        let lightmapMultiplyBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_LIGHTMAP_MULTIPLY)
+                        let drawHasLightmapStage = (draw.flags & lightmapMultiplyBit) != 0 ||
+                            (0..<stageCount).contains { Self.worldStage(draw, $0).useLightmap != 0 }
+                        let noFog = UInt32(Q3_METAL_NO_FOG)
+                        var fogCD = SIMD4<Float>(0, 0, 0, 0)
+                        var fogParams = SIMD4<Float>(0, 0, 0, 0)
+                        var fogSurface = SIMD4<Float>(0, 0, 0, 0)
+                        if draw.fogIndex != noFog {
+                            let count = Q3MetalRenderer_GetWorldFogCount()
+                            if Int(draw.fogIndex) < count,
+                               let fogs = Q3MetalRenderer_GetWorldFogs() {
+                                let f = fogs.advanced(by: Int(draw.fogIndex)).pointee
+                                fogCD = SIMD4(f.color.0, f.color.1, f.color.2, f.distance)
+                                fogParams = SIMD4(f.tcScale, f.hasSurface != 0 ? 1.0 : 0.0, 0, 0)
+                                fogSurface = SIMD4(f.surface.0, f.surface.1, f.surface.2, f.surface.3)
+                            }
+                        }
+                        if worldPass == 5 {
+                            guard fogCD.w > 0,
+                                  (draw.flags & fogOverlayBit) != 0,
+                                  let worldAlphaPipelineState else { continue }
+                            let stage = Self.worldStage(draw, 0)
+                            let chain = Self.fillTcMods(stage)
+                            let (tv0, tv1) = Self.tcGenVectors(stage)
+                            var fogUniforms = WorldDrawUniforms(
+                                tcGen: Float(stage.tcGen),
+                                tcModCount: chain.count,
+                                rgbGen: 0,
+                                alphaGen: 0,
+                                blendMode: 2,
+                                timeSeconds: timeSeconds,
+                                rgbWaveFunc: 0,
+                                alphaWaveFunc: 0,
+                                tcModType: chain.types,
+                                tcModParams0: chain.p0,
+                                tcModParams1: chain.p1,
+                                tcModParams2: chain.p2,
+                                tcModParams3: chain.p3,
+                                fogColorDistance: fogCD,
+                                fogParams: fogParams,
+                                fogSurface: fogSurface,
+                                tcGenVec0: tv0,
+                                tcGenVec1: tv1,
+                                deformWaveFunc: stage.deformWaveFunc,
+                                deformWaveDiv: stage.deformWaveDiv != 0
+                                    ? stage.deformWaveDiv : 1.0,
+                                deformWaveBase: stage.deformWaveBase,
+                                deformWaveAmp: stage.deformWaveAmp,
+                                deformWavePhase: stage.deformWavePhase,
+                                deformWaveFreq: stage.deformWaveFreq,
+                                autospriteMode: stage.autospriteMode,
+                                debugMode: 0,
+                                forceWhiteVertColor: 0,
+                                alphaTestThreshold: 0,
+                                fogOnly: 1,
+                                stageUsesLightmap: 0,
+                                drawHasLightmapStage: 0,
+                                _pad0: 0
+                            )
+                            encoder.setRenderPipelineState(worldAlphaPipelineState)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
+                            encoder.setCullMode(Self.metalCullMode(for: stage.cullMode))
+                            encoder.setFragmentTexture(lightmapTexture, index: 0)
+                            encoder.setFragmentTexture(lightmapTexture, index: 1)
+                            encoder.setFragmentBytes(&fogUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 0)
+                            encoder.setVertexBytes(&fogUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 2)
+                            encoder.drawIndexedPrimitives(
+                                type: .triangle,
+                                indexCount: Int(draw.indexCount),
+                                indexType: .uint32,
+                                indexBuffer: worldIndexBuffer,
+                                indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride
+                            )
+                            continue
+                        }
                         for stageIndex in 0..<stageCount {
                             let stage = Self.worldStage(draw, stageIndex)
                             let blendMode = Int(stage.blendMode)
@@ -1539,10 +1764,10 @@ struct MetalView: UIViewRepresentable {
                                 /* GL_ONE/GL_ONE — distinct pipeline from
                                  * alpha-modulated additive. */
                                 encoder.setRenderPipelineState(worldAdditiveFullPipelineState)
-                                encoder.setDepthStencilState(ensuredDepthStencilState(blendedDepthState, device: view.device))
+                                encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
                             } else if drawPass == 3, let worldAdditivePipelineState {
                                 encoder.setRenderPipelineState(worldAdditivePipelineState)
-                                encoder.setDepthStencilState(ensuredDepthStencilState(blendedDepthState, device: view.device))
+                                encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
                             } else if drawPass == 2, let worldAlphaPipelineState {
                                 encoder.setRenderPipelineState(worldAlphaPipelineState)
                                 encoder.setDepthStencilState(ensuredDepthStencilState(blendedDepthState, device: view.device))
@@ -1563,28 +1788,31 @@ struct MetalView: UIViewRepresentable {
                             // (0xFFFFFFFF) for surfaces outside any fog
                             // volume; on q3dm6 this is every surface. The
                             // MSL shader skips the fog mix when .w == 0.
-                            let noFog = UInt32(Q3_METAL_NO_FOG)
-                            var fogCD = SIMD4<Float>(0, 0, 0, 0)
-                            if draw.fogIndex != noFog {
-                                let count = Q3MetalRenderer_GetWorldFogCount()
-                                if Int(draw.fogIndex) < count,
-                                   let fogs = Q3MetalRenderer_GetWorldFogs() {
-                                    let f = fogs.advanced(by: Int(draw.fogIndex)).pointee
-                                    fogCD = SIMD4(f.color.0, f.color.1, f.color.2, f.distance)
-                                }
-                            }
                             let (tv0, tv1) = Self.tcGenVectors(stage)
+                            let forceWhiteVertex = (blendMode == 1 &&
+                                                    stage.rgbGen == 0 &&
+                                                    stage.alphaGen == 0)
+                                ? Float(1.0)
+                                : Float(0.0)
                             var drawUniforms = WorldDrawUniforms(
                                 tcGen: Float(stage.tcGen),
                                 tcModCount: chain.count,
                                 rgbGen: Float(stage.rgbGen),
+                                alphaGen: Float(stage.alphaGen),
+                                blendMode: Float(stage.blendMode),
                                 timeSeconds: timeSeconds,
+                                rgbWaveFunc: stage.rgbWaveFunc,
+                                alphaWaveFunc: stage.alphaWaveFunc,
                                 tcModType: chain.types,
                                 tcModParams0: chain.p0,
                                 tcModParams1: chain.p1,
                                 tcModParams2: chain.p2,
                                 tcModParams3: chain.p3,
+                                rgbWaveParams: SIMD4(stage.rgbWaveBase, stage.rgbWaveAmp, stage.rgbWavePhase, stage.rgbWaveFreq),
+                                alphaWaveParams: SIMD4(stage.alphaWaveBase, stage.alphaWaveAmp, stage.alphaWavePhase, stage.alphaWaveFreq),
                                 fogColorDistance: fogCD,
+                                fogParams: fogParams,
+                                fogSurface: fogSurface,
                                 tcGenVec0: tv0,
                                 tcGenVec1: tv1,
                                 deformWaveFunc: stage.deformWaveFunc,
@@ -1596,8 +1824,11 @@ struct MetalView: UIViewRepresentable {
                                 deformWaveFreq: stage.deformWaveFreq,
                                 autospriteMode: stage.autospriteMode,
                                 debugMode: Coordinator.worldDebugMode,
-                                forceWhiteVertColor: (blendMode == 1) ? 1.0 : 0.0,
+                                forceWhiteVertColor: forceWhiteVertex,
                                 alphaTestThreshold: alphaTest,
+                                fogOnly: 0,
+                                stageUsesLightmap: stage.useLightmap != 0 ? 1.0 : 0.0,
+                                drawHasLightmapStage: drawHasLightmapStage ? 1.0 : 0.0,
                                 _pad0: 0.0
                             )
                             encoder.setFragmentTexture(baseTexture, index: 0)
@@ -1738,13 +1969,13 @@ struct MetalView: UIViewRepresentable {
                             /* GL_ONE/GL_ONE — NEVER shared with the alpha-
                              * modulated additive pipeline per strict spec. */
                             encoder.setRenderPipelineState(entityAdditiveFullPipelineState)
-                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveEntityDepthStencilState, device: view.device))
+                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveLessDepthStencilState, device: view.device))
                         } else if drawPass == 4, let entitySubtractPipelineState {
                             encoder.setRenderPipelineState(entitySubtractPipelineState)
                             encoder.setDepthStencilState(ensuredDepthStencilState(additiveEntityDepthStencilState, device: view.device))
                         } else if drawPass == 3, let entityAdditivePipelineState {
                             encoder.setRenderPipelineState(entityAdditivePipelineState)
-                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveEntityDepthStencilState, device: view.device))
+                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveLessDepthStencilState, device: view.device))
                         } else if drawPass == 2, let entityAlphaPipelineState {
                             encoder.setRenderPipelineState(entityAlphaPipelineState)
                             encoder.setDepthStencilState(ensuredDepthStencilState(additiveEntityDepthStencilState, device: view.device))
@@ -2383,6 +2614,11 @@ struct MetalView: UIViewRepresentable {
             additiveDepthDescriptor.isDepthWriteEnabled = false
             additiveDepthDescriptor.depthCompareFunction = .lessEqual
             additiveDepthStencilState = device.makeDepthStencilState(descriptor: additiveDepthDescriptor)
+
+            let additiveLessDepthDescriptor = MTLDepthStencilDescriptor()
+            additiveLessDepthDescriptor.isDepthWriteEnabled = false
+            additiveLessDepthDescriptor.depthCompareFunction = .less
+            additiveLessDepthStencilState = device.makeDepthStencilState(descriptor: additiveLessDepthDescriptor)
 
             // Depth-hack state for first-person viewmodel (STEP 8).
             // Q3's depth-hack trick compresses the weapon's depth range so

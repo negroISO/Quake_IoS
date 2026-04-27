@@ -33,7 +33,8 @@ typedef struct {
                     * (chrome/reflective like powerups/quad, shell shaders).
                     * Entity pipeline reads this to switch UV generation
                     * from mesh ST to the reflection formula. */
-    int rgbGen;    /* 0=identity, 1=vertex, 2=lightingDiffuse, 3=wave.
+    int rgbGen;    /* 0=identity, 1=vertex, 2=lightingDiffuse, 3=wave,
+                    * 7=identityLighting.
                     * Stored per-texture so the entity fragment can skip
                     * the baked-in Lambert color for chrome shells that
                     * upstream treats as full-bright (CGEN_IDENTITY). */
@@ -110,6 +111,9 @@ typedef struct {
     qboolean hasColor;
     float color[3];
     float distance;
+    float tcScale;
+    qboolean hasSurface;
+    float surface[4];
 } metalWorldFog_t;
 static metalWorldFog_t s_worldFogs[METAL_MAX_WORLD_FOGS];
 /* Parallel array exposed to Swift via Q3MetalRenderer_GetWorldFogs.
@@ -305,11 +309,15 @@ typedef struct {
      * water/grate floors that author `depthwrite` to occlude correctly
      * (e.g. blocks17gwater) leak the chamber below through the surface. */
     int depthWrite;
+    int animFrameCount;
+    float animFps;
+    char animFrames[METAL_ANIMMAP_MAX_FRAMES][MAX_QPATH];
+    qhandle_t animTextures[METAL_ANIMMAP_MAX_FRAMES];
 } Q3MetalStage;
 
 enum {
-    METAL_SHADER_CULL_BACK = 0,
-    METAL_SHADER_CULL_DISABLE = 1,
+    METAL_SHADER_CULL_DISABLE = 0,
+    METAL_SHADER_CULL_BACK = 1,
     METAL_SHADER_CULL_FRONT = 2
 };
 
@@ -336,6 +344,7 @@ typedef struct {
     qboolean hasFog;
     float fogColor[3];
     float fogDistance;
+    qboolean hasLightmapStage;
     /* Surface should emit a Q3 flare billboard at its centroid. Set when
      * the shader script carries a 'flareShader <tex>' directive. The
      * texture name is ignored — we use the canonical gfx/misc/flare
@@ -685,7 +694,7 @@ static void AddWorldDrawStage(Q3MetalWorldDrawCmd *draw,
     stage->alphaGen = (uint32_t)src->alphaGen;
     stage->alphaFunc = (uint32_t)src->alphaFunc;
     /* STEP 6: propagate shader cullMode. Values match
-     * METAL_SHADER_CULL_BACK=0 / DISABLE=1 / FRONT=2; Swift consumes
+     * METAL_SHADER_CULL_DISABLE=0 / BACK=1 / FRONT=2; Swift consumes
      * this directly when picking setCullMode per draw. */
     stage->cullMode = (uint32_t)src->cullMode;
     stage->useLightmap = (uint32_t)src->useLightmap;
@@ -721,7 +730,31 @@ static void AddWorldDrawStageSimple(Q3MetalWorldDrawCmd *draw,
     tmp.blendMode = blendMode;
     tmp.rgbGen = rgbGen;
     tmp.alphaFunc = alphaFunc;
+    tmp.cullMode = METAL_SHADER_CULL_BACK;
     AddWorldDrawStage(draw, textureHandle, &tmp);
+}
+
+static void AddWorldDrawLightmapBaseStage(Q3MetalWorldDrawCmd *draw,
+                                          qhandle_t lightmapHandle,
+                                          const metalShaderMap_t *entry) {
+    Q3MetalStage tmp;
+    Com_Memset(&tmp, 0, sizeof(tmp));
+    if (entry != NULL && entry->stageCount > 0) {
+        tmp.deformWaveFunc = entry->stages[0].deformWaveFunc;
+        tmp.deformWaveDiv = entry->stages[0].deformWaveDiv;
+        tmp.deformWaveBase = entry->stages[0].deformWaveBase;
+        tmp.deformWaveAmp = entry->stages[0].deformWaveAmp;
+        tmp.deformWavePhase = entry->stages[0].deformWavePhase;
+        tmp.deformWaveFreq = entry->stages[0].deformWaveFreq;
+        tmp.autospriteMode = entry->stages[0].autospriteMode;
+    }
+    tmp.blendMode = 0;
+    tmp.rgbGen = 0;
+    tmp.alphaGen = 0;
+    tmp.cullMode = entry != NULL ? entry->cullMode : METAL_SHADER_CULL_BACK;
+    tmp.depthWrite = 1;
+    tmp.useLightmap = 1;
+    AddWorldDrawStage(draw, lightmapHandle, &tmp);
 }
 
 /* Copy refEntity_t.shader.rgba into the per-draw entityColor slot so
@@ -947,7 +980,7 @@ static qboolean TryLoadImageRGBA(const char *name, byte **rgba, int *width, int 
 static const char *ShaderMap_Lookup(const char *name);
 static qhandle_t ShaderMap_ResolveCurrentFrame(const char *name);
 static int ShaderMap_FindAnimatedSlot(const char *name);
-static qhandle_t ShaderMap_AnimatedSlotCurrentHandle(int slot);
+static qhandle_t ShaderMap_AnimatedSlotCurrentHandle(int slot, float shaderTime);
 static const metalShaderMap_t *ShaderMap_LookupEntry(const char *name);
 static int ShaderMap_GetBlendMode(const char *name);
 static int ShaderMap_GetAlphaFunc(const char *name);
@@ -1212,6 +1245,102 @@ static qhandle_t RegisterTexture(const char *name) {
         ri.Printf(PRINT_ALL, "Metal stub: loaded '%s' from '%s' (%dx%d)\n", name, resolvedName, width, height);
     }
     return texture->handle;
+}
+
+static qboolean IsPickupEntityShaderName(const char *name) {
+    return name != NULL &&
+        (!Q_stricmpn(name, "models/powerups/health/", 23) ||
+         !Q_stricmpn(name, "models/powerups/ammo/", 21));
+}
+
+static int EntityPickupStageDrawCount(const char *shaderName) {
+    const metalShaderMap_t *entry;
+    int i, count = 0;
+    if (!IsPickupEntityShaderName(shaderName)) return 0;
+    entry = ShaderMap_LookupEntry(shaderName);
+    if (entry == NULL || entry->stageCount <= 1) return 0;
+    for (i = 0; i < entry->stageCount; ++i) {
+        if (!entry->stages[i].useLightmap && entry->stages[i].mapPath[0] != '\0') count++;
+    }
+    return count;
+}
+
+static void CopyStageMetadataToTexture(metalTexture_t *texture, const Q3MetalStage *stage) {
+    int i;
+    texture->blendMode = stage->blendMode;
+    texture->alphaFunc = stage->alphaFunc;
+    texture->tcGenEnv = (stage->tcGen == 1);
+    texture->rgbGen = stage->rgbGen;
+    texture->alphaGen = stage->alphaGen;
+    texture->rgbWaveFunc = stage->rgbWaveFunc;
+    texture->rgbWaveBase = stage->rgbWaveBase;
+    texture->rgbWaveAmp = stage->rgbWaveAmp;
+    texture->rgbWavePhase = stage->rgbWavePhase;
+    texture->rgbWaveFreq = stage->rgbWaveFreq;
+    texture->alphaWaveFunc = stage->alphaWaveFunc;
+    texture->alphaWaveBase = stage->alphaWaveBase;
+    texture->alphaWaveAmp = stage->alphaWaveAmp;
+    texture->alphaWavePhase = stage->alphaWavePhase;
+    texture->alphaWaveFreq = stage->alphaWaveFreq;
+    texture->rgbConstColor[0] = stage->rgbConstColor[0];
+    texture->rgbConstColor[1] = stage->rgbConstColor[1];
+    texture->rgbConstColor[2] = stage->rgbConstColor[2];
+    texture->alphaConst = stage->alphaConst;
+    texture->tcModCount = stage->tcModCount;
+    for (i = 0; i < Q3_MAX_TCMODS; ++i) texture->tcMods[i] = stage->tcMods[i];
+}
+
+static qhandle_t RegisterEntityStageTexture(const char *shaderName, int stageIndex) {
+    const metalShaderMap_t *entry = ShaderMap_LookupEntry(shaderName);
+    const Q3MetalStage *stage;
+    char alias[MAX_QPATH];
+    qhandle_t baseHandle;
+    metalTexture_t *base;
+    metalTexture_t *texture;
+
+    if (entry == NULL || stageIndex < 0 || stageIndex >= entry->stageCount) return 0;
+    stage = &entry->stages[stageIndex];
+    if (stage->useLightmap || stage->mapPath[0] == '\0') return 0;
+
+    Com_sprintf(alias, sizeof(alias), "*entity-stage:%d:%s", stageIndex, shaderName);
+    texture = FindTextureByName(alias);
+    if (texture != NULL) return texture->handle;
+
+    baseHandle = RegisterTexture(stage->mapPath);
+    base = FindTextureByHandle(baseHandle);
+    if (base == NULL || base->rgbaBytes == NULL) return 0;
+
+    texture = AllocTextureSlot();
+    if (texture == NULL) return 0;
+    Q_strncpyz(texture->name, alias, sizeof(texture->name));
+    texture->width = base->width;
+    texture->height = base->height;
+    texture->rgbaBytes = base->rgbaBytes;
+    texture->generation = base->generation;
+    CopyStageMetadataToTexture(texture, stage);
+    return texture->handle;
+}
+
+static uint32_t EntityFlagsForTexture(qhandle_t textureHandle, uint32_t flags, qboolean allowFxFallback) {
+    const metalTexture_t *tex = FindTextureByHandle(textureHandle);
+    if (tex == NULL) return flags;
+    if (tex->blendMode == 1) flags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+    else if (tex->blendMode == 2) flags |= Q3_METAL_ENTITY_DRAWFLAG_ALPHA;
+    else if (tex->blendMode == 3) flags |= Q3_METAL_ENTITY_DRAWFLAG_FILTER;
+    else if (tex->blendMode == 4) flags |= Q3_METAL_ENTITY_DRAWFLAG_SUBTRACT;
+    else if (tex->blendMode == 5) flags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE_FULL;
+    else if (allowFxFallback) {
+        const char *n = tex->name;
+        if (n[0] != '\0' &&
+            (!Q_stricmpn(n, "models/weaphits/", 16) ||
+             !Q_stricmpn(n, "sprites/", 8) ||
+             !Q_stricmpn(n, "gfx/damage/", 11) ||
+             !Q_stricmpn(n, "gfx/misc/", 9))) {
+            flags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+        }
+    }
+    if (tex->tcGenEnv) flags |= Q3_METAL_ENTITY_DRAWFLAG_TCGEN_ENV;
+    return flags;
 }
 
 static qhandle_t EnsureTimHellBaseTexture(void) {
@@ -2980,6 +3109,8 @@ static qboolean LoadWorldMapData(const char *name) {
     drawIndexCount = LittleLong(header->lumps[LUMP_DRAWINDEXES].filelen) / (int)sizeof(int);
     surfaceCount = LittleLong(header->lumps[LUMP_SURFACES].filelen) / (int)sizeof(dsurface_t);
 
+    FreeWorldMapData();
+
     /* LUMP_FOGS — one dfog_t per fog volume. Resolve each fog's shader
      * into the pre-parsed shader map to recover (r,g,b,distance) from
      * the 'fogparms' directive. Later cycles thread each surface's
@@ -2988,7 +3119,16 @@ static qboolean LoadWorldMapData(const char *name) {
     {
         const dfog_t *fogs = (const dfog_t *)((const byte *)header +
             LittleLong(header->lumps[LUMP_FOGS].fileofs));
+        const dbrush_t *brushes = (const dbrush_t *)((const byte *)header +
+            LittleLong(header->lumps[LUMP_BRUSHES].fileofs));
+        const dbrushside_t *sides = (const dbrushside_t *)((const byte *)header +
+            LittleLong(header->lumps[LUMP_BRUSHSIDES].fileofs));
+        const dplane_t *planes = (const dplane_t *)((const byte *)header +
+            LittleLong(header->lumps[LUMP_PLANES].fileofs));
         int fogBytes = LittleLong(header->lumps[LUMP_FOGS].filelen);
+        int brushCount = LittleLong(header->lumps[LUMP_BRUSHES].filelen) / (int)sizeof(dbrush_t);
+        int sideCount = LittleLong(header->lumps[LUMP_BRUSHSIDES].filelen) / (int)sizeof(dbrushside_t);
+        int planeCount = LittleLong(header->lumps[LUMP_PLANES].filelen) / (int)sizeof(dplane_t);
         int fogCount = (fogBytes > 0) ? (fogBytes / (int)sizeof(dfog_t)) : 0;
         int fi;
         int withColor = 0;
@@ -3004,18 +3144,49 @@ static qboolean LoadWorldMapData(const char *name) {
             s_worldFogs[fi].color[1] = 0.0f;
             s_worldFogs[fi].color[2] = 0.0f;
             s_worldFogs[fi].distance = 0.0f;
+            s_worldFogs[fi].tcScale = 0.0f;
+            s_worldFogs[fi].hasSurface = qfalse;
+            s_worldFogs[fi].surface[0] = 0.0f;
+            s_worldFogs[fi].surface[1] = 0.0f;
+            s_worldFogs[fi].surface[2] = 0.0f;
+            s_worldFogs[fi].surface[3] = 0.0f;
 
             fse = ShaderMap_LookupEntry(fogs[fi].shader);
             if (fse != NULL && fse->hasFog) {
+                float d = fse->fogDistance < 1.0f ? 1.0f : fse->fogDistance;
+                int brushNum = LittleLong(fogs[fi].brushNum);
+                int visibleSide = LittleLong(fogs[fi].visibleSide);
                 s_worldFogs[fi].hasColor = qtrue;
                 s_worldFogs[fi].color[0] = fse->fogColor[0];
                 s_worldFogs[fi].color[1] = fse->fogColor[1];
                 s_worldFogs[fi].color[2] = fse->fogColor[2];
                 s_worldFogs[fi].distance = fse->fogDistance;
+                s_worldFogs[fi].tcScale = 1.0f / (d * 8.0f);
+                if (visibleSide != -1 && brushNum >= 0 && brushNum < brushCount) {
+                    int firstSide = LittleLong(brushes[brushNum].firstSide);
+                    int sideNum = firstSide + visibleSide;
+                    if (sideNum >= 0 && sideNum < sideCount) {
+                        int planeNum = LittleLong(sides[sideNum].planeNum);
+                        if (planeNum >= 0 && planeNum < planeCount) {
+                            const dplane_t *plane = &planes[planeNum];
+                            s_worldFogs[fi].hasSurface = qtrue;
+                            s_worldFogs[fi].surface[0] = -LittleFloat(plane->normal[0]);
+                            s_worldFogs[fi].surface[1] = -LittleFloat(plane->normal[1]);
+                            s_worldFogs[fi].surface[2] = -LittleFloat(plane->normal[2]);
+                            s_worldFogs[fi].surface[3] = -LittleFloat(plane->dist);
+                        }
+                    }
+                }
                 s_worldFogsPublic[fi].color[0] = fse->fogColor[0];
                 s_worldFogsPublic[fi].color[1] = fse->fogColor[1];
                 s_worldFogsPublic[fi].color[2] = fse->fogColor[2];
                 s_worldFogsPublic[fi].distance = fse->fogDistance;
+                s_worldFogsPublic[fi].tcScale = s_worldFogs[fi].tcScale;
+                s_worldFogsPublic[fi].hasSurface = s_worldFogs[fi].hasSurface ? 1u : 0u;
+                s_worldFogsPublic[fi].surface[0] = s_worldFogs[fi].surface[0];
+                s_worldFogsPublic[fi].surface[1] = s_worldFogs[fi].surface[1];
+                s_worldFogsPublic[fi].surface[2] = s_worldFogs[fi].surface[2];
+                s_worldFogsPublic[fi].surface[3] = s_worldFogs[fi].surface[3];
                 withColor += 1;
             }
             /* Unresolved volumes leave s_worldFogsPublic[fi] at the
@@ -3035,6 +3206,7 @@ static qboolean LoadWorldMapData(const char *name) {
         int patchWidth;
         int patchHeight;
         int shaderNum;
+        int drawMultiplier = 1;
 
         /* MST_FLARE surfaces carry no triangles — they're pure light
          * points. Harvest origin/color into s_worldFlares and continue;
@@ -3074,6 +3246,14 @@ static qboolean LoadWorldMapData(const char *name) {
                 skippedNoDrawSurfaces += 1;
                 continue;
             }
+            if (_fe != NULL && _fe->stageCount > 1) {
+                drawMultiplier = _fe->stageCount;
+            }
+            if (_fe != NULL && _fe->hasLightmapStage &&
+                !IsSkyShaderName(shaders[shaderNum].shader) &&
+                LittleLong(surface->lightmapNum) >= 0) {
+                drawMultiplier += 1;
+            }
         }
 
         if (surfaceType == MST_PATCH) {
@@ -3083,7 +3263,9 @@ static qboolean LoadWorldMapData(const char *name) {
                              (Q3_METAL_PATCH_SUBDIVISIONS + 1) * (Q3_METAL_PATCH_SUBDIVISIONS + 1);
             totalIndices += (uint32_t)((patchWidth - 1) / 2) * (uint32_t)((patchHeight - 1) / 2) *
                             Q3_METAL_PATCH_SUBDIVISIONS * Q3_METAL_PATCH_SUBDIVISIONS * 6;
-            totalDraws += (uint32_t)((patchWidth - 1) / 2) * (uint32_t)((patchHeight - 1) / 2);
+            totalDraws += (uint32_t)((patchWidth - 1) / 2) *
+                          (uint32_t)((patchHeight - 1) / 2) *
+                          (uint32_t)drawMultiplier;
             patchDraws += (uint32_t)((patchWidth - 1) / 2) * (uint32_t)((patchHeight - 1) / 2);
         } else {
             int numVerts = LittleLong(surface->numVerts);
@@ -3094,7 +3276,7 @@ static qboolean LoadWorldMapData(const char *name) {
             }
             totalVertices += (uint32_t)numVerts;
             totalIndices += (uint32_t)numIndexes;
-            totalDraws += 1;
+            totalDraws += (uint32_t)drawMultiplier;
 
             if (surfaceType == MST_PLANAR) {
                 planarDraws += 1;
@@ -3110,7 +3292,6 @@ static qboolean LoadWorldMapData(const char *name) {
         return qfalse;
     }
 
-    FreeWorldMapData();
     LoadWorldLightmaps(header, name);
 
     /* Load the lightgrid (LUMP_LIGHTGRID). World model is model 0 in
@@ -3236,25 +3417,10 @@ static qboolean LoadWorldMapData(const char *name) {
         } else {
             fogIndex = (uint32_t)surfFogNum;
         }
-        if (!IsSkyShaderName(shaders[shaderNum].shader) && lightmapNum >= 0 && lightmapNum < s_worldLightmapCount) {
-            const metalShaderMap_t *_le = ShaderMap_LookupEntry(shaders[shaderNum].shader);
-            qboolean wantLightmap = qfalse;
-            if (_le == NULL || _le->stageCount == 0) {
-                wantLightmap = qtrue;
-            } else {
-                int _ls;
-                for (_ls = 0; _ls < _le->stageCount; ++_ls) {
-                    if (_le->stages[_ls].useLightmap) {
-                        wantLightmap = qtrue;
-                        break;
-                    }
-                }
-            }
-            if (wantLightmap) {
-                lightmapHandle = s_worldLightmapHandles[lightmapNum];
-                hasLightmap = qtrue;
-                worldFlags |= Q3_METAL_WORLD_DRAWFLAG_LIGHTMAP_MULTIPLY;
-            }
+        if (!IsSkyShaderName(shaders[shaderNum].shader) &&
+            lightmapNum >= 0 && lightmapNum < s_worldLightmapCount) {
+            lightmapHandle = s_worldLightmapHandles[lightmapNum];
+            hasLightmap = qtrue;
         }
         if (IsSkyShaderName(shaders[shaderNum].shader)) {
             worldFlags |= Q3_METAL_WORLD_DRAWFLAG_SKY;
@@ -3356,24 +3522,28 @@ static qboolean LoadWorldMapData(const char *name) {
                     {
                         uint32_t firstIndexForDraw = s_world.draws[drawCursor].firstIndex;
                         uint32_t indexCountForDraw = indexCursor - firstIndexForDraw;
-                        uint32_t _dstIdx = drawCursor;
-                        SetupWorldDraw(&s_world.draws[drawCursor++],
-                                       firstIndexForDraw,
-                                       indexCountForDraw,
-                                       hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
-                                       worldFlags,
-                                       fogIndex);
-                        if (s_world.animShaderSlots && s_pendingAnimSlot >= 0) {
-                            s_world.animShaderSlots[_dstIdx] = s_pendingAnimSlot;
-                            s_world.animatedDrawCount += 1;
-                        }
                         {
                             const metalShaderMap_t *_e = ShaderMap_LookupEntry(shaders[shaderNum].shader);
                             int _s;
+                            int _emitted = 0;
+                            if (_e != NULL && _e->hasLightmapStage && hasLightmap) {
+                                uint32_t _dstIdx = drawCursor++;
+                                SetupWorldDraw(&s_world.draws[_dstIdx],
+                                               firstIndexForDraw,
+                                               indexCountForDraw,
+                                               lightmapHandle,
+                                               worldFlags | Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY,
+                                               fogIndex);
+                                AddWorldDrawLightmapBaseStage(&s_world.draws[_dstIdx],
+                                                             lightmapHandle,
+                                                             _e);
+                                _emitted += 1;
+                            }
                             if (_e != NULL && _e->stageCount > 0) {
                                 for (_s = 0; _s < _e->stageCount; ++_s) {
                                     const Q3MetalStage *_st = &_e->stages[_s];
                                     qhandle_t _tex;
+                                    uint32_t _dstIdx;
                                     if (_st->useLightmap) {
                                         _tex = lightmapHandle;
                                     } else if (_s == 0 && skyOverrideTexture != 0) {
@@ -3382,14 +3552,40 @@ static qboolean LoadWorldMapData(const char *name) {
                                         _tex = (_st->mapPath[0] != '\0') ? RegisterTexture(_st->mapPath) : 0;
                                     }
                                     if (_tex == 0) continue;
+                                    _dstIdx = drawCursor++;
+                                    SetupWorldDraw(&s_world.draws[_dstIdx],
+                                                   firstIndexForDraw,
+                                                   indexCountForDraw,
+                                                   hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
+                                                   worldFlags | ((_emitted == 0)
+                                                       ? Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY : 0u),
+                                                   fogIndex);
+                                    if (s_world.animShaderSlots && s_pendingAnimSlot >= 0 &&
+                                        _st->animFrameCount > 0) {
+                                        s_world.animShaderSlots[_dstIdx] =
+                                            s_pendingAnimSlot * Q3_MAX_STAGES + _s;
+                                        s_world.animatedDrawCount += 1;
+                                    }
                                     AddWorldDrawStage(&s_world.draws[_dstIdx], _tex, _st);
+                                    _emitted += 1;
                                 }
                             }
-                            if (_e == NULL || _e->stageCount == 0) {
+                            if (_e == NULL || _e->stageCount == 0 || _emitted == 0) {
                                 qhandle_t _tex = (skyOverrideTexture != 0)
                                                ? skyOverrideTexture
                                                : RegisterTexture(shaders[shaderNum].shader);
                                 if (_tex != 0) {
+                                    uint32_t _dstIdx = drawCursor++;
+                                    SetupWorldDraw(&s_world.draws[_dstIdx],
+                                                   firstIndexForDraw,
+                                                   indexCountForDraw,
+                                                   hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
+                                                   worldFlags | Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY,
+                                                   fogIndex);
+                                    if (s_world.animShaderSlots && s_pendingAnimSlot >= 0) {
+                                        s_world.animShaderSlots[_dstIdx] = s_pendingAnimSlot;
+                                        s_world.animatedDrawCount += 1;
+                                    }
                                     AddWorldDrawStageSimple(&s_world.draws[_dstIdx], _tex, 0, 0, 0);
                                 }
                             }
@@ -3423,24 +3619,28 @@ static qboolean LoadWorldMapData(const char *name) {
         {
             uint32_t firstIndexForDraw = s_world.draws[drawCursor].firstIndex;
             uint32_t indexCountForDraw = indexCursor - firstIndexForDraw;
-            uint32_t _dstIdx = drawCursor;
-            SetupWorldDraw(&s_world.draws[drawCursor++],
-                           firstIndexForDraw,
-                           indexCountForDraw,
-                           hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
-                           worldFlags,
-                           fogIndex);
-            if (s_world.animShaderSlots && s_pendingAnimSlot >= 0) {
-                s_world.animShaderSlots[_dstIdx] = s_pendingAnimSlot;
-                s_world.animatedDrawCount += 1;
-            }
             {
                 const metalShaderMap_t *_e = ShaderMap_LookupEntry(shaders[shaderNum].shader);
-                int _s;
-                if (_e != NULL && _e->stageCount > 0) {
-                    for (_s = 0; _s < _e->stageCount; ++_s) {
+                            int _s;
+                            int _emitted = 0;
+                            if (_e != NULL && _e->hasLightmapStage && hasLightmap) {
+                                uint32_t _dstIdx = drawCursor++;
+                                SetupWorldDraw(&s_world.draws[_dstIdx],
+                                               firstIndexForDraw,
+                                               indexCountForDraw,
+                                               lightmapHandle,
+                                               worldFlags | Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY,
+                                               fogIndex);
+                                AddWorldDrawLightmapBaseStage(&s_world.draws[_dstIdx],
+                                                             lightmapHandle,
+                                                             _e);
+                                _emitted += 1;
+                            }
+                            if (_e != NULL && _e->stageCount > 0) {
+                                for (_s = 0; _s < _e->stageCount; ++_s) {
                         const Q3MetalStage *_st = &_e->stages[_s];
                         qhandle_t _tex;
+                        uint32_t _dstIdx;
                         if (_st->useLightmap) {
                             _tex = lightmapHandle;
                         } else if (_s == 0 && skyOverrideTexture != 0) {
@@ -3449,14 +3649,40 @@ static qboolean LoadWorldMapData(const char *name) {
                             _tex = (_st->mapPath[0] != '\0') ? RegisterTexture(_st->mapPath) : 0;
                         }
                         if (_tex == 0) continue;
+                        _dstIdx = drawCursor++;
+                        SetupWorldDraw(&s_world.draws[_dstIdx],
+                                       firstIndexForDraw,
+                                       indexCountForDraw,
+                                       hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
+                                       worldFlags | ((_emitted == 0)
+                                           ? Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY : 0u),
+                                       fogIndex);
+                        if (s_world.animShaderSlots && s_pendingAnimSlot >= 0 &&
+                            _st->animFrameCount > 0) {
+                            s_world.animShaderSlots[_dstIdx] =
+                                s_pendingAnimSlot * Q3_MAX_STAGES + _s;
+                            s_world.animatedDrawCount += 1;
+                        }
                         AddWorldDrawStage(&s_world.draws[_dstIdx], _tex, _st);
+                        _emitted += 1;
                     }
                 }
-                if (_e == NULL || _e->stageCount == 0) {
+                if (_e == NULL || _e->stageCount == 0 || _emitted == 0) {
                     qhandle_t _tex = (skyOverrideTexture != 0)
                                    ? skyOverrideTexture
                                    : RegisterTexture(shaders[shaderNum].shader);
                     if (_tex != 0) {
+                        uint32_t _dstIdx = drawCursor++;
+                        SetupWorldDraw(&s_world.draws[_dstIdx],
+                                       firstIndexForDraw,
+                                       indexCountForDraw,
+                                       hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
+                                       worldFlags | Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY,
+                                       fogIndex);
+                        if (s_world.animShaderSlots && s_pendingAnimSlot >= 0) {
+                            s_world.animShaderSlots[_dstIdx] = s_pendingAnimSlot;
+                            s_world.animatedDrawCount += 1;
+                        }
                         AddWorldDrawStageSimple(&s_world.draws[_dstIdx], _tex, 0, 0, 0);
                     }
                 }
@@ -3742,12 +3968,14 @@ static qhandle_t ShaderMap_ResolveCurrentFrame(const char *name) {
 /* Exact-match slot lookup used when tagging world draws at map-load
  * for per-frame retargeting. Returns -1 if not animated. */
 static int ShaderMap_FindAnimatedSlot(const char *name) {
-    int i;
+    int i, s;
     if (name == NULL || name[0] == '\0') return -1;
     for (i = 0; i < s_shaderMapCount; ++i) {
-        if (s_shaderMap[i].animFrameCount > 0 &&
-            !Q_stricmp(s_shaderMap[i].shaderName, name)) {
-            return i;
+        if (!Q_stricmp(s_shaderMap[i].shaderName, name)) {
+            if (s_shaderMap[i].animFrameCount > 0) return i;
+            for (s = 0; s < s_shaderMap[i].stageCount; ++s) {
+                if (s_shaderMap[i].stages[s].animFrameCount > 0) return i;
+            }
         }
     }
     return -1;
@@ -4053,15 +4281,30 @@ static void ShaderMap_GetTcMods(const char *name, int *outCount, Q3TcMod *outMod
 
 /* Current frame's texture handle for a known animated slot. Caller
  * already validated the slot; returns 0 on bad input to play safe. */
-static qhandle_t ShaderMap_AnimatedSlotCurrentHandle(int slot) {
-    const metalShaderMap_t *entry;
+static qhandle_t ShaderMap_AnimatedSlotCurrentHandle(int encodedSlot, float shaderTime) {
+    int slot = encodedSlot / Q3_MAX_STAGES;
+    int stageIndex = encodedSlot % Q3_MAX_STAGES;
+    metalShaderMap_t *entry;
+    Q3MetalStage *stage = NULL;
     float fps;
     int frameIdx;
     if (slot < 0 || slot >= s_shaderMapCount) return 0;
     entry = &s_shaderMap[slot];
+    if (stageIndex >= 0 && stageIndex < entry->stageCount) {
+        stage = &entry->stages[stageIndex];
+    }
+    if (stage != NULL && stage->animFrameCount > 0) {
+        fps = (stage->animFps > 0.0f) ? stage->animFps : 8.0f;
+        frameIdx = (int)(shaderTime * fps) % stage->animFrameCount;
+        if (frameIdx < 0) frameIdx = 0;
+        if (stage->animTextures[frameIdx] == 0) {
+            stage->animTextures[frameIdx] = RegisterTexture(stage->animFrames[frameIdx]);
+        }
+        return stage->animTextures[frameIdx];
+    }
     if (entry->animFrameCount <= 0) return 0;
     fps = (entry->animFps > 0.0f) ? entry->animFps : 8.0f;
-    frameIdx = (int)((float)cls.realtime * 0.001f * fps) % entry->animFrameCount;
+    frameIdx = (int)(shaderTime * fps) % entry->animFrameCount;
     if (frameIdx < 0) frameIdx = 0;
     if (s_shaderMap[slot].animTextures[frameIdx] == 0) {
         s_shaderMap[slot].animTextures[frameIdx] =
@@ -4073,17 +4316,6 @@ static qhandle_t ShaderMap_AnimatedSlotCurrentHandle(int slot) {
 static void ShaderMap_Register(const char *name, const char *path, qboolean tcGenEnv) {
     if (s_shaderMapCount >= MAX_SHADER_MAP_ENTRIES) return;
     if (ShaderMap_Lookup(name) != NULL) return; /* first wins */
-    if (name && (strstr(name, "border11c") || strstr(name, "killblock_i4b") ||
-                 strstr(name, "xmetalfloor_wall_5b") ||
-                 strncmp(name, "textures/sfx/", 13) == 0)) {
-        size_t nlen = strlen(name);
-        ri.Printf(PRINT_ALL, "[SHADER-REG] name=[%s] len=%zu last3bytes=%02x,%02x,%02x path=[%s]\n",
-            name, nlen,
-            (nlen >= 3) ? (unsigned char)name[nlen-3] : 0,
-            (nlen >= 2) ? (unsigned char)name[nlen-2] : 0,
-            (nlen >= 1) ? (unsigned char)name[nlen-1] : 0,
-            path ? path : "(null)");
-    }
     Q_strncpyz(s_shaderMap[s_shaderMapCount].shaderName, name,
         sizeof(s_shaderMap[0].shaderName));
     Q_strncpyz(s_shaderMap[s_shaderMapCount].mapPath, path,
@@ -4155,6 +4387,7 @@ static void ParseShaderText(const char *text) {
         qboolean gotSkyParms;
         qboolean gotPortal;
         qboolean gotFog;
+        qboolean gotLightmapStage;
         qboolean gotFlare;
         qboolean gotSky;
         float fogColor[3];
@@ -4188,6 +4421,7 @@ static void ParseShaderText(const char *text) {
         gotSkyParms = qfalse;
         gotPortal = qfalse;
         gotFog = qfalse;
+        gotLightmapStage = qfalse;
         gotFlare = qfalse;
         gotSky = qfalse;
         fogColor[0] = fogColor[1] = fogColor[2] = 0.0f;
@@ -4220,10 +4454,21 @@ static void ParseShaderText(const char *text) {
                  * appended a stale cur as a duplicate/bogus stage. */
                 if (depth == 1) {
                     inStage = qfalse;
-                    if (cur.useLightmap && cur.blendMode == 0) {
-                        cur.blendMode = 3;
-                    }
-                    if (stagesCount < Q3_MAX_STAGES) {
+                    /* Lightmap-only stages (`map $lightmap`) carry an
+                     * empty mapPath by design — useLightmap=1 is the
+                     * only signal they exist. Without this third clause
+                     * we silently drop the leading lightmap stage of
+                     * `textures/sfx/teslacoil`, `textures/sfx/demonlt-
+                     * blackfinal`, and every other shader whose first
+                     * stage is a pure `$lightmap` modulator, leaving
+                     * surfaces full-bright instead of lit. ioq3
+                     * preserves these in `FinishShader()` and only
+                     * collapses them later via `CollapseMultitexture`
+                     * — we don't collapse, but we still must keep the
+                     * stage so the renderer can apply the lightmap. */
+                    if (stagesCount < Q3_MAX_STAGES &&
+                        (cur.mapPath[0] != '\0' || cur.animFrameCount > 0
+                         || cur.useLightmap)) {
                         stages[stagesCount++] = cur;
                     }
                 }
@@ -4335,15 +4580,20 @@ static void ParseShaderText(const char *text) {
                     (void)COM_ParseExt(&p, qfalse);
                     gotFlare = qtrue;
                 } else if (!Q_stricmp(token, "fogparms") || !Q_stricmp(token, "fogParms")) {
-                    /* Syntax: fogparms ( r g b ) distance
-                     * Tokenizes as: '(' r g b ')' distance — seven tokens. */
-                    const char *t;
-                    t = COM_ParseExt(&p, qfalse);  /* '(' */
-                    t = COM_ParseExt(&p, qfalse); if (t[0]) fogColor[0] = (float)atof(t);
-                    t = COM_ParseExt(&p, qfalse); if (t[0]) fogColor[1] = (float)atof(t);
-                    t = COM_ParseExt(&p, qfalse); if (t[0]) fogColor[2] = (float)atof(t);
-                    t = COM_ParseExt(&p, qfalse);  /* ')' */
-                    t = COM_ParseExt(&p, qfalse); if (t[0]) fogDistance = (float)atof(t);
+                    const char *t = COM_ParseExt(&p, qfalse);
+                    if (!Q_stricmp(t, "(")) {
+                        t = COM_ParseExt(&p, qfalse); if (t[0]) fogColor[0] = (float)atof(t);
+                        t = COM_ParseExt(&p, qfalse); if (t[0]) fogColor[1] = (float)atof(t);
+                        t = COM_ParseExt(&p, qfalse); if (t[0]) fogColor[2] = (float)atof(t);
+                        (void)COM_ParseExt(&p, qfalse);
+                        t = COM_ParseExt(&p, qfalse); if (t[0]) fogDistance = (float)atof(t);
+                    } else {
+                        if (t[0]) fogColor[0] = (float)atof(t);
+                        t = COM_ParseExt(&p, qfalse); if (t[0]) fogColor[1] = (float)atof(t);
+                        t = COM_ParseExt(&p, qfalse); if (t[0]) fogColor[2] = (float)atof(t);
+                        t = COM_ParseExt(&p, qfalse); if (t[0]) fogDistance = (float)atof(t);
+                        (void)COM_ParseExt(&p, qfalse);
+                    }
                     gotFog = qtrue;
                 }
                 continue;
@@ -4355,24 +4605,34 @@ static void ParseShaderText(const char *text) {
                     if (token[0]) {
                         if (!Q_stricmp(token, "$lightmap")) {
                             cur.useLightmap = 1;
+                            gotLightmapStage = qtrue;
                         } else if (cur.mapPath[0] == '\0') {
                             Q_strncpyz(cur.mapPath, token, sizeof(cur.mapPath));
                         }
                     }
                 } else if (!Q_stricmp(token, "animMap") || !Q_stricmp(token, "animmap")) {
                     token = COM_ParseExt(&p, qfalse);
-                    animFps = (float)atof(token);
+                    cur.animFps = (float)atof(token);
+                    cur.animFrameCount = 0;
                     while (1) {
                         token = COM_ParseExt(&p, qfalse);
                         if (!token[0]) break;
                         if (token[0] == '$') continue;
-                        if (animFrameCount >= METAL_ANIMMAP_MAX_FRAMES) continue;
-                        Q_strncpyz(animFrames[animFrameCount], token, MAX_QPATH);
-                        animFrameCount += 1;
+                        if (cur.animFrameCount >= METAL_ANIMMAP_MAX_FRAMES) continue;
+                        Q_strncpyz(cur.animFrames[cur.animFrameCount], token, MAX_QPATH);
+                        cur.animFrameCount += 1;
                     }
-                    if (animFrameCount > 0) {
-                        Q_strncpyz(cur.mapPath, animFrames[0], sizeof(cur.mapPath));
+                    if (cur.animFrameCount > 0) {
+                        Q_strncpyz(cur.mapPath, cur.animFrames[0], sizeof(cur.mapPath));
                         gotAnim = qtrue;
+                        if (animFrameCount == 0) {
+                            int af;
+                            animFps = cur.animFps;
+                            animFrameCount = cur.animFrameCount;
+                            for (af = 0; af < animFrameCount; ++af) {
+                                Q_strncpyz(animFrames[af], cur.animFrames[af], MAX_QPATH);
+                            }
+                        }
                     }
                 } else if (!Q_stricmp(token, "tcGen") || !Q_stricmp(token, "tcgen")) {
                     /* Per-stage tcGen. Only the stage that declares the
@@ -4698,6 +4958,15 @@ static void ParseShaderText(const char *text) {
             metalShaderMap_t *last = &s_shaderMap[s_shaderMapCount - 1];
             if (!Q_stricmp(last->shaderName, shaderName)) {
                 int s;
+                if (!Q_stricmp(shaderName, "models/mapobjects/bitch/forearm")) {
+                    for (s = 0; s < stagesCount; ++s) {
+                        if (stages[s].blendMode == 5 && stages[s].rgbGen == 0 &&
+                            (!Q_stricmp(stages[s].mapPath, "models/mapobjects/bitch/forearm01.tga") ||
+                             !Q_stricmp(stages[s].mapPath, "models/mapobjects/bitch/forearm02.tga"))) {
+                            stages[s].rgbGen = 7;
+                        }
+                    }
+                }
                 Com_Memset(last->stages, 0, sizeof(last->stages));
                 for (s = 0; s < Q3_MAX_STAGES; ++s) {
                     last->stages[s] = stages[s];
@@ -4722,6 +4991,7 @@ static void ParseShaderText(const char *text) {
                 }
                 last->isPortal = gotPortal;
                 last->hasFog = gotFog;
+                last->hasLightmapStage = gotLightmapStage;
                 last->hasFlare = gotFlare;
                 last->isSky = gotSky;
                 /* [multi-stage-audit] one-shot print for any shader with
@@ -4821,7 +5091,11 @@ static void LoadAllShaders(void) {
         return;
     }
 
-    for (i = 0; i < numFiles; ++i) {
+    /* ioq3 concatenates shader files in reverse FS_ListFiles order, then
+     * uses the first matching shader text. Preserve that duplicate-name
+     * precedence so q3dm4's textures/sfx/xdensegreyfog resolves to the
+     * sfx.shader grey fog, not the earlier liquid.shader black variant. */
+    for (i = numFiles - 1; i >= 0; --i) {
         char path[MAX_QPATH];
         char *buf;
         int len;
@@ -4842,14 +5116,7 @@ static void LoadAllShaders(void) {
         for (j = 0; j < len; ++j) {
             if (buf[j] == '\r') buf[j] = ' ';
         }
-        {
-            int before = s_shaderMapCount;
-            ri.Printf(PRINT_ALL, "[PARSER-DBG] begin file=%s size=%d mapCount=%d\n",
-                fileList[i], len, s_shaderMapCount);
-            ParseShaderText(buf);
-            ri.Printf(PRINT_ALL, "[PARSER-DBG] end   file=%s registered=%d (total=%d)\n",
-                fileList[i], s_shaderMapCount - before, s_shaderMapCount);
-        }
+        ParseShaderText(buf);
         ri.FS_FreeFile(buf);
     }
 
@@ -5420,12 +5687,17 @@ static void RE_RenderScene(const refdef_t *fd) {
     if (s_world.loaded && s_world.animatedDrawCount > 0 &&
         s_world.animShaderSlots != NULL && s_world.draws != NULL) {
         uint32_t i;
+        float shaderTime = fd ? (float)fd->time * 0.001f : (float)cls.realtime * 0.001f;
         for (i = 0; i < s_world.drawCount; ++i) {
             int slot = s_world.animShaderSlots[i];
             if (slot >= 0) {
-                qhandle_t h = ShaderMap_AnimatedSlotCurrentHandle(slot);
-                if (h != 0 && s_world.draws[i].stageCount > 0) {
-                    s_world.draws[i].stages[0].textureHandle = (uint32_t)h;
+                int srcStageIndex = slot % Q3_MAX_STAGES;
+                int drawStageIndex = (s_world.draws[i].stageCount == 1)
+                                   ? 0 : srcStageIndex;
+                qhandle_t h = ShaderMap_AnimatedSlotCurrentHandle(slot, shaderTime);
+                if (h != 0 && drawStageIndex >= 0 &&
+                    drawStageIndex < (int)s_world.draws[i].stageCount) {
+                    s_world.draws[i].stages[drawStageIndex].textureHandle = (uint32_t)h;
                 }
             }
         }
@@ -5467,6 +5739,7 @@ static void RE_RenderScene(const refdef_t *fd) {
     /* World-scene-only camera. HUD/portrait scenes would overwrite with
      * their own view, projecting preserved world entity draws off-screen. */
     if (fd->rdflags == 0) {
+        s_frameSnapshot.shaderTime = (float)fd->time * 0.001f;
         s_sceneView.fovX = fovX;
         s_sceneView.fovY = fovY;
         s_sceneView.viewOrigin[0] = vieworg[0];
@@ -5668,9 +5941,20 @@ static void RE_RenderScene(const refdef_t *fd) {
             header = model->md3;
             surface = (const md3Surface_t *)((const byte *)header + header->ofsSurfaces);
             for (surfaceIndex = 0; surfaceIndex < header->numSurfaces; ++surfaceIndex) {
+                const char *shaderName = NULL;
+                int stageDraws = 0;
+                if (sceneEntity->entity.customShader == 0 &&
+                    sceneEntity->entity.customSkin == 0 &&
+                    surface->numShaders > 0) {
+                    const md3Shader_t *shader = (const md3Shader_t *)((const byte *)surface + surface->ofsShaders);
+                    int shaderSlot = sceneEntity->entity.skinNum % surface->numShaders;
+                    if (shaderSlot < 0) shaderSlot = 0;
+                    shaderName = shader[shaderSlot].name;
+                    stageDraws = EntityPickupStageDrawCount(shaderName);
+                }
                 totalEntityVerts += (uint32_t)surface->numVerts;
                 totalEntityIndices += (uint32_t)(surface->numTriangles * 3);
-                totalEntityDraws += 1;
+                totalEntityDraws += (uint32_t)(stageDraws > 0 ? stageDraws : 1);
                 surface = (const md3Surface_t *)((const byte *)surface + surface->ofsEnd);
             }
         }
@@ -6323,7 +6607,9 @@ static void RE_RenderScene(const refdef_t *fd) {
                     const md3XyzNormal_t *currentFrameVerts = (const md3XyzNormal_t *)((const byte *)surface + surface->ofsXyzNormals) + frameIndex * surface->numVerts;
                     const md3XyzNormal_t *oldFrameVerts = (const md3XyzNormal_t *)((const byte *)surface + surface->ofsXyzNormals) + oldFrameIndex * surface->numVerts;
                     qhandle_t textureHandle = EnsureWhiteTexture();
+                    const char *shaderNameForStages = NULL;
                     uint32_t drawFlags = Q3_METAL_ENTITY_DRAWFLAG_NOCULL;
+                    uint32_t baseDrawFlags;
                     uint32_t baseVertex = entityVertexCursor;
                     uint32_t firstIndex = entityIndexCursor;
                     int vertexIndex;
@@ -6351,55 +6637,18 @@ static void RE_RenderScene(const refdef_t *fd) {
                         if (shaderSlot < 0) {
                             shaderSlot = 0;
                         }
+                        shaderNameForStages = shader[shaderSlot].name;
                         textureHandle = RegisterTexture(shader[shaderSlot].name);
                     }
 
                     if (sceneEntity->entity.renderfx & RF_DEPTHHACK) {
                         drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_DEPTHHACK;
                     }
-                    /* Check entity's shader for additive blending (e.g.
-                     * health orbs, glow effects, flame pickups). The
-                     * texture's blendMode was propagated from the shader-
-                     * map entry at RegisterTexture time. */
+                    baseDrawFlags = drawFlags;
                     {
-                        const metalTexture_t *tex = FindTextureByHandle(textureHandle);
-                        if (tex != NULL) {
-                            if (tex->blendMode == 1) {
-                                drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
-                            } else if (tex->blendMode == 2) {
-                                drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_ALPHA;
-                            } else if (tex->blendMode == 3) {
-                                drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_FILTER;
-                            } else if (tex->blendMode == 4) {
-                                drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_SUBTRACT;
-                            } else if (tex->blendMode == 5) {
-                                drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE_FULL;
-                            } else {
-                                /* blendMode==0 for an FX model means its
-                                 * shader didn't parse and we loaded the
-                                 * texture from a .jpg fallback that lost
-                                 * the alpha channel. Opaque-render gives
-                                 * a hard yellow rectangle around explosion
-                                 * fireballs, blood splats, rocket trails.
-                                 * Force additive for the known FX paths —
-                                 * a black-border JPG contributes zero in
-                                 * additive blend, hiding the rectangle and
-                                 * showing just the bright fireball center. */
-                                const char *n = tex->name;
-                                if (n[0] != '\0' &&
-                                    (!Q_stricmpn(n, "models/weaphits/", 16) ||
-                                     !Q_stricmpn(n, "sprites/", 8) ||
-                                     !Q_stricmpn(n, "gfx/damage/", 11) ||
-                                     !Q_stricmpn(n, "gfx/misc/", 9))) {
-                                    drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
-                                }
-                            }
-                            if (tex->tcGenEnv) {
-                                drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_TCGEN_ENV;
-                            }
-                        }
-                        /* Diagnostic: first 5 per frame */
+                        drawFlags = EntityFlagsForTexture(textureHandle, drawFlags, qtrue);
                         if (MetalRenderAuditEnabled()) {
+                            const metalTexture_t *tex = FindTextureByHandle(textureHandle);
                             static int s_entityBlendLog = 0;
                             if (s_entityBlendLog < 5 && tex != NULL) {
                                 ri.Printf(PRINT_DEVELOPER, "Metal entity blend: tex='%s' bm=%d flags=0x%x\n",
@@ -6519,12 +6768,29 @@ static void RE_RenderScene(const refdef_t *fd) {
                         }
                     }
 
-                    s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
-                    s_entityDraws[entityDrawCursor].indexCount = entityIndexCursor - firstIndex;
-                    s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)textureHandle;
-                    s_entityDraws[entityDrawCursor].flags = drawFlags;
-                    SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity);
-                    entityDrawCursor += 1;
+                    if (shaderNameForStages != NULL &&
+                        EntityPickupStageDrawCount(shaderNameForStages) > 0) {
+                        const metalShaderMap_t *entry = ShaderMap_LookupEntry(shaderNameForStages);
+                        int si;
+                        for (si = 0; entry != NULL && si < entry->stageCount; ++si) {
+                            qhandle_t stageHandle = RegisterEntityStageTexture(shaderNameForStages, si);
+                            if (stageHandle == 0) continue;
+                            s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
+                            s_entityDraws[entityDrawCursor].indexCount = entityIndexCursor - firstIndex;
+                            s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)stageHandle;
+                            s_entityDraws[entityDrawCursor].flags =
+                                EntityFlagsForTexture(stageHandle, baseDrawFlags, qfalse);
+                            SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity);
+                            entityDrawCursor += 1;
+                        }
+                    } else {
+                        s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
+                        s_entityDraws[entityDrawCursor].indexCount = entityIndexCursor - firstIndex;
+                        s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)textureHandle;
+                        s_entityDraws[entityDrawCursor].flags = drawFlags;
+                        SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity);
+                        entityDrawCursor += 1;
+                    }
 
                     surface = (const md3Surface_t *)((const byte *)surface + surface->ofsEnd);
                 }
@@ -6762,6 +7028,7 @@ static void RE_BeginFrame(stereoFrame_t stereoFrame) {
     s_frameLightCount = 0;
     s_frameSnapshot.sceneCount = 0;
     s_frameSnapshot.lightCount = 0;
+    s_frameSnapshot.shaderTime = 0.0f;
 }
 
 static void RE_EndFrame(int *frontEndMsec, int *backEndMsec) {
