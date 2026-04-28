@@ -68,7 +68,7 @@ typedef struct {
 #define Q3_MAX_TCMODS 4
 
 typedef struct {
-    uint32_t type;        /* 0=none,1=scroll,2=wave-sin,3=rotate,4=scale,5=turb */
+    uint32_t type;        /* 0=none,1=scroll,2=wave-sin,3=rotate,4=scale,5=turb,6=stretch,7=transform,8=translate */
     float params[4];
 } Q3TcMod;
 

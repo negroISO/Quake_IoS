@@ -671,12 +671,61 @@ void Quake3_Init(const char *basePath) {
      * fast for UI/cgame on modern hardware. cgame uses native VM
      * registry (in-binary, not QVM), so vm_cgame doesn't really
      * matter, but we set it for symmetry. */
-    char cmdline[256] = "+set vm_ui 1 +set vm_game 1 +set vm_cgame 1";
+    const char *matchProfileName = getenv("Q3_MATCH_PROFILE");
+    BOOL matchProfile1280 = (matchProfileName && !strcmp(matchProfileName, "metal_1280_25"));
+    BOOL matchProfileNative = (matchProfileName && !strcmp(matchProfileName, "native_ipad_25"));
+    BOOL matchProfile = (matchProfile1280 || matchProfileNative);
+    int matchWidth = 1280;
+    int matchHeight = 960;
+    if (matchProfileNative) {
+        CGSize nativeSize = [UIScreen mainScreen].nativeBounds.size;
+        matchWidth = (int)MAX(nativeSize.width, nativeSize.height);
+        matchHeight = (int)MIN(nativeSize.width, nativeSize.height);
+    }
+
+    char cmdline[1024] = "+set vm_ui 1 +set vm_game 1 +set vm_cgame 1";
+    if (matchProfile) {
+        char matchCmds[768];
+        snprintf(matchCmds, sizeof(matchCmds),
+                 " +safe"
+                 " +set developer 1"
+                 " +set logfile 2"
+                 " +set com_introplayed 1"
+                 " +set r_mode -1"
+                 " +set r_customwidth %d"
+                 " +set r_customheight %d"
+                 " +set r_fullscreen 1"
+                 " +set cg_draw2D 0"
+                 " +set cg_drawGun 1"
+                 " +set cg_drawCrosshair 0"
+                 " +set cg_marks 1"
+                 " +set r_picmip 0"
+                 " +set r_texturebits 32"
+                 " +set r_colorbits 32"
+                 " +set r_depthbits 24"
+                 " +set r_overBrightBits 1"
+                 " +set r_mapOverBrightBits 2"
+                 " +set com_maxfps 25"
+                 " +set com_maxfpsUnfocused 25"
+                 " +set timescale 1"
+                 " +set fixedtime 0"
+                 " +set r_swapInterval 0"
+                 " +set s_initsound 0"
+                 " +set con_notifytime 0",
+                 matchWidth, matchHeight);
+        Q_strcat(cmdline, sizeof(cmdline),
+                 matchCmds);
+    }
     NSLog(@"[Q3-INIT] calling Com_Init cmdline='%s'", cmdline);
     Com_Init(cmdline);
     NSLog(@"[Q3-INIT] Com_Init returned");
-    Cvar_Set("com_maxfps", "120");
-    Cvar_Set("com_maxfpsUnfocused", "120");
+    if (matchProfile) {
+        Cvar_Set("com_maxfps", "25");
+        Cvar_Set("com_maxfpsUnfocused", "25");
+    } else {
+        Cvar_Set("com_maxfps", "120");
+        Cvar_Set("com_maxfpsUnfocused", "120");
+    }
 
     /* Register the statically-linked native cgame so VM_Create (called
      * from CL_InitCGame on map load) resolves to our in-binary cgame
@@ -709,14 +758,22 @@ void Quake3_Init(const char *basePath) {
      * 4:3, so this keeps yfov honest. Detected at runtime via
      * UIUserInterfaceIdiom so a single binary handles both. */
     BOOL isPad = ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad);
-    const char *resCmds = isPad
-        ? "seta r_customwidth 1280; seta r_customheight 960; "
-        : "seta r_customwidth 960; seta r_customheight 444; ";
-    NSLog(@"[Q3-INIT] resolution: %s", isPad ? "iPad 1280x960 (4:3)" : "iPhone 960x444");
+    char resCmds[96];
+    if (matchProfile) {
+        snprintf(resCmds, sizeof(resCmds), "seta r_customwidth %d; seta r_customheight %d; ", matchWidth, matchHeight);
+    } else {
+        snprintf(resCmds, sizeof(resCmds), "%s",
+                 isPad
+                 ? "seta r_customwidth 1280; seta r_customheight 960; "
+                 : "seta r_customwidth 960; seta r_customheight 444; ");
+    }
+    NSLog(@"[Q3-INIT] resolution: %s", matchProfile ? resCmds : (isPad ? "iPad 1280x960 (4:3)" : "iPhone 960x444"));
     Cbuf_AddText(resCmds);
+    Cbuf_AddText("seta r_mode -1; ");
+    Cbuf_AddText(matchProfile
+                 ? "seta r_fullscreen 1; "
+                 : "seta r_fullscreen 0; ");
     Cbuf_AddText(
-        "seta r_mode -1; "
-        "seta r_fullscreen 0; "
         /* Match the reference capture's HUD state: obituary kill-feed
          * visible (via default con_notifytime), no bottom HUD numbers
          * (cg_draw2D 0 kills health/armor/ammo counters). */

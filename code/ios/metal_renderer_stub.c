@@ -248,6 +248,9 @@ static uint32_t s_entityRejectedModelThisFrame;
 #define MAX_SHADER_MAP_ENTRIES 4096
 #define METAL_ANIMMAP_MAX_FRAMES 16
 #define Q3_MAX_STAGES 8
+#define METAL_STAGE_AUDIT_MAX 1024
+#define METAL_DRAW_PLAN_AUDIT_MAX 2048
+#define METAL_ENTITY_STAGE_AUDIT_MAX 1024
 /* Q3_MAX_TCMODS and Q3TcMod live in metal_renderer_shared.h so both the
  * stub and Swift bindings share the exact same tcMod chain layout. */
 
@@ -359,6 +362,197 @@ typedef struct {
     Q3MetalStage stages[Q3_MAX_STAGES];
     int stageCount;
 } metalShaderMap_t;
+
+static metalTexture_t *FindTextureByHandle(qhandle_t handle);
+
+static qboolean s_worldMapAuditActive = qfalse;
+static char s_stageAuditSeen[METAL_STAGE_AUDIT_MAX][MAX_QPATH];
+static int s_stageAuditSeenCount = 0;
+static char s_drawPlanAuditSeen[METAL_DRAW_PLAN_AUDIT_MAX][MAX_QPATH];
+static int s_drawPlanAuditSeenCount = 0;
+static char s_entityStageAuditSeen[METAL_ENTITY_STAGE_AUDIT_MAX][MAX_QPATH];
+static int s_entityStageAuditSeenCount = 0;
+
+static void ResetMetalWorldAudits(void) {
+    s_worldMapAuditActive = qfalse;
+    s_stageAuditSeenCount = 0;
+    s_drawPlanAuditSeenCount = 0;
+    s_entityStageAuditSeenCount = 0;
+    Com_Memset(s_stageAuditSeen, 0, sizeof(s_stageAuditSeen));
+    Com_Memset(s_drawPlanAuditSeen, 0, sizeof(s_drawPlanAuditSeen));
+    Com_Memset(s_entityStageAuditSeen, 0, sizeof(s_entityStageAuditSeen));
+}
+
+static qboolean AuditSeen(char seen[][MAX_QPATH], int *count, int maxCount, const char *key) {
+    int i;
+    if (key == NULL || key[0] == '\0') {
+        return qtrue;
+    }
+    for (i = 0; i < *count; ++i) {
+        if (!Q_stricmp(seen[i], key)) {
+            return qtrue;
+        }
+    }
+    if (*count < maxCount) {
+        Q_strncpyz(seen[*count], key, MAX_QPATH);
+        *count += 1;
+    }
+    return qfalse;
+}
+
+static const char *MetalCullName(int cullMode) {
+    switch (cullMode) {
+        case METAL_SHADER_CULL_DISABLE: return "none";
+        case METAL_SHADER_CULL_FRONT: return "front";
+        case METAL_SHADER_CULL_BACK:
+        default: return "back";
+    }
+}
+
+static const char *MetalRgbGenName(int rgbGen) {
+    switch (rgbGen) {
+        case 1: return "vertex";
+        case 2: return "lightingDiffuse";
+        case 3: return "wave";
+        case 4: return "const";
+        case 7: return "identityLighting";
+        case 0:
+        default: return "identity";
+    }
+}
+
+static const char *MetalTcGenName(int tcGen) {
+    switch (tcGen) {
+        case 1: return "environment";
+        case 2: return "vector";
+        case 0:
+        default: return "base";
+    }
+}
+
+static const char *MetalSrcBlendName(int blendMode) {
+    switch (blendMode) {
+        case 1: return "GL_SRC_ALPHA";
+        case 2: return "GL_SRC_ALPHA";
+        case 3: return "GL_DST_COLOR";
+        case 4: return "GL_ZERO";
+        case 5: return "GL_ONE";
+        case 0:
+        default: return "GL_ONE";
+    }
+}
+
+static const char *MetalDstBlendName(int blendMode) {
+    switch (blendMode) {
+        case 1: return "GL_ONE";
+        case 2: return "GL_ONE_MINUS_SRC_ALPHA";
+        case 3: return "GL_ZERO";
+        case 4: return "GL_ONE_MINUS_SRC_COLOR";
+        case 5: return "GL_ONE";
+        case 0:
+        default: return "GL_ZERO";
+    }
+}
+
+static int MetalPassForBlendMode(int blendMode) {
+    if (blendMode == 5) return 4;
+    if (blendMode == 1) return 3;
+    if (blendMode == 2) return 2;
+    if (blendMode == 3) return 1;
+    return 0;
+}
+
+static qboolean MetalVerboseAuditEnabled(void) {
+    const char *v = getenv("Q3_VERBOSE_AUDIT");
+    return (v != NULL && v[0] == '1');
+}
+
+static void MetalAuditShaderName(const char *name, char *out, size_t outSize) {
+    char *dot;
+    if (out == NULL || outSize == 0) {
+        return;
+    }
+    if (name == NULL) {
+        out[0] = '\0';
+        return;
+    }
+    Q_strncpyz(out, name, outSize);
+    dot = strrchr(out, '.');
+    if (dot == NULL) {
+        return;
+    }
+    if (!Q_stricmp(dot, ".tga") ||
+        !Q_stricmp(dot, ".jpg") ||
+        !Q_stricmp(dot, ".jpeg") ||
+        !Q_stricmp(dot, ".png") ||
+        !Q_stricmp(dot, ".pcx")) {
+        *dot = '\0';
+    }
+}
+
+static void EmitMetalStageAudit(const char *shaderName, const metalShaderMap_t *entry) {
+    int s;
+    if (!s_worldMapAuditActive || shaderName == NULL || entry == NULL || entry->stageCount <= 0) {
+        return;
+    }
+    if (AuditSeen(s_stageAuditSeen, &s_stageAuditSeenCount,
+                  METAL_STAGE_AUDIT_MAX, shaderName)) {
+        return;
+    }
+    for (s = 0; s < entry->stageCount; ++s) {
+        const Q3MetalStage *st = &entry->stages[s];
+        ri.Printf(PRINT_ALL,
+            "[metal-stage-audit] shader=%s stage=%d img=%s lm=%d srcBlend=%s dstBlend=%s rgbGen=%s alphaFunc=%d tcGen=%s tcMods=%d depthW=%d cull=%s\n",
+            shaderName,
+            s,
+            st->mapPath[0] ? st->mapPath : "(none)",
+            st->useLightmap ? 1 : 0,
+            MetalSrcBlendName(st->blendMode),
+            MetalDstBlendName(st->blendMode),
+            MetalRgbGenName(st->rgbGen),
+            st->alphaFunc,
+            MetalTcGenName(st->tcGen),
+            st->tcModCount,
+            st->depthWrite,
+            MetalCullName(entry->cullMode));
+    }
+}
+
+static void EmitMetalDrawPlan(const char *shaderName,
+                              int stageIndex,
+                              const Q3MetalWorldDrawCmd *draw,
+                              const Q3MetalStage *stage,
+                              qhandle_t textureHandle,
+                              qboolean implicitLightmapBase) {
+    char key[MAX_QPATH];
+    const metalTexture_t *tex;
+    int passIndex;
+    qboolean depthWrite;
+    if (!s_worldMapAuditActive || shaderName == NULL || draw == NULL || stage == NULL) {
+        return;
+    }
+    passIndex = MetalPassForBlendMode(stage->blendMode);
+    depthWrite = (stage->blendMode == 0 || stage->depthWrite != 0) ? qtrue : qfalse;
+    Com_sprintf(key, sizeof(key), "%s|%d|%d|%d|%u",
+                shaderName, stageIndex, passIndex,
+                implicitLightmapBase ? 1 : 0,
+                (unsigned)textureHandle);
+    if (AuditSeen(s_drawPlanAuditSeen, &s_drawPlanAuditSeenCount,
+                  METAL_DRAW_PLAN_AUDIT_MAX, key)) {
+        return;
+    }
+    tex = FindTextureByHandle(textureHandle);
+    ri.Printf(PRINT_ALL,
+        "[metal-draw-plan] shader=%s stage=%d pass=%d implicitLightmapBase=%d depthTest=1 depthWrite=%d texture=%s fog=%d cull=%s\n",
+        shaderName,
+        stageIndex,
+        passIndex,
+        implicitLightmapBase ? 1 : 0,
+        depthWrite ? 1 : 0,
+        tex ? tex->name : "(none)",
+        draw->fogIndex == Q3_METAL_NO_FOG ? -1 : (int)draw->fogIndex,
+        MetalCullName(stage->cullMode));
+}
 
 static void CopyColor(float *dst, const float *src) {
     dst[0] = src[0];
@@ -640,7 +834,7 @@ static void AddWorldDrawStage(Q3MetalWorldDrawCmd *draw,
     /* One-shot audit so we can grep '[autosprite-audit]' to see which
      * shaders actually exercise this path on a given map. Bounded to
      * 16 unique handles. */
-    if (src->autospriteMode != 0) {
+    if (src->autospriteMode != 0 && MetalVerboseAuditEnabled()) {
         static uint32_t s_autoSeen[16];
         static int s_autoCount = 0;
         int dup = 0;
@@ -660,7 +854,7 @@ static void AddWorldDrawStage(Q3MetalWorldDrawCmd *draw,
     /* One-shot world tcGen=env audit: print up to 16 unique tcGen-env
      * texture handles so we can correlate chrome/reflective surfaces in
      * captures. Fires only when tcGen==1 (environment). */
-    if (src->tcGen == 1) {
+    if (src->tcGen == 1 && MetalVerboseAuditEnabled()) {
         static uint32_t s_envHandlesSeen[16];
         static int s_envHandlesCount = 0;
         int found = 0;
@@ -736,7 +930,9 @@ static void AddWorldDrawStageSimple(Q3MetalWorldDrawCmd *draw,
 
 static void AddWorldDrawLightmapBaseStage(Q3MetalWorldDrawCmd *draw,
                                           qhandle_t lightmapHandle,
-                                          const metalShaderMap_t *entry) {
+                                          const metalShaderMap_t *entry,
+                                          int blendMode,
+                                          int depthWrite) {
     Q3MetalStage tmp;
     Com_Memset(&tmp, 0, sizeof(tmp));
     if (entry != NULL && entry->stageCount > 0) {
@@ -748,11 +944,11 @@ static void AddWorldDrawLightmapBaseStage(Q3MetalWorldDrawCmd *draw,
         tmp.deformWaveFreq = entry->stages[0].deformWaveFreq;
         tmp.autospriteMode = entry->stages[0].autospriteMode;
     }
-    tmp.blendMode = 0;
+    tmp.blendMode = blendMode;
     tmp.rgbGen = 0;
     tmp.alphaGen = 0;
     tmp.cullMode = entry != NULL ? entry->cullMode : METAL_SHADER_CULL_BACK;
-    tmp.depthWrite = 1;
+    tmp.depthWrite = depthWrite;
     tmp.useLightmap = 1;
     AddWorldDrawStage(draw, lightmapHandle, &tmp);
 }
@@ -1321,6 +1517,50 @@ static qhandle_t RegisterEntityStageTexture(const char *shaderName, int stageInd
     return texture->handle;
 }
 
+static void EmitMetalEntityStageAudit(const char *shaderName, const char *source) {
+    const metalShaderMap_t *entry;
+    char auditName[MAX_QPATH];
+    int s;
+    if (!s_worldMapAuditActive || shaderName == NULL || shaderName[0] == '\0') {
+        return;
+    }
+    entry = ShaderMap_LookupEntry(shaderName);
+    if (entry == NULL || entry->stageCount <= 0) {
+        return;
+    }
+    MetalAuditShaderName(shaderName, auditName, sizeof(auditName));
+    if (AuditSeen(s_entityStageAuditSeen, &s_entityStageAuditSeenCount,
+                  METAL_ENTITY_STAGE_AUDIT_MAX, auditName)) {
+        return;
+    }
+    for (s = 0; s < entry->stageCount; ++s) {
+        const Q3MetalStage *st = &entry->stages[s];
+        ri.Printf(PRINT_ALL,
+            "[metal-entity-stage-audit] shader=%s source=%s stage=%d img=%s lm=%d srcBlend=%s dstBlend=%s rgbGen=%s alphaFunc=%d tcGen=%s tcMods=%d depthW=%d cull=%s\n",
+            auditName,
+            (source != NULL && source[0] != '\0') ? source : "entity",
+            s,
+            st->mapPath[0] ? st->mapPath : "(none)",
+            st->useLightmap ? 1 : 0,
+            MetalSrcBlendName(st->blendMode),
+            MetalDstBlendName(st->blendMode),
+            MetalRgbGenName(st->rgbGen),
+            st->alphaFunc,
+            MetalTcGenName(st->tcGen),
+            st->tcModCount,
+            st->depthWrite,
+            MetalCullName(entry->cullMode));
+    }
+}
+
+static void EmitMetalEntityStageAuditForHandle(qhandle_t textureHandle, const char *source) {
+    const metalTexture_t *tex = FindTextureByHandle(textureHandle);
+    if (tex == NULL) {
+        return;
+    }
+    EmitMetalEntityStageAudit(tex->name, source);
+}
+
 static uint32_t EntityFlagsForTexture(qhandle_t textureHandle, uint32_t flags, qboolean allowFxFallback) {
     const metalTexture_t *tex = FindTextureByHandle(textureHandle);
     if (tex == NULL) return flags;
@@ -1409,6 +1649,7 @@ static void FreeWorldMapData(void) {
 
     /* Parallel BSP tree cleanup — additive, map-scoped. */
     BspFreeWorld();
+    ResetMetalWorldAudits();
 }
 
 static void FreeEntitySceneData(void) {
@@ -3110,6 +3351,7 @@ static qboolean LoadWorldMapData(const char *name) {
     surfaceCount = LittleLong(header->lumps[LUMP_SURFACES].filelen) / (int)sizeof(dsurface_t);
 
     FreeWorldMapData();
+    s_worldMapAuditActive = qtrue;
 
     /* LUMP_FOGS — one dfog_t per fog volume. Resolve each fog's shader
      * into the pre-parsed shader map to recover (r,g,b,distance) from
@@ -3526,25 +3768,55 @@ static qboolean LoadWorldMapData(const char *name) {
                             const metalShaderMap_t *_e = ShaderMap_LookupEntry(shaders[shaderNum].shader);
                             int _s;
                             int _emitted = 0;
-                            if (_e != NULL && _e->hasLightmapStage && hasLightmap) {
-                                uint32_t _dstIdx = drawCursor++;
-                                SetupWorldDraw(&s_world.draws[_dstIdx],
-                                               firstIndexForDraw,
-                                               indexCountForDraw,
-                                               lightmapHandle,
-                                               worldFlags | Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY,
-                                               fogIndex);
-                                AddWorldDrawLightmapBaseStage(&s_world.draws[_dstIdx],
-                                                             lightmapHandle,
-                                                             _e);
-                                _emitted += 1;
-                            }
+                            EmitMetalStageAudit(shaders[shaderNum].shader, _e);
                             if (_e != NULL && _e->stageCount > 0) {
                                 for (_s = 0; _s < _e->stageCount; ++_s) {
                                     const Q3MetalStage *_st = &_e->stages[_s];
+                                    Q3MetalStage _drawStage;
                                     qhandle_t _tex;
                                     uint32_t _dstIdx;
-                                    if (_st->useLightmap) {
+                                    if (_s == 0 && _e->hasLightmapStage && hasLightmap &&
+                                        _e->stages[0].blendMode != 0) {
+                                        Q3MetalStage _lmStage;
+                                        _dstIdx = drawCursor++;
+                                        SetupWorldDraw(&s_world.draws[_dstIdx],
+                                                       firstIndexForDraw,
+                                                       indexCountForDraw,
+                                                       lightmapHandle,
+                                                       worldFlags | ((_emitted == 0)
+                                                           ? Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY : 0u),
+                                                       fogIndex);
+                                        AddWorldDrawLightmapBaseStage(&s_world.draws[_dstIdx],
+                                                                     lightmapHandle,
+                                                                     _e,
+                                                                     0,
+                                                                     1);
+                                        Com_Memset(&_lmStage, 0, sizeof(_lmStage));
+                                        _lmStage.blendMode = 0;
+                                        _lmStage.cullMode = _e->cullMode;
+                                        _lmStage.depthWrite = 1;
+                                        _lmStage.useLightmap = 1;
+                                        EmitMetalDrawPlan(shaders[shaderNum].shader,
+                                                          -1,
+                                                          &s_world.draws[_dstIdx],
+                                                          &_lmStage,
+                                                          lightmapHandle,
+                                                          qtrue);
+                                        _emitted += 1;
+                                    }
+                                    _drawStage = *_st;
+                                    _drawStage.cullMode = _e->cullMode;
+                                    if (_st->animFrameCount > 0) {
+                                        int _idx;
+                                        float _fps = (_st->animFps > 0.0f) ? _st->animFps : 8.0f;
+                                        _idx = (int)((float)cls.realtime * 0.001f * _fps) % _st->animFrameCount;
+                                        if (_idx < 0) _idx = 0;
+                                        if (_st->animTextures[_idx] == 0) {
+                                            ((Q3MetalStage *)_st)->animTextures[_idx] =
+                                                RegisterTexture(_st->animFrames[_idx]);
+                                        }
+                                        _tex = _st->animTextures[_idx];
+                                    } else if (_st->useLightmap) {
                                         _tex = lightmapHandle;
                                     } else if (_s == 0 && skyOverrideTexture != 0) {
                                         _tex = skyOverrideTexture;
@@ -3566,8 +3838,41 @@ static qboolean LoadWorldMapData(const char *name) {
                                             s_pendingAnimSlot * Q3_MAX_STAGES + _s;
                                         s_world.animatedDrawCount += 1;
                                     }
-                                    AddWorldDrawStage(&s_world.draws[_dstIdx], _tex, _st);
+                                    AddWorldDrawStage(&s_world.draws[_dstIdx], _tex, &_drawStage);
+                                    EmitMetalDrawPlan(shaders[shaderNum].shader,
+                                                      _s,
+                                                      &s_world.draws[_dstIdx],
+                                                      &_drawStage,
+                                                      _tex,
+                                                      qfalse);
                                     _emitted += 1;
+                                    if (_s == 0 && _e->hasLightmapStage && hasLightmap &&
+                                        _e->stages[0].blendMode == 0) {
+                                        Q3MetalStage _lmStage;
+                                        _dstIdx = drawCursor++;
+                                        SetupWorldDraw(&s_world.draws[_dstIdx],
+                                                       firstIndexForDraw,
+                                                       indexCountForDraw,
+                                                       lightmapHandle,
+                                                       worldFlags,
+                                                       fogIndex);
+                                        AddWorldDrawLightmapBaseStage(&s_world.draws[_dstIdx],
+                                                                     lightmapHandle,
+                                                                     _e,
+                                                                     3,
+                                                                     0);
+                                        Com_Memset(&_lmStage, 0, sizeof(_lmStage));
+                                        _lmStage.blendMode = 3;
+                                        _lmStage.cullMode = _e->cullMode;
+                                        _lmStage.useLightmap = 1;
+                                        EmitMetalDrawPlan(shaders[shaderNum].shader,
+                                                          -1,
+                                                          &s_world.draws[_dstIdx],
+                                                          &_lmStage,
+                                                          lightmapHandle,
+                                                          qtrue);
+                                        _emitted += 1;
+                                    }
                                 }
                             }
                             if (_e == NULL || _e->stageCount == 0 || _emitted == 0) {
@@ -3587,6 +3892,18 @@ static qboolean LoadWorldMapData(const char *name) {
                                         s_world.animatedDrawCount += 1;
                                     }
                                     AddWorldDrawStageSimple(&s_world.draws[_dstIdx], _tex, 0, 0, 0);
+                                    if (s_world.draws[_dstIdx].stageCount > 0) {
+                                        Q3MetalStage _simple;
+                                        Com_Memset(&_simple, 0, sizeof(_simple));
+                                        _simple.cullMode = METAL_SHADER_CULL_BACK;
+                                        _simple.depthWrite = 1;
+                                        EmitMetalDrawPlan(shaders[shaderNum].shader,
+                                                          0,
+                                                          &s_world.draws[_dstIdx],
+                                                          &_simple,
+                                                          _tex,
+                                                          qfalse);
+                                    }
                                 }
                             }
                         }
@@ -3623,25 +3940,55 @@ static qboolean LoadWorldMapData(const char *name) {
                 const metalShaderMap_t *_e = ShaderMap_LookupEntry(shaders[shaderNum].shader);
                             int _s;
                             int _emitted = 0;
-                            if (_e != NULL && _e->hasLightmapStage && hasLightmap) {
-                                uint32_t _dstIdx = drawCursor++;
-                                SetupWorldDraw(&s_world.draws[_dstIdx],
-                                               firstIndexForDraw,
-                                               indexCountForDraw,
-                                               lightmapHandle,
-                                               worldFlags | Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY,
-                                               fogIndex);
-                                AddWorldDrawLightmapBaseStage(&s_world.draws[_dstIdx],
-                                                             lightmapHandle,
-                                                             _e);
-                                _emitted += 1;
-                            }
+                            EmitMetalStageAudit(shaders[shaderNum].shader, _e);
                             if (_e != NULL && _e->stageCount > 0) {
                                 for (_s = 0; _s < _e->stageCount; ++_s) {
                         const Q3MetalStage *_st = &_e->stages[_s];
+                        Q3MetalStage _drawStage;
                         qhandle_t _tex;
                         uint32_t _dstIdx;
-                        if (_st->useLightmap) {
+                        if (_s == 0 && _e->hasLightmapStage && hasLightmap &&
+                            _e->stages[0].blendMode != 0) {
+                            Q3MetalStage _lmStage;
+                            _dstIdx = drawCursor++;
+                            SetupWorldDraw(&s_world.draws[_dstIdx],
+                                           firstIndexForDraw,
+                                           indexCountForDraw,
+                                           lightmapHandle,
+                                           worldFlags | ((_emitted == 0)
+                                               ? Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY : 0u),
+                                           fogIndex);
+                            AddWorldDrawLightmapBaseStage(&s_world.draws[_dstIdx],
+                                                         lightmapHandle,
+                                                         _e,
+                                                         0,
+                                                         1);
+                            Com_Memset(&_lmStage, 0, sizeof(_lmStage));
+                            _lmStage.blendMode = 0;
+                            _lmStage.cullMode = _e->cullMode;
+                            _lmStage.depthWrite = 1;
+                            _lmStage.useLightmap = 1;
+                            EmitMetalDrawPlan(shaders[shaderNum].shader,
+                                              -1,
+                                              &s_world.draws[_dstIdx],
+                                              &_lmStage,
+                                              lightmapHandle,
+                                              qtrue);
+                            _emitted += 1;
+                        }
+                        _drawStage = *_st;
+                        _drawStage.cullMode = _e->cullMode;
+                        if (_st->animFrameCount > 0) {
+                            int _idx;
+                            float _fps = (_st->animFps > 0.0f) ? _st->animFps : 8.0f;
+                            _idx = (int)((float)cls.realtime * 0.001f * _fps) % _st->animFrameCount;
+                            if (_idx < 0) _idx = 0;
+                            if (_st->animTextures[_idx] == 0) {
+                                ((Q3MetalStage *)_st)->animTextures[_idx] =
+                                    RegisterTexture(_st->animFrames[_idx]);
+                            }
+                            _tex = _st->animTextures[_idx];
+                        } else if (_st->useLightmap) {
                             _tex = lightmapHandle;
                         } else if (_s == 0 && skyOverrideTexture != 0) {
                             _tex = skyOverrideTexture;
@@ -3663,8 +4010,41 @@ static qboolean LoadWorldMapData(const char *name) {
                                 s_pendingAnimSlot * Q3_MAX_STAGES + _s;
                             s_world.animatedDrawCount += 1;
                         }
-                        AddWorldDrawStage(&s_world.draws[_dstIdx], _tex, _st);
+                        AddWorldDrawStage(&s_world.draws[_dstIdx], _tex, &_drawStage);
+                        EmitMetalDrawPlan(shaders[shaderNum].shader,
+                                          _s,
+                                          &s_world.draws[_dstIdx],
+                                          &_drawStage,
+                                          _tex,
+                                          qfalse);
                         _emitted += 1;
+                        if (_s == 0 && _e->hasLightmapStage && hasLightmap &&
+                            _e->stages[0].blendMode == 0) {
+                            Q3MetalStage _lmStage;
+                            _dstIdx = drawCursor++;
+                            SetupWorldDraw(&s_world.draws[_dstIdx],
+                                           firstIndexForDraw,
+                                           indexCountForDraw,
+                                           lightmapHandle,
+                                           worldFlags,
+                                           fogIndex);
+                            AddWorldDrawLightmapBaseStage(&s_world.draws[_dstIdx],
+                                                         lightmapHandle,
+                                                         _e,
+                                                         3,
+                                                         0);
+                            Com_Memset(&_lmStage, 0, sizeof(_lmStage));
+                            _lmStage.blendMode = 3;
+                            _lmStage.cullMode = _e->cullMode;
+                            _lmStage.useLightmap = 1;
+                            EmitMetalDrawPlan(shaders[shaderNum].shader,
+                                              -1,
+                                              &s_world.draws[_dstIdx],
+                                              &_lmStage,
+                                              lightmapHandle,
+                                              qtrue);
+                            _emitted += 1;
+                        }
                     }
                 }
                 if (_e == NULL || _e->stageCount == 0 || _emitted == 0) {
@@ -3684,6 +4064,18 @@ static qboolean LoadWorldMapData(const char *name) {
                             s_world.animatedDrawCount += 1;
                         }
                         AddWorldDrawStageSimple(&s_world.draws[_dstIdx], _tex, 0, 0, 0);
+                        if (s_world.draws[_dstIdx].stageCount > 0) {
+                            Q3MetalStage _simple;
+                            Com_Memset(&_simple, 0, sizeof(_simple));
+                            _simple.cullMode = METAL_SHADER_CULL_BACK;
+                            _simple.depthWrite = 1;
+                            EmitMetalDrawPlan(shaders[shaderNum].shader,
+                                              0,
+                                              &s_world.draws[_dstIdx],
+                                              &_simple,
+                                              _tex,
+                                              qfalse);
+                        }
                     }
                 }
             }
@@ -4454,21 +4846,8 @@ static void ParseShaderText(const char *text) {
                  * appended a stale cur as a duplicate/bogus stage. */
                 if (depth == 1) {
                     inStage = qfalse;
-                    /* Lightmap-only stages (`map $lightmap`) carry an
-                     * empty mapPath by design — useLightmap=1 is the
-                     * only signal they exist. Without this third clause
-                     * we silently drop the leading lightmap stage of
-                     * `textures/sfx/teslacoil`, `textures/sfx/demonlt-
-                     * blackfinal`, and every other shader whose first
-                     * stage is a pure `$lightmap` modulator, leaving
-                     * surfaces full-bright instead of lit. ioq3
-                     * preserves these in `FinishShader()` and only
-                     * collapses them later via `CollapseMultitexture`
-                     * — we don't collapse, but we still must keep the
-                     * stage so the renderer can apply the lightmap. */
                     if (stagesCount < Q3_MAX_STAGES &&
-                        (cur.mapPath[0] != '\0' || cur.animFrameCount > 0
-                         || cur.useLightmap)) {
+                        (cur.mapPath[0] != '\0' || cur.animFrameCount > 0)) {
                         stages[stagesCount++] = cur;
                     }
                 }
@@ -4927,11 +5306,32 @@ static void ParseShaderText(const char *text) {
                             cur.tcModCount += 1;
                         }
                     } else if (token[0] && !Q_stricmp(token, "transform")) {
-                        COM_ParseExt(&p, qfalse);
-                        COM_ParseExt(&p, qfalse);
-                        COM_ParseExt(&p, qfalse);
-                        COM_ParseExt(&p, qfalse);
-                        COM_ParseExt(&p, qfalse);
+                        char m00[MAX_TOKEN_CHARS], m01[MAX_TOKEN_CHARS];
+                        char m10[MAX_TOKEN_CHARS], m11[MAX_TOKEN_CHARS];
+                        char t0[MAX_TOKEN_CHARS], t1[MAX_TOKEN_CHARS];
+                        Q_strncpyz(m00, COM_ParseExt(&p, qfalse), sizeof(m00));
+                        Q_strncpyz(m01, COM_ParseExt(&p, qfalse), sizeof(m01));
+                        Q_strncpyz(m10, COM_ParseExt(&p, qfalse), sizeof(m10));
+                        Q_strncpyz(m11, COM_ParseExt(&p, qfalse), sizeof(m11));
+                        Q_strncpyz(t0, COM_ParseExt(&p, qfalse), sizeof(t0));
+                        Q_strncpyz(t1, COM_ParseExt(&p, qfalse), sizeof(t1));
+                        if (m00[0] && m01[0] && m10[0] && m11[0] &&
+                            cur.tcModCount < Q3_MAX_TCMODS) {
+                            cur.tcMods[cur.tcModCount].type = 7;
+                            cur.tcMods[cur.tcModCount].params[0] = (float)atof(m00);
+                            cur.tcMods[cur.tcModCount].params[1] = (float)atof(m01);
+                            cur.tcMods[cur.tcModCount].params[2] = (float)atof(m10);
+                            cur.tcMods[cur.tcModCount].params[3] = (float)atof(m11);
+                            cur.tcModCount += 1;
+                        }
+                        if (t0[0] && t1[0] && cur.tcModCount < Q3_MAX_TCMODS) {
+                            cur.tcMods[cur.tcModCount].type = 8;
+                            cur.tcMods[cur.tcModCount].params[0] = (float)atof(t0);
+                            cur.tcMods[cur.tcModCount].params[1] = (float)atof(t1);
+                            cur.tcMods[cur.tcModCount].params[2] = 0.0f;
+                            cur.tcMods[cur.tcModCount].params[3] = 0.0f;
+                            cur.tcModCount += 1;
+                        }
                     }
                 }
             }
@@ -5008,7 +5408,7 @@ static void ParseShaderText(const char *text) {
                  * line includes mapPath/lm/blend/alpha/rgb/tcMods/depthW
                  * so future "is this shader parsed correctly?" questions
                  * can be answered from a log grep instead of a code dive. */
-                if (last->stageCount >= 2) {
+                if (s_worldMapAuditActive && last->stageCount >= 2) {
                     static char s_msaSeen[256][MAX_QPATH];
                     static int s_msaCount = 0;
                     int j, dup = 0;
@@ -5045,9 +5445,10 @@ static void ParseShaderText(const char *text) {
                  * are falling back to white. Substring match tolerates
                  * stray trailing chars (\r, \t, spaces) that would break
                  * an exact Q_stricmp comparison. */
-                if (strstr(shaderName, "border11c") ||
-                    strstr(shaderName, "xmetalfloor_wall_5b") ||
-                    strstr(shaderName, "killblock_i4b")) {
+                if (s_worldMapAuditActive &&
+                    (strstr(shaderName, "border11c") ||
+                     strstr(shaderName, "xmetalfloor_wall_5b") ||
+                     strstr(shaderName, "killblock_i4b"))) {
                     int ds;
                     ri.Printf(PRINT_ALL,
                         "[SHADER-DBG] registered '%s' stageCount=%d mapPath='%s' cull=%d portal=%d\n",
@@ -6085,6 +6486,9 @@ static void RE_RenderScene(const refdef_t *fd) {
                             (qhandle_t)sceneEntity->entity.customShader);
                         qboolean isAdditiveLike = qfalse;
                         qboolean hasExplicitATest = qfalse;
+                        EmitMetalEntityStageAuditForHandle(
+                            (qhandle_t)sceneEntity->entity.customShader,
+                            "sprite");
                         if (tex != NULL) {
                             if (tex->blendMode == 1) {
                                 spriteFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
@@ -6116,7 +6520,7 @@ static void RE_RenderScene(const refdef_t *fd) {
                         if (isAdditiveLike && !hasExplicitATest) {
                             spriteFlags |= Q3_METAL_ENTITY_DRAWFLAG_ATEST_GT0;
                         }
-                        if (MetalRenderAuditEnabled()) {
+                        if (MetalVerboseAuditEnabled() && MetalRenderAuditEnabled()) {
                             static int s_spriteAuditCount = 0;
                             if (s_spriteAuditCount < 64) {
                                 ri.Printf(PRINT_DEVELOPER,
@@ -6249,6 +6653,9 @@ static void RE_RenderScene(const refdef_t *fd) {
                     s_entityDraws[entityDrawCursor].flags =
                         Q3_METAL_ENTITY_DRAWFLAG_NOCULL |
                         Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                    EmitMetalEntityStageAuditForHandle(
+                        (qhandle_t)sceneEntity->entity.customShader,
+                        "lightning");
                     SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity);
                     entityDrawCursor += 1;
                     continue;
@@ -6333,6 +6740,9 @@ static void RE_RenderScene(const refdef_t *fd) {
                     s_entityDraws[entityDrawCursor].flags =
                         Q3_METAL_ENTITY_DRAWFLAG_NOCULL |
                         Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                    EmitMetalEntityStageAuditForHandle(
+                        (qhandle_t)sceneEntity->entity.customShader,
+                        "rail_core");
                     SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity);
                     entityDrawCursor += 1;
                     continue;
@@ -6414,6 +6824,7 @@ static void RE_RenderScene(const refdef_t *fd) {
                     s_entityDraws[entityDrawCursor].flags =
                         Q3_METAL_ENTITY_DRAWFLAG_NOCULL |
                         Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                    EmitMetalEntityStageAuditForHandle(texHandle, "beam");
                     SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity);
                     entityDrawCursor += 1;
                     continue;
@@ -6533,6 +6944,9 @@ static void RE_RenderScene(const refdef_t *fd) {
                     s_entityDraws[entityDrawCursor].flags =
                         Q3_METAL_ENTITY_DRAWFLAG_NOCULL |
                         Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                    EmitMetalEntityStageAuditForHandle(
+                        (qhandle_t)sceneEntity->entity.customShader,
+                        "rail_rings");
                     SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity);
                     entityDrawCursor += 1;
                     continue;
@@ -6647,7 +7061,12 @@ static void RE_RenderScene(const refdef_t *fd) {
                     baseDrawFlags = drawFlags;
                     {
                         drawFlags = EntityFlagsForTexture(textureHandle, drawFlags, qtrue);
-                        if (MetalRenderAuditEnabled()) {
+                        if (shaderNameForStages != NULL) {
+                            EmitMetalEntityStageAudit(shaderNameForStages, "model");
+                        } else {
+                            EmitMetalEntityStageAuditForHandle(textureHandle, "model");
+                        }
+                        if (MetalVerboseAuditEnabled() && MetalRenderAuditEnabled()) {
                             const metalTexture_t *tex = FindTextureByHandle(textureHandle);
                             static int s_entityBlendLog = 0;
                             if (s_entityBlendLog < 5 && tex != NULL) {
@@ -6855,6 +7274,7 @@ static void RE_RenderScene(const refdef_t *fd) {
                         /* Unresolved blend = upstream default shader = OPAQUE
                          * (GL_ONE/GL_ZERO). No flag set → opaque pipeline. */
                     }
+                    EmitMetalEntityStageAuditForHandle((qhandle_t)poly->shader, "poly");
 
                     /* One-shot audit: log the first time each distinct
                      * poly shader routes through here. Grep the capture
@@ -6868,7 +7288,7 @@ static void RE_RenderScene(const refdef_t *fd) {
                         for (int i = 0; i < s_auditCount; i++) {
                             if (s_auditSeen[i] == poly->shader) { isNew = qfalse; break; }
                         }
-                        if (isNew && s_auditCount < 64) {
+                        if (MetalVerboseAuditEnabled() && isNew && s_auditCount < 64) {
                             s_auditSeen[s_auditCount++] = poly->shader;
                             ri.Printf(PRINT_ALL,
                                 "[decal-audit] shader=%d name='%s' blendMode=%d rgbGen=%d polyFlags=0x%X\n",

@@ -298,6 +298,12 @@ struct MetalView: UIViewRepresentable {
                 case 6: /* stretch: (base, amp, phase, freq) straight through */
                     types[i] = 6
                     packed[i] = SIMD4(pp.0, pp.1, pp.2, pp.3)
+                case 7: /* transform matrix: m00 m01 m10 m11 */
+                    types[i] = 7
+                    packed[i] = SIMD4(pp.0, pp.1, pp.2, pp.3)
+                case 8: /* transform translate: s t */
+                    types[i] = 8
+                    packed[i] = SIMD4(pp.0, pp.1, 0, 0)
                 default:
                     /* outside scope — leave type=0 so applyTcMod no-ops */
                     break
@@ -699,6 +705,13 @@ struct MetalView: UIViewRepresentable {
                 if (abs(eval) < 0.0001) eval = 1.0;
                 float p = 1.0 / eval;
                 return (uv - 0.5) * p + 0.5;
+            } else if (type == 7) {
+                return float2(
+                    uv.x * params.x + uv.y * params.z,
+                    uv.x * params.y + uv.y * params.w
+                );
+            } else if (type == 8) {
+                return uv + params.xy;
             }
             return uv;
         }
@@ -1430,16 +1443,23 @@ struct MetalView: UIViewRepresentable {
         func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
             // Persistent drawable lock to engine's logical render
             // resolution so the AVI muxer captures pixels at the
-            // declared r_customwidth/r_customheight (1280×960 iPad /
-            // 960×444 iPhone). SwiftUI's natural layout produces
+            // declared r_customwidth/r_customheight. SwiftUI's natural layout produces
             // ~592×720 on iPad which is wrong aspect (5:6 vs 4:3) and
             // invalidates every Vulkan parity diff. Re-apply on every
             // resize event — when we set view.drawableSize=target, the
             // delegate fires again with size==target and the early
             // return below handles it (no recursion).
             let isPad = (UIDevice.current.userInterfaceIdiom == .pad)
-            let target = CGSize(width: isPad ? 1280 : 960,
+            let profile = ProcessInfo.processInfo.environment["Q3_MATCH_PROFILE"]
+            let target: CGSize
+            if profile == "native_ipad_25" {
+                let nativeSize = UIScreen.main.nativeBounds.size
+                target = CGSize(width: max(nativeSize.width, nativeSize.height),
+                                height: min(nativeSize.width, nativeSize.height))
+            } else {
+                target = CGSize(width: isPad ? 1280 : 960,
                                 height: isPad ? 960 : 444)
+            }
             print("[Metal] Drawable size: \(size) (target \(target))")
             if size.width.isFinite && size.height.isFinite
                 && size.width > 0 && size.height > 0
@@ -2235,7 +2255,13 @@ struct MetalView: UIViewRepresentable {
             // and blows the stack.
             view.autoResizeDrawable = false
             view.contentScaleFactor = 1.0
-            view.drawableSize = CGSize(width: 960, height: 444)
+            if ProcessInfo.processInfo.environment["Q3_MATCH_PROFILE"] == "native_ipad_25" {
+                let nativeSize = UIScreen.main.nativeBounds.size
+                view.drawableSize = CGSize(width: max(nativeSize.width, nativeSize.height),
+                                           height: min(nativeSize.width, nativeSize.height))
+            } else {
+                view.drawableSize = CGSize(width: 960, height: 444)
+            }
             // Allow CPU readback of the drawable texture for the `video`
             // command capture path (RE_TakeVideoFrame). MTKView defaults
             // to framebufferOnly = true which blocks getBytes().
