@@ -35,6 +35,7 @@ If a visual issue exists, fix the generic mismatch against ioq3/Kenny behavior.
 #include "../client/client.h"
 #include "../renderercommon/tr_public.h"
 #include "../renderer/tr_common.h"
+#include "../clean_frontend/q3_stage.h"
 #include "metal_renderer_shared.h"
 
 #define LL(x) x=LittleLong(x)
@@ -291,12 +292,25 @@ static uint32_t s_entityRejectedModelThisFrame;
 #define METAL_STAGE_AUDIT_MAX 1024
 #define METAL_DRAW_PLAN_AUDIT_MAX 2048
 #define METAL_ENTITY_STAGE_AUDIT_MAX 1024
+#define Q3_GL_ZERO 0x0000u
+#define Q3_GL_ONE 0x0001u
+#define Q3_GL_SRC_COLOR 0x0300u
+#define Q3_GL_ONE_MINUS_SRC_COLOR 0x0301u
+#define Q3_GL_SRC_ALPHA 0x0302u
+#define Q3_GL_ONE_MINUS_SRC_ALPHA 0x0303u
+#define Q3_GL_DST_ALPHA 0x0304u
+#define Q3_GL_ONE_MINUS_DST_ALPHA 0x0305u
+#define Q3_GL_DST_COLOR 0x0306u
+#define Q3_GL_ONE_MINUS_DST_COLOR 0x0307u
 /* Q3_MAX_TCMODS and Q3TcMod live in metal_renderer_shared.h so both the
  * stub and Swift bindings share the exact same tcMod chain layout. */
 
 typedef struct {
     char mapPath[MAX_QPATH];
     int blendMode;
+    uint32_t rawSrcBlend;
+    uint32_t rawDstBlend;
+    uint32_t depthFunc;
     int rgbGen;
     int alphaGen;
     int alphaFunc;
@@ -500,12 +514,43 @@ static const char *MetalDstBlendName(int blendMode) {
     }
 }
 
+static const char *MetalRawBlendName(uint32_t factor) {
+    switch (factor) {
+        case Q3_GL_ZERO: return "GL_ZERO";
+        case Q3_GL_ONE: return "GL_ONE";
+        case Q3_GL_SRC_COLOR: return "GL_SRC_COLOR";
+        case Q3_GL_ONE_MINUS_SRC_COLOR: return "GL_ONE_MINUS_SRC_COLOR";
+        case Q3_GL_SRC_ALPHA: return "GL_SRC_ALPHA";
+        case Q3_GL_ONE_MINUS_SRC_ALPHA: return "GL_ONE_MINUS_SRC_ALPHA";
+        case Q3_GL_DST_ALPHA: return "GL_DST_ALPHA";
+        case Q3_GL_ONE_MINUS_DST_ALPHA: return "GL_ONE_MINUS_DST_ALPHA";
+        case Q3_GL_DST_COLOR: return "GL_DST_COLOR";
+        case Q3_GL_ONE_MINUS_DST_COLOR: return "GL_ONE_MINUS_DST_COLOR";
+        default: return "GL_ONE";
+    }
+}
+
 static int MetalPassForBlendMode(int blendMode) {
     if (blendMode == 5) return 4;
     if (blendMode == 1) return 3;
     if (blendMode == 2) return 2;
     if (blendMode == 3) return 1;
     return 0;
+}
+
+static void RawBlendFromMode(int blendMode, uint32_t *src, uint32_t *dst) {
+    uint32_t s = Q3_GL_ONE;
+    uint32_t d = Q3_GL_ZERO;
+    switch (blendMode) {
+        case 1: s = Q3_GL_SRC_ALPHA; d = Q3_GL_ONE; break;
+        case 2: s = Q3_GL_SRC_ALPHA; d = Q3_GL_ONE_MINUS_SRC_ALPHA; break;
+        case 3: s = Q3_GL_DST_COLOR; d = Q3_GL_ZERO; break;
+        case 4: s = Q3_GL_ZERO; d = Q3_GL_ONE_MINUS_SRC_COLOR; break;
+        case 5: s = Q3_GL_ONE; d = Q3_GL_ONE; break;
+        default: break;
+    }
+    if (src != NULL) *src = s;
+    if (dst != NULL) *dst = d;
 }
 
 static qboolean MetalVerboseAuditEnabled(void) {
@@ -553,8 +598,8 @@ static void EmitMetalStageAudit(const char *shaderName, const metalShaderMap_t *
             s,
             st->mapPath[0] ? st->mapPath : "(none)",
             st->useLightmap ? 1 : 0,
-            MetalSrcBlendName(st->blendMode),
-            MetalDstBlendName(st->blendMode),
+            MetalRawBlendName(st->rawSrcBlend),
+            MetalRawBlendName(st->rawDstBlend),
             MetalRgbGenName(st->rgbGen),
             st->alphaFunc,
             MetalTcGenName(st->tcGen),
@@ -846,6 +891,9 @@ static void AddWorldDrawStage(Q3MetalWorldDrawCmd *draw,
     stage = &draw->stages[draw->stageCount++];
     stage->textureHandle = (uint32_t)textureHandle;
     stage->blendMode = (uint32_t)src->blendMode;
+    stage->srcBlend = src->rawSrcBlend;
+    stage->dstBlend = src->rawDstBlend;
+    stage->depthFunc = src->depthFunc;
     stage->tcGen = (uint32_t)src->tcGen;
     /* tcGen vector basis (only meaningful when tcGen == 2). Always copy
      * regardless of mode so stale values don't leak into a later
@@ -976,6 +1024,7 @@ static void AddWorldDrawStageSimple(Q3MetalWorldDrawCmd *draw,
     Q3MetalStage tmp;
     Com_Memset(&tmp, 0, sizeof(tmp));
     tmp.blendMode = blendMode;
+    RawBlendFromMode(blendMode, &tmp.rawSrcBlend, &tmp.rawDstBlend);
     tmp.rgbGen = rgbGen;
     tmp.alphaFunc = alphaFunc;
     tmp.cullMode = METAL_SHADER_CULL_BACK;
@@ -1007,6 +1056,7 @@ static void AddWorldDrawLightmapBaseStage(Q3MetalWorldDrawCmd *draw,
         tmp.autospriteMode = entry->stages[0].autospriteMode;
     }
     tmp.blendMode = blendMode;
+    RawBlendFromMode(blendMode, &tmp.rawSrcBlend, &tmp.rawDstBlend);
     tmp.rgbGen = 0;
     tmp.alphaGen = 0;
     tmp.cullMode = entry != NULL ? entry->cullMode : METAL_SHADER_CULL_BACK;
@@ -3970,6 +4020,7 @@ static qboolean LoadWorldMapData(const char *name) {
                                 _dstIdx = drawCursor++;
                                 Com_Memset(&_fogStage, 0, sizeof(_fogStage));
                                 _fogStage.blendMode = 2;
+                                RawBlendFromMode(_fogStage.blendMode, &_fogStage.rawSrcBlend, &_fogStage.rawDstBlend);
                                 _fogStage.cullMode = _e->cullMode;
                                 _fogStage.depthWrite = 0;
                                 SetupWorldDraw(&s_world.draws[_dstIdx],
@@ -4118,6 +4169,7 @@ static qboolean LoadWorldMapData(const char *name) {
                                 _dstIdx = drawCursor++;
                                 Com_Memset(&_fogStage, 0, sizeof(_fogStage));
                                 _fogStage.blendMode = 2;
+                                RawBlendFromMode(_fogStage.blendMode, &_fogStage.rawSrcBlend, &_fogStage.rawDstBlend);
                                 _fogStage.cullMode = _e->cullMode;
                                 _fogStage.depthWrite = 0;
                                 SetupWorldDraw(&s_world.draws[_dstIdx],
@@ -4690,6 +4742,71 @@ static int BlendModeFromTokens(const char *src, const char *dst) {
     return 3;
 }
 
+static uint32_t GLBlendFactorFromToken(const char *token) {
+    if (token == NULL || token[0] == '\0') return Q3_GL_ONE;
+    if (!Q_stricmp(token, "GL_ZERO")) return Q3_GL_ZERO;
+    if (!Q_stricmp(token, "GL_ONE")) return Q3_GL_ONE;
+    if (!Q_stricmp(token, "GL_SRC_COLOR")) return Q3_GL_SRC_COLOR;
+    if (!Q_stricmp(token, "GL_ONE_MINUS_SRC_COLOR")) return Q3_GL_ONE_MINUS_SRC_COLOR;
+    if (!Q_stricmp(token, "GL_SRC_ALPHA")) return Q3_GL_SRC_ALPHA;
+    if (!Q_stricmp(token, "GL_ONE_MINUS_SRC_ALPHA")) return Q3_GL_ONE_MINUS_SRC_ALPHA;
+    if (!Q_stricmp(token, "GL_DST_ALPHA")) return Q3_GL_DST_ALPHA;
+    if (!Q_stricmp(token, "GL_ONE_MINUS_DST_ALPHA")) return Q3_GL_ONE_MINUS_DST_ALPHA;
+    if (!Q_stricmp(token, "GL_DST_COLOR")) return Q3_GL_DST_COLOR;
+    if (!Q_stricmp(token, "GL_ONE_MINUS_DST_COLOR")) return Q3_GL_ONE_MINUS_DST_COLOR;
+    if (!Q_stricmp(token, "add")) return Q3_GL_ONE;
+    if (!Q_stricmp(token, "blend")) return Q3_GL_SRC_ALPHA;
+    if (!Q_stricmp(token, "filter")) return Q3_GL_DST_COLOR;
+    return Q3_GL_ONE;
+}
+
+static uint32_t GLBlendDstFromTokens(const char *src, const char *dst) {
+    if (src != NULL && !Q_stricmp(src, "add")) return Q3_GL_ONE;
+    if (src != NULL && !Q_stricmp(src, "blend")) return Q3_GL_ONE_MINUS_SRC_ALPHA;
+    if (src != NULL && !Q_stricmp(src, "filter")) return Q3_GL_ZERO;
+    return GLBlendFactorFromToken(dst);
+}
+
+static Q3cTcGen CleanTcGenFromMetal(int tcGen, int useLightmap) {
+    if (useLightmap) return Q3C_TCGEN_LIGHTMAP;
+    if (tcGen == 1) return Q3C_TCGEN_ENVIRONMENT_MAPPED;
+    if (tcGen == 2) return Q3C_TCGEN_VECTOR;
+    return Q3C_TCGEN_BASE;
+}
+
+static void ApplyCleanStageToMetalStage(const Q3cShaderStage *clean,
+                                        Q3MetalStage *stage) {
+    int i;
+    if (clean == NULL || stage == NULL) return;
+    if (clean->image[0]) Q_strncpyz(stage->mapPath, clean->image, sizeof(stage->mapPath));
+    stage->useLightmap = clean->isLightmap ? 1 : 0;
+    if (clean->animFrameCount > 0) {
+        int count = (int)clean->animFrameCount;
+        if (count > METAL_ANIMMAP_MAX_FRAMES) count = METAL_ANIMMAP_MAX_FRAMES;
+        stage->animFrameCount = count;
+        stage->animFps = clean->animFrequency;
+        for (i = 0; i < count; ++i) {
+            Q_strncpyz(stage->animFrames[i], clean->animFrames[i], MAX_QPATH);
+        }
+        Q_strncpyz(stage->mapPath, stage->animFrames[0], sizeof(stage->mapPath));
+    }
+    stage->tcGen = (clean->tcGen == Q3C_TCGEN_ENVIRONMENT_MAPPED) ? 1 :
+                   (clean->tcGen == Q3C_TCGEN_VECTOR) ? 2 : 0;
+    stage->tcGenVec0[0] = clean->tcGenVectors[0][0];
+    stage->tcGenVec0[1] = clean->tcGenVectors[0][1];
+    stage->tcGenVec0[2] = clean->tcGenVectors[0][2];
+    stage->tcGenVec0[3] = 0.0f;
+    stage->tcGenVec1[0] = clean->tcGenVectors[1][0];
+    stage->tcGenVec1[1] = clean->tcGenVectors[1][1];
+    stage->tcGenVec1[2] = clean->tcGenVectors[1][2];
+    stage->tcGenVec1[3] = 0.0f;
+    stage->rawSrcBlend = clean->srcBlend ? clean->srcBlend : Q3_GL_ONE;
+    stage->rawDstBlend = clean->dstBlend;
+    stage->depthFunc = clean->depthFunc;
+    stage->depthWrite = clean->depthWrite ? 1 : stage->depthWrite;
+    stage->alphaFunc = (int)clean->alphaFunc;
+}
+
 static int ShaderMap_GetAlphaFunc(const char *name) {
     const metalShaderMap_t *entry;
     if (name == NULL || name[0] == '\0') return 0;
@@ -4935,6 +5052,8 @@ static void ParseShaderText(const char *text) {
         float fogDistance;
         Q3MetalStage cur;
         Q3MetalStage stages[Q3_MAX_STAGES];
+        Q3cShaderGraph cleanGraph;
+        Q3cShaderStage *cleanStage;
         int stagesCount;
 
         token = COM_ParseExt(&p, qtrue);
@@ -4974,8 +5093,14 @@ static void ParseShaderText(const char *text) {
         fogColor[0] = fogColor[1] = fogColor[2] = 0.0f;
         fogDistance = 0.0f;
         Com_Memset(&cur, 0, sizeof(cur));
+        cur.rawSrcBlend = Q3_GL_ONE;
+        cur.rawDstBlend = Q3_GL_ZERO;
         cur.alphaConst = 1.0f;
         Com_Memset(stages, 0, sizeof(stages));
+        Q3cShaderGraph_Clear(&cleanGraph);
+        Q_strncpyz(cleanGraph.name, shaderName, sizeof(cleanGraph.name));
+        cleanGraph.cullType = (uint32_t)cullMode;
+        cleanStage = NULL;
         stagesCount = 0;
 
         while (depth > 0) {
@@ -4987,10 +5112,13 @@ static void ParseShaderText(const char *text) {
                 if (depth == 2) {
                     inStage = qtrue;
                     Com_Memset(&cur, 0, sizeof(cur));
+                    cur.rawSrcBlend = Q3_GL_ONE;
+                    cur.rawDstBlend = Q3_GL_ZERO;
                     /* alphaConst defaults to 1.0 so a stage that sets
                      * alphaGen const without a numeric argument stays
                      * opaque instead of going fully transparent. */
                     cur.alphaConst = 1.0f;
+                    cleanStage = Q3cShaderGraph_AddStage(&cleanGraph);
                 }
                 continue;
             }
@@ -5003,8 +5131,10 @@ static void ParseShaderText(const char *text) {
                     inStage = qfalse;
                     if (stagesCount < Q3_MAX_STAGES &&
                         (cur.mapPath[0] != '\0' || cur.animFrameCount > 0 || cur.useLightmap)) {
+                        ApplyCleanStageToMetalStage(cleanStage, &cur);
                         stages[stagesCount++] = cur;
                     }
+                    cleanStage = NULL;
                 }
                 continue;
             }
@@ -5047,6 +5177,7 @@ static void ParseShaderText(const char *text) {
                     } else {
                         cullMode = METAL_SHADER_CULL_BACK;
                     }
+                    cleanGraph.cullType = (uint32_t)cullMode;
                 } else if (!Q_stricmp(token, "deformVertexes") ||
                            !Q_stricmp(token, "deformvertexes")) {
                     /* Top-level shader directive — applies to all
@@ -5083,6 +5214,13 @@ static void ParseShaderText(const char *text) {
                         deformWaveAmp   = (float)atof(ampBuf);
                         deformWavePhase = (float)atof(phaseBuf);
                         deformWaveFreq  = (float)atof(freqBuf);
+                        {
+                            float args[8] = {
+                                deformWaveDiv, (float)fn, deformWaveBase, deformWaveAmp,
+                                deformWavePhase, deformWaveFreq, 0.0f, 0.0f
+                            };
+                            Q3cShaderGraph_AddDeform(&cleanGraph, Q3C_DEFORM_WAVE, args, 8);
+                        }
                     } else if (!Q_stricmp(modeBuf, "bulge")) {
                         /* `bulge <bulgewidth> <bulgeheight> <bulgespeed>` — 3 args. Skip. */
                         (void)COM_ParseExt(&p, qfalse);
@@ -5116,6 +5254,14 @@ static void ParseShaderText(const char *text) {
                             deformMoveAmp = ampBuf[0] ? (float)atof(ampBuf) : 0.0f;
                             deformMovePhase = phaseBuf[0] ? (float)atof(phaseBuf) : 0.0f;
                             deformMoveFreq = freqBuf[0] ? (float)atof(freqBuf) : 0.0f;
+                            {
+                                float args[8] = {
+                                    deformMoveVector[0], deformMoveVector[1], deformMoveVector[2],
+                                    (float)fn, deformMoveBase, deformMoveAmp,
+                                    deformMovePhase, deformMoveFreq
+                                };
+                                Q3cShaderGraph_AddDeform(&cleanGraph, Q3C_DEFORM_MOVE, args, 8);
+                            }
                         }
                     } else if (!Q_stricmp(modeBuf, "normal")) {
                         /* `normal <amplitude> <frequency>` — 2 args. Skip. */
@@ -5124,10 +5270,12 @@ static void ParseShaderText(const char *text) {
                     } else if (!Q_stricmp(modeBuf, "autosprite")) {
                         /* 0 args. Tag the shader; transform deferred. */
                         topAutospriteMode = 1;
+                        Q3cShaderGraph_AddDeform(&cleanGraph, Q3C_DEFORM_AUTOSPRITE, NULL, 0);
                     } else if (!Q_stricmp(modeBuf, "autoSprite2") ||
                                !Q_stricmp(modeBuf, "autosprite2")) {
                         /* 0 args. Tag the shader; transform deferred. */
                         topAutospriteMode = 2;
+                        Q3cShaderGraph_AddDeform(&cleanGraph, Q3C_DEFORM_AUTOSPRITE2, NULL, 0);
                     }
                     /* `projectionShadow` / `text0..text7` take 0 args. */
                 } else if (!Q_stricmp(token, "q3map_flare")) {
@@ -5155,6 +5303,10 @@ static void ParseShaderText(const char *text) {
                         (void)COM_ParseExt(&p, qfalse);
                     }
                     gotFog = qtrue;
+                    cleanGraph.fogColor[0] = fogColor[0];
+                    cleanGraph.fogColor[1] = fogColor[1];
+                    cleanGraph.fogColor[2] = fogColor[2];
+                    cleanGraph.fogDistance = fogDistance;
                 }
                 continue;
             }
@@ -5165,25 +5317,48 @@ static void ParseShaderText(const char *text) {
                     if (token[0]) {
                         if (!Q_stricmp(token, "$lightmap")) {
                             cur.useLightmap = 1;
+                            if (cleanStage != NULL) {
+                                cleanStage->isLightmap = 1;
+                                cleanStage->tcGen = Q3C_TCGEN_LIGHTMAP;
+                            }
                             gotLightmapStage = qtrue;
                         } else if (cur.mapPath[0] == '\0') {
                             Q_strncpyz(cur.mapPath, token, sizeof(cur.mapPath));
+                            if (cleanStage != NULL) {
+                                Q_strncpyz(cleanStage->image, token, sizeof(cleanStage->image));
+                            }
                         }
                     }
                 } else if (!Q_stricmp(token, "animMap") || !Q_stricmp(token, "animmap")) {
                     token = COM_ParseExt(&p, qfalse);
                     cur.animFps = (float)atof(token);
                     cur.animFrameCount = 0;
+                    if (cleanStage != NULL) {
+                        cleanStage->animFrequency = cur.animFps;
+                        cleanStage->animFrameCount = 0;
+                    }
                     while (1) {
                         token = COM_ParseExt(&p, qfalse);
                         if (!token[0]) break;
                         if (token[0] == '$') continue;
                         if (cur.animFrameCount >= METAL_ANIMMAP_MAX_FRAMES) continue;
                         Q_strncpyz(cur.animFrames[cur.animFrameCount], token, MAX_QPATH);
+                        if (cleanStage != NULL &&
+                            cleanStage->animFrameCount < Q3C_MAX_ANIM_FRAMES) {
+                            Q_strncpyz(cleanStage->animFrames[cleanStage->animFrameCount],
+                                       token,
+                                       sizeof(cleanStage->animFrames[0]));
+                            cleanStage->animFrameCount += 1;
+                        }
                         cur.animFrameCount += 1;
                     }
                     if (cur.animFrameCount > 0) {
                         Q_strncpyz(cur.mapPath, cur.animFrames[0], sizeof(cur.mapPath));
+                        if (cleanStage != NULL) {
+                            Q_strncpyz(cleanStage->image,
+                                       cleanStage->animFrames[0],
+                                       sizeof(cleanStage->image));
+                        }
                         gotAnim = qtrue;
                         if (animFrameCount == 0) {
                             int af;
@@ -5206,6 +5381,9 @@ static void ParseShaderText(const char *text) {
                     if (modeBuf[0] && (!Q_stricmp(modeBuf, "environment") ||
                                        !Q_stricmp(modeBuf, "env"))) {
                         cur.tcGen = 1;
+                        if (cleanStage != NULL) {
+                            cleanStage->tcGen = Q3C_TCGEN_ENVIRONMENT_MAPPED;
+                        }
                         tcGenEnv = qtrue;
                     } else if (modeBuf[0] && !Q_stricmp(modeBuf, "vector")) {
                         /* Syntax: tcGen vector ( x y z ) ( x y z )
@@ -5244,6 +5422,15 @@ static void ParseShaderText(const char *text) {
                             cur.tcGenVec1[2] = vecs[1][2];
                             cur.tcGenVec1[3] = 0.0f;
                             cur.tcGen = 2;
+                            if (cleanStage != NULL) {
+                                cleanStage->tcGen = Q3C_TCGEN_VECTOR;
+                                cleanStage->tcGenVectors[0][0] = vecs[0][0];
+                                cleanStage->tcGenVectors[0][1] = vecs[0][1];
+                                cleanStage->tcGenVectors[0][2] = vecs[0][2];
+                                cleanStage->tcGenVectors[1][0] = vecs[1][0];
+                                cleanStage->tcGenVectors[1][1] = vecs[1][1];
+                                cleanStage->tcGenVectors[1][2] = vecs[1][2];
+                            }
                             /* One-shot per-shader audit so we know which
                              * surfaces actually exercise the vector path
                              * in a capture run. Bounded to 16 unique
@@ -5284,12 +5471,23 @@ static void ParseShaderText(const char *text) {
                     const char *dst = COM_ParseExt(&p, qfalse);
                     if (srcCopy[0]) {
                         cur.blendMode = BlendModeFromTokens(srcCopy, dst);
+                        cur.rawSrcBlend = GLBlendFactorFromToken(srcCopy);
+                        cur.rawDstBlend = GLBlendDstFromTokens(srcCopy, dst);
+                        cur.depthWrite = 0;
+                        if (cleanStage != NULL) {
+                            cleanStage->srcBlend = cur.rawSrcBlend;
+                            cleanStage->dstBlend = cur.rawDstBlend;
+                            cleanStage->depthWrite = 0;
+                        }
                     }
                 } else if (!Q_stricmp(token, "alphaFunc") || !Q_stricmp(token, "alphafunc")) {
                     token = COM_ParseExt(&p, qfalse);
                     if (!Q_stricmp(token, "GT0")) cur.alphaFunc = 1;
                     else if (!Q_stricmp(token, "GE128")) cur.alphaFunc = 2;
                     else if (!Q_stricmp(token, "LT128")) cur.alphaFunc = 3;
+                    if (cleanStage != NULL) {
+                        cleanStage->alphaFunc = (uint32_t)cur.alphaFunc;
+                    }
                 } else if (!Q_stricmp(token, "depthWrite") || !Q_stricmp(token, "depthwrite")) {
                     /* Explicit Q3 keyword that overrides the default
                      * depth-mask-off behavior for blended stages. ioq3
@@ -5299,6 +5497,9 @@ static void ParseShaderText(const char *text) {
                      * flag to pick a depth-write-ON depth-stencil state
                      * even on filter/alpha/additive passes. No arg. */
                     cur.depthWrite = 1;
+                    if (cleanStage != NULL) {
+                        cleanStage->depthWrite = 1;
+                    }
                 } else if (!Q_stricmp(token, "rgbGen") || !Q_stricmp(token, "rgbgen")) {
                     token = COM_ParseExt(&p, qfalse);
                     if (!Q_stricmp(token, "vertex")) cur.rgbGen = 1;
@@ -5342,6 +5543,13 @@ static void ParseShaderText(const char *text) {
                         if (ampBuf[0]) cur.rgbWaveAmp = (float)atof(ampBuf);
                         if (phaseBuf[0]) cur.rgbWavePhase = (float)atof(phaseBuf);
                         if (freqBuf[0]) cur.rgbWaveFreq = (float)atof(freqBuf);
+                        if (cleanStage != NULL) {
+                            cleanStage->rgbGen = (uint32_t)cur.rgbGen;
+                            cleanStage->rgbWave[0] = cur.rgbWaveBase;
+                            cleanStage->rgbWave[1] = cur.rgbWaveAmp;
+                            cleanStage->rgbWave[2] = cur.rgbWavePhase;
+                            cleanStage->rgbWave[3] = cur.rgbWaveFreq;
+                        }
                     } else if (!Q_stricmp(token, "const")) {
                         /* rgbGen const ( r g b ). Copy r/g/b to locals so
                          * the tokens survive subsequent COM_ParseExt calls. */
@@ -5355,6 +5563,9 @@ static void ParseShaderText(const char *text) {
                         cur.rgbConstColor[0] = rBuf[0] ? (float)atof(rBuf) : 1.0f;
                         cur.rgbConstColor[1] = gBuf[0] ? (float)atof(gBuf) : 1.0f;
                         cur.rgbConstColor[2] = bBuf[0] ? (float)atof(bBuf) : 1.0f;
+                    }
+                    if (cleanStage != NULL) {
+                        cleanStage->rgbGen = (uint32_t)cur.rgbGen;
                     }
                     /* exactVertex / exactvertex / identity / vertex /
                      * lightingDiffuse / oneMinusVertex / oneMinusEntity /
@@ -5401,12 +5612,22 @@ static void ParseShaderText(const char *text) {
                         if (ampBuf[0]) cur.alphaWaveAmp = (float)atof(ampBuf);
                         if (phaseBuf[0]) cur.alphaWavePhase = (float)atof(phaseBuf);
                         if (freqBuf[0]) cur.alphaWaveFreq = (float)atof(freqBuf);
+                        if (cleanStage != NULL) {
+                            cleanStage->alphaGen = (uint32_t)cur.alphaGen;
+                            cleanStage->alphaWave[0] = cur.alphaWaveBase;
+                            cleanStage->alphaWave[1] = cur.alphaWaveAmp;
+                            cleanStage->alphaWave[2] = cur.alphaWavePhase;
+                            cleanStage->alphaWave[3] = cur.alphaWaveFreq;
+                        }
                     } else if (!Q_stricmp(token, "const")) {
                         /* alphaGen const <value>: fixed alpha channel. */
                         const char *vTok = COM_ParseExt(&p, qfalse);
                         cur.alphaConst = (vTok && vTok[0]) ? (float)atof(vTok) : 1.0f;
                     } else if (!Q_stricmp(token, "portal")) {
                         (void)COM_ParseExt(&p, qfalse);
+                    }
+                    if (cleanStage != NULL) {
+                        cleanStage->alphaGen = (uint32_t)cur.alphaGen;
                     }
                 } else if (!Q_stricmp(token, "tcMod") || !Q_stricmp(token, "tcmod")) {
                     token = COM_ParseExt(&p, qfalse);
@@ -5421,6 +5642,13 @@ static void ParseShaderText(const char *text) {
                             cur.tcMods[cur.tcModCount].params[1] = (float)atof(tBuf);
                             cur.tcMods[cur.tcModCount].params[2] = 0.0f;
                             cur.tcMods[cur.tcModCount].params[3] = 0.0f;
+                            if (cleanStage != NULL) {
+                                float args[2] = {
+                                    cur.tcMods[cur.tcModCount].params[0],
+                                    cur.tcMods[cur.tcModCount].params[1]
+                                };
+                                Q3cShaderStage_AddTcMod(cleanStage, Q3C_TCMOD_SCROLL, args, 2);
+                            }
                             cur.tcModCount += 1;
                         }
                     } else if (token[0] && !Q_stricmp(token, "scale")) {
@@ -5433,6 +5661,13 @@ static void ParseShaderText(const char *text) {
                             cur.tcMods[cur.tcModCount].params[1] = (float)atof(tBuf);
                             cur.tcMods[cur.tcModCount].params[2] = 0.0f;
                             cur.tcMods[cur.tcModCount].params[3] = 0.0f;
+                            if (cleanStage != NULL) {
+                                float args[2] = {
+                                    cur.tcMods[cur.tcModCount].params[0],
+                                    cur.tcMods[cur.tcModCount].params[1]
+                                };
+                                Q3cShaderStage_AddTcMod(cleanStage, Q3C_TCMOD_SCALE, args, 2);
+                            }
                             cur.tcModCount += 1;
                         }
                     } else if (token[0] && !Q_stricmp(token, "turb")) {
@@ -5449,6 +5684,15 @@ static void ParseShaderText(const char *text) {
                             cur.tcMods[cur.tcModCount].params[1] = (float)atof(freqBuf);
                             cur.tcMods[cur.tcModCount].params[2] = (float)atof(phaseBuf);
                             cur.tcMods[cur.tcModCount].params[3] = 0.0f;
+                            if (cleanStage != NULL) {
+                                float args[4] = {
+                                    (float)atof(baseBuf),
+                                    cur.tcMods[cur.tcModCount].params[0],
+                                    cur.tcMods[cur.tcModCount].params[2],
+                                    cur.tcMods[cur.tcModCount].params[1]
+                                };
+                                Q3cShaderStage_AddTcMod(cleanStage, Q3C_TCMOD_TURB, args, 4);
+                            }
                             cur.tcModCount += 1;
                         }
                     } else if (token[0] && !Q_stricmp(token, "rotate")) {
@@ -5459,6 +5703,10 @@ static void ParseShaderText(const char *text) {
                             cur.tcMods[cur.tcModCount].params[1] = 0.0f;
                             cur.tcMods[cur.tcModCount].params[2] = 0.0f;
                             cur.tcMods[cur.tcModCount].params[3] = 0.0f;
+                            if (cleanStage != NULL) {
+                                float args[1] = { cur.tcMods[cur.tcModCount].params[0] };
+                                Q3cShaderStage_AddTcMod(cleanStage, Q3C_TCMOD_ROTATE, args, 1);
+                            }
                             cur.tcModCount += 1;
                         }
                     } else if (token[0] && !Q_stricmp(token, "stretch")) {
@@ -5484,6 +5732,16 @@ static void ParseShaderText(const char *text) {
                             cur.tcMods[cur.tcModCount].params[1] = (float)atof(ampBuf);
                             cur.tcMods[cur.tcModCount].params[2] = (float)atof(phaseBuf);
                             cur.tcMods[cur.tcModCount].params[3] = (float)atof(freqBuf);
+                            if (cleanStage != NULL) {
+                                float args[5] = {
+                                    0.0f,
+                                    cur.tcMods[cur.tcModCount].params[0],
+                                    cur.tcMods[cur.tcModCount].params[1],
+                                    cur.tcMods[cur.tcModCount].params[2],
+                                    cur.tcMods[cur.tcModCount].params[3]
+                                };
+                                Q3cShaderStage_AddTcMod(cleanStage, Q3C_TCMOD_STRETCH, args, 5);
+                            }
                             cur.tcModCount += 1;
                         }
                     } else if (token[0] && !Q_stricmp(token, "transform")) {
@@ -5503,6 +5761,17 @@ static void ParseShaderText(const char *text) {
                             cur.tcMods[cur.tcModCount].params[1] = (float)atof(m01);
                             cur.tcMods[cur.tcModCount].params[2] = (float)atof(m10);
                             cur.tcMods[cur.tcModCount].params[3] = (float)atof(m11);
+                            if (cleanStage != NULL) {
+                                float args[6] = {
+                                    cur.tcMods[cur.tcModCount].params[0],
+                                    cur.tcMods[cur.tcModCount].params[1],
+                                    cur.tcMods[cur.tcModCount].params[2],
+                                    cur.tcMods[cur.tcModCount].params[3],
+                                    t0[0] ? (float)atof(t0) : 0.0f,
+                                    t1[0] ? (float)atof(t1) : 0.0f
+                                };
+                                Q3cShaderStage_AddTcMod(cleanStage, Q3C_TCMOD_TRANSFORM, args, 6);
+                            }
                             cur.tcModCount += 1;
                         }
                         if (t0[0] && t1[0] && cur.tcModCount < Q3_MAX_TCMODS) {

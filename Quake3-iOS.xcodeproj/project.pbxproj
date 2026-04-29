@@ -55,6 +55,7 @@
 		37686A17B777FC941F37F2DE /* cl_ui.c in Sources */ = {isa = PBXBuildFile; fileRef = 64509FD02DEB921A7979F036 /* cl_ui.c */; };
 		39CB50402A4E9476686DFDE2 /* metal_renderer_stub.c in Sources */ = {isa = PBXBuildFile; fileRef = A829066F48EC957F7F46B575 /* metal_renderer_stub.c */; };
 		39FFE03E1A2F39065362304D /* l_script.c in Sources */ = {isa = PBXBuildFile; fileRef = 2BAEBF1BD00157496D23138E /* l_script.c */; };
+		3A01C0DE0000000000000001 /* q3_stage.c in Sources */ = {isa = PBXBuildFile; fileRef = 3A01C0DE0000000000000003 /* q3_stage.c */; };
 		3DAFCE140E9A740F2CFCA6B1 /* huffman_static.c in Sources */ = {isa = PBXBuildFile; fileRef = 65F2F2635EB76FCEE400DCF9 /* huffman_static.c */; };
 		3DD3766ED5C734AA6A78FC0A /* block.c in Sources */ = {isa = PBXBuildFile; fileRef = 3CA6EFCE1472E38EE44115A7 /* block.c */; };
 		41D5A79FF6D76CEA942BC424 /* cg_effects.c in Sources */ = {isa = PBXBuildFile; fileRef = 3687CEC782967F86B248E896 /* cg_effects.c */; settings = {COMPILER_FLAGS = "-DCGAME_NATIVE=1 -Wno-strict-prototypes -Wno-pointer-sign"; }; };
@@ -62,6 +63,7 @@
 		43058DF8C993EA9EB9F33FAA /* cmd.c in Sources */ = {isa = PBXBuildFile; fileRef = FA68CE331D7394E76B180E13 /* cmd.c */; };
 		443D5ED629C877A6EAA59AC6 /* snd_adpcm.c in Sources */ = {isa = PBXBuildFile; fileRef = 7D5CBEF0BCB79DCEDAF57E19 /* snd_adpcm.c */; };
 		4665DA1B2C281DE4C038DB06 /* MetalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 88E516AF1355E11FE7A7FD28 /* MetalView.swift */; };
+		4665DA1B2C281DE4C038DB07 /* Q3MetalStateMap.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A01C0DE0000000000000005 /* Q3MetalStateMap.swift */; };
 		4681157CF5CDEC093DABC017 /* l_struct.c in Sources */ = {isa = PBXBuildFile; fileRef = 37A7AD7D116A551C8FFF36B2 /* l_struct.c */; };
 		468F4B7B4A648E3D09C85120 /* sv_game.c in Sources */ = {isa = PBXBuildFile; fileRef = 467F925E8F727F04638A9BF5 /* sv_game.c */; };
 		46BA05CE058B5BDDA643DB58 /* cg_playerstate.c in Sources */ = {isa = PBXBuildFile; fileRef = 90E4E7DC3B39D84E1A5D24B2 /* cg_playerstate.c */; settings = {COMPILER_FLAGS = "-DCGAME_NATIVE=1 -Wno-strict-prototypes -Wno-pointer-sign"; }; };
@@ -298,6 +300,9 @@
 		3FDA683D37C52CD981976290 /* be_aas_main.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = be_aas_main.c; sourceTree = "<group>"; };
 		403070B14A8CBF864A3CC165 /* cg_main.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = cg_main.c; sourceTree = "<group>"; };
 		4100A27C781C7AB90E9F7DC8 /* mdct.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = mdct.h; sourceTree = "<group>"; };
+		3A01C0DE0000000000000003 /* q3_stage.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = q3_stage.c; sourceTree = "<group>"; };
+		3A01C0DE0000000000000004 /* q3_stage.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = q3_stage.h; sourceTree = "<group>"; };
+		3A01C0DE0000000000000005 /* Q3MetalStateMap.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Q3MetalStateMap.swift; sourceTree = "<group>"; };
 		44B6D5C1E0E90613355CEB09 /* jpeglib.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = jpeglib.h; sourceTree = "<group>"; };
 		45311376687BBBC1B284279A /* cm_patch.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = cm_patch.c; sourceTree = "<group>"; };
 		45A92960FE2D42C45BE88E48 /* bitrate.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = bitrate.h; sourceTree = "<group>"; };
@@ -665,6 +670,15 @@
 			path = lib;
 			sourceTree = "<group>";
 		};
+		3A01C0DE0000000000000002 /* clean_frontend */ = {
+			isa = PBXGroup;
+			children = (
+				3A01C0DE0000000000000003 /* q3_stage.c */,
+				3A01C0DE0000000000000004 /* q3_stage.h */,
+			);
+			path = clean_frontend;
+			sourceTree = "<group>";
+		};
 		41F3AC3A3D57721807BC54D7 /* uncoupled */ = {
 			isa = PBXGroup;
 			children = (
@@ -901,6 +915,7 @@
 				8D3035D05932C4DB81A3D80A /* botlib */,
 				64560CA4FF0420EB56D28155 /* cgame */,
 				8E5D52D7FF86A22338A21155 /* client */,
+				3A01C0DE0000000000000002 /* clean_frontend */,
 				A4AF12E807C1DD875E55B2D4 /* game */,
 				EE506E26A002102936D9288B /* ios */,
 				200067CEEC3BC251DE013968 /* libjpeg */,
@@ -1058,6 +1073,7 @@
 				821B19B90747068CAC27A35B /* Assets.xcassets */,
 				2C8B120A0EBCD9CEE983C412 /* LaunchMenuView.swift */,
 				88E516AF1355E11FE7A7FD28 /* MetalView.swift */,
+				3A01C0DE0000000000000005 /* Q3MetalStateMap.swift */,
 				12703A83024DC702F9413C41 /* Quake3_iOSApp.swift */,
 				6AF21139679F9E7FC929A172 /* Quake3-iOS-Bridging-Header.h */,
 			);
@@ -1138,6 +1154,7 @@
 			files = (
 				13E1EBA63D1082D3878C8049 /* LaunchMenuView.swift in Sources */,
 				4665DA1B2C281DE4C038DB06 /* MetalView.swift in Sources */,
+				4665DA1B2C281DE4C038DB07 /* Q3MetalStateMap.swift in Sources */,
 				FAE1E11980EB55CB99AC1EFC /* Quake3_iOSApp.swift in Sources */,
 				D38C90BB2B1D4064FE9E7C4C /* analysis.c in Sources */,
 				36E64738B68D9C670599B04A /* be_aas_bspq3.c in Sources */,
@@ -1281,6 +1298,7 @@
 				2FCA20DA19A0C9809553CD7F /* md5.c in Sources */,
 				0F15366889727F3B0F941332 /* mdct.c in Sources */,
 				39CB50402A4E9476686DFDE2 /* metal_renderer_stub.c in Sources */,
+				3A01C0DE0000000000000001 /* q3_stage.c in Sources */,
 				99F9976A1626D46EA7332C7E /* msg.c in Sources */,
 				D1F5B010A1A96058C8DAD196 /* net_chan.c in Sources */,
 				78718236CEC13C5556B92B1C /* net_ip.c in Sources */,

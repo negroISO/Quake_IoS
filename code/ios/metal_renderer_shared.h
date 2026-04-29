@@ -75,6 +75,9 @@ typedef struct {
 typedef struct {
     uint32_t textureHandle;
     uint32_t blendMode;   /* 0=opaque,1=add,2=alpha,3=filter */
+    uint32_t srcBlend;    /* Raw GL blend factor from q3_stage. */
+    uint32_t dstBlend;    /* Raw GL blend factor from q3_stage. */
+    uint32_t depthFunc;   /* 0=lessEqual, 1=equal */
     uint32_t tcGen;       /* 0=base, 1=environment, 2=vector */
     Q3TcMod tcMods[Q3_MAX_TCMODS];
     uint32_t tcModCount;

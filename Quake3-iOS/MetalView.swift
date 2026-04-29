@@ -169,12 +169,42 @@ struct MetalView: UIViewRepresentable {
         private var skyStagesLogged: Bool = false
 
         private static func metalCullMode(for stageCullMode: UInt32) -> MTLCullMode {
-            // Matches C side METAL_SHADER_CULL_*: 0=disable, 1=back, 2=front.
-            switch stageCullMode {
-            case 0: return .none
-            case 2: return .front
-            default: return .back
+            Q3MetalStateMap.cullMode(stageCullMode)
+        }
+
+        private static func blendClass(src: UInt32, dst: UInt32) -> Int {
+            switch (src, dst) {
+            case (Q3GLBlendFactor.one.rawValue, Q3GLBlendFactor.one.rawValue):
+                return 5
+            case (Q3GLBlendFactor.srcAlpha.rawValue, Q3GLBlendFactor.one.rawValue):
+                return 1
+            case (Q3GLBlendFactor.srcAlpha.rawValue, Q3GLBlendFactor.oneMinusSrcAlpha.rawValue):
+                return 2
+            case (Q3GLBlendFactor.dstColor.rawValue, Q3GLBlendFactor.zero.rawValue),
+                 (Q3GLBlendFactor.zero.rawValue, Q3GLBlendFactor.srcColor.rawValue):
+                return 3
+            case (Q3GLBlendFactor.zero.rawValue, Q3GLBlendFactor.oneMinusSrcColor.rawValue):
+                return 4
+            default:
+                return 0
             }
+        }
+
+        private static func worldBlendClass(for stage: Q3MetalWorldStage) -> Int {
+            Self.blendClass(src: stage.srcBlend, dst: stage.dstBlend)
+        }
+
+        private static func configureBlend(_ attachment: MTLRenderPipelineColorAttachmentDescriptor,
+                                           src: UInt32,
+                                           dst: UInt32) {
+            attachment.isBlendingEnabled = true
+            attachment.writeMask = .all
+            attachment.rgbBlendOperation = .add
+            attachment.alphaBlendOperation = .add
+            attachment.sourceRGBBlendFactor = Q3MetalStateMap.blendFactor(src)
+            attachment.sourceAlphaBlendFactor = Q3MetalStateMap.blendFactor(src)
+            attachment.destinationRGBBlendFactor = Q3MetalStateMap.blendFactor(dst)
+            attachment.destinationAlphaBlendFactor = Q3MetalStateMap.blendFactor(dst)
         }
 
         private static func alphaTestThreshold(for alphaFunc: UInt32) -> Float {
@@ -1153,14 +1183,6 @@ struct MetalView: UIViewRepresentable {
             if (!additiveStage) {
                 lit = applyDlights(lit, in.worldPos, dlights);
             }
-            if (drawUniforms.fogColorDistance.w > 0.0) {
-                float f = q3FogFactor(in.worldPos, uniforms, drawUniforms);
-                if (additiveStage) {
-                    lit *= (1.0 - f);
-                } else {
-                    lit = mix(lit, drawUniforms.fogColorDistance.xyz, f);
-                }
-            }
             return float4(lit, texel.a * va);
         }
 
@@ -1711,7 +1733,7 @@ struct MetalView: UIViewRepresentable {
                                     continue
                                 }
                                 /* Strict blend split — NEVER merge 1 and 5. */
-                                let skyBlend = Int(stage.blendMode)
+                                let skyBlend = Self.worldBlendClass(for: stage)
                                 let isAdditiveAlpha = skyBlend == 1
                                 let isAdditiveFull  = skyBlend == 5
                                 let pipeline: MTLRenderPipelineState
@@ -1736,7 +1758,7 @@ struct MetalView: UIViewRepresentable {
                                     tcModCount: skyChain.count,
                                     rgbGen: Float(stage.rgbGen),
                                     alphaGen: Float(stage.alphaGen),
-                                    blendMode: Float(stage.blendMode),
+                                    blendMode: Float(skyBlend),
                                     timeSeconds: timeSeconds,
                                     rgbWaveFunc: stage.rgbWaveFunc,
                                     alphaWaveFunc: stage.alphaWaveFunc,
@@ -1868,7 +1890,7 @@ struct MetalView: UIViewRepresentable {
                         }
                         for stageIndex in 0..<stageCount {
                             let stage = Self.worldStage(draw, stageIndex)
-                            let blendMode = Int(stage.blendMode)
+                            let blendMode = Self.worldBlendClass(for: stage)
                             let drawPass = (blendMode == 5) ? 4
                                          : (blendMode == 1) ? 3
                                          : (blendMode == 2) ? 2
@@ -1931,7 +1953,7 @@ struct MetalView: UIViewRepresentable {
                                 tcModCount: chain.count,
                                 rgbGen: Float(stage.rgbGen),
                                 alphaGen: Float(stage.alphaGen),
-                                blendMode: Float(stage.blendMode),
+                                blendMode: Float(blendMode),
                                 timeSeconds: timeSeconds,
                                 rgbWaveFunc: stage.rgbWaveFunc,
                                 alphaWaveFunc: stage.alphaWaveFunc,
@@ -2503,13 +2525,9 @@ struct MetalView: UIViewRepresentable {
             }
 
             let worldFilterPipelineDescriptor = worldPipelineDescriptor.copy() as! MTLRenderPipelineDescriptor
-            worldFilterPipelineDescriptor.colorAttachments[0].isBlendingEnabled = true
-            worldFilterPipelineDescriptor.colorAttachments[0].rgbBlendOperation = .add
-            worldFilterPipelineDescriptor.colorAttachments[0].alphaBlendOperation = .add
-            worldFilterPipelineDescriptor.colorAttachments[0].sourceRGBBlendFactor = .destinationColor
-            worldFilterPipelineDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
-            worldFilterPipelineDescriptor.colorAttachments[0].destinationRGBBlendFactor = .zero
-            worldFilterPipelineDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .zero
+            Self.configureBlend(worldFilterPipelineDescriptor.colorAttachments[0],
+                                src: Q3GLBlendFactor.dstColor.rawValue,
+                                dst: Q3GLBlendFactor.zero.rawValue)
             do {
                 worldFilterPipelineState = try device.makeRenderPipelineState(descriptor: worldFilterPipelineDescriptor)
             } catch {
@@ -2517,13 +2535,9 @@ struct MetalView: UIViewRepresentable {
             }
 
             let worldAlphaPipelineDescriptor = worldPipelineDescriptor.copy() as! MTLRenderPipelineDescriptor
-            worldAlphaPipelineDescriptor.colorAttachments[0].isBlendingEnabled = true
-            worldAlphaPipelineDescriptor.colorAttachments[0].rgbBlendOperation = .add
-            worldAlphaPipelineDescriptor.colorAttachments[0].alphaBlendOperation = .add
-            worldAlphaPipelineDescriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
-            worldAlphaPipelineDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
-            worldAlphaPipelineDescriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
-            worldAlphaPipelineDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            Self.configureBlend(worldAlphaPipelineDescriptor.colorAttachments[0],
+                                src: Q3GLBlendFactor.srcAlpha.rawValue,
+                                dst: Q3GLBlendFactor.oneMinusSrcAlpha.rawValue)
             do {
                 worldAlphaPipelineState = try device.makeRenderPipelineState(descriptor: worldAlphaPipelineDescriptor)
             } catch {
@@ -2532,14 +2546,9 @@ struct MetalView: UIViewRepresentable {
 
             /* Alpha-modulated additive (blendMode=1): GL_SRC_ALPHA/GL_ONE. */
             let worldAdditivePipelineDescriptor = worldPipelineDescriptor.copy() as! MTLRenderPipelineDescriptor
-            worldAdditivePipelineDescriptor.colorAttachments[0].isBlendingEnabled = true
-            worldAdditivePipelineDescriptor.colorAttachments[0].writeMask = .all
-            worldAdditivePipelineDescriptor.colorAttachments[0].rgbBlendOperation = .add
-            worldAdditivePipelineDescriptor.colorAttachments[0].alphaBlendOperation = .add
-            worldAdditivePipelineDescriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
-            worldAdditivePipelineDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
-            worldAdditivePipelineDescriptor.colorAttachments[0].destinationRGBBlendFactor = .one
-            worldAdditivePipelineDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .one
+            Self.configureBlend(worldAdditivePipelineDescriptor.colorAttachments[0],
+                                src: Q3GLBlendFactor.srcAlpha.rawValue,
+                                dst: Q3GLBlendFactor.one.rawValue)
             do {
                 worldAdditivePipelineState = try device.makeRenderPipelineState(descriptor: worldAdditivePipelineDescriptor)
             } catch {
@@ -2549,14 +2558,9 @@ struct MetalView: UIViewRepresentable {
             /* Full-intensity additive (blendMode=5): GL_ONE/GL_ONE. Distinct
              * pipeline from worldAdditivePipelineState per strict spec. */
             let worldAdditiveFullDescriptor = worldPipelineDescriptor.copy() as! MTLRenderPipelineDescriptor
-            worldAdditiveFullDescriptor.colorAttachments[0].isBlendingEnabled = true
-            worldAdditiveFullDescriptor.colorAttachments[0].writeMask = .all
-            worldAdditiveFullDescriptor.colorAttachments[0].rgbBlendOperation = .add
-            worldAdditiveFullDescriptor.colorAttachments[0].alphaBlendOperation = .add
-            worldAdditiveFullDescriptor.colorAttachments[0].sourceRGBBlendFactor = .one
-            worldAdditiveFullDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
-            worldAdditiveFullDescriptor.colorAttachments[0].destinationRGBBlendFactor = .one
-            worldAdditiveFullDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .one
+            Self.configureBlend(worldAdditiveFullDescriptor.colorAttachments[0],
+                                src: Q3GLBlendFactor.one.rawValue,
+                                dst: Q3GLBlendFactor.one.rawValue)
             do {
                 worldAdditiveFullPipelineState = try device.makeRenderPipelineState(descriptor: worldAdditiveFullDescriptor)
             } catch {
@@ -2581,14 +2585,9 @@ struct MetalView: UIViewRepresentable {
             /* Full-intensity additive sky stage (blendMode=5, GL_ONE/GL_ONE).
              * Stock Q3 cloud overlays (killsky_2 over killsky_1). */
             let skyAdditiveDescriptor = skyPipelineDescriptor.copy() as! MTLRenderPipelineDescriptor
-            skyAdditiveDescriptor.colorAttachments[0].isBlendingEnabled = true
-            skyAdditiveDescriptor.colorAttachments[0].writeMask = .all
-            skyAdditiveDescriptor.colorAttachments[0].rgbBlendOperation = .add
-            skyAdditiveDescriptor.colorAttachments[0].alphaBlendOperation = .add
-            skyAdditiveDescriptor.colorAttachments[0].sourceRGBBlendFactor = .one
-            skyAdditiveDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
-            skyAdditiveDescriptor.colorAttachments[0].destinationRGBBlendFactor = .one
-            skyAdditiveDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .one
+            Self.configureBlend(skyAdditiveDescriptor.colorAttachments[0],
+                                src: Q3GLBlendFactor.one.rawValue,
+                                dst: Q3GLBlendFactor.one.rawValue)
             do {
                 skyAdditivePipelineState = try device.makeRenderPipelineState(descriptor: skyAdditiveDescriptor)
             } catch {
@@ -2598,14 +2597,9 @@ struct MetalView: UIViewRepresentable {
             /* Alpha-modulated additive sky stage (blendMode=1, GL_SRC_ALPHA/GL_ONE).
              * Distinct pipeline — NEVER shared with skyAdditivePipelineState. */
             let skyAdditiveAlphaDesc = skyPipelineDescriptor.copy() as! MTLRenderPipelineDescriptor
-            skyAdditiveAlphaDesc.colorAttachments[0].isBlendingEnabled = true
-            skyAdditiveAlphaDesc.colorAttachments[0].writeMask = .all
-            skyAdditiveAlphaDesc.colorAttachments[0].rgbBlendOperation = .add
-            skyAdditiveAlphaDesc.colorAttachments[0].alphaBlendOperation = .add
-            skyAdditiveAlphaDesc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
-            skyAdditiveAlphaDesc.colorAttachments[0].sourceAlphaBlendFactor = .one
-            skyAdditiveAlphaDesc.colorAttachments[0].destinationRGBBlendFactor = .one
-            skyAdditiveAlphaDesc.colorAttachments[0].destinationAlphaBlendFactor = .one
+            Self.configureBlend(skyAdditiveAlphaDesc.colorAttachments[0],
+                                src: Q3GLBlendFactor.srcAlpha.rawValue,
+                                dst: Q3GLBlendFactor.one.rawValue)
             do {
                 skyAdditiveAlphaPipelineState = try device.makeRenderPipelineState(descriptor: skyAdditiveAlphaDesc)
             } catch {
