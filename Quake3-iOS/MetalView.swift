@@ -1130,24 +1130,28 @@ struct MetalView: UIViewRepresentable {
             // washed-out punch that matches the reference PC build.
             // Without it the whole world renders ~50% too dark.
             // saturate() clamps to [0,1] so highlights don't wrap.
-            float3 vertexColor = float3(1.0);
-            if (rgbGen == 1) {
-                vertexColor = in.color.rgb;
-            } else if (rgbGen == 7) {
-                vertexColor = float3(1.0);
-            }
-            if (rgbGen == 3) {
-                float4 wp = drawUniforms.rgbWaveParams;
-                vertexColor *= clamp(evalWave(drawUniforms.rgbWaveFunc, wp.x, wp.y, wp.z, wp.w, drawUniforms.timeSeconds), 0.0, 1.0);
-            }
-            if (additiveStage && rgbGen == 1) {
-                vertexColor = float3(1.0);
-            }
-            float3 vc = mix(vertexColor, float3(1.0), drawUniforms.forceWhiteVertColor);
-            float  va = mix(in.color.a,   1.0,          drawUniforms.forceWhiteVertColor);
-            if (alphaGen == 3) {
-                float4 ap = drawUniforms.alphaWaveParams;
-                va *= clamp(evalWave(drawUniforms.alphaWaveFunc, ap.x, ap.y, ap.z, ap.w, drawUniforms.timeSeconds), 0.0, 1.0);
+            float3 vc = float3(1.0);
+            float  va = 1.0;
+            if (drawUniforms.stageUsesLightmap <= 0.5) {
+                float3 vertexColor = float3(1.0);
+                if (rgbGen == 1) {
+                    vertexColor = in.color.rgb;
+                } else if (rgbGen == 7) {
+                    vertexColor = float3(1.0);
+                }
+                if (rgbGen == 3) {
+                    float4 wp = drawUniforms.rgbWaveParams;
+                    vertexColor *= clamp(evalWave(drawUniforms.rgbWaveFunc, wp.x, wp.y, wp.z, wp.w, drawUniforms.timeSeconds), 0.0, 1.0);
+                }
+                if (additiveStage && rgbGen == 1) {
+                    vertexColor = float3(1.0);
+                }
+                vc = mix(vertexColor, float3(1.0), drawUniforms.forceWhiteVertColor);
+                va = mix(in.color.a, 1.0, drawUniforms.forceWhiteVertColor);
+                if (alphaGen == 3) {
+                    float4 ap = drawUniforms.alphaWaveParams;
+                    va *= clamp(evalWave(drawUniforms.alphaWaveFunc, ap.x, ap.y, ap.z, ap.w, drawUniforms.timeSeconds), 0.0, 1.0);
+                }
             }
             // Overbright handling for the three render paths:
             //   stageUsesLightmap=1   → THIS draw is the lightmap stage. Stock Q3
@@ -1165,7 +1169,7 @@ struct MetalView: UIViewRepresentable {
             //                           inline (existing behavior).
             float3 lm;
             if (drawUniforms.stageUsesLightmap > 0.5) {
-                lm = float3(2.0);
+                lm = float3(1.0);
             } else if (drawUniforms.drawHasLightmapStage > 0.5 ||
                        rgbGen == 1 ||
                        rgbGen == 7 ||
@@ -1891,7 +1895,8 @@ struct MetalView: UIViewRepresentable {
                         for stageIndex in 0..<stageCount {
                             let stage = Self.worldStage(draw, stageIndex)
                             let blendMode = Self.worldBlendClass(for: stage)
-                            let drawPass = (blendMode == 5) ? 4
+                            let drawPass = (stage.useLightmap != 0) ? 1
+                                         : (blendMode == 5) ? 4
                                          : (blendMode == 1) ? 3
                                          : (blendMode == 2) ? 2
                                          : (blendMode == 3) ? 1
@@ -1911,7 +1916,7 @@ struct MetalView: UIViewRepresentable {
                             // Pick the depth-write-ON state for blended
                             // stages with depthWrite=1; depth-read-only
                             // (additiveDepthStencilState) otherwise.
-                            let blendedDepthState = stage.depthWrite != 0
+                            let blendedDepthState = (stage.useLightmap == 0 && stage.depthWrite != 0)
                                 ? depthStencilState
                                 : additiveDepthStencilState
                             if drawPass == 4, let worldAdditiveFullPipelineState {
