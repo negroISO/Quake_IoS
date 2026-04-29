@@ -358,11 +358,26 @@ typedef struct {
      * water/grate floors that author `depthwrite` to occlude correctly
      * (e.g. blocks17gwater) leak the chamber below through the surface. */
     int depthWrite;
+    int rawSrcBlend;
+    int rawDstBlend;
     int animFrameCount;
     float animFps;
     char animFrames[METAL_ANIMMAP_MAX_FRAMES][MAX_QPATH];
     qhandle_t animTextures[METAL_ANIMMAP_MAX_FRAMES];
 } Q3MetalStage;
+
+enum {
+    METAL_BLEND_UNSPECIFIED = 0,
+    METAL_BLEND_ZERO,
+    METAL_BLEND_ONE,
+    METAL_BLEND_DST_COLOR,
+    METAL_BLEND_SRC_COLOR,
+    METAL_BLEND_SRC_ALPHA,
+    METAL_BLEND_ONE_MINUS_SRC_ALPHA,
+    METAL_BLEND_ONE_MINUS_DST_ALPHA,
+    METAL_BLEND_ONE_MINUS_SRC_COLOR,
+    METAL_BLEND_ONE_MINUS_DST_COLOR
+};
 
 enum {
     METAL_SHADER_CULL_DISABLE = 0,
@@ -946,13 +961,11 @@ static void AddWorldDrawStage(Q3MetalWorldDrawCmd *draw,
      * this directly when picking setCullMode per draw. */
     stage->cullMode = (uint32_t)src->cullMode;
     stage->useLightmap = (uint32_t)src->useLightmap;
-    /* Explicit `depthwrite` keyword OR opaque base stage. ioq3 sets
-     * GLS_DEPTHMASK_TRUE for these; we forward the bit so Swift can
-     * pick a depth-write-ON state even on a filter/alpha/additive
-     * pass. Opaque stages (blendMode==0) implicitly get depth-write
-     * via the opaque pipeline anyway, so this bit only matters for
-     * blended stages. */
-    stage->depthWrite = (uint32_t)src->depthWrite;
+    /* Explicit `depthwrite` keyword OR opaque stage. ioq3 sets
+     * GLS_DEPTHMASK_TRUE on opaque stages by default; carrying that bit
+     * through keeps the stage graph/audit aligned with tr_shader.c and
+     * still lets blended stages opt in via the explicit keyword. */
+    stage->depthWrite = (uint32_t)(src->depthWrite || src->blendMode == 0);
     stage->rgbWaveFunc = (uint32_t)src->rgbWaveFunc;
     stage->rgbWaveBase = src->rgbWaveBase;
     stage->rgbWaveAmp = src->rgbWaveAmp;
@@ -4690,6 +4703,75 @@ static int BlendModeFromTokens(const char *src, const char *dst) {
     return 3;
 }
 
+static int BlendFactorFromToken(const char *token) {
+    if (token == NULL || token[0] == '\0') return METAL_BLEND_UNSPECIFIED;
+    if (!Q_stricmp(token, "GL_ZERO")) return METAL_BLEND_ZERO;
+    if (!Q_stricmp(token, "GL_ONE")) return METAL_BLEND_ONE;
+    if (!Q_stricmp(token, "GL_DST_COLOR")) return METAL_BLEND_DST_COLOR;
+    if (!Q_stricmp(token, "GL_SRC_COLOR")) return METAL_BLEND_SRC_COLOR;
+    if (!Q_stricmp(token, "GL_SRC_ALPHA")) return METAL_BLEND_SRC_ALPHA;
+    if (!Q_stricmp(token, "GL_ONE_MINUS_SRC_ALPHA")) return METAL_BLEND_ONE_MINUS_SRC_ALPHA;
+    if (!Q_stricmp(token, "GL_ONE_MINUS_DST_ALPHA")) return METAL_BLEND_ONE_MINUS_DST_ALPHA;
+    if (!Q_stricmp(token, "GL_ONE_MINUS_SRC_COLOR")) return METAL_BLEND_ONE_MINUS_SRC_COLOR;
+    if (!Q_stricmp(token, "GL_ONE_MINUS_DST_COLOR")) return METAL_BLEND_ONE_MINUS_DST_COLOR;
+    return METAL_BLEND_UNSPECIFIED;
+}
+
+static void SetStageBlend(Q3MetalStage *stage, const char *src, const char *dst) {
+    if (stage == NULL || src == NULL || src[0] == '\0') return;
+    stage->blendMode = BlendModeFromTokens(src, dst);
+    if (!Q_stricmp(src, "add")) {
+        stage->rawSrcBlend = METAL_BLEND_ONE;
+        stage->rawDstBlend = METAL_BLEND_ONE;
+    } else if (!Q_stricmp(src, "blend")) {
+        stage->rawSrcBlend = METAL_BLEND_SRC_ALPHA;
+        stage->rawDstBlend = METAL_BLEND_ONE_MINUS_SRC_ALPHA;
+    } else if (!Q_stricmp(src, "filter")) {
+        stage->rawSrcBlend = METAL_BLEND_DST_COLOR;
+        stage->rawDstBlend = METAL_BLEND_ZERO;
+    } else {
+        stage->rawSrcBlend = BlendFactorFromToken(src);
+        stage->rawDstBlend = BlendFactorFromToken(dst);
+    }
+}
+
+static qboolean StageIsLightmapModulateCollapse(const Q3MetalStage *a,
+                                                const Q3MetalStage *b) {
+    if (a == NULL || b == NULL) return qfalse;
+    if (!a->useLightmap || a->blendMode != 0 || b->blendMode != 3) return qfalse;
+    if (a->rgbGen != b->rgbGen || a->alphaGen != b->alphaGen) return qfalse;
+    if (a->rgbWaveFunc != b->rgbWaveFunc || a->alphaWaveFunc != b->alphaWaveFunc) return qfalse;
+    return (b->rawSrcBlend == METAL_BLEND_DST_COLOR && b->rawDstBlend == METAL_BLEND_ZERO) ||
+           (b->rawSrcBlend == METAL_BLEND_ZERO && b->rawDstBlend == METAL_BLEND_SRC_COLOR);
+}
+
+static void CollapseLightmapModulateStages(Q3MetalStage *stages,
+                                           int *stageCount,
+                                           qboolean *gotLightmapStage) {
+    int s;
+    qboolean stillHasLightmap = qfalse;
+    if (stages == NULL || stageCount == NULL || *stageCount < 2) return;
+    if (StageIsLightmapModulateCollapse(&stages[0], &stages[1])) {
+        stages[1].blendMode = 0;
+        stages[1].rawSrcBlend = METAL_BLEND_ONE;
+        stages[1].rawDstBlend = METAL_BLEND_ZERO;
+        stages[1].depthWrite = 1;
+        stages[0] = stages[1];
+        memmove(&stages[1], &stages[2], sizeof(stages[0]) * (Q3_MAX_STAGES - 2));
+        Com_Memset(&stages[Q3_MAX_STAGES - 1], 0, sizeof(stages[0]));
+        *stageCount -= 1;
+    }
+    for (s = 0; s < *stageCount; ++s) {
+        if (stages[s].useLightmap) {
+            stillHasLightmap = qtrue;
+            break;
+        }
+    }
+    if (gotLightmapStage != NULL) {
+        *gotLightmapStage = stillHasLightmap;
+    }
+}
+
 static int ShaderMap_GetAlphaFunc(const char *name) {
     const metalShaderMap_t *entry;
     if (name == NULL || name[0] == '\0') return 0;
@@ -5283,7 +5365,7 @@ static void ParseShaderText(const char *text) {
                     Q_strncpyz(srcCopy, srcTok, sizeof(srcCopy));
                     const char *dst = COM_ParseExt(&p, qfalse);
                     if (srcCopy[0]) {
-                        cur.blendMode = BlendModeFromTokens(srcCopy, dst);
+                        SetStageBlend(&cur, srcCopy, dst);
                     }
                 } else if (!Q_stricmp(token, "alphaFunc") || !Q_stricmp(token, "alphafunc")) {
                     token = COM_ParseExt(&p, qfalse);
@@ -5515,6 +5597,13 @@ static void ParseShaderText(const char *text) {
                         }
                     }
                 }
+            }
+        }
+
+        CollapseLightmapModulateStages(stages, &stagesCount, &gotLightmapStage);
+        for (int ds = 0; ds < stagesCount; ++ds) {
+            if (stages[ds].blendMode == 0) {
+                stages[ds].depthWrite = 1;
             }
         }
 

@@ -42,11 +42,13 @@ APP=$(/usr/bin/find "$DERIVED" -maxdepth 6 -type d -name "Quake3-iOS.app" \
 
 if [[ -z "${DEVICE:-}" ]]; then
     # Match lines like:
-    #   Oled  Oled.coredevice.local  <UUID>  connected  iPad Pro 13-inch ...
+    #   Oled  Oled.coredevice.local  <UUID>  available (paired)  iPad Pro 13-inch ...
+    # Older CoreDevice output used "connected"; newer output reports USB-
+    # reachable paired devices as "available (paired)".
     # Device names contain spaces so positional awk doesn't work — pull
-    # the 36-char UUID with grep -oE instead, gated on "connected" + iOS device.
+    # the 36-char UUID with grep -oE instead, gated on reachable iOS devices.
     DEVICE=$(xcrun devicectl list devices 2>&1 \
-              | grep -E 'connected.*(iPhone|iPad)' \
+              | grep -E '(connected|available \\(paired\\)).*(iPhone|iPad)' \
               | grep -oE '[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}' \
               | head -1)
 fi

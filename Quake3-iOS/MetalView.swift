@@ -748,8 +748,8 @@ struct MetalView: UIViewRepresentable {
 
             if (drawUniforms.fogParams.y > 0.5) {
                 float4 surface = drawUniforms.fogSurface;
-            t = dot(worldPos, surface.xyz) + surface.w;
-            float eyeT = dot(float3(uniforms.cameraPos), surface.xyz) + surface.w;
+                t = dot(worldPos, surface.xyz) + surface.w;
+                float eyeT = dot(float3(uniforms.cameraPos), surface.xyz) + surface.w;
                 if (eyeT < 0.0) {
                     if (t < 1.0) {
                         t = 1.0 / 32.0;
@@ -822,8 +822,8 @@ struct MetalView: UIViewRepresentable {
 
             if (uniforms.fogParams.y > 0.5) {
                 float4 surface = uniforms.fogSurface;
-            t = dot(worldPos, surface.xyz) + surface.w;
-            float eyeT = dot(uniforms.cameraPos, surface.xyz) + surface.w;
+                t = dot(worldPos, surface.xyz) + surface.w;
+                float eyeT = dot(uniforms.cameraPos, surface.xyz) + surface.w;
                 if (eyeT < 0.0) {
                     if (t < 1.0) {
                         t = 1.0 / 32.0;
