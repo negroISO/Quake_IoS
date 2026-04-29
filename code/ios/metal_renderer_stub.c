@@ -3698,11 +3698,6 @@ static qboolean LoadWorldMapData(const char *name) {
                 if (_fe != NULL && _fe->stageCount > 1) {
                     drawMultiplier = _fe->stageCount;
                 }
-                if (_fe != NULL && _fe->hasLightmapStage &&
-                    !IsSkyShaderName(shaders[shaderNum].shader) &&
-                    LittleLong(surface->lightmapNum) >= 0) {
-                    drawMultiplier += 1;
-                }
             }
         }
 
@@ -4002,35 +3997,6 @@ static qboolean LoadWorldMapData(const char *name) {
                                     Q3MetalStage _drawStage;
                                     qhandle_t _tex;
                                     uint32_t _dstIdx;
-                                    if (_s == 0 && _e->hasLightmapStage && hasLightmap &&
-                                        _e->stages[0].blendMode != 0) {
-                                        Q3MetalStage _lmStage;
-                                        _dstIdx = drawCursor++;
-                                        SetupWorldDraw(&s_world.draws[_dstIdx],
-                                                       firstIndexForDraw,
-                                                       indexCountForDraw,
-                                                       lightmapHandle,
-                                                       worldFlags | ((_emitted == 0)
-                                                           ? Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY : 0u),
-                                                       fogIndex);
-                                        AddWorldDrawLightmapBaseStage(&s_world.draws[_dstIdx],
-                                                                     lightmapHandle,
-                                                                     _e,
-                                                                     0,
-                                                                     1);
-                                        Com_Memset(&_lmStage, 0, sizeof(_lmStage));
-                                        _lmStage.blendMode = 0;
-                                        _lmStage.cullMode = _e->cullMode;
-                                        _lmStage.depthWrite = 1;
-                                        _lmStage.useLightmap = 1;
-                                        EmitMetalDrawPlan(shaders[shaderNum].shader,
-                                                          -1,
-                                                          &s_world.draws[_dstIdx],
-                                                          &_lmStage,
-                                                          lightmapHandle,
-                                                          qtrue);
-                                        _emitted += 1;
-                                    }
                                     _drawStage = *_st;
                                     _drawStage.cullMode = _e->cullMode;
                                     if (_st->animFrameCount > 0) {
@@ -4056,8 +4022,10 @@ static qboolean LoadWorldMapData(const char *name) {
                                                    firstIndexForDraw,
                                                    indexCountForDraw,
                                                    hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
-                                                   worldFlags | ((_emitted == 0)
-                                                       ? Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY : 0u),
+                                                   worldFlags |
+                                                       (_e->hasLightmapStage ? Q3_METAL_WORLD_DRAWFLAG_LIGHTMAP_MULTIPLY : 0u) |
+                                                       ((_emitted == 0)
+                                                           ? Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY : 0u),
                                                    fogIndex);
                                     if (s_world.animShaderSlots && s_pendingAnimSlot >= 0 &&
                                         _st->animFrameCount > 0) {
@@ -4073,33 +4041,6 @@ static qboolean LoadWorldMapData(const char *name) {
                                                       _tex,
                                                       qfalse);
                                     _emitted += 1;
-                                    if (_s == 0 && _e->hasLightmapStage && hasLightmap &&
-                                        _e->stages[0].blendMode == 0) {
-                                        Q3MetalStage _lmStage;
-                                        _dstIdx = drawCursor++;
-                                        SetupWorldDraw(&s_world.draws[_dstIdx],
-                                                       firstIndexForDraw,
-                                                       indexCountForDraw,
-                                                       lightmapHandle,
-                                                       worldFlags,
-                                                       fogIndex);
-                                        AddWorldDrawLightmapBaseStage(&s_world.draws[_dstIdx],
-                                                                     lightmapHandle,
-                                                                     _e,
-                                                                     3,
-                                                                     0);
-                                        Com_Memset(&_lmStage, 0, sizeof(_lmStage));
-                                        _lmStage.blendMode = 3;
-                                        _lmStage.cullMode = _e->cullMode;
-                                        _lmStage.useLightmap = 1;
-                                        EmitMetalDrawPlan(shaders[shaderNum].shader,
-                                                          -1,
-                                                          &s_world.draws[_dstIdx],
-                                                          &_lmStage,
-                                                          lightmapHandle,
-                                                          qtrue);
-                                        _emitted += 1;
-                                    }
                                 }
                             }
                             if (_e == NULL || _e->stageCount == 0 || _emitted == 0) {
@@ -4204,35 +4145,6 @@ static qboolean LoadWorldMapData(const char *name) {
                         Q3MetalStage _drawStage;
                         qhandle_t _tex;
                         uint32_t _dstIdx;
-                        if (_s == 0 && _e->hasLightmapStage && hasLightmap &&
-                            _e->stages[0].blendMode != 0) {
-                            Q3MetalStage _lmStage;
-                            _dstIdx = drawCursor++;
-                            SetupWorldDraw(&s_world.draws[_dstIdx],
-                                           firstIndexForDraw,
-                                           indexCountForDraw,
-                                           lightmapHandle,
-                                           worldFlags | ((_emitted == 0)
-                                               ? Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY : 0u),
-                                           fogIndex);
-                            AddWorldDrawLightmapBaseStage(&s_world.draws[_dstIdx],
-                                                         lightmapHandle,
-                                                         _e,
-                                                         0,
-                                                         1);
-                            Com_Memset(&_lmStage, 0, sizeof(_lmStage));
-                            _lmStage.blendMode = 0;
-                            _lmStage.cullMode = _e->cullMode;
-                            _lmStage.depthWrite = 1;
-                            _lmStage.useLightmap = 1;
-                            EmitMetalDrawPlan(shaders[shaderNum].shader,
-                                              -1,
-                                              &s_world.draws[_dstIdx],
-                                              &_lmStage,
-                                              lightmapHandle,
-                                              qtrue);
-                            _emitted += 1;
-                        }
                         _drawStage = *_st;
                         _drawStage.cullMode = _e->cullMode;
                         if (_st->animFrameCount > 0) {
@@ -4258,8 +4170,10 @@ static qboolean LoadWorldMapData(const char *name) {
                                        firstIndexForDraw,
                                        indexCountForDraw,
                                        hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
-                                       worldFlags | ((_emitted == 0)
-                                           ? Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY : 0u),
+                                       worldFlags |
+                                           (_e->hasLightmapStage ? Q3_METAL_WORLD_DRAWFLAG_LIGHTMAP_MULTIPLY : 0u) |
+                                           ((_emitted == 0)
+                                               ? Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY : 0u),
                                        fogIndex);
                         if (s_world.animShaderSlots && s_pendingAnimSlot >= 0 &&
                             _st->animFrameCount > 0) {
@@ -4275,33 +4189,6 @@ static qboolean LoadWorldMapData(const char *name) {
                                           _tex,
                                           qfalse);
                         _emitted += 1;
-                        if (_s == 0 && _e->hasLightmapStage && hasLightmap &&
-                            _e->stages[0].blendMode == 0) {
-                            Q3MetalStage _lmStage;
-                            _dstIdx = drawCursor++;
-                            SetupWorldDraw(&s_world.draws[_dstIdx],
-                                           firstIndexForDraw,
-                                           indexCountForDraw,
-                                           lightmapHandle,
-                                           worldFlags,
-                                           fogIndex);
-                            AddWorldDrawLightmapBaseStage(&s_world.draws[_dstIdx],
-                                                         lightmapHandle,
-                                                         _e,
-                                                         3,
-                                                         0);
-                            Com_Memset(&_lmStage, 0, sizeof(_lmStage));
-                            _lmStage.blendMode = 3;
-                            _lmStage.cullMode = _e->cullMode;
-                            _lmStage.useLightmap = 1;
-                            EmitMetalDrawPlan(shaders[shaderNum].shader,
-                                              -1,
-                                              &s_world.draws[_dstIdx],
-                                              &_lmStage,
-                                              lightmapHandle,
-                                              qtrue);
-                            _emitted += 1;
-                        }
                     }
                 }
                 if (_e == NULL || _e->stageCount == 0 || _emitted == 0) {
@@ -4690,7 +4577,6 @@ static int ShaderMap_GetBlendMode(const char *name) {
  *   3 = filter     (GL_DST_COLOR/GL_ZERO and commutative form GL_ZERO/GL_SRC_COLOR)
  *   4 = subtract   (GL_ZERO/GL_ONE_MINUS_SRC_COLOR — blood/bullet/shadow decals)
  *   5 = additive-full (GL_ONE/GL_ONE — full-intensity, ignores alpha)
- *
  * CRITICAL: 1 and 5 MUST stay distinct. Merging them leaks full-intensity
  * explosion/glow shaders through an alpha-modulated pipeline (or vice versa),
  * producing scene-wide yellow/gold blowout when the alpha channel is close
@@ -5116,7 +5002,7 @@ static void ParseShaderText(const char *text) {
                 if (depth == 1) {
                     inStage = qfalse;
                     if (stagesCount < Q3_MAX_STAGES &&
-                        (cur.mapPath[0] != '\0' || cur.animFrameCount > 0)) {
+                        (cur.mapPath[0] != '\0' || cur.animFrameCount > 0 || cur.useLightmap)) {
                         stages[stagesCount++] = cur;
                     }
                 }

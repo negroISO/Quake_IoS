@@ -1474,6 +1474,7 @@ struct MetalView: UIViewRepresentable {
         private var worldSamplerState: MTLSamplerState?
         private var depthStencilState: MTLDepthStencilState?
         private var additiveDepthStencilState: MTLDepthStencilState?
+        private var fogEqualDepthStencilState: MTLDepthStencilState?
         private var additiveLessDepthStencilState: MTLDepthStencilState?
         private var depthHackDepthStencilState: MTLDepthStencilState?
         private var fallbackDepthStencilState: MTLDepthStencilState?
@@ -1847,7 +1848,10 @@ struct MetalView: UIViewRepresentable {
                                 _pad0: 0
                             )
                             encoder.setRenderPipelineState(worldAlphaPipelineState)
-                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
+                            let fogDepthState = (draw.flags & fogOnlyBit) != 0
+                                ? additiveDepthStencilState
+                                : fogEqualDepthStencilState
+                            encoder.setDepthStencilState(ensuredDepthStencilState(fogDepthState, device: view.device))
                             encoder.setCullMode(Self.metalCullMode(for: stage.cullMode))
                             encoder.setFragmentTexture(lightmapTexture, index: 0)
                             encoder.setFragmentTexture(lightmapTexture, index: 1)
@@ -2771,6 +2775,11 @@ struct MetalView: UIViewRepresentable {
             additiveDepthDescriptor.isDepthWriteEnabled = false
             additiveDepthDescriptor.depthCompareFunction = .lessEqual
             additiveDepthStencilState = device.makeDepthStencilState(descriptor: additiveDepthDescriptor)
+
+            let fogEqualDepthDescriptor = MTLDepthStencilDescriptor()
+            fogEqualDepthDescriptor.isDepthWriteEnabled = false
+            fogEqualDepthDescriptor.depthCompareFunction = .equal
+            fogEqualDepthStencilState = device.makeDepthStencilState(descriptor: fogEqualDepthDescriptor)
 
             let additiveLessDepthDescriptor = MTLDepthStencilDescriptor()
             additiveLessDepthDescriptor.isDepthWriteEnabled = false
