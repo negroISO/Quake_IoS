@@ -772,33 +772,8 @@ struct MetalView: UIViewRepresentable {
 
             float3 forward = normalize(cross(float3(uniforms.cameraUp),
                                              float3(uniforms.cameraRight)));
-            float s = dot(worldPos - float3(uniforms.cameraPos), forward) *
-                      drawUniforms.fogParams.x;
-            float t = 31.0 / 32.0;
-
-            if (drawUniforms.fogParams.y > 0.5) {
-                float4 surface = drawUniforms.fogSurface;
-            t = dot(worldPos, surface.xyz) + surface.w;
-            float eyeT = dot(float3(uniforms.cameraPos), surface.xyz) + surface.w;
-                if (eyeT < 0.0) {
-                    if (t < 1.0) {
-                        t = 1.0 / 32.0;
-                    } else {
-                        t = 1.0 / 32.0 + (30.0 / 32.0 * t) / (t - eyeT);
-                    }
-                } else {
-                    t = (t < 0.0) ? (1.0 / 32.0) : (31.0 / 32.0);
-                }
-            }
-
-            if (s < 0.0 || t < (1.0 / 32.0)) {
-                return 0.0;
-            }
-            if (t < (31.0 / 32.0)) {
-                s *= (t - 1.0 / 32.0) / (30.0 / 32.0);
-            }
-            s *= 8.0;
-            return sqrt(saturate(s));
+            float depth = dot(worldPos - float3(uniforms.cameraPos), forward);
+            return sqrt(saturate(depth * drawUniforms.fogParams.x));
         }
 
         struct EntityVertexIn {
@@ -1874,10 +1849,7 @@ struct MetalView: UIViewRepresentable {
                                 _pad0: 0
                             )
                             encoder.setRenderPipelineState(worldAlphaPipelineState)
-                            let fogDepthState = (draw.flags & fogOnlyBit) != 0
-                                ? additiveDepthStencilState
-                                : fogEqualDepthStencilState
-                            encoder.setDepthStencilState(ensuredDepthStencilState(fogDepthState, device: view.device))
+                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveLessDepthStencilState, device: view.device))
                             encoder.setCullMode(Self.metalCullMode(for: stage.cullMode))
                             encoder.setFragmentTexture(lightmapTexture, index: 0)
                             encoder.setFragmentTexture(lightmapTexture, index: 1)
