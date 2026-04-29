@@ -139,19 +139,24 @@ fi
 
 # Pull the AVI out of the app sandbox via devicectl. Path is
 # Documents/baseq3/videos/<video>.avi inside appDataContainer.
-# Same gates as the sim path: skip if no AVI / wedged run.
-if [[ $LINES -lt 2000 ]]; then
-    echo "→ avi:    SKIPPED (only $LINES stdout lines — looks like a wedged or short run)"
-else
-    if xcrun devicectl device copy from \
-        --device "$DEVICE" \
-        --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
-        --source "Documents/baseq3/videos/${VIDEO_NAME}.avi" \
-        --destination "$OUTDIR/${VIDEO_NAME}.avi" >/dev/null 2>&1; then
-        AVI_SIZE=$(/usr/bin/stat -f '%z' "$OUTDIR/${VIDEO_NAME}.avi")
-        AVI_MB=$((AVI_SIZE / 1024 / 1024))
-        echo "→ avi:    $OUTDIR/${VIDEO_NAME}.avi (${AVI_MB} MB)"
+# Always try to pull and extract frames; stdout length is not a reliable
+# signal for video availability on physical devices.
+if xcrun devicectl device copy from \
+    --device "$DEVICE" \
+    --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
+    --source "Documents/baseq3/videos/${VIDEO_NAME}.avi" \
+    --destination "$OUTDIR/${VIDEO_NAME}.avi" >/dev/null 2>&1; then
+    AVI_SIZE=$(/usr/bin/stat -f '%z' "$OUTDIR/${VIDEO_NAME}.avi")
+    AVI_MB=$((AVI_SIZE / 1024 / 1024))
+    echo "→ avi:    $OUTDIR/${VIDEO_NAME}.avi (${AVI_MB} MB)"
+    if command -v ffmpeg >/dev/null 2>&1; then
+        mkdir -p "$OUTDIR/frames"
+        ffmpeg -y -i "$OUTDIR/${VIDEO_NAME}.avi" \
+            -vf fps=10 "$OUTDIR/frames/frame_%04d.png" >/dev/null 2>&1 \
+            && echo "→ frames: $OUTDIR/frames"
     else
-        echo "→ avi:    FAILED to pull (no ${VIDEO_NAME}.avi on device — video cbuf disabled?)"
+        echo "→ frames: SKIPPED (ffmpeg not found)"
     fi
+else
+    echo "→ avi:    FAILED to pull (no ${VIDEO_NAME}.avi on device — video cbuf disabled?)"
 fi

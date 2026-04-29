@@ -1,5 +1,34 @@
-// metal_renderer_stub.c — Phase 1 stub renderer providing GetRefAPI()
-// Replaces the Vulkan renderer with no-op implementations
+/*
+=============================================================================
+
+Metal Renderer Stub - Quake Frontend / Metal Backend
+
+This file implements the translation layer between Quake III's CPU-side
+renderer and Apple's Metal GPU pipeline.
+
+Architecture:
+    Quake frontend:
+        - parse shader scripts
+        - build stage lists
+        - preserve GLS blend/depth/cull semantics
+
+    Metal backend:
+        - translate stage state into Metal draw commands
+        - bind textures and buffers
+        - execute draw calls
+
+Rules:
+    - Do not add shader-name-specific fixes.
+    - Do not add hardcoded visual tweaks.
+    - Do not merge, skip, or reorder stages for convenience.
+    - Cull is shader-level.
+    - Lightmap is a real stage.
+    - Blend must converge on srcBlend/dstBlend passthrough, not compressed modes.
+
+If a visual issue exists, fix the generic mismatch against ioq3/Kenny behavior.
+
+=============================================================================
+*/
 
 #include "../qcommon/q_shared.h"
 #include "../qcommon/qfiles.h"
@@ -114,6 +143,8 @@ typedef struct {
     float tcScale;
     qboolean hasSurface;
     float surface[4];
+    qboolean hasBounds;
+    vec3_t bounds[2];
 } metalWorldFog_t;
 static metalWorldFog_t s_worldFogs[METAL_MAX_WORLD_FOGS];
 /* Parallel array exposed to Swift via Q3MetalRenderer_GetWorldFogs.
@@ -204,12 +235,21 @@ typedef struct {
     qhandle_t shader;
     int firstVert;
     int numVerts;
+    uint32_t fogIndex;
 } metalScenePoly_t;
 
 static metalScenePoly_t s_scenePolys[Q3_METAL_MAX_SCENE_POLYS];
 static polyVert_t s_scenePolyVerts[Q3_METAL_MAX_SCENE_POLY_VERTS];
 static int s_scenePolyCount;
 static int s_scenePolyVertCount;
+
+typedef struct {
+    qboolean valid;
+    vec3_t origin;
+    vec3_t axis[3];
+} metalPortalSurface_t;
+
+static metalPortalSurface_t s_scenePortalSurface;
 
 /* Audit: once-per-session dedup log for missing-feature tracking. Copies
  * the message string into owned storage so callers can safely pass stack
@@ -275,6 +315,12 @@ typedef struct {
     float deformWaveAmp;
     float deformWavePhase;
     float deformWaveFreq;
+    int deformMoveFunc;
+    float deformMoveVector[3];
+    float deformMoveBase;
+    float deformMoveAmp;
+    float deformMovePhase;
+    float deformMoveFreq;
     /* deformVertexes autosprite (1) / autoSprite2 (2). Tag-only for
      * the moment — pipeline awareness lands here so a follow-up
      * commit can wire the camera-aligned transform without touching
@@ -816,6 +862,14 @@ static void AddWorldDrawStage(Q3MetalWorldDrawCmd *draw,
     stage->deformWaveAmp   = src->deformWaveAmp;
     stage->deformWavePhase = src->deformWavePhase;
     stage->deformWaveFreq  = src->deformWaveFreq;
+    stage->deformMoveFunc  = (uint32_t)src->deformMoveFunc;
+    stage->deformMoveVector[0] = src->deformMoveVector[0];
+    stage->deformMoveVector[1] = src->deformMoveVector[1];
+    stage->deformMoveVector[2] = src->deformMoveVector[2];
+    stage->deformMoveBase  = src->deformMoveBase;
+    stage->deformMoveAmp   = src->deformMoveAmp;
+    stage->deformMovePhase = src->deformMovePhase;
+    stage->deformMoveFreq  = src->deformMoveFreq;
     /* deformVertexes autosprite/autoSprite2 mode. Tag-only — propagated
      * to a draw flag below so Swift can route to a future autosprite
      * vertex shader path. The actual camera-aligned billboard transform
@@ -942,6 +996,14 @@ static void AddWorldDrawLightmapBaseStage(Q3MetalWorldDrawCmd *draw,
         tmp.deformWaveAmp = entry->stages[0].deformWaveAmp;
         tmp.deformWavePhase = entry->stages[0].deformWavePhase;
         tmp.deformWaveFreq = entry->stages[0].deformWaveFreq;
+        tmp.deformMoveFunc = entry->stages[0].deformMoveFunc;
+        tmp.deformMoveVector[0] = entry->stages[0].deformMoveVector[0];
+        tmp.deformMoveVector[1] = entry->stages[0].deformMoveVector[1];
+        tmp.deformMoveVector[2] = entry->stages[0].deformMoveVector[2];
+        tmp.deformMoveBase = entry->stages[0].deformMoveBase;
+        tmp.deformMoveAmp = entry->stages[0].deformMoveAmp;
+        tmp.deformMovePhase = entry->stages[0].deformMovePhase;
+        tmp.deformMoveFreq = entry->stages[0].deformMoveFreq;
         tmp.autospriteMode = entry->stages[0].autospriteMode;
     }
     tmp.blendMode = blendMode;
@@ -1581,6 +1643,102 @@ static uint32_t EntityFlagsForTexture(qhandle_t textureHandle, uint32_t flags, q
     }
     if (tex->tcGenEnv) flags |= Q3_METAL_ENTITY_DRAWFLAG_TCGEN_ENV;
     return flags;
+}
+
+static int MetalRailCvarInteger(const char *name, int fallback) {
+    cvar_t *cv = ri.Cvar_Get(name, va("%d", fallback), CVAR_ARCHIVE);
+    return (cv != NULL && cv->integer > 0) ? cv->integer : fallback;
+}
+
+static float MetalRailCvarValue(const char *name, float fallback) {
+    cvar_t *cv = ri.Cvar_Get(name, va("%g", fallback), CVAR_ARCHIVE);
+    return (cv != NULL && cv->value > 0.0f) ? cv->value : fallback;
+}
+
+static void MetalSetEntityVertex(uint32_t index, const vec3_t xyz,
+                                 float s, float t,
+                                 float r, float g, float b, float a) {
+    s_entityVertices[index].position[0] = xyz[0];
+    s_entityVertices[index].position[1] = xyz[1];
+    s_entityVertices[index].position[2] = xyz[2];
+    s_entityVertices[index].texCoord[0] = s;
+    s_entityVertices[index].texCoord[1] = t;
+    s_entityVertices[index].color[0] = r;
+    s_entityVertices[index].color[1] = g;
+    s_entityVertices[index].color[2] = b;
+    s_entityVertices[index].color[3] = a;
+    s_entityVertices[index].normal[0] = 0.0f;
+    s_entityVertices[index].normal[1] = 0.0f;
+    s_entityVertices[index].normal[2] = 0.0f;
+}
+
+static void MetalEmitRailCore(uint32_t *vertexCursor,
+                              uint32_t *indexCursor,
+                              const vec3_t start,
+                              const vec3_t end,
+                              const vec3_t up,
+                              float len,
+                              float spanWidth,
+                              float r,
+                              float g,
+                              float b,
+                              float a) {
+    uint32_t vbase = *vertexCursor;
+    vec3_t p0, p1, p2, p3;
+    float t = len / 256.0f;
+
+    VectorMA(start, spanWidth, up, p0);
+    VectorMA(start, -spanWidth, up, p1);
+    VectorMA(end, spanWidth, up, p2);
+    VectorMA(end, -spanWidth, up, p3);
+
+    MetalSetEntityVertex(vbase + 0, p0, 0.0f, 0.0f, r * 0.25f, g * 0.25f, b * 0.25f, a);
+    MetalSetEntityVertex(vbase + 1, p1, 0.0f, 1.0f, r, g, b, a);
+    MetalSetEntityVertex(vbase + 2, p2, t,    0.0f, r, g, b, a);
+    MetalSetEntityVertex(vbase + 3, p3, t,    1.0f, r, g, b, a);
+
+    s_entityIndices[*indexCursor + 0] = vbase + 0;
+    s_entityIndices[*indexCursor + 1] = vbase + 1;
+    s_entityIndices[*indexCursor + 2] = vbase + 2;
+    s_entityIndices[*indexCursor + 3] = vbase + 2;
+    s_entityIndices[*indexCursor + 4] = vbase + 1;
+    s_entityIndices[*indexCursor + 5] = vbase + 3;
+
+    *vertexCursor += 4;
+    *indexCursor += 6;
+}
+
+static int MetalScenePolyFogIndex(const polyVert_t *verts, int numVerts) {
+    vec3_t bounds[2];
+    int i;
+    int fogIndex;
+
+    if (!s_world.loaded || s_worldFogCount <= 0 || verts == NULL || numVerts <= 0) {
+        return -1;
+    }
+
+    VectorCopy(verts[0].xyz, bounds[0]);
+    VectorCopy(verts[0].xyz, bounds[1]);
+    for (i = 1; i < numVerts; ++i) {
+        AddPointToBounds(verts[i].xyz, bounds[0], bounds[1]);
+    }
+
+    for (fogIndex = 0; fogIndex < s_worldFogCount; ++fogIndex) {
+        const metalWorldFog_t *fog = &s_worldFogs[fogIndex];
+        if (!fog->hasBounds) {
+            continue;
+        }
+        if (bounds[1][0] >= fog->bounds[0][0] &&
+            bounds[1][1] >= fog->bounds[0][1] &&
+            bounds[1][2] >= fog->bounds[0][2] &&
+            bounds[0][0] <= fog->bounds[1][0] &&
+            bounds[0][1] <= fog->bounds[1][1] &&
+            bounds[0][2] <= fog->bounds[1][2]) {
+            return fogIndex;
+        }
+    }
+
+    return -1;
 }
 
 static qhandle_t EnsureTimHellBaseTexture(void) {
@@ -3392,20 +3550,67 @@ static qboolean LoadWorldMapData(const char *name) {
             s_worldFogs[fi].surface[1] = 0.0f;
             s_worldFogs[fi].surface[2] = 0.0f;
             s_worldFogs[fi].surface[3] = 0.0f;
+            s_worldFogs[fi].hasBounds = qfalse;
+            ClearBounds(s_worldFogs[fi].bounds[0], s_worldFogs[fi].bounds[1]);
 
             fse = ShaderMap_LookupEntry(fogs[fi].shader);
             if (fse != NULL && fse->hasFog) {
                 float d = fse->fogDistance < 1.0f ? 1.0f : fse->fogDistance;
                 int brushNum = LittleLong(fogs[fi].brushNum);
                 int visibleSide = LittleLong(fogs[fi].visibleSide);
+                int firstSide = -1;
                 s_worldFogs[fi].hasColor = qtrue;
                 s_worldFogs[fi].color[0] = fse->fogColor[0];
                 s_worldFogs[fi].color[1] = fse->fogColor[1];
                 s_worldFogs[fi].color[2] = fse->fogColor[2];
                 s_worldFogs[fi].distance = fse->fogDistance;
                 s_worldFogs[fi].tcScale = 1.0f / (d * 8.0f);
+                if (brushNum >= 0 && brushNum < brushCount) {
+                    firstSide = LittleLong(brushes[brushNum].firstSide);
+                    if (firstSide >= 0 && firstSide + 5 < sideCount) {
+                        int sideNum;
+                        int planeNum;
+                        const dplane_t *plane;
+                        sideNum = firstSide + 0;
+                        planeNum = LittleLong(sides[sideNum].planeNum);
+                        if (planeNum >= 0 && planeNum < planeCount) {
+                            plane = &planes[planeNum];
+                            s_worldFogs[fi].bounds[0][0] = -LittleFloat(plane->dist);
+                            sideNum = firstSide + 1;
+                            planeNum = LittleLong(sides[sideNum].planeNum);
+                            if (planeNum >= 0 && planeNum < planeCount) {
+                                plane = &planes[planeNum];
+                                s_worldFogs[fi].bounds[1][0] = LittleFloat(plane->dist);
+                                sideNum = firstSide + 2;
+                                planeNum = LittleLong(sides[sideNum].planeNum);
+                                if (planeNum >= 0 && planeNum < planeCount) {
+                                    plane = &planes[planeNum];
+                                    s_worldFogs[fi].bounds[0][1] = -LittleFloat(plane->dist);
+                                    sideNum = firstSide + 3;
+                                    planeNum = LittleLong(sides[sideNum].planeNum);
+                                    if (planeNum >= 0 && planeNum < planeCount) {
+                                        plane = &planes[planeNum];
+                                        s_worldFogs[fi].bounds[1][1] = LittleFloat(plane->dist);
+                                        sideNum = firstSide + 4;
+                                        planeNum = LittleLong(sides[sideNum].planeNum);
+                                        if (planeNum >= 0 && planeNum < planeCount) {
+                                            plane = &planes[planeNum];
+                                            s_worldFogs[fi].bounds[0][2] = -LittleFloat(plane->dist);
+                                            sideNum = firstSide + 5;
+                                            planeNum = LittleLong(sides[sideNum].planeNum);
+                                            if (planeNum >= 0 && planeNum < planeCount) {
+                                                plane = &planes[planeNum];
+                                                s_worldFogs[fi].bounds[1][2] = LittleFloat(plane->dist);
+                                                s_worldFogs[fi].hasBounds = qtrue;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 if (visibleSide != -1 && brushNum >= 0 && brushNum < brushCount) {
-                    int firstSide = LittleLong(brushes[brushNum].firstSide);
                     int sideNum = firstSide + visibleSide;
                     if (sideNum >= 0 && sideNum < sideCount) {
                         int planeNum = LittleLong(sides[sideNum].planeNum);
@@ -3479,22 +3684,25 @@ static qboolean LoadWorldMapData(const char *name) {
             skippedNoDrawSurfaces += 1;
             continue;
         }
-        /* First-pass counterpart of the fog-volume skip in the emit
-         * loop below. Keep buffer sizing exactly aligned with what we
-         * end up emitting. */
         {
             const metalShaderMap_t *_fe = ShaderMap_LookupEntry(shaders[shaderNum].shader);
             if (_fe != NULL && _fe->hasFog) {
-                skippedNoDrawSurfaces += 1;
-                continue;
-            }
-            if (_fe != NULL && _fe->stageCount > 1) {
-                drawMultiplier = _fe->stageCount;
-            }
-            if (_fe != NULL && _fe->hasLightmapStage &&
-                !IsSkyShaderName(shaders[shaderNum].shader) &&
-                LittleLong(surface->lightmapNum) >= 0) {
-                drawMultiplier += 1;
+                int _fogNum = LittleLong(surface->fogNum);
+                if (_fogNum < 0 || _fogNum >= s_worldFogCount ||
+                    !s_worldFogs[_fogNum].hasColor) {
+                    skippedNoDrawSurfaces += 1;
+                    continue;
+                }
+                drawMultiplier = 1;
+            } else {
+                if (_fe != NULL && _fe->stageCount > 1) {
+                    drawMultiplier = _fe->stageCount;
+                }
+                if (_fe != NULL && _fe->hasLightmapStage &&
+                    !IsSkyShaderName(shaders[shaderNum].shader) &&
+                    LittleLong(surface->lightmapNum) >= 0) {
+                    drawMultiplier += 1;
+                }
             }
         }
 
@@ -3603,24 +3811,6 @@ static qboolean LoadWorldMapData(const char *name) {
         if (!IsDrawableWorldShader(&shaders[shaderNum])) {
             continue;
         }
-        /* Skip fog-volume brushes. Q3 fog shaders (e.g.
-         * `textures/sfx/fog_q3dm4`, `proto_hellfog`) typically declare
-         * only `surfaceparm fog` + `fogparms` and have NO `map`
-         * directive — meaning our shader-map entry has empty mapPath
-         * and stageCount=0. Without this skip, the brush's visible
-         * face renders via the white-fallback path, producing a solid
-         * white plane covering the floor wherever the player stands
-         * inside the fog volume (visible on q3dm4). The actual fog
-         * tinting (per-fragment exp(-distance) blend) is consumed by
-         * the BSP fogNum + LUMP_FOGS pipeline already; the brush face
-         * itself is supposed to be invisible. */
-        {
-            const metalShaderMap_t *_fe = ShaderMap_LookupEntry(shaders[shaderNum].shader);
-            if (_fe != NULL && _fe->hasFog) {
-                continue;
-            }
-        }
-
         if (IsSkyShaderName(shaders[shaderNum].shader)) {
             qhandle_t skyFace = 0;
             if (numVerts > 0) {
@@ -3658,6 +3848,13 @@ static qboolean LoadWorldMapData(const char *name) {
             fogIndex = Q3_METAL_NO_FOG;
         } else {
             fogIndex = (uint32_t)surfFogNum;
+        }
+        {
+            const metalShaderMap_t *_fe = ShaderMap_LookupEntry(shaders[shaderNum].shader);
+            if (_fe != NULL && _fe->hasFog &&
+                fogIndex == Q3_METAL_NO_FOG) {
+                continue;
+            }
         }
         if (!IsSkyShaderName(shaders[shaderNum].shader) &&
             lightmapNum >= 0 && lightmapNum < s_worldLightmapCount) {
@@ -3769,6 +3966,36 @@ static qboolean LoadWorldMapData(const char *name) {
                             int _s;
                             int _emitted = 0;
                             EmitMetalStageAudit(shaders[shaderNum].shader, _e);
+                            if (_e != NULL && _e->hasFog) {
+                                Q3MetalStage _fogStage;
+                                uint32_t _dstIdx;
+                                if (fogIndex == Q3_METAL_NO_FOG) {
+                                    continue;
+                                }
+                                _dstIdx = drawCursor++;
+                                Com_Memset(&_fogStage, 0, sizeof(_fogStage));
+                                _fogStage.blendMode = 2;
+                                _fogStage.cullMode = _e->cullMode;
+                                _fogStage.depthWrite = 0;
+                                SetupWorldDraw(&s_world.draws[_dstIdx],
+                                               firstIndexForDraw,
+                                               indexCountForDraw,
+                                               EnsureWhiteTexture(),
+                                               worldFlags |
+                                                   Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY |
+                                                   Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY,
+                                               fogIndex);
+                                AddWorldDrawStage(&s_world.draws[_dstIdx],
+                                                  EnsureWhiteTexture(),
+                                                  &_fogStage);
+                                EmitMetalDrawPlan(shaders[shaderNum].shader,
+                                                  -2,
+                                                  &s_world.draws[_dstIdx],
+                                                  &_fogStage,
+                                                  EnsureWhiteTexture(),
+                                                  qfalse);
+                                continue;
+                            }
                             if (_e != NULL && _e->stageCount > 0) {
                                 for (_s = 0; _s < _e->stageCount; ++_s) {
                                     const Q3MetalStage *_st = &_e->stages[_s];
@@ -3941,6 +4168,36 @@ static qboolean LoadWorldMapData(const char *name) {
                             int _s;
                             int _emitted = 0;
                             EmitMetalStageAudit(shaders[shaderNum].shader, _e);
+                            if (_e != NULL && _e->hasFog) {
+                                Q3MetalStage _fogStage;
+                                uint32_t _dstIdx;
+                                if (fogIndex == Q3_METAL_NO_FOG) {
+                                    continue;
+                                }
+                                _dstIdx = drawCursor++;
+                                Com_Memset(&_fogStage, 0, sizeof(_fogStage));
+                                _fogStage.blendMode = 2;
+                                _fogStage.cullMode = _e->cullMode;
+                                _fogStage.depthWrite = 0;
+                                SetupWorldDraw(&s_world.draws[_dstIdx],
+                                               firstIndexForDraw,
+                                               indexCountForDraw,
+                                               EnsureWhiteTexture(),
+                                               worldFlags |
+                                                   Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY |
+                                                   Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY,
+                                               fogIndex);
+                                AddWorldDrawStage(&s_world.draws[_dstIdx],
+                                                  EnsureWhiteTexture(),
+                                                  &_fogStage);
+                                EmitMetalDrawPlan(shaders[shaderNum].shader,
+                                                  -2,
+                                                  &s_world.draws[_dstIdx],
+                                                  &_fogStage,
+                                                  EnsureWhiteTexture(),
+                                                  qfalse);
+                                continue;
+                            }
                             if (_e != NULL && _e->stageCount > 0) {
                                 for (_s = 0; _s < _e->stageCount; ++_s) {
                         const Q3MetalStage *_st = &_e->stages[_s];
@@ -4773,6 +5030,12 @@ static void ParseShaderText(const char *text) {
         float deformWaveAmp;
         float deformWavePhase;
         float deformWaveFreq;
+        int deformMoveFunc;
+        float deformMoveVector[3];
+        float deformMoveBase;
+        float deformMoveAmp;
+        float deformMovePhase;
+        float deformMoveFreq;
         /* deformVertexes autosprite/autoSprite2 (1/2). 0 = no autosprite. */
         int topAutospriteMode;
         char skyBoxBase[MAX_QPATH];
@@ -4808,6 +5071,12 @@ static void ParseShaderText(const char *text) {
         deformWaveAmp = 0.0f;
         deformWavePhase = 0.0f;
         deformWaveFreq = 0.0f;
+        deformMoveFunc = 0;
+        deformMoveVector[0] = deformMoveVector[1] = deformMoveVector[2] = 0.0f;
+        deformMoveBase = 0.0f;
+        deformMoveAmp = 0.0f;
+        deformMovePhase = 0.0f;
+        deformMoveFreq = 0.0f;
         topAutospriteMode = 0;
         skyBoxBase[0] = '\0';
         gotSkyParms = qfalse;
@@ -4934,8 +5203,34 @@ static void ParseShaderText(const char *text) {
                         (void)COM_ParseExt(&p, qfalse);
                         (void)COM_ParseExt(&p, qfalse);
                     } else if (!Q_stricmp(modeBuf, "move")) {
-                        /* `move <x> <y> <z> <fn> <base> <amp> <phase> <freq>` — 8 args. Skip. */
-                        for (int dm = 0; dm < 8; ++dm) (void)COM_ParseExt(&p, qfalse);
+                        char xBuf[MAX_TOKEN_CHARS], yBuf[MAX_TOKEN_CHARS], zBuf[MAX_TOKEN_CHARS];
+                        char funcBuf[MAX_TOKEN_CHARS], baseBuf[MAX_TOKEN_CHARS];
+                        char ampBuf[MAX_TOKEN_CHARS], phaseBuf[MAX_TOKEN_CHARS], freqBuf[MAX_TOKEN_CHARS];
+                        Q_strncpyz(xBuf,     COM_ParseExt(&p, qfalse), sizeof(xBuf));
+                        Q_strncpyz(yBuf,     COM_ParseExt(&p, qfalse), sizeof(yBuf));
+                        Q_strncpyz(zBuf,     COM_ParseExt(&p, qfalse), sizeof(zBuf));
+                        Q_strncpyz(funcBuf,  COM_ParseExt(&p, qfalse), sizeof(funcBuf));
+                        Q_strncpyz(baseBuf,  COM_ParseExt(&p, qfalse), sizeof(baseBuf));
+                        Q_strncpyz(ampBuf,   COM_ParseExt(&p, qfalse), sizeof(ampBuf));
+                        Q_strncpyz(phaseBuf, COM_ParseExt(&p, qfalse), sizeof(phaseBuf));
+                        Q_strncpyz(freqBuf,  COM_ParseExt(&p, qfalse), sizeof(freqBuf));
+                        if (xBuf[0] && yBuf[0] && zBuf[0] && funcBuf[0]) {
+                            int fn = 1;
+                            if (!Q_stricmp(funcBuf, "sin")) fn = 1;
+                            else if (!Q_stricmp(funcBuf, "triangle")) fn = 2;
+                            else if (!Q_stricmp(funcBuf, "square")) fn = 3;
+                            else if (!Q_stricmp(funcBuf, "sawtooth")) fn = 4;
+                            else if (!Q_stricmp(funcBuf, "inversesawtooth") ||
+                                     !Q_stricmp(funcBuf, "inverseSawtooth")) fn = 5;
+                            deformMoveFunc = fn;
+                            deformMoveVector[0] = (float)atof(xBuf);
+                            deformMoveVector[1] = (float)atof(yBuf);
+                            deformMoveVector[2] = (float)atof(zBuf);
+                            deformMoveBase = baseBuf[0] ? (float)atof(baseBuf) : 0.0f;
+                            deformMoveAmp = ampBuf[0] ? (float)atof(ampBuf) : 0.0f;
+                            deformMovePhase = phaseBuf[0] ? (float)atof(phaseBuf) : 0.0f;
+                            deformMoveFreq = freqBuf[0] ? (float)atof(freqBuf) : 0.0f;
+                        }
                     } else if (!Q_stricmp(modeBuf, "normal")) {
                         /* `normal <amplitude> <frequency>` — 2 args. Skip. */
                         (void)COM_ParseExt(&p, qfalse);
@@ -5358,15 +5653,6 @@ static void ParseShaderText(const char *text) {
             metalShaderMap_t *last = &s_shaderMap[s_shaderMapCount - 1];
             if (!Q_stricmp(last->shaderName, shaderName)) {
                 int s;
-                if (!Q_stricmp(shaderName, "models/mapobjects/bitch/forearm")) {
-                    for (s = 0; s < stagesCount; ++s) {
-                        if (stages[s].blendMode == 5 && stages[s].rgbGen == 0 &&
-                            (!Q_stricmp(stages[s].mapPath, "models/mapobjects/bitch/forearm01.tga") ||
-                             !Q_stricmp(stages[s].mapPath, "models/mapobjects/bitch/forearm02.tga"))) {
-                            stages[s].rgbGen = 7;
-                        }
-                    }
-                }
                 Com_Memset(last->stages, 0, sizeof(last->stages));
                 for (s = 0; s < Q3_MAX_STAGES; ++s) {
                     last->stages[s] = stages[s];
@@ -5387,6 +5673,14 @@ static void ParseShaderText(const char *text) {
                     last->stages[s].deformWaveAmp   = deformWaveAmp;
                     last->stages[s].deformWavePhase = deformWavePhase;
                     last->stages[s].deformWaveFreq  = deformWaveFreq;
+                    last->stages[s].deformMoveFunc  = deformMoveFunc;
+                    last->stages[s].deformMoveVector[0] = deformMoveVector[0];
+                    last->stages[s].deformMoveVector[1] = deformMoveVector[1];
+                    last->stages[s].deformMoveVector[2] = deformMoveVector[2];
+                    last->stages[s].deformMoveBase  = deformMoveBase;
+                    last->stages[s].deformMoveAmp   = deformMoveAmp;
+                    last->stages[s].deformMovePhase = deformMovePhase;
+                    last->stages[s].deformMoveFreq  = deformMoveFreq;
                     last->stages[s].autospriteMode  = topAutospriteMode;
                 }
                 last->isPortal = gotPortal;
@@ -5853,6 +6147,7 @@ static void RE_ClearScene(void) {
      * RenderScene of the world pass. HUD scenes never AddPoly. */
     s_scenePolyCount = 0;
     s_scenePolyVertCount = 0;
+    Com_Memset(&s_scenePortalSurface, 0, sizeof(s_scenePortalSurface));
     /* DO NOT reset s_entity{Vertex,Index,Draw}Count here. Cgame calls
      * ClearScene between every scene (world + HUD + HUD). If we wiped the
      * draw buffer here, the world scene's draws would be lost before the
@@ -5874,12 +6169,24 @@ static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime
         s_entityRejectedNullThisFrame += 1;
         return;
     }
+    /* RT_PORTALSURFACE is metadata for mirror/portal surface matching in
+     * the stock renderer. It intentionally does not emit draw geometry.
+     * Accept it as a handled no-op so audits only report genuinely missing
+     * entity paths. */
+    if (re->reType == RT_PORTALSURFACE) {
+        AuditOnce("ENTITY:RT_PORTALSURFACE");
+        s_scenePortalSurface.valid = qtrue;
+        VectorCopy(re->origin, s_scenePortalSurface.origin);
+        VectorCopy(re->axis[0], s_scenePortalSurface.axis[0]);
+        VectorCopy(re->axis[1], s_scenePortalSurface.axis[1]);
+        VectorCopy(re->axis[2], s_scenePortalSurface.axis[2]);
+        s_entityAcceptedThisFrame += 1;
+        return;
+    }
     /* RT_SPRITE: billboard quad (plasma bolts, rail core, muzzle flashes,
      * smoke puffs). We accept sprites into the scene-entity list and emit
      * their geometry at RE_RenderScene time (camera-facing math requires
-     * the view axes, which aren't known here). All other reTypes
-     * (RT_BEAM, RT_RAIL_CORE, etc.) are still rejected for now and emit
-     * an audit entry so we can see what else the map submits. */
+     * the view axes, which aren't known here). */
     if (re->reType == RT_SPRITE) {
         AuditOnce("ENTITY:RT_SPRITE");
         s_sceneEntities[s_sceneEntityCount].entity = *re;
@@ -5936,8 +6243,7 @@ static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime
         return;
     }
     if (re->reType != RT_MODEL) {
-        if (re->reType == RT_PORTALSURFACE) AuditOnce("ENTITY:RT_PORTALSURFACE");
-        else AuditOnce("ENTITY:reType unknown");
+        AuditOnce("ENTITY:reType unknown");
         s_entityRejectedTypeThisFrame += 1;
         return;
     }
@@ -5985,7 +6291,7 @@ static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime
 static void RE_AddPolyToScene(qhandle_t hShader, int numVerts, const polyVert_t *verts, int num) {
     int polyIdx;
     AuditOnce("POLY:RE_AddPolyToScene");
-    if (verts == NULL || numVerts < 3) return;
+    if (hShader == 0 || verts == NULL || numVerts < 3) return;
     /* num is the number of polys in this batch, each with numVerts verts.
      * Blood/shadow/marks typically call with num=1. Iterate all regardless. */
     for (polyIdx = 0; polyIdx < num; ++polyIdx) {
@@ -5995,6 +6301,8 @@ static void RE_AddPolyToScene(qhandle_t hShader, int numVerts, const polyVert_t 
         s_scenePolys[s_scenePolyCount].shader = hShader;
         s_scenePolys[s_scenePolyCount].firstVert = s_scenePolyVertCount;
         s_scenePolys[s_scenePolyCount].numVerts = numVerts;
+        s_scenePolys[s_scenePolyCount].fogIndex =
+            (uint32_t)MetalScenePolyFogIndex(&verts[polyIdx * numVerts], numVerts);
         for (vi = 0; vi < numVerts; ++vi) {
             s_scenePolyVerts[s_scenePolyVertCount + vi] = verts[polyIdx * numVerts + vi];
         }
@@ -6303,33 +6611,36 @@ static void RE_RenderScene(const refdef_t *fd) {
                 totalEntityDraws += 1;
                 continue;
             }
-            /* Lightning bolt: same quad budget as a sprite (single view-
-             * aligned rail core between origin and oldorigin). */
             if (sceneEntity->entity.reType == RT_LIGHTNING) {
-                totalEntityVerts += 4;
-                totalEntityIndices += 6;
+                totalEntityVerts += 4 * 4;
+                totalEntityIndices += 4 * 6;
                 totalEntityDraws += 1;
                 continue;
             }
-            /* Rail core: single view-aligned quad like lightning. */
             if (sceneEntity->entity.reType == RT_RAIL_CORE) {
                 totalEntityVerts += 4;
                 totalEntityIndices += 6;
                 totalEntityDraws += 1;
                 continue;
             }
-            /* Rail rings: up to 32 segments × 4 verts each, 1 draw. */
             if (sceneEntity->entity.reType == RT_RAIL_RINGS) {
-                totalEntityVerts += 32 * 4;
-                totalEntityIndices += 32 * 6;
+                vec3_t railVec;
+                float railLen;
+                float segmentLength = MetalRailCvarValue("r_railSegmentLength", 32.0f);
+                int numSegs;
+                VectorSubtract(sceneEntity->entity.origin, sceneEntity->entity.oldorigin, railVec);
+                railLen = VectorLength(railVec);
+                numSegs = (int)(railLen / segmentLength);
+                if (numSegs <= 0) numSegs = 1;
+                if (numSegs > 1) numSegs--;
+                totalEntityVerts += (uint32_t)(numSegs * 4);
+                totalEntityIndices += (uint32_t)(numSegs * 6);
                 totalEntityDraws += 1;
                 continue;
             }
-            /* Generic beam: single view-aligned quad, same budget as
-             * lightning/rail-core. */
             if (sceneEntity->entity.reType == RT_BEAM) {
-                totalEntityVerts += 4;
-                totalEntityIndices += 6;
+                totalEntityVerts += 6 * 4;
+                totalEntityIndices += 6 * 6;
                 totalEntityDraws += 1;
                 continue;
             }
@@ -6370,6 +6681,14 @@ static void RE_RenderScene(const refdef_t *fd) {
             uint32_t entityVertexCursor = s_entityVertexCount;
             uint32_t entityIndexCursor = s_entityIndexCount;
             uint32_t entityDrawCursor = s_entityDrawCount;
+            {
+                uint32_t drawInit;
+                for (drawInit = entityDrawCursor;
+                     drawInit < entityDrawCursor + totalEntityDraws;
+                     ++drawInit) {
+                    s_entityDraws[drawInit].fogIndex = Q3_METAL_NO_FOG;
+                }
+            }
 
             for (entityIndex = 0; entityIndex < s_sceneEntityCount; ++entityIndex) {
                 const metalSceneEntity_t *sceneEntity = &s_sceneEntities[entityIndex];
@@ -6400,24 +6719,23 @@ static void RE_RenderScene(const refdef_t *fd) {
                     vec3_t v0, v1, v2, v3;
                     float r, g, b, a;
                     int i;
-                    if (radius < 0.5f) radius = 8.0f;  /* sensible default */
-                    /* TASK #3: clamp oversize sprite radii. Stock Q3 rocket
-                     * explosion sprite radius is 64; plasma/rail are 1-16.
-                     * Anything over 256 produces a screen-filling quad
-                     * (the polka-dot plasma artifact seen in debug frames)
-                     * and is almost certainly a corrupted entity field.
-                     * Log the first few for diagnostics. */
-                    if (radius > 256.0f) {
-                        static int s_oversizeLog = 0;
-                        if (++s_oversizeLog <= 8) {
-                            ri.Printf(PRINT_WARNING,
-                                "[metal] RT_SPRITE oversize radius=%.1f shader=%d (clamped to 256)\n",
-                                radius, (int)sceneEntity->entity.customShader);
-                        }
-                        radius = 256.0f;
+                    if (sceneEntity->entity.rotation == 0.0f) {
+                        VectorScale(axis1, -radius, right);
+                        VectorScale(axis2,  radius, up);
+                    } else {
+                        float ang = (float)(M_PI / 180.0) * sceneEntity->entity.rotation;
+                        float s = sinf(ang);
+                        float c = cosf(ang);
+                        vec3_t left;
+
+                        VectorScale(axis1, c * radius, left);
+                        VectorMA(left, -s * radius, axis2, left);
+
+                        VectorScale(axis2, c * radius, up);
+                        VectorMA(up, s * radius, axis1, up);
+
+                        VectorSubtract(vec3_origin, left, right);
                     }
-                    VectorScale(axis1, -radius, right);
-                    VectorScale(axis2,  radius, up);
                     /* Four billboard corners. CCW order with UV
                      * origin at top-left (Q3 tex convention). */
                     VectorSubtract(sceneEntity->entity.origin, right, v0);
@@ -6546,113 +6864,48 @@ static void RE_RenderScene(const refdef_t *fd) {
                     continue;
                 }
 
-                /* RT_LIGHTNING: single rail-core quad between origin ("from")
-                 * and oldorigin ("to"). The side vector is perpendicular to
-                 * both the beam direction AND the viewer-to-beam direction,
-                 * so the quad is broadest when viewed from the side and
-                 * narrows into a line when viewed end-on — matches the Q3
-                 * lightning bolt look. Color from entity.shader.rgba.
-                 * Width fixed at 8 world units (Q3 reference). Stock Q3
-                 * crosshatches 4 cores for volume; we emit one core for
-                 * MVP (visible bolt). */
                 if (sceneEntity->entity.reType == RT_LIGHTNING) {
-                    uint32_t baseVertex = entityVertexCursor;
                     uint32_t firstIndex = entityIndexCursor;
                     const float *start = sceneEntity->entity.origin;
                     const float *end = sceneEntity->entity.oldorigin;
                     vec3_t beamDir, v1, v2, right;
-                    vec3_t corner0, corner1, corner2, corner3;
                     float len;
-                    float t;
                     float r, g, b, a;
-                    const float spanWidth = 8.0f;
+                    int i;
 
                     VectorSubtract(end, start, beamDir);
-                    len = VectorLength(beamDir);
-                    if (len < 1.0f) {
-                        /* Degenerate beam, skip. */
-                        continue;
-                    }
-                    t = len / 256.0f;     /* Q3 texcoord stretch */
+                    len = VectorNormalize(beamDir);
+                    if (len == 0.0f) continue;
 
                     VectorSubtract(start, vieworg, v1);
                     VectorNormalize(v1);
                     VectorSubtract(end, vieworg, v2);
                     VectorNormalize(v2);
                     CrossProduct(v1, v2, right);
-                    if (VectorLength(right) < 1e-4f) {
-                        /* Viewer directly on the beam line — degenerate
-                         * cross product. Fall back to camera's up-right
-                         * axis so we still emit visible geometry. */
-                        VectorCopy(axis2, right);
-                    }
                     VectorNormalize(right);
-                    VectorScale(right, spanWidth, right);
-
-                    /* corner0 = start + right, corner1 = start - right,
-                     * corner2 = end + right, corner3 = end - right. */
-                    VectorAdd(start, right, corner0);
-                    VectorSubtract(start, right, corner1);
-                    VectorAdd(end, right, corner2);
-                    VectorSubtract(end, right, corner3);
 
                     r = (float)sceneEntity->entity.shader.rgba[0] / 255.0f;
                     g = (float)sceneEntity->entity.shader.rgba[1] / 255.0f;
                     b = (float)sceneEntity->entity.shader.rgba[2] / 255.0f;
                     a = (float)sceneEntity->entity.shader.rgba[3] / 255.0f;
-                    /* cgame sometimes ships alpha=0 on lightning — treat
-                     * as fully opaque so the bolt is visible. */
-                    if (a < 0.01f) a = 1.0f;
 
-                    s_entityVertices[baseVertex + 0].position[0] = corner0[0];
-                    s_entityVertices[baseVertex + 0].position[1] = corner0[1];
-                    s_entityVertices[baseVertex + 0].position[2] = corner0[2];
-                    s_entityVertices[baseVertex + 0].texCoord[0] = 0.0f;
-                    s_entityVertices[baseVertex + 0].texCoord[1] = 0.0f;
-                    s_entityVertices[baseVertex + 1].position[0] = corner1[0];
-                    s_entityVertices[baseVertex + 1].position[1] = corner1[1];
-                    s_entityVertices[baseVertex + 1].position[2] = corner1[2];
-                    s_entityVertices[baseVertex + 1].texCoord[0] = 0.0f;
-                    s_entityVertices[baseVertex + 1].texCoord[1] = 1.0f;
-                    s_entityVertices[baseVertex + 2].position[0] = corner2[0];
-                    s_entityVertices[baseVertex + 2].position[1] = corner2[1];
-                    s_entityVertices[baseVertex + 2].position[2] = corner2[2];
-                    s_entityVertices[baseVertex + 2].texCoord[0] = t;
-                    s_entityVertices[baseVertex + 2].texCoord[1] = 0.0f;
-                    s_entityVertices[baseVertex + 3].position[0] = corner3[0];
-                    s_entityVertices[baseVertex + 3].position[1] = corner3[1];
-                    s_entityVertices[baseVertex + 3].position[2] = corner3[2];
-                    s_entityVertices[baseVertex + 3].texCoord[0] = t;
-                    s_entityVertices[baseVertex + 3].texCoord[1] = 1.0f;
-                    {
-                        int _i;
-                        for (_i = 0; _i < 4; ++_i) {
-                            s_entityVertices[baseVertex + _i].color[0] = r;
-                            s_entityVertices[baseVertex + _i].color[1] = g;
-                            s_entityVertices[baseVertex + _i].color[2] = b;
-                            s_entityVertices[baseVertex + _i].color[3] = a;
-                        }
+                    for (i = 0; i < 4; ++i) {
+                        vec3_t temp;
+                        MetalEmitRailCore(&entityVertexCursor, &entityIndexCursor,
+                                          start, end, right, len, 8.0f,
+                                          r, g, b, a);
+                        RotatePointAroundVector(temp, beamDir, right, 45.0f);
+                        VectorCopy(temp, right);
                     }
-                    s_entityIndices[entityIndexCursor + 0] = baseVertex + 0;
-                    s_entityIndices[entityIndexCursor + 1] = baseVertex + 1;
-                    s_entityIndices[entityIndexCursor + 2] = baseVertex + 2;
-                    s_entityIndices[entityIndexCursor + 3] = baseVertex + 2;
-                    s_entityIndices[entityIndexCursor + 4] = baseVertex + 1;
-                    s_entityIndices[entityIndexCursor + 5] = baseVertex + 3;
-                    entityVertexCursor += 4;
-                    entityIndexCursor += 6;
 
                     s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
-                    s_entityDraws[entityDrawCursor].indexCount = 6;
+                    s_entityDraws[entityDrawCursor].indexCount = entityIndexCursor - firstIndex;
                     s_entityDraws[entityDrawCursor].textureHandle =
                         (uint32_t)sceneEntity->entity.customShader;
-                    /* Lightning bolt texture is additive in stock Q3
-                     * (lightningBolt shader uses GL_ONE GL_ONE) — force
-                     * the additive pipeline + no-cull so the beam is
-                     * visible from both sides and blends over the world. */
                     s_entityDraws[entityDrawCursor].flags =
-                        Q3_METAL_ENTITY_DRAWFLAG_NOCULL |
-                        Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                        EntityFlagsForTexture((qhandle_t)sceneEntity->entity.customShader,
+                                              Q3_METAL_ENTITY_DRAWFLAG_NOCULL,
+                                              qfalse);
                     EmitMetalEntityStageAuditForHandle(
                         (qhandle_t)sceneEntity->entity.customShader,
                         "lightning");
@@ -6661,85 +6914,41 @@ static void RE_RenderScene(const refdef_t *fd) {
                     continue;
                 }
 
-                /* RT_RAIL_CORE: identical geometry to lightning, just wider.
-                 * Q3's r_railCoreWidth defaults to 16 (vs lightning's 8). */
                 if (sceneEntity->entity.reType == RT_RAIL_CORE) {
-                    uint32_t baseVertex = entityVertexCursor;
                     uint32_t firstIndex = entityIndexCursor;
                     const float *start = sceneEntity->entity.origin;
                     const float *end = sceneEntity->entity.oldorigin;
                     vec3_t beamDir, v1, v2, right;
-                    vec3_t c0, c1, c2, c3;
-                    float len, t;
+                    float len;
                     float r, g, b, a;
-                    const float spanWidth = 16.0f;
-                    int i;
+                    float spanWidth = (float)MetalRailCvarInteger("r_railCoreWidth", 6);
 
                     VectorSubtract(end, start, beamDir);
-                    len = VectorLength(beamDir);
-                    if (len < 1.0f) continue;
-                    t = len / 256.0f;
+                    len = VectorNormalize(beamDir);
+                    if (len == 0.0f) continue;
 
                     VectorSubtract(start, vieworg, v1); VectorNormalize(v1);
                     VectorSubtract(end, vieworg, v2);   VectorNormalize(v2);
                     CrossProduct(v1, v2, right);
-                    if (VectorLength(right) < 1e-4f) VectorCopy(axis2, right);
                     VectorNormalize(right);
-                    VectorScale(right, spanWidth, right);
-
-                    VectorAdd(start, right, c0);
-                    VectorSubtract(start, right, c1);
-                    VectorAdd(end, right, c2);
-                    VectorSubtract(end, right, c3);
 
                     r = (float)sceneEntity->entity.shader.rgba[0] / 255.0f;
                     g = (float)sceneEntity->entity.shader.rgba[1] / 255.0f;
                     b = (float)sceneEntity->entity.shader.rgba[2] / 255.0f;
                     a = (float)sceneEntity->entity.shader.rgba[3] / 255.0f;
-                    if (a < 0.01f) a = 1.0f;
 
-                    s_entityVertices[baseVertex + 0].position[0] = c0[0];
-                    s_entityVertices[baseVertex + 0].position[1] = c0[1];
-                    s_entityVertices[baseVertex + 0].position[2] = c0[2];
-                    s_entityVertices[baseVertex + 0].texCoord[0] = 0.0f;
-                    s_entityVertices[baseVertex + 0].texCoord[1] = 0.0f;
-                    s_entityVertices[baseVertex + 1].position[0] = c1[0];
-                    s_entityVertices[baseVertex + 1].position[1] = c1[1];
-                    s_entityVertices[baseVertex + 1].position[2] = c1[2];
-                    s_entityVertices[baseVertex + 1].texCoord[0] = 0.0f;
-                    s_entityVertices[baseVertex + 1].texCoord[1] = 1.0f;
-                    s_entityVertices[baseVertex + 2].position[0] = c2[0];
-                    s_entityVertices[baseVertex + 2].position[1] = c2[1];
-                    s_entityVertices[baseVertex + 2].position[2] = c2[2];
-                    s_entityVertices[baseVertex + 2].texCoord[0] = t;
-                    s_entityVertices[baseVertex + 2].texCoord[1] = 0.0f;
-                    s_entityVertices[baseVertex + 3].position[0] = c3[0];
-                    s_entityVertices[baseVertex + 3].position[1] = c3[1];
-                    s_entityVertices[baseVertex + 3].position[2] = c3[2];
-                    s_entityVertices[baseVertex + 3].texCoord[0] = t;
-                    s_entityVertices[baseVertex + 3].texCoord[1] = 1.0f;
-                    for (i = 0; i < 4; ++i) {
-                        s_entityVertices[baseVertex + i].color[0] = r;
-                        s_entityVertices[baseVertex + i].color[1] = g;
-                        s_entityVertices[baseVertex + i].color[2] = b;
-                        s_entityVertices[baseVertex + i].color[3] = a;
-                    }
-                    s_entityIndices[entityIndexCursor + 0] = baseVertex + 0;
-                    s_entityIndices[entityIndexCursor + 1] = baseVertex + 1;
-                    s_entityIndices[entityIndexCursor + 2] = baseVertex + 2;
-                    s_entityIndices[entityIndexCursor + 3] = baseVertex + 2;
-                    s_entityIndices[entityIndexCursor + 4] = baseVertex + 1;
-                    s_entityIndices[entityIndexCursor + 5] = baseVertex + 3;
-                    entityVertexCursor += 4;
-                    entityIndexCursor += 6;
+                    MetalEmitRailCore(&entityVertexCursor, &entityIndexCursor,
+                                      start, end, right, len, spanWidth,
+                                      r, g, b, a);
 
                     s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
                     s_entityDraws[entityDrawCursor].indexCount = 6;
                     s_entityDraws[entityDrawCursor].textureHandle =
                         (uint32_t)sceneEntity->entity.customShader;
                     s_entityDraws[entityDrawCursor].flags =
-                        Q3_METAL_ENTITY_DRAWFLAG_NOCULL |
-                        Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                        EntityFlagsForTexture((qhandle_t)sceneEntity->entity.customShader,
+                                              Q3_METAL_ENTITY_DRAWFLAG_NOCULL,
+                                              qfalse);
                     EmitMetalEntityStageAuditForHandle(
                         (qhandle_t)sceneEntity->entity.customShader,
                         "rail_core");
@@ -6748,202 +6957,135 @@ static void RE_RenderScene(const refdef_t *fd) {
                     continue;
                 }
 
-                /* RT_BEAM: grapple / mission beam. View-aligned quad with
-                 * stock Q3's red color (1,0,0,1) and width 4. Uses the
-                 * white fallback texture (customShader is typically 0
-                 * for RT_BEAM — Q3 disables texturing entirely for it). */
                 if (sceneEntity->entity.reType == RT_BEAM) {
-                    uint32_t baseVertex = entityVertexCursor;
                     uint32_t firstIndex = entityIndexCursor;
                     const float *start = sceneEntity->entity.origin;
                     const float *end = sceneEntity->entity.oldorigin;
-                    vec3_t beamDir, v1, v2, right;
-                    vec3_t c0, c1, c2, c3;
+                    vec3_t direction, normalizedDirection, perpvec;
                     float len;
-                    const float spanWidth = 4.0f;
                     qhandle_t texHandle;
                     int i;
 
-                    VectorSubtract(end, start, beamDir);
-                    len = VectorLength(beamDir);
-                    if (len < 1.0f) continue;
+                    VectorSubtract(end, start, direction);
+                    VectorCopy(direction, normalizedDirection);
+                    len = VectorNormalize(normalizedDirection);
+                    if (len == 0.0f) continue;
 
-                    VectorSubtract(start, vieworg, v1); VectorNormalize(v1);
-                    VectorSubtract(end, vieworg, v2);   VectorNormalize(v2);
-                    CrossProduct(v1, v2, right);
-                    if (VectorLength(right) < 1e-4f) VectorCopy(axis2, right);
-                    VectorNormalize(right);
-                    VectorScale(right, spanWidth, right);
+                    PerpendicularVector(perpvec, normalizedDirection);
+                    VectorScale(perpvec, 4.0f, perpvec);
 
-                    VectorAdd(start, right, c0);
-                    VectorSubtract(start, right, c1);
-                    VectorAdd(end, right, c2);
-                    VectorSubtract(end, right, c3);
+                    for (i = 0; i < 6; ++i) {
+                        uint32_t vbase = entityVertexCursor;
+                        vec3_t s0, s1, e0, e1, rot0, rot1;
+                        RotatePointAroundVector(rot0, normalizedDirection, perpvec, (360.0f / 6.0f) * i);
+                        RotatePointAroundVector(rot1, normalizedDirection, perpvec, (360.0f / 6.0f) * (i + 1));
+                        VectorAdd(start, rot0, s0);
+                        VectorAdd(start, rot1, s1);
+                        VectorAdd(end, rot1, e1);
+                        VectorAdd(end, rot0, e0);
 
-                    s_entityVertices[baseVertex + 0].position[0] = c0[0];
-                    s_entityVertices[baseVertex + 0].position[1] = c0[1];
-                    s_entityVertices[baseVertex + 0].position[2] = c0[2];
-                    s_entityVertices[baseVertex + 0].texCoord[0] = 0.0f;
-                    s_entityVertices[baseVertex + 0].texCoord[1] = 0.0f;
-                    s_entityVertices[baseVertex + 1].position[0] = c1[0];
-                    s_entityVertices[baseVertex + 1].position[1] = c1[1];
-                    s_entityVertices[baseVertex + 1].position[2] = c1[2];
-                    s_entityVertices[baseVertex + 1].texCoord[0] = 0.0f;
-                    s_entityVertices[baseVertex + 1].texCoord[1] = 1.0f;
-                    s_entityVertices[baseVertex + 2].position[0] = c2[0];
-                    s_entityVertices[baseVertex + 2].position[1] = c2[1];
-                    s_entityVertices[baseVertex + 2].position[2] = c2[2];
-                    s_entityVertices[baseVertex + 2].texCoord[0] = 1.0f;
-                    s_entityVertices[baseVertex + 2].texCoord[1] = 0.0f;
-                    s_entityVertices[baseVertex + 3].position[0] = c3[0];
-                    s_entityVertices[baseVertex + 3].position[1] = c3[1];
-                    s_entityVertices[baseVertex + 3].position[2] = c3[2];
-                    s_entityVertices[baseVertex + 3].texCoord[0] = 1.0f;
-                    s_entityVertices[baseVertex + 3].texCoord[1] = 1.0f;
-                    for (i = 0; i < 4; ++i) {
-                        s_entityVertices[baseVertex + i].color[0] = 1.0f;
-                        s_entityVertices[baseVertex + i].color[1] = 0.0f;
-                        s_entityVertices[baseVertex + i].color[2] = 0.0f;
-                        s_entityVertices[baseVertex + i].color[3] = 1.0f;
+                        MetalSetEntityVertex(vbase + 0, s0, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f);
+                        MetalSetEntityVertex(vbase + 1, s1, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f, 1.0f);
+                        MetalSetEntityVertex(vbase + 2, e1, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 1.0f);
+                        MetalSetEntityVertex(vbase + 3, e0, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f);
+
+                        s_entityIndices[entityIndexCursor + 0] = vbase + 0;
+                        s_entityIndices[entityIndexCursor + 1] = vbase + 1;
+                        s_entityIndices[entityIndexCursor + 2] = vbase + 2;
+                        s_entityIndices[entityIndexCursor + 3] = vbase + 0;
+                        s_entityIndices[entityIndexCursor + 4] = vbase + 2;
+                        s_entityIndices[entityIndexCursor + 5] = vbase + 3;
+                        entityVertexCursor += 4;
+                        entityIndexCursor += 6;
                     }
-                    s_entityIndices[entityIndexCursor + 0] = baseVertex + 0;
-                    s_entityIndices[entityIndexCursor + 1] = baseVertex + 1;
-                    s_entityIndices[entityIndexCursor + 2] = baseVertex + 2;
-                    s_entityIndices[entityIndexCursor + 3] = baseVertex + 2;
-                    s_entityIndices[entityIndexCursor + 4] = baseVertex + 1;
-                    s_entityIndices[entityIndexCursor + 5] = baseVertex + 3;
-                    entityVertexCursor += 4;
-                    entityIndexCursor += 6;
 
-                    texHandle = (sceneEntity->entity.customShader > 0)
-                        ? sceneEntity->entity.customShader
-                        : (qhandle_t)EnsureWhiteTexture();
+                    texHandle = (qhandle_t)EnsureWhiteTexture();
                     s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
-                    s_entityDraws[entityDrawCursor].indexCount = 6;
+                    s_entityDraws[entityDrawCursor].indexCount = entityIndexCursor - firstIndex;
                     s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)texHandle;
                     s_entityDraws[entityDrawCursor].flags =
                         Q3_METAL_ENTITY_DRAWFLAG_NOCULL |
-                        Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                        Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE_FULL;
                     EmitMetalEntityStageAuditForHandle(texHandle, "beam");
                     SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity);
                     entityDrawCursor += 1;
                     continue;
                 }
 
-                /* RT_RAIL_RINGS: series of small billboard quads placed
-                 * every r_railSegmentLength units along the beam. Stock
-                 * Q3 draws 4 rotated quads per segment for a spiral
-                 * effect; we emit a single view-aligned quad per segment
-                 * for MVP, using the ring texture (customShader). */
                 if (sceneEntity->entity.reType == RT_RAIL_RINGS) {
-                    uint32_t baseVertex = entityVertexCursor;
                     uint32_t firstIndex = entityIndexCursor;
                     const float *a0 = sceneEntity->entity.oldorigin; /* start */
                     const float *a1 = sceneEntity->entity.origin;    /* end */
-                    vec3_t beamDir, unitDir, right, up;
+                    vec3_t vec, right, up;
+                    vec3_t pos[4];
                     float len;
-                    const float segmentLength = 64.0f;  /* r_railSegmentLength */
-                    const float ringSize = 8.0f;
+                    float segmentLength = MetalRailCvarValue("r_railSegmentLength", 32.0f);
+                    int spanWidth = MetalRailCvarInteger("r_railWidth", 16);
                     int numSegs;
                     int seg;
                     float r, g, b, a;
                     uint32_t localIndexCount = 0;
+                    int j;
 
-                    VectorSubtract(a1, a0, beamDir);
-                    len = VectorLength(beamDir);
-                    if (len < 1.0f) continue;
-                    VectorScale(beamDir, 1.0f / len, unitDir);
-
-                    /* Right + up axes perpendicular to beam for the ring
-                     * quads. Cheap Gram-Schmidt off the world up axis,
-                     * falling back if the beam is vertical. */
-                    {
-                        vec3_t worldUp = {0.0f, 0.0f, 1.0f};
-                        float d = DotProduct(unitDir, worldUp);
-                        if (fabsf(d) > 0.99f) {
-                            vec3_t alt = {1.0f, 0.0f, 0.0f};
-                            CrossProduct(unitDir, alt, right);
-                        } else {
-                            CrossProduct(unitDir, worldUp, right);
-                        }
-                        VectorNormalize(right);
-                        CrossProduct(unitDir, right, up);
-                        VectorNormalize(up);
-                    }
+                    VectorSubtract(a1, a0, vec);
+                    len = VectorNormalize(vec);
+                    if (len == 0.0f) continue;
+                    MakeNormalVectors(vec, right, up);
 
                     numSegs = (int)(len / segmentLength);
-                    if (numSegs < 1) numSegs = 1;
-                    if (numSegs > 32) numSegs = 32;
+                    if (numSegs <= 0) numSegs = 1;
+                    VectorScale(vec, segmentLength, vec);
+                    if (numSegs > 1) numSegs--;
+                    if (!numSegs) continue;
 
                     r = (float)sceneEntity->entity.shader.rgba[0] / 255.0f;
                     g = (float)sceneEntity->entity.shader.rgba[1] / 255.0f;
                     b = (float)sceneEntity->entity.shader.rgba[2] / 255.0f;
                     a = (float)sceneEntity->entity.shader.rgba[3] / 255.0f;
-                    if (a < 0.01f) a = 1.0f;
+
+                    for (j = 0; j < 4; ++j) {
+                        vec3_t v;
+                        float c = cosf((float)(M_PI / 180.0) * (45.0f + (float)j * 90.0f));
+                        float s = sinf((float)(M_PI / 180.0) * (45.0f + (float)j * 90.0f));
+                        v[0] = (right[0] * c + up[0] * s) * 0.25f * (float)spanWidth;
+                        v[1] = (right[1] * c + up[1] * s) * 0.25f * (float)spanWidth;
+                        v[2] = (right[2] * c + up[2] * s) * 0.25f * (float)spanWidth;
+                        VectorAdd(a0, v, pos[j]);
+                        if (numSegs > 1) {
+                            VectorAdd(pos[j], vec, pos[j]);
+                        }
+                    }
 
                     for (seg = 0; seg < numSegs; ++seg) {
                         uint32_t segBase = entityVertexCursor;
-                        vec3_t center;
-                        vec3_t scaledRight, scaledUp;
-                        vec3_t rc0, rc1, rc2, rc3;
-                        float step = (float)(seg + 1) * segmentLength;
                         int vi;
 
-                        center[0] = a0[0] + unitDir[0] * step;
-                        center[1] = a0[1] + unitDir[1] * step;
-                        center[2] = a0[2] + unitDir[2] * step;
-                        VectorScale(right, ringSize, scaledRight);
-                        VectorScale(up, ringSize, scaledUp);
-                        VectorSubtract(center, scaledRight, rc0); VectorSubtract(rc0, scaledUp, rc0);
-                        VectorAdd(center, scaledRight, rc1); VectorSubtract(rc1, scaledUp, rc1);
-                        VectorAdd(center, scaledRight, rc2); VectorAdd(rc2, scaledUp, rc2);
-                        VectorSubtract(center, scaledRight, rc3); VectorAdd(rc3, scaledUp, rc3);
-
-                        s_entityVertices[segBase + 0].position[0] = rc0[0];
-                        s_entityVertices[segBase + 0].position[1] = rc0[1];
-                        s_entityVertices[segBase + 0].position[2] = rc0[2];
-                        s_entityVertices[segBase + 0].texCoord[0] = 0.0f;
-                        s_entityVertices[segBase + 0].texCoord[1] = 1.0f;
-                        s_entityVertices[segBase + 1].position[0] = rc1[0];
-                        s_entityVertices[segBase + 1].position[1] = rc1[1];
-                        s_entityVertices[segBase + 1].position[2] = rc1[2];
-                        s_entityVertices[segBase + 1].texCoord[0] = 1.0f;
-                        s_entityVertices[segBase + 1].texCoord[1] = 1.0f;
-                        s_entityVertices[segBase + 2].position[0] = rc2[0];
-                        s_entityVertices[segBase + 2].position[1] = rc2[1];
-                        s_entityVertices[segBase + 2].position[2] = rc2[2];
-                        s_entityVertices[segBase + 2].texCoord[0] = 1.0f;
-                        s_entityVertices[segBase + 2].texCoord[1] = 0.0f;
-                        s_entityVertices[segBase + 3].position[0] = rc3[0];
-                        s_entityVertices[segBase + 3].position[1] = rc3[1];
-                        s_entityVertices[segBase + 3].position[2] = rc3[2];
-                        s_entityVertices[segBase + 3].texCoord[0] = 0.0f;
-                        s_entityVertices[segBase + 3].texCoord[1] = 0.0f;
                         for (vi = 0; vi < 4; ++vi) {
-                            s_entityVertices[segBase + vi].color[0] = r;
-                            s_entityVertices[segBase + vi].color[1] = g;
-                            s_entityVertices[segBase + vi].color[2] = b;
-                            s_entityVertices[segBase + vi].color[3] = a;
+                            MetalSetEntityVertex(segBase + vi, pos[vi],
+                                                 (float)(vi < 2),
+                                                 (float)(vi && vi != 3),
+                                                 r, g, b, a);
+                            VectorAdd(pos[vi], vec, pos[vi]);
                         }
                         s_entityIndices[entityIndexCursor + 0] = segBase + 0;
                         s_entityIndices[entityIndexCursor + 1] = segBase + 1;
-                        s_entityIndices[entityIndexCursor + 2] = segBase + 2;
-                        s_entityIndices[entityIndexCursor + 3] = segBase + 0;
-                        s_entityIndices[entityIndexCursor + 4] = segBase + 2;
-                        s_entityIndices[entityIndexCursor + 5] = segBase + 3;
+                        s_entityIndices[entityIndexCursor + 2] = segBase + 3;
+                        s_entityIndices[entityIndexCursor + 3] = segBase + 3;
+                        s_entityIndices[entityIndexCursor + 4] = segBase + 1;
+                        s_entityIndices[entityIndexCursor + 5] = segBase + 2;
                         entityVertexCursor += 4;
                         entityIndexCursor += 6;
                         localIndexCount += 6;
                     }
 
-                    (void)baseVertex;
                     s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
                     s_entityDraws[entityDrawCursor].indexCount = localIndexCount;
                     s_entityDraws[entityDrawCursor].textureHandle =
                         (uint32_t)sceneEntity->entity.customShader;
                     s_entityDraws[entityDrawCursor].flags =
-                        Q3_METAL_ENTITY_DRAWFLAG_NOCULL |
-                        Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                        EntityFlagsForTexture((qhandle_t)sceneEntity->entity.customShader,
+                                              Q3_METAL_ENTITY_DRAWFLAG_NOCULL,
+                                              qfalse);
                     EmitMetalEntityStageAuditForHandle(
                         (qhandle_t)sceneEntity->entity.customShader,
                         "rail_rings");
@@ -7231,7 +7373,7 @@ static void RE_RenderScene(const refdef_t *fd) {
                     uint32_t firstIndex;
                     int vi, ti;
                     const metalTexture_t *ptex;
-                    uint32_t polyFlags = Q3_METAL_ENTITY_DRAWFLAG_NOCULL;
+                    uint32_t polyFlags = 0;
 
                     if (nv < 3) continue;
                     baseVertex = entityVertexCursor;
@@ -7304,6 +7446,7 @@ static void RE_RenderScene(const refdef_t *fd) {
                     s_entityDraws[entityDrawCursor].indexCount = (uint32_t)((nv - 2) * 3);
                     s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)poly->shader;
                     s_entityDraws[entityDrawCursor].flags = polyFlags;
+                    s_entityDraws[entityDrawCursor].fogIndex = poly->fogIndex;
                     /* Scene polys (RE_AddPolyToScene) carry per-vertex
                      * polyVert_t.modulate already; rgbGen=entity isn't a
                      * concept here. Default the per-draw entityColor to

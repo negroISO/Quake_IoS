@@ -137,11 +137,16 @@ struct MetalView: UIViewRepresentable {
             var deformWaveAmp: Float = 0
             var deformWavePhase: Float = 0
             var deformWaveFreq: Float = 0
+            var deformMoveFunc: UInt32 = 0
+            var deformMoveVector: SIMD3<Float> = SIMD3<Float>(0, 0, 0)
+            var deformMoveBase: Float = 0
+            var deformMoveAmp: Float = 0
+            var deformMovePhase: Float = 0
+            var deformMoveFreq: Float = 0
             // deformVertexes autosprite/autoSprite2 mode. 0 = none,
             // 1 = autosprite (full billboard), 2 = autoSprite2
             // (elongated; transform pending).
             var autospriteMode: UInt32 = 0
-            var _deformPad0: Float = 0
             var debugMode: Float
             var forceWhiteVertColor: Float
             var alphaTestThreshold: Float
@@ -367,6 +372,7 @@ struct MetalView: UIViewRepresentable {
              * shaders (quad shell, regen, battlesuit). 16-byte aligned
              * via SIMD3 (w is padding). */
             var cameraPos: SIMD3<Float> = SIMD3<Float>(0, 0, 0)
+            var cameraForward: SIMD3<Float> = SIMD3<Float>(1, 0, 0)
             /* 1.0 when the current draw's shader has `tcGen environment`.
              * Set per entity based on Q3_METAL_ENTITY_DRAWFLAG_TCGEN_ENV.
              * 0.0 otherwise — fragment keeps mesh ST coords. */
@@ -429,6 +435,9 @@ struct MetalView: UIViewRepresentable {
              * diffuse already baked in by the C entity build loop;
              * this carries the un-Lambert'd, raw entity color. */
             var entityColor: SIMD4<Float> = SIMD4<Float>(1, 1, 1, 1)
+            var fogColorDistance: SIMD4<Float> = SIMD4<Float>(0, 0, 0, 0)
+            var fogParams: SIMD4<Float> = SIMD4<Float>(0, 0, 0, 0)
+            var fogSurface: SIMD4<Float> = SIMD4<Float>(0, 0, 0, 0)
             /* 1 for GL_ONE/GL_ONE entity draws. These shaders are already
              * authored as full-bright additive effects; applying dynamic
              * lights to the source texture itself double-brightens muzzle
@@ -621,10 +630,15 @@ struct MetalView: UIViewRepresentable {
             float deformWaveAmp;
             float deformWavePhase;
             float deformWaveFreq;
+            uint  deformMoveFunc;
+            float3 deformMoveVector;
+            float deformMoveBase;
+            float deformMoveAmp;
+            float deformMovePhase;
+            float deformMoveFreq;
             // deformVertexes autosprite mode (1=autosprite, 2=autoSprite2,
             // 0=none).
             uint  autospriteMode;
-            float _deformPad0;
             float debugMode;
             float forceWhiteVertColor;
             float alphaTestThreshold;
@@ -664,7 +678,9 @@ struct MetalView: UIViewRepresentable {
 
         float2 applyTcMod(float2 uv, float3 worldPos, int type, float4 params, float timeSeconds) {
             if (type == 1) {
-                return uv + fract(params.xy * timeSeconds);
+                float2 adj = params.xy * timeSeconds;
+                adj -= floor(adj);
+                return uv + adj;
             } else if (type == 2) {
                 float s = sin(timeSeconds * params.w) * params.y;
                 return uv + float2(s, s);
@@ -707,8 +723,8 @@ struct MetalView: UIViewRepresentable {
                 return (uv - 0.5) * p + 0.5;
             } else if (type == 7) {
                 return float2(
-                    uv.x * params.x + uv.y * params.z,
-                    uv.x * params.y + uv.y * params.w
+                    uv.x * params.x + uv.y * params.y,
+                    uv.x * params.z + uv.y * params.w
                 );
             } else if (type == 8) {
                 return uv + params.xy;
@@ -732,8 +748,8 @@ struct MetalView: UIViewRepresentable {
 
             if (drawUniforms.fogParams.y > 0.5) {
                 float4 surface = drawUniforms.fogSurface;
-                t = dot(worldPos, surface.xyz) + surface.w;
-                float eyeT = dot(float3(uniforms.cameraPos), surface.xyz) + surface.w;
+            t = dot(worldPos, surface.xyz) + surface.w;
+            float eyeT = dot(float3(uniforms.cameraPos), surface.xyz) + surface.w;
                 if (eyeT < 0.0) {
                     if (t < 1.0) {
                         t = 1.0 / 32.0;
@@ -768,6 +784,7 @@ struct MetalView: UIViewRepresentable {
              * boundaries, so the explicit pads keep offsets aligned with
              * the Swift layout. Read by q3_entity_fragment for tcGen env. */
             float3 cameraPos;
+            float3 cameraForward;
             float  tcGen;
             float  timeSeconds;
             int    tcModCount;
@@ -785,8 +802,48 @@ struct MetalView: UIViewRepresentable {
             float4 alphaGenWaveParams;
             float4 rgbConstColor;
             float4 entityColor;
+            float4 fogColorDistance;
+            float4 fogParams;
+            float4 fogSurface;
             uint suppressDlights;
         };
+
+        float q3EntityFogFactor(float3 worldPos,
+                                constant EntityUniforms &uniforms) {
+            if (uniforms.fogColorDistance.w <= 0.0 ||
+                uniforms.fogParams.x <= 0.0) {
+                return 0.0;
+            }
+
+            float s = dot(worldPos - uniforms.cameraPos,
+                          normalize(uniforms.cameraForward)) *
+                      uniforms.fogParams.x;
+            float t = 31.0 / 32.0;
+
+            if (uniforms.fogParams.y > 0.5) {
+                float4 surface = uniforms.fogSurface;
+            t = dot(worldPos, surface.xyz) + surface.w;
+            float eyeT = dot(uniforms.cameraPos, surface.xyz) + surface.w;
+                if (eyeT < 0.0) {
+                    if (t < 1.0) {
+                        t = 1.0 / 32.0;
+                    } else {
+                        t = 1.0 / 32.0 + (30.0 / 32.0 * t) / (t - eyeT);
+                    }
+                } else {
+                    t = (t < 0.0) ? (1.0 / 32.0) : (31.0 / 32.0);
+                }
+            }
+
+            if (s < 0.0 || t < (1.0 / 32.0)) {
+                return 0.0;
+            }
+            if (t < (31.0 / 32.0)) {
+                s *= (t - 1.0 / 32.0) / (30.0 / 32.0);
+            }
+            s *= 8.0;
+            return sqrt(saturate(s));
+        }
 
         struct EntityVertexOut {
             float4 position [[position]];
@@ -834,6 +891,15 @@ struct MetalView: UIViewRepresentable {
                                            drawUniforms.timeSeconds);
                     worldPos += n * scale;
                 }
+            }
+            if (drawUniforms.deformMoveFunc != 0u) {
+                float scale = evalWave(drawUniforms.deformMoveFunc,
+                                       drawUniforms.deformMoveBase,
+                                       drawUniforms.deformMoveAmp,
+                                       drawUniforms.deformMovePhase,
+                                       drawUniforms.deformMoveFreq,
+                                       drawUniforms.timeSeconds);
+                worldPos += drawUniforms.deformMoveVector * scale;
             }
             /* deformVertexes autosprite (mode 1): camera-aligned
              * billboard. Replaces the authored corner position with
@@ -1246,6 +1312,10 @@ struct MetalView: UIViewRepresentable {
             if (uniforms.suppressDlights == 0u) {
                 base.rgb = applyDlights(base.rgb, in.worldPos, dlights);
             }
+            if (uniforms.fogColorDistance.w > 0.0) {
+                float f = q3EntityFogFactor(in.worldPos, uniforms);
+                base.rgb = mix(base.rgb, uniforms.fogColorDistance.xyz, f);
+            }
             return base;
         }
 
@@ -1593,6 +1663,7 @@ struct MetalView: UIViewRepresentable {
 
                     let skyFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
                     let fogOverlayBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY)
+                    let fogOnlyBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY)
 
                     // Ordered world passes:
                     // 0 = opaque, 1 = filter, 2 = alpha,
@@ -1604,6 +1675,9 @@ struct MetalView: UIViewRepresentable {
                     for worldPass in 0..<6 {
                     for draw in worldDraws where draw.indexCount > 0 {
                         let isSky = (draw.flags & skyFlagBit) != 0
+                        if (draw.flags & fogOnlyBit) != 0 && worldPass != 5 {
+                            continue
+                        }
                         if isSky {
                             // Only emit sky during the opaque pass to avoid
                             // duplicated draws across 4 pass iterations.
@@ -1675,6 +1749,14 @@ struct MetalView: UIViewRepresentable {
                                     fogColorDistance: SIMD4<Float>(0, 0, 0, 0),
                                     tcGenVec0: skyTV0,
                                     tcGenVec1: skyTV1,
+                                    deformMoveFunc: stage.deformMoveFunc,
+                                    deformMoveVector: SIMD3(stage.deformMoveVector.0,
+                                                            stage.deformMoveVector.1,
+                                                            stage.deformMoveVector.2),
+                                    deformMoveBase: stage.deformMoveBase,
+                                    deformMoveAmp: stage.deformMoveAmp,
+                                    deformMovePhase: stage.deformMovePhase,
+                                    deformMoveFreq: stage.deformMoveFreq,
                                     debugMode: 0,
                                     forceWhiteVertColor: 0,
                                     alphaTestThreshold: 0,
@@ -1747,6 +1829,14 @@ struct MetalView: UIViewRepresentable {
                                 deformWaveAmp: stage.deformWaveAmp,
                                 deformWavePhase: stage.deformWavePhase,
                                 deformWaveFreq: stage.deformWaveFreq,
+                                deformMoveFunc: stage.deformMoveFunc,
+                                deformMoveVector: SIMD3(stage.deformMoveVector.0,
+                                                        stage.deformMoveVector.1,
+                                                        stage.deformMoveVector.2),
+                                deformMoveBase: stage.deformMoveBase,
+                                deformMoveAmp: stage.deformMoveAmp,
+                                deformMovePhase: stage.deformMovePhase,
+                                deformMoveFreq: stage.deformMoveFreq,
                                 autospriteMode: stage.autospriteMode,
                                 debugMode: 0,
                                 forceWhiteVertColor: 0,
@@ -1860,6 +1950,14 @@ struct MetalView: UIViewRepresentable {
                                 deformWaveAmp: stage.deformWaveAmp,
                                 deformWavePhase: stage.deformWavePhase,
                                 deformWaveFreq: stage.deformWaveFreq,
+                                deformMoveFunc: stage.deformMoveFunc,
+                                deformMoveVector: SIMD3(stage.deformMoveVector.0,
+                                                        stage.deformMoveVector.1,
+                                                        stage.deformMoveVector.2),
+                                deformMoveBase: stage.deformMoveBase,
+                                deformMoveAmp: stage.deformMoveAmp,
+                                deformMovePhase: stage.deformMovePhase,
+                                deformMoveFreq: stage.deformMoveFreq,
                                 autospriteMode: stage.autospriteMode,
                                 debugMode: Coordinator.worldDebugMode,
                                 forceWhiteVertColor: forceWhiteVertex,
@@ -1914,8 +2012,10 @@ struct MetalView: UIViewRepresentable {
                let entityIndexBuffer {
                 let entityViewProjection = makeWorldViewProjection(sceneView)
                 let cameraPos = SIMD3<Float>(sceneView.viewOrigin.0, sceneView.viewOrigin.1, sceneView.viewOrigin.2)
+                let cameraForward = SIMD3<Float>(sceneView.viewAxis.0, sceneView.viewAxis.1, sceneView.viewAxis.2)
                 let entityTimeSeconds = Float(CACurrentMediaTime() - frameTimeOrigin)
                 var entityUniforms = EntityUniforms(viewProjection: entityViewProjection, cameraPos: cameraPos, tcGen: 0, timeSeconds: entityTimeSeconds)
+                entityUniforms.cameraForward = cameraForward
                 encoder.setRenderPipelineState(entityPipelineState)
                 encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
                 encoder.setFrontFacing(.clockwise)
@@ -1993,6 +2093,19 @@ struct MetalView: UIViewRepresentable {
                          * scene polys — the shader's resolved genMode
                          * flows through verbatim from packEntityRgbGen. */
                         let isScenePoly = (draw.flags & scenePolyBit) != 0
+                        entityUniforms.fogColorDistance = SIMD4<Float>(0, 0, 0, 0)
+                        entityUniforms.fogParams = SIMD4<Float>(0, 0, 0, 0)
+                        entityUniforms.fogSurface = SIMD4<Float>(0, 0, 0, 0)
+                        if draw.fogIndex != UInt32(Q3_METAL_NO_FOG) {
+                            let count = Q3MetalRenderer_GetWorldFogCount()
+                            if Int(draw.fogIndex) < count,
+                               let fogs = Q3MetalRenderer_GetWorldFogs() {
+                                let f = fogs.advanced(by: Int(draw.fogIndex)).pointee
+                                entityUniforms.fogColorDistance = SIMD4(f.color.0, f.color.1, f.color.2, f.distance)
+                                entityUniforms.fogParams = SIMD4(f.tcScale, f.hasSurface != 0 ? 1.0 : 0.0, 0, 0)
+                                entityUniforms.fogSurface = SIMD4(f.surface.0, f.surface.1, f.surface.2, f.surface.3)
+                            }
+                        }
                         /* Implicit alphaFunc GT0 for sprite billboards whose
                          * additive shader didn't declare alphaFunc. Matches
                          * upstream Q3 intent: dark / transparent regions of
@@ -2273,7 +2386,7 @@ struct MetalView: UIViewRepresentable {
             do {
                 library = try device.makeLibrary(source: shaderSource, options: nil)
             } catch {
-                print("[Metal] Failed to compile UI shaders: \\(error)")
+                print("[Metal] Failed to compile shaders: \(error)")
                 return
             }
 

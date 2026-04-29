@@ -104,6 +104,12 @@ typedef struct {
     float    deformWaveAmp;
     float    deformWavePhase;
     float    deformWaveFreq;
+    uint32_t deformMoveFunc;
+    float    deformMoveVector[3];
+    float    deformMoveBase;
+    float    deformMoveAmp;
+    float    deformMovePhase;
+    float    deformMoveFreq;
     /* deformVertexes autosprite / autoSprite2 (shader-level). Tag-only
      * for the moment — the camera-aligned billboard transform that
      * matches ioq3 RB_AutospriteDeform / RB_Autosprite2Deform is a
@@ -112,7 +118,6 @@ typedef struct {
      * authored quads.
      * 0 = none, 1 = autosprite, 2 = autoSprite2. */
     uint32_t autospriteMode;
-    float    _deformPad[1];
     uint32_t rgbGen;      /* 0=identity,1=vertex,2=lightingDiffuse,3=wave,
                            * 7=identityLighting */
     uint32_t alphaGen;    /* 0=identity,1=vertex,3=wave */
@@ -197,6 +202,7 @@ typedef struct {
      * which has Lambert diffuse already baked in by the C build loop. */
     float entityColor[4];
     float shaderTime;
+    uint32_t fogIndex;
 } Q3MetalEntityDrawCmd;
 
 enum {
@@ -226,7 +232,8 @@ enum {
      * surface. Split multi-stage draws still carry fogIndex on every
      * stage for per-pass attenuation, but only one draw should emit the
      * final fog pass. */
-    Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY = 1u << 10
+    Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY = 1u << 10,
+    Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY = 1u << 11
 };
 
 enum {
