@@ -2080,7 +2080,15 @@ static void LoadWorldLightmaps(const dheader_t *header, const char *mapName) {
     {
         int mapOverbright = ri.Cvar_VariableIntegerValue("r_mapOverBrightBits");
         int frameOverbright = ri.Cvar_VariableIntegerValue("r_overBrightBits");
-        int shift = mapOverbright - frameOverbright;
+        /* +1 absorbs the GL_RGB_SCALE=2 stock Q3 applies to the lightmap
+         * texture unit. With the lightmap now a real second-pass stage
+         * blending via GL_DST_COLOR/GL_ZERO (no shader-side `lightmap*2`
+         * hack), the loader bakes the full 4x boost in. Empirically
+         * the best q3dm4 MAE so far (22.71). Plain (no +1) scored 23.37;
+         * adding a uniform fragment-side scalar regressed (compounds
+         * across base + lightmap stages). The proper lightgrid +
+         * RB_CalcDiffuseColor path is the long-term fix. */
+        int shift = mapOverbright - frameOverbright + 1;
         if (shift < 0) shift = 0; /* we never downshift — behaviour matches stock path 122-138 */
         for (i = 0; i < lightmapCount; ++i) {
             byte *rgba = ri.Malloc(LIGHTMAP_WIDTH * LIGHTMAP_HEIGHT * 4);
@@ -4074,7 +4082,11 @@ static qboolean LoadWorldMapData(const char *name) {
                                                    indexCountForDraw,
                                                    hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
                                                    worldFlags |
-                                                       (_e->hasLightmapStage ? Q3_METAL_WORLD_DRAWFLAG_LIGHTMAP_MULTIPLY : 0u) |
+                                                       /* LIGHTMAP_MULTIPLY removed: lightmap is now a
+                                                        * real second-pass stage emitted in this same
+                                                        * loop with its own parsed blendFunc filter
+                                                        * (GL_DST_COLOR/GL_ZERO via worldFilterPipelineState).
+                                                        * Stage-driven, not flag-driven. */
                                                        ((_emitted == 0)
                                                            ? Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY : 0u),
                                                    fogIndex);
@@ -4223,7 +4235,7 @@ static qboolean LoadWorldMapData(const char *name) {
                                        indexCountForDraw,
                                        hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
                                        worldFlags |
-                                           (_e->hasLightmapStage ? Q3_METAL_WORLD_DRAWFLAG_LIGHTMAP_MULTIPLY : 0u) |
+                                           /* LIGHTMAP_MULTIPLY removed — see comment in patch path above. */
                                            ((_emitted == 0)
                                                ? Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY : 0u),
                                        fogIndex);

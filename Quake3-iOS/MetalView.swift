@@ -113,6 +113,14 @@ struct MetalView: UIViewRepresentable {
             var tcModParams3: SIMD4<Float>
             var rgbWaveParams: SIMD4<Float> = SIMD4(0, 0, 0, 0)
             var alphaWaveParams: SIMD4<Float> = SIMD4(0, 0, 0, 0)
+            /* CGEN_CONST tint + AGEN_CONST alpha. .xyz = const rgb,
+             * .w = const alpha (mirrors EntityUniforms.rgbConstColor).
+             * Defaults to (1,1,1,1) so non-CONST stages no-op. */
+            var rgbConstColor: SIMD4<Float> = SIMD4(1, 1, 1, 1)
+            /* CGEN_ENTITY rgb + AGEN_ENTITY alpha. .xyz = entity rgb,
+             * .w = entity alpha. World draws populate as identity;
+             * entity shaders use the dedicated EntityUniforms path. */
+            var entityColor: SIMD4<Float> = SIMD4(1, 1, 1, 1)
             // Fog for this draw. xyz = linear fog color, w = fog distance
             // (units of world space). w == 0 ⇒ no fog, fragment skips the
             // mix entirely. Populated per-draw from s_worldFogs[fogIndex].
@@ -643,6 +651,10 @@ struct MetalView: UIViewRepresentable {
             float4 tcModParams3;
             float4 rgbWaveParams;
             float4 alphaWaveParams;
+            // CGEN_CONST tint + AGEN_CONST alpha. .xyz = const rgb, .w = const alpha.
+            float4 rgbConstColor;
+            // CGEN_ENTITY rgb + AGEN_ENTITY alpha. .xyz = entity rgb, .w = entity alpha.
+            float4 entityColor;
             // Fog: xyz = color, w = distance (world units). w == 0 ⇒
             // no fog applies to this draw, fragment skips the mix.
             float4 fogColorDistance;
@@ -704,6 +716,72 @@ struct MetalView: UIViewRepresentable {
                 w = sin(2.0 * 3.14159265 * f);
             }
             return base + w * amp;
+        }
+
+        /* ComputeRGBGen — exact ioq3 ComputeColors mapping using the
+         * CURRENT Metal parser numbering at metal_renderer_stub.c:5503-
+         * 5520. (Spec-literal CGEN_* numbering forbidden by the
+         * directive's "DO NOT modify parser" rule.)
+         *   0 IDENTITY         → (1,1,1)
+         *   1 VERTEX/EXACTVERTEX → vertexColor
+         *   2 LIGHTING_DIFFUSE → vertexColor   (BSP-baked diffuse already
+         *                        lives in the per-vertex color stream;
+         *                        ioq3 RB_CalcDiffuseColor recomputes
+         *                        Lambert per-frame, but world surfaces
+         *                        on iPad use the pre-baked path)
+         *   3 WAVEFORM         → float3(waveVal) (replaces; doesn't
+         *                        multiply by vertexColor — matches ioq3)
+         *   4 CONST            → constColor.rgb
+         *   5 ENTITY           → entityColor
+         *   6 ONE_MINUS_ENTITY → (1,1,1) - entityColor
+         *   7 IDENTITY_LIGHTING → (1,1,1) (parser doesn't emit; safety net)
+         */
+        float3 ComputeRGBGen(int rgbGen,
+                             float3 vertexColor,
+                             float4 constColor,
+                             float3 entityColor,
+                             float3 lightingDiffuse,
+                             float waveVal) {
+            switch (rgbGen) {
+                case 1: return vertexColor;
+                /* case 2 LIGHTING_DIFFUSE: returns identity (1,1,1) until
+                 * the lightgrid + RB_CalcDiffuseColor path is implemented.
+                 * Empirically (q3dm4 v2 MAE): identity=22.71 vs
+                 * vertexColor=24.36 — identity is closer. Vertex color
+                 * carries BSP-baked lighting that doesn't match what
+                 * ioq3 RB_CalcDiffuseColor produces (per-frame Lambert
+                 * against entity light + lightgrid). */
+                case 2: return float3(1.0);
+                case 3: return float3(waveVal);
+                case 4: return constColor.rgb;
+                case 5: return entityColor;
+                case 6: return float3(1.0) - entityColor;
+                case 0: case 7: default: return float3(1.0);
+            }
+        }
+
+        /* ComputeAlphaGen — ioq3 alphaGen, current Metal parser numbering
+         * (parser switch at metal_renderer_stub.c:5578-5589).
+         *   0 IDENTITY         → 1.0
+         *   1 VERTEX           → vertexAlpha
+         *   3 WAVEFORM         → waveVal
+         *   4 CONST            → constAlpha
+         *   5 ENTITY           → entityAlpha
+         *   6 ONE_MINUS_ENTITY → 1.0 - entityAlpha
+         */
+        float ComputeAlphaGen(int alphaGen,
+                              float vertexAlpha,
+                              float constAlpha,
+                              float entityAlpha,
+                              float waveVal) {
+            switch (alphaGen) {
+                case 1: return vertexAlpha;
+                case 3: return waveVal;
+                case 4: return constAlpha;
+                case 5: return entityAlpha;
+                case 6: return 1.0 - entityAlpha;
+                case 0: default: return 1.0;
+            }
         }
 
         float2 applyTcMod(float2 uv, float3 worldPos, int type, float4 params, float timeSeconds) {
@@ -1035,6 +1113,11 @@ struct MetalView: UIViewRepresentable {
                     dot(in.worldPos, drawUniforms.tcGenVec0.xyz),
                     dot(in.worldPos, drawUniforms.tcGenVec1.xyz)
                 );
+            } else if (tcGenMode == 4) {
+                /* TCGEN_LIGHTMAP. Mirrors ioq3. The Swift draw loop sets
+                 * tcGen=4 when stage.useLightmap != 0; the bound
+                 * colorTexture for that stage IS the lightmap. */
+                texCoord = in.lightmapTexCoord;
             }
             // tcMod chain — apply in order. Q3 shaders stack mods (e.g. scale
             // then scroll); order matters and cannot be reduced to one slot.
@@ -1043,15 +1126,20 @@ struct MetalView: UIViewRepresentable {
             if (modCount > 1) texCoord = applyTcMod(texCoord, in.worldPos, int(drawUniforms.tcModType.y + 0.5), drawUniforms.tcModParams1, drawUniforms.timeSeconds);
             if (modCount > 2) texCoord = applyTcMod(texCoord, in.worldPos, int(drawUniforms.tcModType.z + 0.5), drawUniforms.tcModParams2, drawUniforms.timeSeconds);
             if (modCount > 3) texCoord = applyTcMod(texCoord, in.worldPos, int(drawUniforms.tcModType.w + 0.5), drawUniforms.tcModParams3, drawUniforms.timeSeconds);
-            float4 lightmap = lightmapTexture.sample(textureSampler, in.lightmapTexCoord);
-            float4 texel = drawUniforms.stageUsesLightmap > 0.5
-                          ? lightmap
-                          : colorTexture.sample(textureSampler, texCoord);
+            /* Always sample the per-stage colorTexture using the tcGen-
+             * resolved texCoord. For lightmap stages tcGenMode==4 above
+             * routed texCoord to lightmapTexCoord and colorTexture *is*
+             * the lightmap. Stage-driven via tcGen, no flag branch. */
+            float4 texel = colorTexture.sample(textureSampler, texCoord);
             int mode = int(drawUniforms.debugMode + 0.5);
             if (mode == 1) {
                 return float4(texel.rgb, 1.0);
             }
             if (mode == 2) {
+                /* Debug mode 2 still samples the global lightmap binding
+                 * for a "lightmap only" overlay. Localized so the read
+                 * doesn't fire on the normal path. */
+                float4 lightmap = lightmapTexture.sample(textureSampler, in.lightmapTexCoord);
                 return float4(lightmap.rgb, 1.0);
             }
             if (mode == 3) {
@@ -1096,69 +1184,46 @@ struct MetalView: UIViewRepresentable {
                 if (texel.a >= -drawUniforms.alphaTestThreshold) discard_fragment();
             }
 
-            // For additive surfaces (flames, glow), BSP vertex color is
-            // typically (0,0,0) because Q3 shaders use rgbGen identity.
-            // forceWhiteVertColor=1.0 substitutes white, preventing the
-            // multiply from zeroing out the fragment.
-            // Overbright (r_overBrightBits=1): stock Q3 multiplies the
-            // lightmap by 2.0 and clamps, giving bright-lit surfaces the
-            // washed-out punch that matches the reference PC build.
-            // Without it the whole world renders ~50% too dark.
-            // saturate() clamps to [0,1] so highlights don't wrap.
-            float3 vc = float3(1.0);
-            float  va = 1.0;
-            if (drawUniforms.stageUsesLightmap <= 0.5) {
-                float3 vertexColor = float3(1.0);
-                if (rgbGen == 1) {
-                    vertexColor = in.color.rgb;
-                } else if (rgbGen == 7) {
-                    vertexColor = float3(1.0);
-                }
-                if (rgbGen == 3) {
-                    float4 wp = drawUniforms.rgbWaveParams;
-                    vertexColor *= clamp(evalWave(drawUniforms.rgbWaveFunc, wp.x, wp.y, wp.z, wp.w, drawUniforms.timeSeconds), 0.0, 1.0);
-                }
-                if (additiveStage && rgbGen == 1) {
-                    vertexColor = float3(1.0);
-                }
-                vc = mix(vertexColor, float3(1.0), drawUniforms.forceWhiteVertColor);
-                va = mix(in.color.a, 1.0, drawUniforms.forceWhiteVertColor);
-                if (alphaGen == 3) {
-                    float4 ap = drawUniforms.alphaWaveParams;
-                    va *= clamp(evalWave(drawUniforms.alphaWaveFunc, ap.x, ap.y, ap.z, ap.w, drawUniforms.timeSeconds), 0.0, 1.0);
-                }
-            }
-            // Overbright handling for the three render paths:
-            //   stageUsesLightmap=1   → THIS draw is the lightmap stage. Stock Q3
-            //                           writes the lightmap × 2 to the framebuffer
-            //                           so the next FILTER stage's `dst=src*dst`
-            //                           multiplies texture by the boosted lightmap.
-            //                           Without the 2× here, multi-pass shaders
-            //                           render at half brightness.
-            //   drawHasLightmapStage  → THIS draw is a diffuse stage in a multi-
-            //                           pass shader; lightmap was already written
-            //                           (boosted) by an earlier pass. Just output
-            //                           texel × vc and let the FILTER blend modulate.
-            //   neither               → single-pass shader; sample the lightmap
-            //                           binding directly and apply the 2× boost
-            //                           inline (existing behavior).
-            float3 lm;
-            if (drawUniforms.stageUsesLightmap > 0.5) {
-                lm = float3(1.0);
-            } else if (drawUniforms.drawHasLightmapStage > 0.5 ||
-                       rgbGen == 1 ||
-                       rgbGen == 7 ||
-                       additiveStage) {
-                lm = float3(1.0);
-            } else {
-                lm = saturate(lightmap.rgb * 2.0);
-            }
-            float3 lit = texel.rgb * lm * vc;
-            // Dynamic lights (muzzle flashes, rocket/plasma glow, lightning
-            // halos). Applied BEFORE fog so distant explosions still fog
-            // correctly. For filter/multiply stages the blend is source*dest
-            // so contribution flips meaning, but the visual impact is small
-            // and the per-draw blendMode isn't currently in WorldDrawUniforms.
+            /* Stage color via ioq3 ComputeColors helpers. No rgbGen↔
+             * lightmap coupling, no blend-based force-white. Lightmap
+             * stages receive vc=(1,1,1) naturally via parser
+             * rgbGen=identity, and their GL_DST_COLOR/GL_ZERO blend
+             * (worldFilterPipelineState) handles the framebuffer
+             * multiply. Mode 2 (LIGHTING_DIFFUSE) returns vertex color
+             * since BSP-baked diffuse already lives there. */
+            float4 wp = drawUniforms.rgbWaveParams;
+            float waveRGB = clamp(evalWave(drawUniforms.rgbWaveFunc,
+                                           wp.x, wp.y, wp.z, wp.w,
+                                           drawUniforms.timeSeconds),
+                                  0.0, 1.0);
+            float4 ap = drawUniforms.alphaWaveParams;
+            float waveA = clamp(evalWave(drawUniforms.alphaWaveFunc,
+                                         ap.x, ap.y, ap.z, ap.w,
+                                         drawUniforms.timeSeconds),
+                                0.0, 1.0);
+            float3 vc = ComputeRGBGen(rgbGen,
+                                      in.color.rgb,
+                                      drawUniforms.rgbConstColor,
+                                      drawUniforms.entityColor.xyz,
+                                      in.color.rgb,
+                                      waveRGB);
+            float va = ComputeAlphaGen(alphaGen,
+                                       in.color.a,
+                                       drawUniforms.rgbConstColor.w,
+                                       drawUniforms.entityColor.w,
+                                       waveA);
+            /* No shader-side lightmap multiply: lightmap is a real
+             * second-pass stage now, blending via GL_DST_COLOR/GL_ZERO.
+             * Loader pre-shifts by (mapOverbright-frameOverbright+1)
+             * to absorb the GL_RGB_SCALE=2 stock Q3 applies on the
+             * lightmap texture unit (see metal_renderer_stub.c:2080).
+             * Uniform fragment-side scalar was tested and rejected —
+             * compounds across base+lightmap stages (regressed MAE). */
+            float3 lit = texel.rgb * vc;
+            /* Dynamic lights only on non-additive stages — ioq3 runs
+             * dlights as a separate iteration that skips src=ONE
+             * additive blends; we don't have that separate iteration so
+             * we gate inline. */
             if (!additiveStage) {
                 lit = applyDlights(lit, in.worldPos, dlights);
             }
@@ -1781,9 +1846,13 @@ struct MetalView: UIViewRepresentable {
                         }
                         let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
                         guard stageCount > 0 else { continue }
-                        let lightmapMultiplyBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_LIGHTMAP_MULTIPLY)
-                        let drawHasLightmapStage = (draw.flags & lightmapMultiplyBit) != 0 ||
-                            (0..<stageCount).contains { Self.worldStage(draw, $0).useLightmap != 0 }
+                        /* Identity flag: true if any stage in this draw
+                         * binds the lightmap. C-side no longer sets
+                         * Q3_METAL_WORLD_DRAWFLAG_LIGHTMAP_MULTIPLY, so
+                         * detect directly from per-stage useLightmap.
+                         * Kept as metadata for diagnostics; NOT consumed
+                         * by the world fragment's rgbGen/alphaGen path. */
+                        let drawHasLightmapStage = (0..<stageCount).contains { Self.worldStage(draw, $0).useLightmap != 0 }
                         let noFog = UInt32(Q3_METAL_NO_FOG)
                         var fogCD = SIMD4<Float>(0, 0, 0, 0)
                         var fogParams = SIMD4<Float>(0, 0, 0, 0)
@@ -1920,13 +1989,13 @@ struct MetalView: UIViewRepresentable {
                             // volume; on q3dm6 this is every surface. The
                             // MSL shader skips the fog mix when .w == 0.
                             let (tv0, tv1) = Self.tcGenVectors(stage)
-                            let forceWhiteVertex = (blendMode == 1 &&
-                                                    stage.rgbGen == 0 &&
-                                                    stage.alphaGen == 0)
-                                ? Float(1.0)
-                                : Float(0.0)
                             var drawUniforms = WorldDrawUniforms(
-                                tcGen: Float(stage.tcGen),
+                                /* tcGen=4 (TCGEN_LIGHTMAP) routes the
+                                 * world fragment to sample colorTexture
+                                 * using in.lightmapTexCoord. For
+                                 * lightmap stages the bound colorTexture
+                                 * IS the lightmap. Mirrors ioq3 TCGEN_LIGHTMAP. */
+                                tcGen: stage.useLightmap != 0 ? Float(4) : Float(stage.tcGen),
                                 tcModCount: chain.count,
                                 rgbGen: Float(stage.rgbGen),
                                 alphaGen: Float(stage.alphaGen),
@@ -1941,6 +2010,12 @@ struct MetalView: UIViewRepresentable {
                                 tcModParams3: chain.p3,
                                 rgbWaveParams: SIMD4(stage.rgbWaveBase, stage.rgbWaveAmp, stage.rgbWavePhase, stage.rgbWaveFreq),
                                 alphaWaveParams: SIMD4(stage.alphaWaveBase, stage.alphaWaveAmp, stage.alphaWavePhase, stage.alphaWaveFreq),
+                                /* TODO: wire from per-stage clean->
+                                 * rgbConstColor once Q3MetalWorldStage
+                                 * carries it (parser-side change). */
+                                rgbConstColor: SIMD4(1, 1, 1, 1),
+                                /* World draws don't bind a refEntity. */
+                                entityColor: SIMD4(1, 1, 1, 1),
                                 fogColorDistance: fogCD,
                                 fogParams: fogParams,
                                 fogSurface: fogSurface,
@@ -1963,7 +2038,10 @@ struct MetalView: UIViewRepresentable {
                                 deformMoveFreq: stage.deformMoveFreq,
                                 autospriteMode: stage.autospriteMode,
                                 debugMode: Coordinator.worldDebugMode,
-                                forceWhiteVertColor: forceWhiteVertex,
+                                /* forceWhiteVertColor no longer consumed
+                                 * by the fragment shader. Field retained
+                                 * for ABI; always 0. */
+                                forceWhiteVertColor: 0,
                                 alphaTestThreshold: alphaTest,
                                 fogOnly: 0,
                                 stageUsesLightmap: stage.useLightmap != 0 ? 1.0 : 0.0,
