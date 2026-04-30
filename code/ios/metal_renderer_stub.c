@@ -2009,6 +2009,10 @@ static void EvalQuadraticDrawVert(const drawVert_t *a, const drawVert_t *b, cons
     }
 }
 
+/* Forward decl: SampleLightgrid is defined later in this file. EmitWorldVertex
+ * needs it to compute per-vertex lightingDiffuse at world load. */
+static void SampleLightgrid(const vec3_t worldPos, vec3_t outAmbient, vec3_t outDirected, vec3_t outLightDir);
+
 static void EmitWorldVertex(Q3MetalWorldVertex *dest, const drawVert_t *source) {
     dest->position[0] = LittleFloat(source->xyz[0]);
     dest->position[1] = LittleFloat(source->xyz[1]);
@@ -2039,6 +2043,31 @@ static void EmitWorldVertex(Q3MetalWorldVertex *dest, const drawVert_t *source) 
     dest->autospriteLongAxis[1] = 0.0f;
     dest->autospriteLongAxis[2] = 0.0f;
     dest->autospriteLongAxis[3] = 0.0f;
+    /* CGEN_LIGHTING_DIFFUSE per-vertex: sample the BSP lightgrid at
+     * this vertex's world position and Lambert against its normal.
+     * Mirrors ioq3 R_LightForPoint + RB_CalcDiffuseColor (ent->ambient +
+     * ent->directed * max(0, dot(N, L))) applied to world surfaces.
+     * Returns identity when the lightgrid isn't loaded — same fallback
+     * SampleLightgrid uses internally. */
+    {
+        vec3_t worldPos, vNormal, ambient, directed, lightDir;
+        float incoming;
+        int c;
+        worldPos[0] = dest->position[0];
+        worldPos[1] = dest->position[1];
+        worldPos[2] = dest->position[2];
+        vNormal[0] = dest->normal[0];
+        vNormal[1] = dest->normal[1];
+        vNormal[2] = dest->normal[2];
+        SampleLightgrid(worldPos, ambient, directed, lightDir);
+        incoming = DotProduct(vNormal, lightDir);
+        if (incoming < 0.0f) incoming = 0.0f;
+        for (c = 0; c < 3; ++c) {
+            float v = ambient[c] + directed[c] * incoming;
+            if (v > 1.0f) v = 1.0f;
+            dest->lightingDiffuse[c] = v;
+        }
+    }
 }
 
 static void LoadWorldLightmaps(const dheader_t *header, const char *mapName) {

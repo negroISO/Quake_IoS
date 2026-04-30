@@ -80,6 +80,12 @@ struct MetalView: UIViewRepresentable {
              * autoSprite2 verts. Mode 2 vertex shader projects camera
              * basis perpendicular to this axis to build the billboard. */
             var autospriteLongAxis: SIMD4<Float>
+            /* Per-vertex CGEN_LIGHTING_DIFFUSE — ambient + directed *
+             * Lambert from the BSP lightgrid sampled at this vertex's
+             * world position. Computed C-side in EmitWorldVertex.
+             * Consumed by the world fragment's ComputeRGBGen mode 2.
+             * SIMD3 stride = 16 (3 floats + pad); matches MSL float3. */
+            var lightingDiffuse: SIMD3<Float>
         }
 
         struct WorldUniforms {
@@ -564,6 +570,9 @@ struct MetalView: UIViewRepresentable {
             float4 color;
             float4 autospriteCenter;
             float4 autospriteLongAxis;
+            // Per-vertex CGEN_LIGHTING_DIFFUSE (ambient + directed*Lambert
+            // from the BSP lightgrid). Used by the fragment via WorldVertexOut.
+            float3 lightingDiffuse;
         };
 
         struct WorldUniforms {
@@ -589,6 +598,10 @@ struct MetalView: UIViewRepresentable {
             // when the source path didn't supply normals — fragment
             // detects that and falls back to dfdx/dfdy face derivation.
             float3 worldNormal;
+            // Per-vertex CGEN_LIGHTING_DIFFUSE — ambient + directed*Lambert
+            // from the BSP lightgrid sampled at the vertex's world pos.
+            // Smooth-interpolated; consumed by ComputeRGBGen mode 2.
+            float3 lightingDiffuse;
         };
 
         /* Dynamic point light, matches C Q3MetalLight. */
@@ -744,14 +757,12 @@ struct MetalView: UIViewRepresentable {
                              float waveVal) {
             switch (rgbGen) {
                 case 1: return vertexColor;
-                /* case 2 LIGHTING_DIFFUSE: returns identity (1,1,1) until
-                 * the lightgrid + RB_CalcDiffuseColor path is implemented.
-                 * Empirically (q3dm4 v2 MAE): identity=22.71 vs
-                 * vertexColor=24.36 — identity is closer. Vertex color
-                 * carries BSP-baked lighting that doesn't match what
-                 * ioq3 RB_CalcDiffuseColor produces (per-frame Lambert
-                 * against entity light + lightgrid). */
-                case 2: return float3(1.0);
+                /* case 2 LIGHTING_DIFFUSE: per-vertex value pre-baked at
+                 * world load by EmitWorldVertex calling SampleLightgrid +
+                 * Lambert against the vertex normal (mirrors ioq3
+                 * RB_CalcDiffuseColor / R_LightForPoint applied to world
+                 * surfaces). Caller passes in.lightingDiffuse. */
+                case 2: return lightingDiffuse;
                 case 3: return float3(waveVal);
                 case 4: return constColor.rgb;
                 case 5: return entityColor;
@@ -1064,6 +1075,11 @@ struct MetalView: UIViewRepresentable {
             // (drawVert_t.normal); after rasterizer interpolation the
             // fragment renormalizes before reflection math.
             out.worldNormal = inVertex.normal;
+            // Pre-baked CGEN_LIGHTING_DIFFUSE: ambient + directed*Lambert
+            // sampled C-side from the BSP lightgrid against the vertex
+            // normal. Smooth-interpolated by the rasterizer; consumed by
+            // ComputeRGBGen mode 2 in the fragment.
+            out.lightingDiffuse = inVertex.lightingDiffuse;
             return out;
         }
 
@@ -1205,7 +1221,7 @@ struct MetalView: UIViewRepresentable {
                                       in.color.rgb,
                                       drawUniforms.rgbConstColor,
                                       drawUniforms.entityColor.xyz,
-                                      in.color.rgb,
+                                      in.lightingDiffuse,
                                       waveRGB);
             float va = ComputeAlphaGen(alphaGen,
                                        in.color.a,
@@ -2913,7 +2929,11 @@ struct MetalView: UIViewRepresentable {
                                 vertex.autospriteLongAxis.0,
                                 vertex.autospriteLongAxis.1,
                                 vertex.autospriteLongAxis.2,
-                                vertex.autospriteLongAxis.3)
+                                vertex.autospriteLongAxis.3),
+                            lightingDiffuse: SIMD3<Float>(
+                                vertex.lightingDiffuse.0,
+                                vertex.lightingDiffuse.1,
+                                vertex.lightingDiffuse.2)
                         )
                     )
                 }

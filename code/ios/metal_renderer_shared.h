@@ -39,6 +39,13 @@ typedef struct {
      * quad's two long edges by picking the pair-of-pairs split with
      * maximum total length, then takes the mean direction. */
     float autospriteLongAxis[4];
+    /* Per-vertex CGEN_LIGHTING_DIFFUSE: ambient + directed * Lambert,
+     * computed from the BSP lightgrid (SampleLightgrid) at this vertex's
+     * world position with its drawVert_t normal. Mirrors ioq3
+     * RB_CalcDiffuseColor / R_LightForPoint applied per-vertex at world
+     * load. The world fragment shader's ComputeRGBGen helper picks this
+     * up when stage rgbGen == 2. .xyz used; alignment-tail pad implicit. */
+    float lightingDiffuse[3];
 } Q3MetalWorldVertex;
 
 typedef struct {
