@@ -208,6 +208,16 @@ struct MetalView: UIViewRepresentable {
             Self.blendClass(src: stage.srcBlend, dst: stage.dstBlend)
         }
 
+        private static func worldRenderPass(for stage: Q3MetalWorldStage) -> Int {
+            let blendMode = Self.worldBlendClass(for: stage)
+            return (stage.useLightmap != 0) ? 1
+                 : (blendMode == 5) ? 4
+                 : (blendMode == 1) ? 3
+                 : (blendMode == 2) ? 2
+                 : (blendMode == 3) ? 1
+                 : 0
+        }
+
         private static func configureBlend(_ attachment: MTLRenderPipelineColorAttachmentDescriptor,
                                            src: UInt32,
                                            dst: UInt32) {
@@ -1843,8 +1853,47 @@ struct MetalView: UIViewRepresentable {
                     // 5 = fog overlay pass (post-stage alpha fog).
                     // Sky draws are handled in pass 0 through the sky pipeline
                     // (view-direction spherical projection, no lightmap).
+                    var worldDrawIndicesByPass = Array(repeating: [Int](), count: 6)
+                    if !worldDraws.isEmpty {
+                        worldDrawIndicesByPass[0].reserveCapacity(worldDraws.count)
+                        worldDrawIndicesByPass[1].reserveCapacity(worldDraws.count)
+                        for pass in 2..<6 {
+                            worldDrawIndicesByPass[pass].reserveCapacity(max(16, worldDraws.count / 8))
+                        }
+                    }
+
+                    for drawIndex in 0..<worldDraws.count {
+                        let draw = worldDraws[drawIndex]
+                        guard draw.indexCount > 0 else { continue }
+
+                        if (draw.flags & fogOnlyBit) != 0 {
+                            worldDrawIndicesByPass[5].append(drawIndex)
+                            continue
+                        }
+
+                        if (draw.flags & skyFlagBit) != 0 {
+                            worldDrawIndicesByPass[0].append(drawIndex)
+                            continue
+                        }
+
+                        let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+                        guard stageCount > 0 else { continue }
+
+                        var passMask: UInt8 = 0
+                        for stageIndex in 0..<stageCount {
+                            let stage = Self.worldStage(draw, stageIndex)
+                            let drawPass = Self.worldRenderPass(for: stage)
+                            passMask |= UInt8(1 << drawPass)
+                        }
+
+                        for pass in 0..<5 where (passMask & UInt8(1 << pass)) != 0 {
+                            worldDrawIndicesByPass[pass].append(drawIndex)
+                        }
+                    }
+
                     for worldPass in 0..<6 {
-                    for draw in worldDraws where draw.indexCount > 0 {
+                        for drawIndex in worldDrawIndicesByPass[worldPass] {
+                        let draw = worldDraws[drawIndex]
                         let isSky = (draw.flags & skyFlagBit) != 0
                         if (draw.flags & fogOnlyBit) != 0 && worldPass != 5 {
                             continue
@@ -2041,12 +2090,7 @@ struct MetalView: UIViewRepresentable {
                         for stageIndex in 0..<stageCount {
                             let stage = Self.worldStage(draw, stageIndex)
                             let blendMode = Self.worldBlendClass(for: stage)
-                            let drawPass = (stage.useLightmap != 0) ? 1
-                                         : (blendMode == 5) ? 4
-                                         : (blendMode == 1) ? 3
-                                         : (blendMode == 2) ? 2
-                                         : (blendMode == 3) ? 1
-                                         : 0
+                            let drawPass = Self.worldRenderPass(for: stage)
                             guard drawPass == worldPass else { continue }
                             guard let baseTexture = texture(for: stage.textureHandle, device: view.device) else {
                                 continue
