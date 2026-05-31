@@ -40,6 +40,15 @@ struct MetalView: UIViewRepresentable {
         // intent here — the delegate enforces it on every resize.
         view.autoResizeDrawable = false
         if let metalLayer = view.layer as? CAMetalLayer {
+            /* Keep three drawables in flight on ProMotion devices. q3dm4
+             * showed low CPU encode time but ~13ms stalls in
+             * MTKView.currentDrawable on iPad; double buffering turns a
+             * short GPU/present delay into a visible 60Hz cap. */
+            if #available(iOS 13.0, visionOS 1.0, *) {
+                metalLayer.maximumDrawableCount = 3
+                print("[Metal] layer maximumDrawableCount=\(metalLayer.maximumDrawableCount)")
+            }
+            metalLayer.presentsWithTransaction = false
             if #available(iOS 16.0, visionOS 1.0, *) {
                 metalLayer.developerHUDProperties = ["mode": "hidden"]
             }
@@ -1956,11 +1965,14 @@ struct MetalView: UIViewRepresentable {
             }
 
             Q3MetalRenderer_UpdateDrawableSize(Int32(view.drawableSize.width), Int32(view.drawableSize.height))
-            let q3FrameStart = CACurrentMediaTime()
-            Quake3_Frame()
-            let q3FrameMs = (CACurrentMediaTime() - q3FrameStart) * 1000.0
 
-            guard let snapshot = Q3MetalRenderer_GetFrameSnapshot()?.pointee else { return }
+            /* Acquire the CAMetalLayer drawable before running the Q3
+             * simulation/render build. On ProMotion hardware, waiting until
+             * after a 3-5ms Quake3_Frame() can miss the layer's current
+             * acquisition window, turning otherwise-fast maps (nv15) into
+             * every-other-vblank 60Hz despite low GPU time. Holding the
+             * drawable while Q3 builds command lists is short in steady
+             * state and lets us commit before the next 120Hz deadline. */
             let drawableAcquireStart = CACurrentMediaTime()
             guard let drawable = view.currentDrawable,
                   let descriptor = view.currentRenderPassDescriptor,
@@ -1971,6 +1983,12 @@ struct MetalView: UIViewRepresentable {
             else { return }
             let drawableAcquireMs = (CACurrentMediaTime() - drawableAcquireStart) * 1000.0
             commandBuffer.label = "Q3.frame"
+
+            let q3FrameStart = CACurrentMediaTime()
+            Quake3_Frame()
+            let q3FrameMs = (CACurrentMediaTime() - q3FrameStart) * 1000.0
+
+            guard let snapshot = Q3MetalRenderer_GetFrameSnapshot()?.pointee else { return }
 
             descriptor.colorAttachments[0].clearColor = MTLClearColor(
                 red: Double(snapshot.clearColor.0),
