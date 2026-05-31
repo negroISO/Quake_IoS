@@ -206,6 +206,14 @@ typedef struct {
 } Q3MetalWorldDrawCmd;
 
 typedef struct {
+    uint32_t firstIndex;   /* Offset into Q3MetalRenderer_GetWorldBatchIndices(). */
+    uint32_t indexCount;
+    uint32_t renderPass;   /* Same pass numbering as Swift worldRenderPass(). */
+    uint32_t stageIndex;
+    Q3MetalWorldDrawCmd draw; /* Representative draw; firstIndex/indexCount ignored by Swift batch path. */
+} Q3MetalWorldBatchCmd;
+
+typedef struct {
     uint32_t firstIndex;
     uint32_t indexCount;
     uint32_t textureHandle;
@@ -248,7 +256,13 @@ enum {
      * stage for per-pass attenuation, but only one draw should emit the
      * final fog pass. */
     Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY = 1u << 10,
-    Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY = 1u << 11
+    Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY = 1u << 11,
+    /* Fast path for ordinary diffuse+lightmap world surfaces. The draw's
+     * stage[0] samples the base texture and the fragment shader also samples
+     * lightmapTexture at uv1, replacing the historical second
+     * GL_DST_COLOR/GL_ZERO lightmap draw. Only set for simple opaque
+     * base/lightmap pairs so multi-stage shader semantics stay intact. */
+    Q3_METAL_WORLD_DRAWFLAG_COMBINED_LIGHTMAP = 1u << 12
 };
 
 enum {
@@ -406,6 +420,11 @@ const Q3MetalDrawCmd *Q3MetalRenderer_GetDrawCommands(void);
 const Q3MetalWorldVertex *Q3MetalRenderer_GetWorldVertices(void);
 const uint32_t *Q3MetalRenderer_GetWorldIndices(void);
 const Q3MetalWorldDrawCmd *Q3MetalRenderer_GetWorldDrawCommands(void);
+uint32_t Q3MetalRenderer_BuildWorldBatches(uint32_t passMask);
+const Q3MetalWorldBatchCmd *Q3MetalRenderer_GetWorldBatches(void);
+uint32_t Q3MetalRenderer_GetWorldBatchCount(void);
+const uint32_t *Q3MetalRenderer_GetWorldBatchIndices(void);
+uint32_t Q3MetalRenderer_GetWorldBatchIndexCount(void);
 /* Per-world fog LUT. fogIndex values on Q3MetalWorldDrawCmd are indices
  * into this array. Returns 0/NULL if the loaded map has no fog volumes.
  * Each entry's color is linear RGB and distance is world units. */

@@ -244,6 +244,17 @@ typedef struct {
 } metalSceneEntity_t;
 
 typedef struct {
+    uint32_t firstDraw;
+    uint32_t drawCount;
+} Q3MetalSurfaceDrawRange;
+
+typedef struct {
+    uint32_t drawIndex;
+    uint32_t stageIndex;
+    uint32_t batchIndex;
+} Q3MetalWorldBatchEntry;
+
+typedef struct {
     qboolean loaded;
     uint32_t generation;
     uint32_t vertexCount;
@@ -252,6 +263,28 @@ typedef struct {
     Q3MetalWorldVertex *vertices;
     uint32_t *indices;
     Q3MetalWorldDrawCmd *draws;
+    Q3MetalWorldDrawCmd *visibleDraws;
+    Q3MetalWorldBatchCmd *batches;
+    uint32_t batchCount;
+    uint32_t batchCapacity;
+    uint32_t *batchIndices;
+    uint32_t batchIndexCount;
+    uint32_t batchIndexCapacity;
+    Q3MetalWorldBatchEntry *batchEntries;
+    uint32_t batchEntryCount;
+    uint32_t batchEntryCapacity;
+    uint32_t *batchWriteCursors;
+    uint32_t batchWriteCursorCapacity;
+    uint32_t visibleDrawCount;
+    uint32_t visibleDrawCapacity;
+    qboolean visibleDrawsValid;
+    Q3MetalSurfaceDrawRange *surfaceDrawRanges;
+    int surfaceDrawRangeCount;
+    int lastViewCluster;
+    uint32_t lastAreaMaskHash;
+    qboolean lastAreaMaskValid;
+    uint32_t visibleVisCount;      /* PVS/node stamp; only changes when cluster changes. */
+    uint32_t visibleSurfaceStamp;  /* Per-frame surface dedupe stamp. */
     /* Parallel table of animated shader slot per draw index.
      * Slot == -1 means static; >= 0 indexes s_shaderMap for per-frame
      * retargeting (fire/lava/teleport on world geometry). */
@@ -1180,6 +1213,37 @@ static qboolean shaderShouldInjectImplicitLightmap(const metalShaderMap_t *entry
     return qtrue;
 }
 
+static int MetalShaderCombinedLightmapBaseStage(const metalShaderMap_t *entry,
+                                                qboolean hasLightmap,
+                                                qhandle_t lightmapHandle) {
+    if (!hasLightmap || lightmapHandle == 0) {
+        return -1;
+    }
+    if (entry == NULL || entry->stageCount <= 0) {
+        return 0;
+    }
+    if (entry->hasFog) {
+        return -1;
+    }
+    if (entry->stageCount == 1 && shaderShouldInjectImplicitLightmap(entry)) {
+        return 0;
+    }
+    if (entry->stageCount >= 2 &&
+        !entry->stages[0].useLightmap &&
+        entry->stages[0].blendMode == 0 &&
+        entry->stages[1].useLightmap &&
+        entry->stages[1].blendMode == 3) {
+        return 0;
+    }
+    if (entry->stageCount >= 2 &&
+        entry->stages[0].useLightmap &&
+        !entry->stages[1].useLightmap &&
+        entry->stages[1].blendMode == 3) {
+        return 1;
+    }
+    return -1;
+}
+
 static void AddWorldDrawLightmapBaseStage(Q3MetalWorldDrawCmd *draw,
                                           qhandle_t lightmapHandle,
                                           const metalShaderMap_t *entry,
@@ -1465,6 +1529,35 @@ static qhandle_t RegisterTexture(const char *name) {
 
     if (name == NULL || name[0] == '\0' || !Q_stricmp(name, "white")) {
         return EnsureWhiteTexture();
+    }
+
+    /* Some stock/custom shader scripts contain accidental duplicate path
+     * separators (pak0 base_wall.shader has textures//base_wall/...).
+     * id FS tolerates this, but our direct image loader/key cache did not,
+     * causing a white fallback on nv15. Canonicalize before lookup/load. */
+    {
+        char cleanName[MAX_QPATH];
+        int si = 0;
+        int di = 0;
+        qboolean changed = qfalse;
+        char prev = '\0';
+        while (name[si] != '\0' && di < (int)sizeof(cleanName) - 1) {
+            char c = name[si++];
+            if (c == '\\') {
+                c = '/';
+                changed = qtrue;
+            }
+            if (c == '/' && prev == '/') {
+                changed = qtrue;
+                continue;
+            }
+            cleanName[di++] = c;
+            prev = c;
+        }
+        cleanName[di] = '\0';
+        if (changed && cleanName[0] != '\0') {
+            return RegisterTexture(cleanName);
+        }
     }
     /* Q3 internal sentinel shaders use '$whiteimage' / '*white' /
      * '*whiteimage' / '*default' as their stage map. The engine was
@@ -1987,6 +2080,24 @@ static void FreeWorldMapData(void) {
     if (s_world.draws != NULL) {
         ri.Free(s_world.draws);
     }
+    if (s_world.visibleDraws != NULL) {
+        ri.Free(s_world.visibleDraws);
+    }
+    if (s_world.batches != NULL) {
+        ri.Free(s_world.batches);
+    }
+    if (s_world.batchIndices != NULL) {
+        ri.Free(s_world.batchIndices);
+    }
+    if (s_world.batchEntries != NULL) {
+        ri.Free(s_world.batchEntries);
+    }
+    if (s_world.batchWriteCursors != NULL) {
+        ri.Free(s_world.batchWriteCursors);
+    }
+    if (s_world.surfaceDrawRanges != NULL) {
+        ri.Free(s_world.surfaceDrawRanges);
+    }
     if (s_world.animShaderSlots != NULL) {
         ri.Free(s_world.animShaderSlots);
     }
@@ -2101,7 +2212,7 @@ static float ByteToVisibleColor(byte value) {
     return 0.25f + normalized * 0.75f;
 }
 
-#define Q3_METAL_PATCH_SUBDIVISIONS 5
+#define Q3_METAL_PATCH_SUBDIVISIONS 4
 
 static void LerpDrawVert(const drawVert_t *a, const drawVert_t *b, drawVert_t *out) {
     int i;
@@ -2878,8 +2989,11 @@ typedef struct {
 
 typedef struct bspMsurface_s {
     int                 viewCount;
+    uint32_t            metalVisibleStamp;
     bspShader_t         *shader;
     int                 fogIndex;
+    vec3_t              bounds[2];
+    qboolean            boundsValid;
     bspSurfaceType_t    *data;
 } bspMsurface_t;
 
@@ -2949,6 +3063,7 @@ static struct {
     bspMsurface_t   *surfaces;
     int             nummarksurfaces;
     bspMsurface_t   **marksurfaces;
+    int             numClusters;
     int             numShaders;
     bspShader_t     *shaders;
     /* Linear pool for variable-size surface structs (face/grid/tri payload).
@@ -3277,15 +3392,18 @@ static void BspParseFace(const dsurface_t *ds, const drawVert_t *verts, int numP
     cv->numIndices = numIndexes;
     cv->ofsIndices = ofsIndexes;
 
+    ClearBounds(surf->bounds[0], surf->bounds[1]);
     for (i = 0; i < numPoints; i++) {
         for (j = 0; j < 3; j++)
             cv->points[i][j] = LittleFloat(verts[i].xyz[j]);
+        AddPointToBounds(cv->points[i], surf->bounds[0], surf->bounds[1]);
         for (j = 0; j < 2; j++) {
             cv->points[i][3+j] = LittleFloat(verts[i].st[j]);
             cv->points[i][5+j] = LittleFloat(verts[i].lightmap[j]);
         }
         Com_Memcpy((byte *)&cv->points[i][7], verts[i].color.rgba, 4);
     }
+    surf->boundsValid = (numPoints > 0) ? qtrue : qfalse;
 
     indexes = (int *)((byte *)cv + cv->ofsIndices);
     for (i = 0; i < numIndexes; i++) {
@@ -3353,6 +3471,9 @@ static void BspParseMesh(const dsurface_t *ds, const drawVert_t *verts, int numV
         return;
     }
     surf->data = (bspSurfaceType_t *)grid;
+    VectorCopy(grid->meshBounds[0], surf->bounds[0]);
+    VectorCopy(grid->meshBounds[1], surf->bounds[1]);
+    surf->boundsValid = qtrue;
 
     for (i = 0; i < 3; i++) {
         bounds[0][i] = LittleFloat(ds->lightmapVecs[0][i]);
@@ -3405,6 +3526,9 @@ static void BspParseTriSurf(const dsurface_t *ds, const drawVert_t *verts, int n
         if (v < 0 || v >= numVerts) v = 0;
         tri->indexes[i] = v;
     }
+    VectorCopy(tri->bounds[0], surf->bounds[0]);
+    VectorCopy(tri->bounds[1], surf->bounds[1]);
+    surf->boundsValid = (numVerts > 0) ? qtrue : qfalse;
 }
 
 static void BspParseFlare(const dsurface_t *ds, bspMsurface_t *surf,
@@ -3427,6 +3551,11 @@ static void BspParseFlare(const dsurface_t *ds, bspMsurface_t *surf,
         flare->color[i]  = LittleFloat(ds->lightmapVecs[0][i]);
         flare->normal[i] = BspClampDenorm(LittleFloat(ds->lightmapVecs[2][i]));
     }
+    for (i = 0; i < 3; i++) {
+        surf->bounds[0][i] = flare->origin[i] - 16.0f;
+        surf->bounds[1][i] = flare->origin[i] + 16.0f;
+    }
+    surf->boundsValid = qtrue;
 }
 
 /* ---- tr_bsp.c Load*() ports ---- */
@@ -3543,6 +3672,9 @@ static void BspLoadNodesAndLeafs(const dheader_t *header, const byte *fileBase) 
         }
         out->cluster = LittleLong(inLeaf->cluster);
         out->area    = LittleLong(inLeaf->area);
+        if (out->cluster >= s_bspWorld.numClusters) {
+            s_bspWorld.numClusters = out->cluster + 1;
+        }
         out->contents = 0; /* !=CONTENTS_NODE — it's a leaf */
         firstmarksurface = (unsigned)LittleLong(inLeaf->firstLeafSurface);
         nummarksurfaces  = (unsigned)LittleLong(inLeaf->numLeafSurfaces);
@@ -3693,6 +3825,749 @@ static qboolean BspLoad(const dheader_t *header, const byte *fileBase,
     ri.Printf(PRINT_ALL, "[BSP] blobUsed=%zu/%zu bytes\n",
               s_bspWorld.blobUsed, s_bspWorld.blobCap);
     return qtrue;
+}
+
+/* ========================================================================== */
+
+static void MetalWorldSetSurfaceDrawRange(int surfaceIndex, uint32_t firstDraw, uint32_t endDraw) {
+    if (s_world.surfaceDrawRanges == NULL) return;
+    if (surfaceIndex < 0 || surfaceIndex >= s_world.surfaceDrawRangeCount) return;
+    if (endDraw < firstDraw) endDraw = firstDraw;
+    s_world.surfaceDrawRanges[surfaceIndex].firstDraw = firstDraw;
+    s_world.surfaceDrawRanges[surfaceIndex].drawCount = endDraw - firstDraw;
+}
+
+static bspMnode_t *MetalWorldPointInLeaf(const vec3_t p) {
+    bspMnode_t *node;
+    if (!s_bspWorld.loaded || s_bspWorld.nodes == NULL) {
+        return NULL;
+    }
+    node = s_bspWorld.nodes;
+    while (node != NULL && node->contents == CONTENTS_NODE) {
+        const cplane_t *plane = node->plane;
+        float d;
+        if (plane == NULL) {
+            return NULL;
+        }
+        d = DotProduct(p, plane->normal) - plane->dist;
+        node = node->children[(d > 0.0f) ? 0 : 1];
+    }
+    return node;
+}
+
+static const byte *MetalWorldClusterPVS(int cluster) {
+    if (cluster < 0 || cluster >= s_bspWorld.numClusters) {
+        return NULL;
+    }
+    if (ri.CM_ClusterPVS != NULL) {
+        return ri.CM_ClusterPVS(cluster);
+    }
+    return NULL;
+}
+
+static uint32_t MetalWorldAreaMaskHash(const byte *areamask) {
+    uint32_t hash = 2166136261u;
+    int i;
+    if (areamask == NULL) {
+        return 0;
+    }
+    for (i = 0; i < MAX_MAP_AREA_BYTES; ++i) {
+        hash ^= (uint32_t)areamask[i];
+        hash *= 16777619u;
+    }
+    return (hash != 0) ? hash : 1u;
+}
+
+static void MetalWorldBumpVisCount(void) {
+    s_world.visibleVisCount += 1;
+    if (s_world.visibleVisCount == 0) {
+        int i;
+        for (i = 0; i < s_bspWorld.numnodes; ++i) {
+            s_bspWorld.nodes[i].visframe = 0;
+        }
+        s_world.visibleVisCount = 1;
+    }
+}
+
+static uint32_t MetalWorldNextSurfaceStamp(void) {
+    s_world.visibleSurfaceStamp += 1;
+    if (s_world.visibleSurfaceStamp == 0) {
+        int i;
+        if (s_bspWorld.surfaces != NULL) {
+            for (i = 0; i < s_bspWorld.numsurfaces; ++i) {
+                s_bspWorld.surfaces[i].metalVisibleStamp = 0;
+            }
+        }
+        s_world.visibleSurfaceStamp = 1;
+    }
+    return s_world.visibleSurfaceStamp;
+}
+
+static void MetalWorldMarkAllLeaves(void) {
+    int i;
+    MetalWorldBumpVisCount();
+    for (i = 0; i < s_bspWorld.numnodes; ++i) {
+        s_bspWorld.nodes[i].visframe = (int)s_world.visibleVisCount;
+    }
+}
+
+static void MetalWorldMarkLeaves(const vec3_t vieworg, const byte *areamask) {
+    bspMnode_t *leaf;
+    const byte *vis;
+    int cluster;
+    uint32_t areaMaskHash;
+    int i;
+
+    if (!s_bspWorld.loaded || s_bspWorld.nodes == NULL || s_bspWorld.numnodes <= 0) {
+        return;
+    }
+
+    leaf = MetalWorldPointInLeaf(vieworg);
+    if (leaf == NULL) {
+        MetalWorldMarkAllLeaves();
+        s_world.lastViewCluster = -2;
+        return;
+    }
+
+    cluster = leaf->cluster;
+    areaMaskHash = MetalWorldAreaMaskHash(areamask);
+    if (cluster == s_world.lastViewCluster &&
+        s_world.visibleVisCount != 0 &&
+        s_world.lastAreaMaskValid &&
+        s_world.lastAreaMaskHash == areaMaskHash) {
+        return;
+    }
+
+    vis = MetalWorldClusterPVS(cluster);
+    if (cluster < 0 || vis == NULL || s_bspWorld.numClusters <= 0) {
+        MetalWorldMarkAllLeaves();
+        s_world.lastViewCluster = cluster;
+        s_world.lastAreaMaskHash = areaMaskHash;
+        s_world.lastAreaMaskValid = qtrue;
+        return;
+    }
+
+    MetalWorldBumpVisCount();
+    s_world.lastViewCluster = cluster;
+    s_world.lastAreaMaskHash = areaMaskHash;
+    s_world.lastAreaMaskValid = qtrue;
+
+    for (i = s_bspWorld.numDecisionNodes; i < s_bspWorld.numnodes; ++i) {
+        bspMnode_t *node = &s_bspWorld.nodes[i];
+        int leafCluster = node->cluster;
+        bspMnode_t *parent;
+        if (leafCluster < 0 || leafCluster >= s_bspWorld.numClusters) {
+            continue;
+        }
+        if (areamask != NULL && node->area >= 0 &&
+            (areamask[node->area >> 3] & (1 << (node->area & 7))) != 0) {
+            continue;
+        }
+        if ((vis[leafCluster >> 3] & (1 << (leafCluster & 7))) == 0) {
+            continue;
+        }
+        for (parent = node; parent != NULL; parent = parent->parent) {
+            if (parent->visframe == (int)s_world.visibleVisCount) {
+                break;
+            }
+            parent->visframe = (int)s_world.visibleVisCount;
+        }
+    }
+}
+
+static void MetalWorldBuildFrustum(cplane_t frustum[4],
+                                   const vec3_t vieworg,
+                                   const vec3_t axis0,
+                                   const vec3_t axis1,
+                                   const vec3_t axis2,
+                                   float fovX,
+                                   float fovY) {
+    float xmax = tanf(DEG2RAD(fovX) * 0.5f);
+    float ymax = tanf(DEG2RAD(fovY) * 0.5f);
+    float length;
+    float oppleg;
+    float adjleg;
+    int i;
+
+    if (xmax < 0.001f) xmax = 0.001f;
+    if (ymax < 0.001f) ymax = 0.001f;
+
+    length = sqrtf(xmax * xmax + 1.0f);
+    oppleg = xmax / length;
+    adjleg = 1.0f / length;
+
+    VectorScale(axis0, oppleg, frustum[0].normal);
+    VectorMA(frustum[0].normal, adjleg, axis1, frustum[0].normal);
+
+    VectorScale(axis0, oppleg, frustum[1].normal);
+    VectorMA(frustum[1].normal, -adjleg, axis1, frustum[1].normal);
+
+    length = sqrtf(ymax * ymax + 1.0f);
+    oppleg = ymax / length;
+    adjleg = 1.0f / length;
+
+    VectorScale(axis0, oppleg, frustum[2].normal);
+    VectorMA(frustum[2].normal, adjleg, axis2, frustum[2].normal);
+
+    VectorScale(axis0, oppleg, frustum[3].normal);
+    VectorMA(frustum[3].normal, -adjleg, axis2, frustum[3].normal);
+
+    for (i = 0; i < 4; ++i) {
+        frustum[i].type = PLANE_NON_AXIAL;
+        frustum[i].dist = DotProduct(vieworg, frustum[i].normal);
+        SetPlaneSignbits(&frustum[i]);
+    }
+}
+
+static qboolean MetalWorldSurfaceBoundsInFrustum(bspMsurface_t *surf,
+                                                 const cplane_t frustum[4]) {
+    int i;
+    if (surf == NULL || !surf->boundsValid) {
+        return qtrue;
+    }
+    for (i = 0; i < 4; ++i) {
+        if (BoxOnPlaneSide(surf->bounds[0], surf->bounds[1], (cplane_t *)&frustum[i]) == 2) {
+            return qfalse;
+        }
+    }
+    return qtrue;
+}
+
+static qboolean MetalWorldCullFaceSurface(bspMsurface_t *surf,
+                                          Q3MetalSurfaceDrawRange range,
+                                          const vec3_t vieworg) {
+    bspSrfSurfaceFace_t *face;
+    Q3MetalWorldDrawCmd *draw;
+    uint32_t cullMode;
+    float d;
+
+    if (surf == NULL || surf->data == NULL || *(surf->data) != BSP_SF_FACE) {
+        return qfalse;
+    }
+    if (range.drawCount == 0 || range.firstDraw >= s_world.drawCount) {
+        return qfalse;
+    }
+    draw = &s_world.draws[range.firstDraw];
+    if (draw->stageCount == 0) {
+        return qfalse;
+    }
+
+    cullMode = draw->stages[0].cullMode;
+    if (cullMode == METAL_SHADER_CULL_DISABLE) {
+        return qfalse;
+    }
+
+    face = (bspSrfSurfaceFace_t *)surf->data;
+    d = DotProduct(vieworg, face->plane.normal);
+    if (cullMode == METAL_SHADER_CULL_FRONT) {
+        return (d > face->plane.dist + 8.0f) ? qtrue : qfalse;
+    }
+    return (d < face->plane.dist - 8.0f) ? qtrue : qfalse;
+}
+
+static void MetalWorldAppendSurfaceDraws(bspMsurface_t *surf,
+                                         uint32_t surfaceStamp,
+                                         const vec3_t vieworg,
+                                         const cplane_t frustum[4]) {
+    intptr_t surfaceIndex;
+    Q3MetalSurfaceDrawRange range;
+
+    if (surf == NULL || s_bspWorld.surfaces == NULL) return;
+    if (surf->metalVisibleStamp == surfaceStamp) return;
+    if (!MetalWorldSurfaceBoundsInFrustum(surf, frustum)) return;
+
+    surfaceIndex = surf - s_bspWorld.surfaces;
+    if (surfaceIndex < 0 || surfaceIndex >= s_world.surfaceDrawRangeCount) return;
+    if (s_world.surfaceDrawRanges == NULL || s_world.visibleDraws == NULL) return;
+
+    range = s_world.surfaceDrawRanges[surfaceIndex];
+    if (range.drawCount == 0) return;
+    if (range.firstDraw >= s_world.drawCount) return;
+    if (range.firstDraw + range.drawCount > s_world.drawCount) {
+        range.drawCount = s_world.drawCount - range.firstDraw;
+    }
+    if (MetalWorldCullFaceSurface(surf, range, vieworg)) return;
+
+    surf->metalVisibleStamp = surfaceStamp;
+
+    if (range.drawCount > s_world.visibleDrawCapacity - s_world.visibleDrawCount) {
+        range.drawCount = s_world.visibleDrawCapacity - s_world.visibleDrawCount;
+    }
+    if (range.drawCount == 0) return;
+    Com_Memcpy(&s_world.visibleDraws[s_world.visibleDrawCount],
+               &s_world.draws[range.firstDraw],
+               range.drawCount * sizeof(s_world.visibleDraws[0]));
+    s_world.visibleDrawCount += range.drawCount;
+}
+
+static void MetalWorldRecursiveNode(bspMnode_t *node,
+                                    int planeBits,
+                                    const cplane_t frustum[4],
+                                    const vec3_t vieworg,
+                                    uint32_t surfaceStamp) {
+    int i;
+
+    if (node == NULL) return;
+    if (node->visframe != (int)s_world.visibleVisCount) return;
+
+    for (i = 0; i < 4; ++i) {
+        int side;
+        int bit = 1 << i;
+        if ((planeBits & bit) == 0) continue;
+        side = BoxOnPlaneSide(node->mins, node->maxs, (cplane_t *)&frustum[i]);
+        if (side == 2) return;
+        if (side == 1) planeBits &= ~bit;
+    }
+
+    if (node->contents != CONTENTS_NODE) {
+        bspMsurface_t **mark = node->firstmarksurface;
+        int c = node->nummarksurfaces;
+        while (c-- > 0 && mark != NULL) {
+            MetalWorldAppendSurfaceDraws(*mark, surfaceStamp, vieworg, frustum);
+            mark++;
+        }
+        return;
+    }
+
+    MetalWorldRecursiveNode(node->children[0], planeBits, frustum, vieworg, surfaceStamp);
+    MetalWorldRecursiveNode(node->children[1], planeBits, frustum, vieworg, surfaceStamp);
+}
+
+static void MetalWorldBuildVisibleDraws(const vec3_t vieworg,
+                                        const vec3_t axis0,
+                                        const vec3_t axis1,
+                                        const vec3_t axis2,
+                                        float fovX,
+                                        float fovY,
+                                        const byte *areamask) {
+    cplane_t frustum[4];
+    uint32_t surfaceStamp;
+
+    s_world.visibleDrawsValid = qfalse;
+    s_world.visibleDrawCount = 0;
+
+    if (!s_world.loaded || !s_bspWorld.loaded || s_bspWorld.nodes == NULL ||
+        s_world.draws == NULL || s_world.visibleDraws == NULL ||
+        s_world.surfaceDrawRanges == NULL || s_world.visibleDrawCapacity == 0) {
+        return;
+    }
+
+    MetalWorldMarkLeaves(vieworg, areamask);
+    if (s_world.visibleVisCount == 0) {
+        return;
+    }
+
+    MetalWorldBuildFrustum(frustum, vieworg, axis0, axis1, axis2, fovX, fovY);
+    surfaceStamp = MetalWorldNextSurfaceStamp();
+    MetalWorldRecursiveNode(s_bspWorld.nodes, 15, frustum, vieworg, surfaceStamp);
+
+    if (s_world.visibleDrawCount > 0) {
+        s_world.visibleDrawsValid = qtrue;
+    }
+}
+
+static uint32_t MetalWorldCurrentDrawCount(void) {
+    return (s_world.visibleDrawsValid) ? s_world.visibleDrawCount : s_world.drawCount;
+}
+
+static int MetalWorldBlendClass(uint32_t src, uint32_t dst) {
+    if (src == Q3_GL_ONE && dst == Q3_GL_ONE) return 5;
+    if (src == Q3_GL_SRC_ALPHA && dst == Q3_GL_ONE) return 1;
+    if (src == Q3_GL_SRC_ALPHA && dst == Q3_GL_ONE_MINUS_SRC_ALPHA) return 2;
+    if ((src == Q3_GL_DST_COLOR && dst == Q3_GL_ZERO) ||
+        (src == Q3_GL_ZERO && dst == Q3_GL_SRC_COLOR)) return 3;
+    if (src == Q3_GL_ZERO && dst == Q3_GL_ONE_MINUS_SRC_COLOR) return 4;
+    return 0;
+}
+
+static uint32_t MetalWorldStageRenderPass(const Q3MetalWorldStage *stage) {
+    int blendMode;
+    if (stage == NULL) return 0;
+    blendMode = MetalWorldBlendClass(stage->srcBlend, stage->dstBlend);
+    if (stage->useLightmap != 0) return 1;
+    if (blendMode == 5) return 4;
+    if (blendMode == 1) return 3;
+    if (blendMode == 2) return 2;
+    if (blendMode == 3) return 1;
+    return 0;
+}
+
+static qboolean MetalWorldDrawHasLightmapStageC(const Q3MetalWorldDrawCmd *draw) {
+    uint32_t i;
+    uint32_t count;
+    if (draw == NULL) return qfalse;
+    count = draw->stageCount;
+    if (count > Q3_METAL_MAX_STAGES) count = Q3_METAL_MAX_STAGES;
+    for (i = 0; i < count; ++i) {
+        if (draw->stages[i].useLightmap != 0) return qtrue;
+    }
+    return qfalse;
+}
+
+static qboolean MetalWorldStagesEqualC(const Q3MetalWorldStage *a,
+                                       const Q3MetalWorldStage *b) {
+    if (a == NULL || b == NULL) return qfalse;
+    return (memcmp(a, b, sizeof(*a)) == 0) ? qtrue : qfalse;
+}
+
+static qboolean MetalWorldBatchCompatible(const Q3MetalWorldBatchCmd *batch,
+                                          const Q3MetalWorldDrawCmd *draw,
+                                          const Q3MetalWorldStage *stage,
+                                          uint32_t stageIndex,
+                                          uint32_t renderPass) {
+    const Q3MetalWorldDrawCmd *baseDraw;
+    if (batch == NULL || draw == NULL || stage == NULL) return qfalse;
+    if (batch->renderPass != renderPass || batch->stageIndex != stageIndex) return qfalse;
+
+    baseDraw = &batch->draw;
+    if (baseDraw->lightmapTextureHandle != draw->lightmapTextureHandle ||
+        baseDraw->flags != draw->flags ||
+        baseDraw->fogIndex != draw->fogIndex ||
+        baseDraw->stageCount != draw->stageCount) {
+        return qfalse;
+    }
+    if (MetalWorldDrawHasLightmapStageC(baseDraw) != MetalWorldDrawHasLightmapStageC(draw)) {
+        return qfalse;
+    }
+    if (stageIndex >= draw->stageCount || stageIndex >= baseDraw->stageCount ||
+        stageIndex >= Q3_METAL_MAX_STAGES) {
+        return qfalse;
+    }
+    return MetalWorldStagesEqualC(&baseDraw->stages[stageIndex], stage);
+}
+
+static qboolean MetalWorldEnsureBatchCapacity(uint32_t batchCapacity,
+                                              uint32_t entryCapacity,
+                                              uint32_t indexCapacity) {
+    if (batchCapacity > s_world.batchCapacity) {
+        Q3MetalWorldBatchCmd *newBatches =
+            ri.Malloc(batchCapacity * sizeof(*newBatches));
+        if (newBatches == NULL) return qfalse;
+        if (s_world.batches != NULL) ri.Free(s_world.batches);
+        s_world.batches = newBatches;
+        s_world.batchCapacity = batchCapacity;
+    }
+    if (entryCapacity > s_world.batchEntryCapacity) {
+        Q3MetalWorldBatchEntry *newEntries =
+            ri.Malloc(entryCapacity * sizeof(*newEntries));
+        if (newEntries == NULL) return qfalse;
+        if (s_world.batchEntries != NULL) ri.Free(s_world.batchEntries);
+        s_world.batchEntries = newEntries;
+        s_world.batchEntryCapacity = entryCapacity;
+    }
+    if (indexCapacity > s_world.batchIndexCapacity) {
+        uint32_t *newIndices = ri.Malloc(indexCapacity * sizeof(*newIndices));
+        if (newIndices == NULL) return qfalse;
+        if (s_world.batchIndices != NULL) ri.Free(s_world.batchIndices);
+        s_world.batchIndices = newIndices;
+        s_world.batchIndexCapacity = indexCapacity;
+    }
+    if (batchCapacity > s_world.batchWriteCursorCapacity) {
+        uint32_t *newCursors = ri.Malloc(batchCapacity * sizeof(*newCursors));
+        if (newCursors == NULL) return qfalse;
+        if (s_world.batchWriteCursors != NULL) ri.Free(s_world.batchWriteCursors);
+        s_world.batchWriteCursors = newCursors;
+        s_world.batchWriteCursorCapacity = batchCapacity;
+    }
+    return qtrue;
+}
+
+static uint32_t MetalWorldFindOrCreateBatch(const Q3MetalWorldDrawCmd *draw,
+                                            const Q3MetalWorldStage *stage,
+                                            uint32_t stageIndex,
+                                            uint32_t renderPass) {
+    uint32_t i;
+    for (i = 0; i < s_world.batchCount; ++i) {
+        if (MetalWorldBatchCompatible(&s_world.batches[i], draw, stage,
+                                      stageIndex, renderPass)) {
+            return i;
+        }
+    }
+    if (s_world.batchCount >= s_world.batchCapacity) {
+        return UINT32_MAX;
+    }
+    i = s_world.batchCount++;
+    Com_Memset(&s_world.batches[i], 0, sizeof(s_world.batches[i]));
+    s_world.batches[i].renderPass = renderPass;
+    s_world.batches[i].stageIndex = stageIndex;
+    s_world.batches[i].draw = *draw;
+    return i;
+}
+
+uint32_t Q3MetalRenderer_BuildWorldBatches(uint32_t passMask) {
+    const Q3MetalWorldDrawCmd *draws;
+    uint32_t drawCount;
+    uint32_t maxEntries;
+    uint32_t maxBatches;
+    uint32_t drawIndex;
+    uint32_t entryIndex;
+    uint32_t batchIndex;
+    uint32_t cursor;
+    qboolean overflow;
+
+    s_world.batchCount = 0;
+    s_world.batchIndexCount = 0;
+    s_world.batchEntryCount = 0;
+
+    if (!s_world.loaded || s_world.indices == NULL || passMask == 0) {
+        return 0;
+    }
+
+    draws = (s_world.visibleDrawsValid && s_world.visibleDraws != NULL)
+        ? s_world.visibleDraws
+        : s_world.draws;
+    drawCount = MetalWorldCurrentDrawCount();
+    if (draws == NULL || drawCount == 0) {
+        return 0;
+    }
+
+    maxEntries = drawCount * Q3_METAL_MAX_STAGES;
+    maxBatches = (maxEntries < 4096u) ? maxEntries : 4096u;
+    if (!MetalWorldEnsureBatchCapacity(maxBatches, maxEntries, s_world.indexCount * Q3_METAL_MAX_STAGES)) {
+        return 0;
+    }
+    if (s_world.batches == NULL || s_world.batchEntries == NULL ||
+        s_world.batchIndices == NULL || s_world.batchWriteCursors == NULL) {
+        return 0;
+    }
+
+    overflow = qfalse;
+    for (drawIndex = 0; drawIndex < drawCount; ++drawIndex) {
+        const Q3MetalWorldDrawCmd *draw = &draws[drawIndex];
+        uint32_t stageCount;
+        uint32_t stageIndex;
+
+        if (draw->indexCount == 0) continue;
+        if ((draw->flags & (Q3_METAL_WORLD_DRAWFLAG_SKY |
+                            Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY)) != 0) {
+            continue;
+        }
+        if (draw->firstIndex >= s_world.indexCount ||
+            draw->firstIndex + draw->indexCount > s_world.indexCount) {
+            continue;
+        }
+
+        stageCount = draw->stageCount;
+        if (stageCount > Q3_METAL_MAX_STAGES) stageCount = Q3_METAL_MAX_STAGES;
+        for (stageIndex = 0; stageIndex < stageCount; ++stageIndex) {
+            const Q3MetalWorldStage *stage = &draw->stages[stageIndex];
+            uint32_t renderPass = MetalWorldStageRenderPass(stage);
+            uint32_t mask = (renderPass < 32) ? (1u << renderPass) : 0u;
+            if ((passMask & mask) == 0) continue;
+
+            batchIndex = MetalWorldFindOrCreateBatch(draw, stage, stageIndex, renderPass);
+            if (batchIndex == UINT32_MAX || s_world.batchEntryCount >= s_world.batchEntryCapacity) {
+                overflow = qtrue;
+                break;
+            }
+            s_world.batchEntries[s_world.batchEntryCount].drawIndex = drawIndex;
+            s_world.batchEntries[s_world.batchEntryCount].stageIndex = stageIndex;
+            s_world.batchEntries[s_world.batchEntryCount].batchIndex = batchIndex;
+            s_world.batchEntryCount += 1;
+            s_world.batches[batchIndex].indexCount += draw->indexCount;
+            s_world.batchIndexCount += draw->indexCount;
+        }
+        if (overflow) break;
+    }
+
+    if (overflow || s_world.batchCount == 0 || s_world.batchIndexCount == 0 ||
+        s_world.batchIndexCount > s_world.batchIndexCapacity) {
+        s_world.batchCount = 0;
+        s_world.batchIndexCount = 0;
+        s_world.batchEntryCount = 0;
+        return 0;
+    }
+
+    cursor = 0;
+    for (batchIndex = 0; batchIndex < s_world.batchCount; ++batchIndex) {
+        s_world.batches[batchIndex].firstIndex = cursor;
+        s_world.batchWriteCursors[batchIndex] = cursor;
+        cursor += s_world.batches[batchIndex].indexCount;
+    }
+
+    for (entryIndex = 0; entryIndex < s_world.batchEntryCount; ++entryIndex) {
+        Q3MetalWorldBatchEntry *entry = &s_world.batchEntries[entryIndex];
+        const Q3MetalWorldDrawCmd *draw;
+        uint32_t writeCursor;
+        if (entry->batchIndex >= s_world.batchCount || entry->drawIndex >= drawCount) continue;
+        draw = &draws[entry->drawIndex];
+        if (draw->indexCount == 0) continue;
+        writeCursor = s_world.batchWriteCursors[entry->batchIndex];
+        if (writeCursor + draw->indexCount > s_world.batchIndexCapacity) continue;
+        Com_Memcpy(&s_world.batchIndices[writeCursor],
+                   &s_world.indices[draw->firstIndex],
+                   draw->indexCount * sizeof(uint32_t));
+        s_world.batchWriteCursors[entry->batchIndex] = writeCursor + draw->indexCount;
+    }
+
+    return s_world.batchCount;
+}
+
+const Q3MetalWorldBatchCmd *Q3MetalRenderer_GetWorldBatches(void) {
+    return s_world.batches;
+}
+
+uint32_t Q3MetalRenderer_GetWorldBatchCount(void) {
+    return s_world.batchCount;
+}
+
+const uint32_t *Q3MetalRenderer_GetWorldBatchIndices(void) {
+    return s_world.batchIndices;
+}
+
+uint32_t Q3MetalRenderer_GetWorldBatchIndexCount(void) {
+    return s_world.batchIndexCount;
+}
+
+/* ========================================================================== */
+
+static void MetalWorldEmitSurfaceStages(const char *shaderName,
+                                        qhandle_t lightmapHandle,
+                                        qhandle_t skyOverrideTexture,
+                                        qboolean hasLightmap,
+                                        uint32_t worldFlags,
+                                        uint32_t fogIndex,
+                                        uint32_t firstIndexForDraw,
+                                        uint32_t indexCountForDraw,
+                                        uint32_t *drawCursorPtr) {
+    const metalShaderMap_t *_e;
+    int _s;
+    int _emitted;
+    int _combinedLightmapBaseStage;
+    qboolean _combinedLightmap;
+
+    if (shaderName == NULL || drawCursorPtr == NULL || indexCountForDraw == 0) {
+        return;
+    }
+
+    _e = ShaderMap_LookupEntry(shaderName);
+    _emitted = 0;
+    _combinedLightmapBaseStage = MetalShaderCombinedLightmapBaseStage(_e, hasLightmap, lightmapHandle);
+    _combinedLightmap = (_combinedLightmapBaseStage >= 0) ? qtrue : qfalse;
+    EmitMetalStageAudit(shaderName, _e);
+
+    if (_e != NULL && _e->hasFog) {
+        Q3MetalStage _fogStage;
+        uint32_t _dstIdx;
+        if (fogIndex == Q3_METAL_NO_FOG) {
+            return;
+        }
+        _dstIdx = (*drawCursorPtr)++;
+        Com_Memset(&_fogStage, 0, sizeof(_fogStage));
+        _fogStage.blendMode = 2;
+        RawBlendFromMode(_fogStage.blendMode, &_fogStage.rawSrcBlend, &_fogStage.rawDstBlend);
+        _fogStage.cullMode = _e->cullMode;
+        _fogStage.depthWrite = 0;
+        SetupWorldDraw(&s_world.draws[_dstIdx], firstIndexForDraw, indexCountForDraw,
+                       EnsureWhiteTexture(),
+                       worldFlags | Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY |
+                           Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY,
+                       fogIndex);
+        AddWorldDrawStage(&s_world.draws[_dstIdx], EnsureWhiteTexture(), &_fogStage);
+        EmitMetalDrawPlan(shaderName, -2, &s_world.draws[_dstIdx], &_fogStage,
+                          EnsureWhiteTexture(), qfalse);
+        return;
+    }
+
+    if (_e != NULL && _e->stageCount > 0) {
+        for (_s = 0; _s < _e->stageCount; ++_s) {
+            const Q3MetalStage *_st = &_e->stages[_s];
+            Q3MetalStage _drawStage;
+            qhandle_t _tex;
+            uint32_t _dstIdx;
+            uint32_t _drawFlags;
+            if (_combinedLightmap && _st->useLightmap) {
+                continue;
+            }
+            _drawStage = *_st;
+            _drawStage.cullMode = _e->cullMode;
+            if (_combinedLightmap && _s == _combinedLightmapBaseStage && _drawStage.blendMode == 3) {
+                _drawStage.blendMode = 0;
+                RawBlendFromMode(_drawStage.blendMode, &_drawStage.rawSrcBlend, &_drawStage.rawDstBlend);
+                _drawStage.depthWrite = 1;
+            }
+            if (_st->animFrameCount > 0) {
+                int _idx;
+                float _fps = (_st->animFps > 0.0f) ? _st->animFps : 8.0f;
+                _idx = (int)((float)cls.realtime * 0.001f * _fps) % _st->animFrameCount;
+                if (_idx < 0) _idx = 0;
+                if (_st->animTextures[_idx] == 0) {
+                    ((Q3MetalStage *)_st)->animTextures[_idx] = RegisterTexture(_st->animFrames[_idx]);
+                }
+                _tex = _st->animTextures[_idx];
+            } else if (_st->useLightmap) {
+                _tex = lightmapHandle;
+            } else if (_s == 0 && skyOverrideTexture != 0) {
+                _tex = skyOverrideTexture;
+            } else {
+                _tex = (_st->mapPath[0] != '\0') ? RegisterTexture(_st->mapPath) : 0;
+            }
+            if (_tex == 0) continue;
+            _dstIdx = (*drawCursorPtr)++;
+            _drawFlags = worldFlags;
+            if (_combinedLightmap && _s == _combinedLightmapBaseStage) {
+                _drawFlags |= Q3_METAL_WORLD_DRAWFLAG_COMBINED_LIGHTMAP;
+            }
+            SetupWorldDraw(&s_world.draws[_dstIdx], firstIndexForDraw, indexCountForDraw,
+                           hasLightmap ? lightmapHandle : EnsureWhiteTexture(), _drawFlags, fogIndex);
+            if (s_world.animShaderSlots && s_pendingAnimSlot >= 0 && _st->animFrameCount > 0) {
+                s_world.animShaderSlots[_dstIdx] = s_pendingAnimSlot * Q3_MAX_STAGES + _s;
+                s_world.animatedDrawCount += 1;
+            }
+            AddWorldDrawStage(&s_world.draws[_dstIdx], _tex, &_drawStage);
+            EmitMetalDrawPlan(shaderName, _s, &s_world.draws[_dstIdx], &_drawStage, _tex, qfalse);
+            _emitted += 1;
+        }
+    }
+
+    if (_e == NULL || _e->stageCount == 0 || _emitted == 0) {
+        qhandle_t _tex = (skyOverrideTexture != 0) ? skyOverrideTexture : RegisterTexture(shaderName);
+        if (_tex != 0) {
+            uint32_t _dstIdx = (*drawCursorPtr)++;
+            uint32_t _drawFlags = worldFlags;
+            if (_combinedLightmap) {
+                _drawFlags |= Q3_METAL_WORLD_DRAWFLAG_COMBINED_LIGHTMAP;
+            }
+            SetupWorldDraw(&s_world.draws[_dstIdx], firstIndexForDraw, indexCountForDraw,
+                           hasLightmap ? lightmapHandle : EnsureWhiteTexture(), _drawFlags, fogIndex);
+            if (s_world.animShaderSlots && s_pendingAnimSlot >= 0) {
+                s_world.animShaderSlots[_dstIdx] = s_pendingAnimSlot;
+                s_world.animatedDrawCount += 1;
+            }
+            AddWorldDrawStageSimple(&s_world.draws[_dstIdx], _tex, 0, 0, 0);
+            if (s_world.draws[_dstIdx].stageCount > 0) {
+                Q3MetalStage _simple;
+                Com_Memset(&_simple, 0, sizeof(_simple));
+                _simple.cullMode = METAL_SHADER_CULL_BACK;
+                _simple.depthWrite = 1;
+                EmitMetalDrawPlan(shaderName, 0, &s_world.draws[_dstIdx], &_simple, _tex, qfalse);
+                _emitted += 1;
+            }
+        }
+    }
+
+    if (!_combinedLightmap && hasLightmap && lightmapHandle != 0 &&
+        _emitted > 0 && shaderShouldInjectImplicitLightmap(_e)) {
+        uint32_t _ldst = (*drawCursorPtr)++;
+        SetupWorldDraw(&s_world.draws[_ldst], firstIndexForDraw, indexCountForDraw,
+                       lightmapHandle, worldFlags, fogIndex);
+        AddWorldDrawLightmapBaseStage(&s_world.draws[_ldst], lightmapHandle, _e,
+                                      /*blendMode=*/3, /*depthWrite=*/0);
+    }
+
+    if (fogIndex != Q3_METAL_NO_FOG && MetalShaderShouldEmitFogPass(_e, _emitted)) {
+        Q3MetalStage _fogStage;
+        uint32_t _fdst;
+        Com_Memset(&_fogStage, 0, sizeof(_fogStage));
+        _fogStage.blendMode = 2;
+        RawBlendFromMode(_fogStage.blendMode, &_fogStage.rawSrcBlend, &_fogStage.rawDstBlend);
+        _fogStage.cullMode = (_e != NULL) ? _e->cullMode : METAL_SHADER_CULL_BACK;
+        _fogStage.depthWrite = 0;
+        _fdst = (*drawCursorPtr)++;
+        SetupWorldDraw(&s_world.draws[_fdst], firstIndexForDraw, indexCountForDraw,
+                       EnsureWhiteTexture(), worldFlags | Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY, fogIndex);
+        AddWorldDrawStage(&s_world.draws[_fdst], EnsureWhiteTexture(), &_fogStage);
+    }
 }
 
 /* ========================================================================== */
@@ -4010,13 +4885,25 @@ static qboolean LoadWorldMapData(const char *name) {
     s_world.vertices = ri.Malloc(totalVertices * sizeof(*s_world.vertices));
     s_world.indices = ri.Malloc(totalIndices * sizeof(*s_world.indices));
     s_world.draws = ri.Malloc(totalDraws * sizeof(*s_world.draws));
+    s_world.visibleDraws = ri.Malloc(totalDraws * sizeof(*s_world.visibleDraws));
+    s_world.visibleDrawCapacity = totalDraws;
+    s_world.visibleDrawCount = 0;
+    s_world.visibleDrawsValid = qfalse;
+    s_world.surfaceDrawRanges = ri.Malloc(surfaceCount * sizeof(*s_world.surfaceDrawRanges));
+    s_world.surfaceDrawRangeCount = surfaceCount;
+    s_world.lastViewCluster = -9999;
     s_world.animShaderSlots = ri.Malloc(totalDraws * sizeof(*s_world.animShaderSlots));
     s_world.animatedDrawCount = 0;
+    if (s_world.surfaceDrawRanges != NULL) {
+        Com_Memset(s_world.surfaceDrawRanges, 0, surfaceCount * sizeof(*s_world.surfaceDrawRanges));
+    }
     if (s_world.animShaderSlots != NULL) {
         uint32_t _i;
         for (_i = 0; _i < totalDraws; ++_i) s_world.animShaderSlots[_i] = -1;
     }
-    if (s_world.vertices == NULL || s_world.indices == NULL || s_world.draws == NULL) {
+    if (s_world.vertices == NULL || s_world.indices == NULL ||
+        s_world.draws == NULL || s_world.visibleDraws == NULL ||
+        s_world.surfaceDrawRanges == NULL) {
         ri.Printf(PRINT_WARNING, "Metal world: allocation failed for '%s'\n", name);
         FreeWorldMapData();
         ri.FS_FreeFile(fileBuffer);
@@ -4041,6 +4928,7 @@ static qboolean LoadWorldMapData(const char *name) {
         qboolean hasLightmap;
         uint32_t worldFlags;
         uint32_t fogIndex;
+        uint32_t surfaceFirstDraw;
         int surfFogNum;
         int j;
 
@@ -4108,6 +4996,7 @@ static qboolean LoadWorldMapData(const char *name) {
                 continue;
             }
         }
+        surfaceFirstDraw = drawCursor;
         if (!IsSkyShaderName(shaders[shaderNum].shader) &&
             lightmapNum >= 0 && lightmapNum < s_worldLightmapCount) {
             lightmapHandle = s_worldLightmapHandles[lightmapNum];
@@ -4154,9 +5043,11 @@ static qboolean LoadWorldMapData(const char *name) {
         if (surfaceType == MST_PATCH) {
             int patchX;
             int patchY;
+            uint32_t firstIndexForDraw;
 
             patchWidth = LittleLong(surface->patchWidth);
             patchHeight = LittleLong(surface->patchHeight);
+            firstIndexForDraw = indexCursor;
 
             for (patchY = 0; patchY < patchHeight - 1; patchY += 2) {
                 for (patchX = 0; patchX < patchWidth - 1; patchX += 2) {
@@ -4171,7 +5062,6 @@ static qboolean LoadWorldMapData(const char *name) {
                     }
 
                     baseVertex = vertexCursor;
-                    s_world.draws[drawCursor].firstIndex = indexCursor;
 
                     for (stepY = 0; stepY <= Q3_METAL_PATCH_SUBDIVISIONS; ++stepY) {
                         float v = (float)stepY / (float)Q3_METAL_PATCH_SUBDIVISIONS;
@@ -4185,7 +5075,6 @@ static qboolean LoadWorldMapData(const char *name) {
                         for (stepX = 0; stepX <= Q3_METAL_PATCH_SUBDIVISIONS; ++stepX) {
                             float u = (float)stepX / (float)Q3_METAL_PATCH_SUBDIVISIONS;
                             drawVert_t evaluated;
-
                             EvalQuadraticDrawVert(&row[0], &row[1], &row[2], u, &evaluated);
                             EmitWorldVertex(&s_world.vertices[vertexCursor++], &evaluated);
                         }
@@ -4200,7 +5089,6 @@ static qboolean LoadWorldMapData(const char *name) {
                             uint32_t i1 = i0 + 1;
                             uint32_t i2 = row1 + (uint32_t)stepX;
                             uint32_t i3 = i2 + 1;
-
                             s_world.indices[indexCursor++] = i0;
                             s_world.indices[indexCursor++] = i2;
                             s_world.indices[indexCursor++] = i1;
@@ -4209,200 +5097,24 @@ static qboolean LoadWorldMapData(const char *name) {
                             s_world.indices[indexCursor++] = i3;
                         }
                     }
-
-                    {
-                        uint32_t firstIndexForDraw = s_world.draws[drawCursor].firstIndex;
-                        uint32_t indexCountForDraw = indexCursor - firstIndexForDraw;
-                        {
-                            const metalShaderMap_t *_e = ShaderMap_LookupEntry(shaders[shaderNum].shader);
-                            int _s;
-                            int _emitted = 0;
-                            EmitMetalStageAudit(shaders[shaderNum].shader, _e);
-                            if (_e != NULL && _e->hasFog) {
-                                Q3MetalStage _fogStage;
-                                uint32_t _dstIdx;
-                                if (fogIndex == Q3_METAL_NO_FOG) {
-                                    continue;
-                                }
-                                _dstIdx = drawCursor++;
-                                Com_Memset(&_fogStage, 0, sizeof(_fogStage));
-                                _fogStage.blendMode = 2;
-                                RawBlendFromMode(_fogStage.blendMode, &_fogStage.rawSrcBlend, &_fogStage.rawDstBlend);
-                                _fogStage.cullMode = _e->cullMode;
-                                _fogStage.depthWrite = 0;
-                                SetupWorldDraw(&s_world.draws[_dstIdx],
-                                               firstIndexForDraw,
-                                               indexCountForDraw,
-                                               EnsureWhiteTexture(),
-                                               worldFlags |
-                                                   Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY |
-                                                   Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY,
-                                               fogIndex);
-                                AddWorldDrawStage(&s_world.draws[_dstIdx],
-                                                  EnsureWhiteTexture(),
-                                                  &_fogStage);
-                                EmitMetalDrawPlan(shaders[shaderNum].shader,
-                                                  -2,
-                                                  &s_world.draws[_dstIdx],
-                                                  &_fogStage,
-                                                  EnsureWhiteTexture(),
-                                                  qfalse);
-                                continue;
-                            }
-                            if (_e != NULL && _e->stageCount > 0) {
-                                for (_s = 0; _s < _e->stageCount; ++_s) {
-                                    const Q3MetalStage *_st = &_e->stages[_s];
-                                    Q3MetalStage _drawStage;
-                                    qhandle_t _tex;
-                                    uint32_t _dstIdx;
-                                    _drawStage = *_st;
-                                    _drawStage.cullMode = _e->cullMode;
-                                    if (_st->animFrameCount > 0) {
-                                        int _idx;
-                                        float _fps = (_st->animFps > 0.0f) ? _st->animFps : 8.0f;
-                                        _idx = (int)((float)cls.realtime * 0.001f * _fps) % _st->animFrameCount;
-                                        if (_idx < 0) _idx = 0;
-                                        if (_st->animTextures[_idx] == 0) {
-                                            ((Q3MetalStage *)_st)->animTextures[_idx] =
-                                                RegisterTexture(_st->animFrames[_idx]);
-                                        }
-                                        _tex = _st->animTextures[_idx];
-                                    } else if (_st->useLightmap) {
-                                        _tex = lightmapHandle;
-                                    } else if (_s == 0 && skyOverrideTexture != 0) {
-                                        _tex = skyOverrideTexture;
-                                    } else {
-                                        _tex = (_st->mapPath[0] != '\0') ? RegisterTexture(_st->mapPath) : 0;
-                                    }
-                                    if (_tex == 0) continue;
-                                    _dstIdx = drawCursor++;
-                                    SetupWorldDraw(&s_world.draws[_dstIdx],
-                                                   firstIndexForDraw,
-                                                   indexCountForDraw,
-                                                   hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
-                                                   /* LIGHTMAP_MULTIPLY removed (real second-pass
-                                                    * lightmap stage). FOG_OVERLAY removed (fog now
-                                                    * emitted as a separate post-stage draw with
-                                                    * FOG_ONLY — see EmitWorldFogPassDraw call
-                                                    * after this surface's stages). Stage rendering
-                                                    * is fog-free; ioq3 RB_FogPass equivalent. */
-                                                   worldFlags,
-                                                   fogIndex);
-                                    if (s_world.animShaderSlots && s_pendingAnimSlot >= 0 &&
-                                        _st->animFrameCount > 0) {
-                                        s_world.animShaderSlots[_dstIdx] =
-                                            s_pendingAnimSlot * Q3_MAX_STAGES + _s;
-                                        s_world.animatedDrawCount += 1;
-                                    }
-                                    AddWorldDrawStage(&s_world.draws[_dstIdx], _tex, &_drawStage);
-                                    EmitMetalDrawPlan(shaders[shaderNum].shader,
-                                                      _s,
-                                                      &s_world.draws[_dstIdx],
-                                                      &_drawStage,
-                                                      _tex,
-                                                      qfalse);
-                                    _emitted += 1;
-                                }
-                            }
-                            if (_e == NULL || _e->stageCount == 0 || _emitted == 0) {
-                                qhandle_t _tex = (skyOverrideTexture != 0)
-                                               ? skyOverrideTexture
-                                               : RegisterTexture(shaders[shaderNum].shader);
-                                if (_tex != 0) {
-                                    uint32_t _dstIdx = drawCursor++;
-                                    SetupWorldDraw(&s_world.draws[_dstIdx],
-                                                   firstIndexForDraw,
-                                                   indexCountForDraw,
-                                                   hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
-                                                   /* FOG_OVERLAY removed — fog is post-stage now. */
-                                                   worldFlags,
-                                                   fogIndex);
-                                    if (s_world.animShaderSlots && s_pendingAnimSlot >= 0) {
-                                        s_world.animShaderSlots[_dstIdx] = s_pendingAnimSlot;
-                                        s_world.animatedDrawCount += 1;
-                                    }
-                                    AddWorldDrawStageSimple(&s_world.draws[_dstIdx], _tex, 0, 0, 0);
-                                    if (s_world.draws[_dstIdx].stageCount > 0) {
-                                        Q3MetalStage _simple;
-                                        Com_Memset(&_simple, 0, sizeof(_simple));
-                                        _simple.cullMode = METAL_SHADER_CULL_BACK;
-                                        _simple.depthWrite = 1;
-                                        EmitMetalDrawPlan(shaders[shaderNum].shader,
-                                                          0,
-                                                          &s_world.draws[_dstIdx],
-                                                          &_simple,
-                                                          _tex,
-                                                          qfalse);
-                                        _emitted += 1;
-                                    }
-                                }
-                            }
-                            /* Implicit lightmap pass — stock Q3's
-                             * R_StageIteratorGeneric adds a GL_DST_COLOR/GL_ZERO
-                             * lightmap multiply on top of every world surface
-                             * that has a baked lightmap but no explicit
-                             * `map $lightmap` stage in its .shader. Without
-                             * this, floors/walls with single-stage diffuse-
-                             * only shaders render at full unshaded brightness
-                             * (the q3dm4 floor symptom). */
-                            if (hasLightmap && lightmapHandle != 0 && _emitted > 0 &&
-                                shaderShouldInjectImplicitLightmap(_e)) {
-                                uint32_t _ldst = drawCursor++;
-                                SetupWorldDraw(&s_world.draws[_ldst],
-                                               firstIndexForDraw,
-                                               indexCountForDraw,
-                                               lightmapHandle,
-                                               worldFlags,
-                                               fogIndex);
-                                AddWorldDrawLightmapBaseStage(&s_world.draws[_ldst],
-                                                              lightmapHandle,
-                                                              _e,
-                                                              /*blendMode=*/3,
-                                                              /*depthWrite=*/0);
-                            }
-                            /* RB_FogPass equivalent: separate fog-only draw at
-                             * the end of this surface's stage list when the
-                             * surface is inside a fog volume. Mirrors ioq3
-                             * `if (shader->fogPass) RB_FogPass()` post-stage
-                             * compositing. Swift worldPass==5 picks it up via
-                             * the FOG_ONLY flag and renders with alpha blend
-                             * (src_alpha / one_minus_src_alpha), read-only depth. */
-                            {
-                                static int s_fogGateLogged = 0;
-                                qboolean shouldEmit = MetalShaderShouldEmitFogPass(_e, _emitted);
-                                qboolean wouldFog = (fogIndex != Q3_METAL_NO_FOG) && shouldEmit;
-                                if (s_fogGateLogged < 8) {
-                                    ri.Printf(PRINT_ALL,
-                                              "[FOG-DBG] surface fogIndex=%d emitted=%d should=%d -> %s\n",
-                                              (int)fogIndex, _emitted, (int)shouldEmit,
-                                              wouldFog ? "FOG-DRAW" : "skip");
-                                    s_fogGateLogged += 1;
-                                }
-                            }
-                            if (fogIndex != Q3_METAL_NO_FOG &&
-                                MetalShaderShouldEmitFogPass(_e, _emitted)) {
-                                Q3MetalStage _fogStage;
-                                uint32_t _fdst;
-                                Com_Memset(&_fogStage, 0, sizeof(_fogStage));
-                                _fogStage.blendMode = 2;
-                                RawBlendFromMode(_fogStage.blendMode, &_fogStage.rawSrcBlend, &_fogStage.rawDstBlend);
-                                _fogStage.cullMode = (_e != NULL) ? _e->cullMode : METAL_SHADER_CULL_BACK;
-                                _fogStage.depthWrite = 0;
-                                _fdst = drawCursor++;
-                                SetupWorldDraw(&s_world.draws[_fdst],
-                                               firstIndexForDraw,
-                                               indexCountForDraw,
-                                               EnsureWhiteTexture(),
-                                               worldFlags | Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY,
-                                               fogIndex);
-                                AddWorldDrawStage(&s_world.draws[_fdst], EnsureWhiteTexture(), &_fogStage);
-                            }
-                        }
-                    }
                 }
             }
+
+            if (indexCursor > firstIndexForDraw) {
+                MetalWorldEmitSurfaceStages(shaders[shaderNum].shader,
+                                            lightmapHandle,
+                                            skyOverrideTexture,
+                                            hasLightmap,
+                                            worldFlags,
+                                            fogIndex,
+                                            firstIndexForDraw,
+                                            indexCursor - firstIndexForDraw,
+                                            &drawCursor);
+            }
+            MetalWorldSetSurfaceDrawRange(i, surfaceFirstDraw, drawCursor);
             continue;
         }
+
 
         if (numIndexes % 3) {
             numIndexes -= numIndexes % 3;
@@ -4427,170 +5139,22 @@ static qboolean LoadWorldMapData(const char *name) {
         {
             uint32_t firstIndexForDraw = s_world.draws[drawCursor].firstIndex;
             uint32_t indexCountForDraw = indexCursor - firstIndexForDraw;
-            {
-                const metalShaderMap_t *_e = ShaderMap_LookupEntry(shaders[shaderNum].shader);
-                            int _s;
-                            int _emitted = 0;
-                            EmitMetalStageAudit(shaders[shaderNum].shader, _e);
-                            if (_e != NULL && _e->hasFog) {
-                                Q3MetalStage _fogStage;
-                                uint32_t _dstIdx;
-                                if (fogIndex == Q3_METAL_NO_FOG) {
-                                    continue;
-                                }
-                                _dstIdx = drawCursor++;
-                                Com_Memset(&_fogStage, 0, sizeof(_fogStage));
-                                _fogStage.blendMode = 2;
-                                RawBlendFromMode(_fogStage.blendMode, &_fogStage.rawSrcBlend, &_fogStage.rawDstBlend);
-                                _fogStage.cullMode = _e->cullMode;
-                                _fogStage.depthWrite = 0;
-                                SetupWorldDraw(&s_world.draws[_dstIdx],
-                                               firstIndexForDraw,
-                                               indexCountForDraw,
-                                               EnsureWhiteTexture(),
-                                               worldFlags |
-                                                   Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY |
-                                                   Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY,
-                                               fogIndex);
-                                AddWorldDrawStage(&s_world.draws[_dstIdx],
-                                                  EnsureWhiteTexture(),
-                                                  &_fogStage);
-                                EmitMetalDrawPlan(shaders[shaderNum].shader,
-                                                  -2,
-                                                  &s_world.draws[_dstIdx],
-                                                  &_fogStage,
-                                                  EnsureWhiteTexture(),
-                                                  qfalse);
-                                continue;
-                            }
-                            if (_e != NULL && _e->stageCount > 0) {
-                                for (_s = 0; _s < _e->stageCount; ++_s) {
-                        const Q3MetalStage *_st = &_e->stages[_s];
-                        Q3MetalStage _drawStage;
-                        qhandle_t _tex;
-                        uint32_t _dstIdx;
-                        _drawStage = *_st;
-                        _drawStage.cullMode = _e->cullMode;
-                        if (_st->animFrameCount > 0) {
-                            int _idx;
-                            float _fps = (_st->animFps > 0.0f) ? _st->animFps : 8.0f;
-                            _idx = (int)((float)cls.realtime * 0.001f * _fps) % _st->animFrameCount;
-                            if (_idx < 0) _idx = 0;
-                            if (_st->animTextures[_idx] == 0) {
-                                ((Q3MetalStage *)_st)->animTextures[_idx] =
-                                    RegisterTexture(_st->animFrames[_idx]);
-                            }
-                            _tex = _st->animTextures[_idx];
-                        } else if (_st->useLightmap) {
-                            _tex = lightmapHandle;
-                        } else if (_s == 0 && skyOverrideTexture != 0) {
-                            _tex = skyOverrideTexture;
-                        } else {
-                            _tex = (_st->mapPath[0] != '\0') ? RegisterTexture(_st->mapPath) : 0;
-                        }
-                        if (_tex == 0) continue;
-                        _dstIdx = drawCursor++;
-                        SetupWorldDraw(&s_world.draws[_dstIdx],
-                                       firstIndexForDraw,
-                                       indexCountForDraw,
-                                       hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
-                                       /* LIGHTMAP_MULTIPLY + FOG_OVERLAY both removed — see
-                                        * comment in patch path above; fog emits as a separate
-                                        * post-stage draw via EmitWorldFogPassDraw. */
-                                       worldFlags,
-                                       fogIndex);
-                        if (s_world.animShaderSlots && s_pendingAnimSlot >= 0 &&
-                            _st->animFrameCount > 0) {
-                            s_world.animShaderSlots[_dstIdx] =
-                                s_pendingAnimSlot * Q3_MAX_STAGES + _s;
-                            s_world.animatedDrawCount += 1;
-                        }
-                        AddWorldDrawStage(&s_world.draws[_dstIdx], _tex, &_drawStage);
-                        EmitMetalDrawPlan(shaders[shaderNum].shader,
-                                          _s,
-                                          &s_world.draws[_dstIdx],
-                                          &_drawStage,
-                                          _tex,
-                                          qfalse);
-                        _emitted += 1;
-                    }
-                }
-                if (_e == NULL || _e->stageCount == 0 || _emitted == 0) {
-                    qhandle_t _tex = (skyOverrideTexture != 0)
-                                   ? skyOverrideTexture
-                                   : RegisterTexture(shaders[shaderNum].shader);
-                    if (_tex != 0) {
-                        uint32_t _dstIdx = drawCursor++;
-                        SetupWorldDraw(&s_world.draws[_dstIdx],
-                                       firstIndexForDraw,
-                                       indexCountForDraw,
-                                       hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
-                                       /* FOG_OVERLAY removed — fog is post-stage now. */
-                                       worldFlags,
-                                       fogIndex);
-                        if (s_world.animShaderSlots && s_pendingAnimSlot >= 0) {
-                            s_world.animShaderSlots[_dstIdx] = s_pendingAnimSlot;
-                            s_world.animatedDrawCount += 1;
-                        }
-                        AddWorldDrawStageSimple(&s_world.draws[_dstIdx], _tex, 0, 0, 0);
-                        if (s_world.draws[_dstIdx].stageCount > 0) {
-                            Q3MetalStage _simple;
-                            Com_Memset(&_simple, 0, sizeof(_simple));
-                            _simple.cullMode = METAL_SHADER_CULL_BACK;
-                            _simple.depthWrite = 1;
-                            EmitMetalDrawPlan(shaders[shaderNum].shader,
-                                              0,
-                                              &s_world.draws[_dstIdx],
-                                              &_simple,
-                                              _tex,
-                                              qfalse);
-                            _emitted += 1;
-                        }
-                    }
-                }
-                /* Implicit lightmap pass (see explanation at first emission
-                 * site above). Tris/planar surfaces follow the same rule. */
-                if (hasLightmap && lightmapHandle != 0 && _emitted > 0 &&
-                    shaderShouldInjectImplicitLightmap(_e)) {
-                    uint32_t _ldst = drawCursor++;
-                    SetupWorldDraw(&s_world.draws[_ldst],
-                                   firstIndexForDraw,
-                                   indexCountForDraw,
-                                   lightmapHandle,
-                                   worldFlags,
-                                   fogIndex);
-                    AddWorldDrawLightmapBaseStage(&s_world.draws[_ldst],
-                                                  lightmapHandle,
-                                                  _e,
-                                                  /*blendMode=*/3,
-                                                  /*depthWrite=*/0);
-                }
-                /* RB_FogPass equivalent: see patches path above. Tris/planar
-                 * surfaces follow the same post-stage fog emission rule —
-                 * one FOG_ONLY draw per surface inside a fog volume. */
-                if (fogIndex != Q3_METAL_NO_FOG &&
-                    MetalShaderShouldEmitFogPass(_e, _emitted)) {
-                    Q3MetalStage _fogStage;
-                    uint32_t _fdst;
-                    Com_Memset(&_fogStage, 0, sizeof(_fogStage));
-                    _fogStage.blendMode = 2;
-                    RawBlendFromMode(_fogStage.blendMode, &_fogStage.rawSrcBlend, &_fogStage.rawDstBlend);
-                    _fogStage.cullMode = (_e != NULL) ? _e->cullMode : METAL_SHADER_CULL_BACK;
-                    _fogStage.depthWrite = 0;
-                    _fdst = drawCursor++;
-                    SetupWorldDraw(&s_world.draws[_fdst],
-                                   firstIndexForDraw,
-                                   indexCountForDraw,
-                                   EnsureWhiteTexture(),
-                                   worldFlags | Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY,
-                                   fogIndex);
-                    AddWorldDrawStage(&s_world.draws[_fdst], EnsureWhiteTexture(), &_fogStage);
-                }
+            if (indexCountForDraw > 0) {
+                MetalWorldEmitSurfaceStages(shaders[shaderNum].shader,
+                                            lightmapHandle,
+                                            skyOverrideTexture,
+                                            hasLightmap,
+                                            worldFlags,
+                                            fogIndex,
+                                            firstIndexForDraw,
+                                            indexCountForDraw,
+                                            &drawCursor);
             }
         }
+        MetalWorldSetSurfaceDrawRange(i, surfaceFirstDraw, drawCursor);
     }
 
-    s_world.loaded = qtrue;
+	    s_world.loaded = qtrue;
     s_world.generation += 1;
     s_world.vertexCount = vertexCursor;
     s_world.indexCount = indexCursor;
@@ -6937,11 +7501,15 @@ static void RE_RenderScene(const refdef_t *fd) {
                 );
             }
         }
-    }
+	    }
 
-    /* World-scene-only camera. HUD/portrait scenes would overwrite with
-     * their own view, projecting preserved world entity draws off-screen. */
-    if (fd->rdflags == 0) {
+	    if (s_world.loaded && !(fd->rdflags & RDF_NOWORLDMODEL)) {
+	        MetalWorldBuildVisibleDraws(vieworg, axis0, axis1, axis2, fovX, fovY, fd->areamask);
+	    }
+
+	    /* World-scene-only camera. HUD/portrait scenes would overwrite with
+	     * their own view, projecting preserved world entity draws off-screen. */
+	    if (fd->rdflags == 0) {
         s_frameSnapshot.shaderTime = (float)fd->time * 0.001f;
         s_sceneView.fovX = fovX;
         s_sceneView.fovY = fovY;
@@ -6961,20 +7529,23 @@ static void RE_RenderScene(const refdef_t *fd) {
 
     s_sceneLogCounter += 1;
     if (MetalRenderAuditEnabled() && (s_sceneLogCounter % 60) == 0) {
-        ri.Printf(
-            PRINT_ALL,
-            "Metal debug refdef[%u]: vieworg=(%.2f %.2f %.2f) axis0=(%.3f %.3f %.3f) "
-            "axis1=(%.3f %.3f %.3f) axis2=(%.3f %.3f %.3f) fov=(%.2f %.2f) rdflags=0x%x worldLoaded=%d draws=%u\n",
-            s_sceneLogCounter,
-            vieworg[0], vieworg[1], vieworg[2],
-            axis0[0], axis0[1], axis0[2],
+	        ri.Printf(
+	            PRINT_ALL,
+	            "Metal debug refdef[%u]: vieworg=(%.2f %.2f %.2f) axis0=(%.3f %.3f %.3f) "
+	            "axis1=(%.3f %.3f %.3f) axis2=(%.3f %.3f %.3f) fov=(%.2f %.2f) rdflags=0x%x worldLoaded=%d draws=%u visible=%u static=%u pvs=%d\n",
+	            s_sceneLogCounter,
+	            vieworg[0], vieworg[1], vieworg[2],
+	            axis0[0], axis0[1], axis0[2],
             axis1[0], axis1[1], axis1[2],
             axis2[0], axis2[1], axis2[2],
-            fovX, fovY,
-            fd->rdflags,
-            s_world.loaded,
-            s_world.drawCount
-        );
+	            fovX, fovY,
+	            fd->rdflags,
+	            s_world.loaded,
+	            MetalWorldCurrentDrawCount(),
+	            s_world.visibleDrawCount,
+	            s_world.drawCount,
+	            s_world.visibleDrawsValid ? 1 : 0
+	        );
         ri.Printf(
             PRINT_ALL,
             "Metal entity queue[%u]: accepted=%u rejectNull=%u rejectType=%u rejectModel=%u sceneEntities=%u clearCalls=%u renderCalls=%u rawEntries=%u\n",
@@ -7060,12 +7631,12 @@ static void RE_RenderScene(const refdef_t *fd) {
         }
     }
 
-    if (s_world.loaded && !(fd->rdflags & RDF_NOWORLDMODEL)) {
-        s_frameSnapshot.worldVertexCount = s_world.vertexCount;
-        s_frameSnapshot.worldIndexCount = s_world.indexCount;
-        s_frameSnapshot.worldCommandCount = s_world.drawCount;
-        s_frameSnapshot.worldGeneration = s_world.generation;
-    }
+	    if (s_world.loaded && !(fd->rdflags & RDF_NOWORLDMODEL)) {
+	        s_frameSnapshot.worldVertexCount = s_world.vertexCount;
+	        s_frameSnapshot.worldIndexCount = s_world.indexCount;
+	        s_frameSnapshot.worldCommandCount = MetalWorldCurrentDrawCount();
+	        s_frameSnapshot.worldGeneration = s_world.generation;
+	    }
 
     /* Multi-scene: capture this scene's entity command range BEFORE
      * emission, then measure how many commands emission pushed. Pool
@@ -8469,7 +9040,29 @@ static void R_ModelBounds(qhandle_t model, vec3_t mins, vec3_t maxs) {
 
 static void RE_RemapShader(const char *oldShader, const char *newShader, const char *offsetTime) {}
 static qboolean RE_GetEntityToken(char *buffer, int size) { return qfalse; }
-static qboolean R_inPVS(const vec3_t p1, const vec3_t p2) { return qfalse; }
+static qboolean R_inPVS(const vec3_t p1, const vec3_t p2) {
+    bspMnode_t *leaf1;
+    bspMnode_t *leaf2;
+    const byte *vis;
+    if (!s_bspWorld.loaded || s_bspWorld.nodes == NULL) {
+        return qfalse;
+    }
+    leaf1 = MetalWorldPointInLeaf(p1);
+    leaf2 = MetalWorldPointInLeaf(p2);
+    if (leaf1 == NULL || leaf2 == NULL) {
+        return qfalse;
+    }
+    if (leaf1->cluster < 0 || leaf2->cluster < 0 ||
+        leaf1->cluster >= s_bspWorld.numClusters ||
+        leaf2->cluster >= s_bspWorld.numClusters) {
+        return qfalse;
+    }
+    vis = MetalWorldClusterPVS(leaf1->cluster);
+    if (vis == NULL) {
+        return qfalse;
+    }
+    return (vis[leaf2->cluster >> 3] & (1 << (leaf2->cluster & 7))) ? qtrue : qfalse;
+}
 
 /* Video capture shared buffer.
  *
@@ -8599,6 +9192,9 @@ const uint32_t *Q3MetalRenderer_GetWorldIndices(void) {
 }
 
 const Q3MetalWorldDrawCmd *Q3MetalRenderer_GetWorldDrawCommands(void) {
+    if (s_world.visibleDrawsValid && s_world.visibleDraws != NULL) {
+        return s_world.visibleDraws;
+    }
     return s_world.draws;
 }
 

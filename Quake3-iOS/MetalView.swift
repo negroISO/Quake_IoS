@@ -13,7 +13,11 @@ struct MetalView: UIViewRepresentable {
         #if os(visionOS)
         let maxFPS = 90
         #else
-        let maxFPS = UIScreen.main.maximumFramesPerSecond
+        /* Prefer ProMotion-rate rendering when available. Some Simulator
+         * runtimes report 60 even for Pro-class devices, but setting a
+         * 120Hz range is harmless there and lets real iPhone Pro/Max
+         * hardware run past 60 when the renderer has headroom. */
+        let maxFPS = max(UIScreen.main.maximumFramesPerSecond, 120)
         #endif
         view.preferredFramesPerSecond = maxFPS
         view.enableSetNeedsDisplay = false
@@ -251,6 +255,195 @@ struct MetalView: UIViewRepresentable {
             case 6: return draw.stages.6
             default: return draw.stages.7
             }
+        }
+
+        private struct WorldPassEntry {
+            let drawIndex: Int
+            /* -1 = sky draw (all sky stages), -2 = fog-only draw. */
+            let stageIndex: Int
+        }
+
+        private struct WorldIndexBatch {
+            let drawIndex: Int
+            let stageIndex: Int
+            var firstMergedIndex: Int
+            var indexCount: Int
+        }
+
+        private var worldBatchIndexScratch: [UInt32] = []
+        private var worldBatchIndexBuffers: [MTLBuffer?] = Array(repeating: nil, count: 3)
+        private var worldBatchIndexBufferCapacities: [Int] = Array(repeating: 0, count: 3)
+
+        private func ensureWorldBatchIndexBuffer(device: MTLDevice, indexCount: Int, slot: Int) -> MTLBuffer? {
+            let byteCount = max(4, indexCount * MemoryLayout<UInt32>.stride)
+            let clampedSlot = max(0, min(slot, worldBatchIndexBuffers.count - 1))
+            if worldBatchIndexBuffers[clampedSlot] == nil || worldBatchIndexBufferCapacities[clampedSlot] < byteCount {
+                worldBatchIndexBuffers[clampedSlot] = device.makeBuffer(length: byteCount, options: .storageModeShared)
+                worldBatchIndexBufferCapacities[clampedSlot] = byteCount
+            }
+            return worldBatchIndexBuffers[clampedSlot]
+        }
+
+        private static func tcModEqual(_ a: Q3TcMod, _ b: Q3TcMod) -> Bool {
+            a.type == b.type &&
+            a.params.0 == b.params.0 &&
+            a.params.1 == b.params.1 &&
+            a.params.2 == b.params.2 &&
+            a.params.3 == b.params.3
+        }
+
+        private static func float4Equal(_ a: (Float, Float, Float, Float),
+                                        _ b: (Float, Float, Float, Float)) -> Bool {
+            a.0 == b.0 && a.1 == b.1 && a.2 == b.2 && a.3 == b.3
+        }
+
+        private static func float3Equal(_ a: (Float, Float, Float),
+                                        _ b: (Float, Float, Float)) -> Bool {
+            a.0 == b.0 && a.1 == b.1 && a.2 == b.2
+        }
+
+        private static func worldDrawHasLightmapStage(_ draw: Q3MetalWorldDrawCmd) -> Bool {
+            let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+            guard stageCount > 0 else { return false }
+            for i in 0..<stageCount where Self.worldStage(draw, i).useLightmap != 0 {
+                return true
+            }
+            return false
+        }
+
+        private static func hashCombine(_ hash: inout UInt64, _ value: UInt64) {
+            hash ^= value &+ 0x9e3779b97f4a7c15 &+ (hash << 6) &+ (hash >> 2)
+        }
+
+        private static func floatBits(_ value: Float) -> UInt64 {
+            UInt64(value.bitPattern)
+        }
+
+        private static func worldBatchHash(draw: Q3MetalWorldDrawCmd,
+                                           stage: Q3MetalWorldStage,
+                                           pass: Int) -> UInt64 {
+            var h: UInt64 = 0xcbf29ce484222325
+            hashCombine(&h, UInt64(pass))
+            hashCombine(&h, UInt64(draw.lightmapTextureHandle))
+            hashCombine(&h, UInt64(draw.flags))
+            hashCombine(&h, UInt64(draw.fogIndex))
+            hashCombine(&h, Self.worldDrawHasLightmapStage(draw) ? 1 : 0)
+            hashCombine(&h, UInt64(stage.textureHandle))
+            hashCombine(&h, UInt64(stage.srcBlend))
+            hashCombine(&h, UInt64(stage.dstBlend))
+            hashCombine(&h, UInt64(stage.depthFunc))
+            hashCombine(&h, UInt64(stage.tcGen))
+            hashCombine(&h, UInt64(stage.tcModCount))
+            hashCombine(&h, UInt64(stage.rgbGen))
+            hashCombine(&h, UInt64(stage.alphaGen))
+            hashCombine(&h, UInt64(stage.alphaFunc))
+            hashCombine(&h, UInt64(stage.cullMode))
+            hashCombine(&h, UInt64(stage.useLightmap))
+            hashCombine(&h, UInt64(stage.depthWrite))
+            hashCombine(&h, UInt64(stage.rgbWaveFunc))
+            hashCombine(&h, floatBits(stage.rgbWaveBase))
+            hashCombine(&h, floatBits(stage.rgbWaveAmp))
+            hashCombine(&h, floatBits(stage.rgbWavePhase))
+            hashCombine(&h, floatBits(stage.rgbWaveFreq))
+            hashCombine(&h, UInt64(stage.alphaWaveFunc))
+            hashCombine(&h, floatBits(stage.alphaWaveBase))
+            hashCombine(&h, floatBits(stage.alphaWaveAmp))
+            hashCombine(&h, floatBits(stage.alphaWavePhase))
+            hashCombine(&h, floatBits(stage.alphaWaveFreq))
+            let mods = [stage.tcMods.0, stage.tcMods.1, stage.tcMods.2, stage.tcMods.3]
+            for m in mods {
+                hashCombine(&h, UInt64(m.type))
+                hashCombine(&h, floatBits(m.params.0))
+                hashCombine(&h, floatBits(m.params.1))
+                hashCombine(&h, floatBits(m.params.2))
+                hashCombine(&h, floatBits(m.params.3))
+            }
+            return h
+        }
+
+        private static func worldStagesEquivalentForMerge(_ a: Q3MetalWorldStage,
+                                                          _ b: Q3MetalWorldStage) -> Bool {
+            guard a.textureHandle == b.textureHandle,
+                  a.blendMode == b.blendMode,
+                  a.srcBlend == b.srcBlend,
+                  a.dstBlend == b.dstBlend,
+                  a.depthFunc == b.depthFunc,
+                  a.tcGen == b.tcGen,
+                  a.tcModCount == b.tcModCount,
+                  a.deformWaveFunc == b.deformWaveFunc,
+                  a.deformWaveDiv == b.deformWaveDiv,
+                  a.deformWaveBase == b.deformWaveBase,
+                  a.deformWaveAmp == b.deformWaveAmp,
+                  a.deformWavePhase == b.deformWavePhase,
+                  a.deformWaveFreq == b.deformWaveFreq,
+                  a.deformMoveFunc == b.deformMoveFunc,
+                  float3Equal(a.deformMoveVector, b.deformMoveVector),
+                  a.deformMoveBase == b.deformMoveBase,
+                  a.deformMoveAmp == b.deformMoveAmp,
+                  a.deformMovePhase == b.deformMovePhase,
+                  a.deformMoveFreq == b.deformMoveFreq,
+                  a.autospriteMode == b.autospriteMode,
+                  a.rgbGen == b.rgbGen,
+                  a.alphaGen == b.alphaGen,
+                  a.alphaFunc == b.alphaFunc,
+                  a.cullMode == b.cullMode,
+                  a.useLightmap == b.useLightmap,
+                  a.depthWrite == b.depthWrite,
+                  a.rgbWaveFunc == b.rgbWaveFunc,
+                  a.rgbWaveBase == b.rgbWaveBase,
+                  a.rgbWaveAmp == b.rgbWaveAmp,
+                  a.rgbWavePhase == b.rgbWavePhase,
+                  a.rgbWaveFreq == b.rgbWaveFreq,
+                  a.alphaWaveFunc == b.alphaWaveFunc,
+                  a.alphaWaveBase == b.alphaWaveBase,
+                  a.alphaWaveAmp == b.alphaWaveAmp,
+                  a.alphaWavePhase == b.alphaWavePhase,
+                  a.alphaWaveFreq == b.alphaWaveFreq,
+                  float3Equal(a.rgbConstColor, b.rgbConstColor),
+                  a.alphaConst == b.alphaConst,
+                  float4Equal(a.tcGenVec0, b.tcGenVec0),
+                  float4Equal(a.tcGenVec1, b.tcGenVec1) else {
+                return false
+            }
+
+            return tcModEqual(a.tcMods.0, b.tcMods.0) &&
+                   tcModEqual(a.tcMods.1, b.tcMods.1) &&
+                   tcModEqual(a.tcMods.2, b.tcMods.2) &&
+                   tcModEqual(a.tcMods.3, b.tcMods.3)
+        }
+
+        private static func worldDrawsCanMerge(_ draw: Q3MetalWorldDrawCmd,
+                                               stage: Q3MetalWorldStage,
+                                               nextDraw: Q3MetalWorldDrawCmd,
+                                               nextStage: Q3MetalWorldStage,
+                                               pass: Int,
+                                               mergedIndexCount: Int) -> Bool {
+            guard nextDraw.indexCount > 0,
+                  nextDraw.firstIndex == draw.firstIndex + UInt32(mergedIndexCount),
+                  nextDraw.lightmapTextureHandle == draw.lightmapTextureHandle,
+                  nextDraw.flags == draw.flags,
+                  nextDraw.fogIndex == draw.fogIndex,
+                  Self.worldRenderPass(for: nextStage) == pass,
+                  Self.worldDrawHasLightmapStage(nextDraw) == Self.worldDrawHasLightmapStage(draw) else {
+                return false
+            }
+            return Self.worldStagesEquivalentForMerge(stage, nextStage)
+        }
+
+        private static func worldDrawsCanBatch(_ draw: Q3MetalWorldDrawCmd,
+                                               stage: Q3MetalWorldStage,
+                                               nextDraw: Q3MetalWorldDrawCmd,
+                                               nextStage: Q3MetalWorldStage,
+                                               pass: Int) -> Bool {
+            guard nextDraw.indexCount > 0,
+                  nextDraw.lightmapTextureHandle == draw.lightmapTextureHandle,
+                  nextDraw.flags == draw.flags,
+                  nextDraw.fogIndex == draw.fogIndex,
+                  Self.worldRenderPass(for: nextStage) == pass,
+                  Self.worldDrawHasLightmapStage(nextDraw) == Self.worldDrawHasLightmapStage(draw) else {
+                return false
+            }
+            return Self.worldStagesEquivalentForMerge(stage, nextStage)
         }
 
         typealias TcModChainPack = (types: SIMD4<Float>,
@@ -949,15 +1142,11 @@ struct MetalView: UIViewRepresentable {
         float q3FogFactor(float3 worldPos,
                           constant WorldUniforms &uniforms,
                           constant WorldDrawUniforms &drawUniforms) {
-            /* DEBUG: force visible fog so user can confirm draws reach GPU. */
-            return 0.8;
-            #if 0
             Q3FogTexCoord st = q3FogTexCoords(worldPos, uniforms, drawUniforms);
             if (st.s < 0.0 || st.t < (1.0 / 32.0)) {
                 return 0.0;
             }
             return saturate(q3FogImageFactor(st.s, st.t));
-            #endif
         }
 
         struct EntityVertexIn {
@@ -1006,13 +1195,13 @@ struct MetalView: UIViewRepresentable {
 
             float s = dot(worldPos - uniforms.cameraPos,
                           normalize(uniforms.cameraForward)) *
-                      uniforms.fogParams.x;
+                      uniforms.fogParams.x + (1.0 / 512.0);
             float t = 31.0 / 32.0;
 
             if (uniforms.fogParams.y > 0.5) {
                 float4 surface = uniforms.fogSurface;
-            t = dot(worldPos, surface.xyz) + surface.w;
-            float eyeT = dot(uniforms.cameraPos, surface.xyz) + surface.w;
+                t = dot(worldPos, surface.xyz) - surface.w;
+                float eyeT = dot(uniforms.cameraPos, surface.xyz) - surface.w;
                 if (eyeT < 0.0) {
                     if (t < 1.0) {
                         t = 1.0 / 32.0;
@@ -1027,11 +1216,7 @@ struct MetalView: UIViewRepresentable {
             if (s < 0.0 || t < (1.0 / 32.0)) {
                 return 0.0;
             }
-            if (t < (31.0 / 32.0)) {
-                s *= (t - 1.0 / 32.0) / (30.0 / 32.0);
-            }
-            s *= 8.0;
-            return sqrt(saturate(s));
+            return saturate(q3FogImageFactor(s, t));
         }
 
         struct EntityVertexOut {
@@ -1324,14 +1509,16 @@ struct MetalView: UIViewRepresentable {
                                        drawUniforms.rgbConstColor.w,
                                        drawUniforms.entityColor.w,
                                        waveA);
-            /* No shader-side lightmap multiply: lightmap is a real
-             * second-pass stage now, blending via GL_DST_COLOR/GL_ZERO.
-             * Loader pre-shifts by (mapOverbright-frameOverbright+1)
-             * to absorb the GL_RGB_SCALE=2 stock Q3 applies on the
-             * lightmap texture unit (see metal_renderer_stub.c:2080).
-             * Uniform fragment-side scalar was tested and rejected —
-             * compounds across base+lightmap stages (regressed MAE). */
             float3 lit = texel.rgb * vc;
+            if (drawUniforms._pad0 > 0.5) {
+                /* Combined base+lightmap fast path for simple opaque world
+                 * surfaces. Equivalent to Q3's base pass followed by the
+                 * GL_DST_COLOR/GL_ZERO lightmap pass, but avoids one Metal
+                 * encoder draw for the common case. Complex multi-stage
+                 * shaders still use explicit stage draws. */
+                float3 lm = lightmapTexture.sample(textureSampler, in.lightmapTexCoord).rgb;
+                lit *= lm;
+            }
             /* Dynamic lights only on non-additive stages — ioq3 runs
              * dlights as a separate iteration that skips src=ONE
              * additive blends; we don't have that separate iteration so
@@ -1684,6 +1871,8 @@ struct MetalView: UIViewRepresentable {
         private var entityIndexBufferCapacity = 0
         private var debugFrameCounter: UInt32 = 0
         private var frameTimeOrigin = CACurrentMediaTime()
+        private var lastPerfLogTime = CACurrentMediaTime()
+        private var lastPerfLogFrame: UInt32 = 0
 
         override init() {
             super.init()
@@ -1723,14 +1912,18 @@ struct MetalView: UIViewRepresentable {
         }
 
         func draw(in view: MTKView) {
+            let drawFrameStart = CACurrentMediaTime()
             if commandQueue == nil {
                 configureRenderer(for: view)
             }
 
             Q3MetalRenderer_UpdateDrawableSize(Int32(view.drawableSize.width), Int32(view.drawableSize.height))
+            let q3FrameStart = CACurrentMediaTime()
             Quake3_Frame()
+            let q3FrameMs = (CACurrentMediaTime() - q3FrameStart) * 1000.0
 
             guard let snapshot = Q3MetalRenderer_GetFrameSnapshot()?.pointee else { return }
+            let drawableAcquireStart = CACurrentMediaTime()
             guard let drawable = view.currentDrawable,
                   let descriptor = view.currentRenderPassDescriptor,
                   let commandQueue,
@@ -1738,6 +1931,7 @@ struct MetalView: UIViewRepresentable {
                   let worldSamplerState,
                   let commandBuffer = commandQueue.makeCommandBuffer()
             else { return }
+            let drawableAcquireMs = (CACurrentMediaTime() - drawableAcquireStart) * 1000.0
             commandBuffer.label = "Q3.frame"
 
             descriptor.colorAttachments[0].clearColor = MTLClearColor(
@@ -1836,6 +2030,14 @@ struct MetalView: UIViewRepresentable {
                 // world draws in this scene — scene-constant, not per-draw.
                 Self.bindDlightBlock(snapshot: snapshot, encoder: encoder, index: 2)
 
+                var worldPassEntryCount = 0
+                var worldEncodedDrawCalls = 0
+                var worldPassEntryCounts = [Int](repeating: 0, count: 6)
+                var worldEncodedDrawCallsByPass = [Int](repeating: 0, count: 6)
+                var worldBatchGroupCounts = [Int](repeating: 0, count: 6)
+                var worldBatchBuildMs: Double = 0
+                var worldBatchCopyMs: Double = 0
+                var worldEncodeMs: Double = 0
                 if let worldDrawsPointer = Q3MetalRenderer_GetWorldDrawCommands(),
                    let indicesPointer = Q3MetalRenderer_GetWorldIndices() {
                     let _ = indicesPointer
@@ -1845,6 +2047,7 @@ struct MetalView: UIViewRepresentable {
                     let skyFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
                     let fogOverlayBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY)
                     let fogOnlyBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY)
+                    let combinedLightmapBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_COMBINED_LIGHTMAP)
 
                     // Ordered world passes:
                     // 0 = opaque, 1 = filter, 2 = alpha,
@@ -1853,12 +2056,12 @@ struct MetalView: UIViewRepresentable {
                     // 5 = fog overlay pass (post-stage alpha fog).
                     // Sky draws are handled in pass 0 through the sky pipeline
                     // (view-direction spherical projection, no lightmap).
-                    var worldDrawIndicesByPass = Array(repeating: [Int](), count: 6)
+                    var worldPassEntriesByPass = Array(repeating: [WorldPassEntry](), count: 6)
                     if !worldDraws.isEmpty {
-                        worldDrawIndicesByPass[0].reserveCapacity(worldDraws.count)
-                        worldDrawIndicesByPass[1].reserveCapacity(worldDraws.count)
+                        worldPassEntriesByPass[0].reserveCapacity(worldDraws.count)
+                        worldPassEntriesByPass[1].reserveCapacity(worldDraws.count)
                         for pass in 2..<6 {
-                            worldDrawIndicesByPass[pass].reserveCapacity(max(16, worldDraws.count / 8))
+                            worldPassEntriesByPass[pass].reserveCapacity(max(16, worldDraws.count / 8))
                         }
                     }
 
@@ -1867,44 +2070,361 @@ struct MetalView: UIViewRepresentable {
                         guard draw.indexCount > 0 else { continue }
 
                         if (draw.flags & fogOnlyBit) != 0 {
-                            worldDrawIndicesByPass[5].append(drawIndex)
+                            worldPassEntriesByPass[5].append(WorldPassEntry(drawIndex: drawIndex, stageIndex: -2))
                             continue
                         }
 
                         if (draw.flags & skyFlagBit) != 0 {
-                            worldDrawIndicesByPass[0].append(drawIndex)
+                            worldPassEntriesByPass[0].append(WorldPassEntry(drawIndex: drawIndex, stageIndex: -1))
                             continue
                         }
 
                         let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
                         guard stageCount > 0 else { continue }
 
-                        var passMask: UInt8 = 0
                         for stageIndex in 0..<stageCount {
                             let stage = Self.worldStage(draw, stageIndex)
                             let drawPass = Self.worldRenderPass(for: stage)
-                            passMask |= UInt8(1 << drawPass)
+                            worldPassEntriesByPass[drawPass].append(WorldPassEntry(drawIndex: drawIndex, stageIndex: stageIndex))
                         }
-
-                        for pass in 0..<5 where (passMask & UInt8(1 << pass)) != 0 {
-                            worldDrawIndicesByPass[pass].append(drawIndex)
+                    }
+                    worldPassEntryCount = worldPassEntriesByPass.reduce(0) { $0 + $1.count }
+                    for pass in 0..<6 {
+                        worldPassEntryCounts[pass] = worldPassEntriesByPass[pass].count
+                    }
+                    let shouldSampleWorldBatchGroups = ((debugFrameCounter &+ 1) % 60) == 0
+                    if shouldSampleWorldBatchGroups {
+                        for pass in 0...1 {
+                            var hashes = Set<UInt64>()
+                            hashes.reserveCapacity(min(worldPassEntriesByPass[pass].count, 256))
+                            for entry in worldPassEntriesByPass[pass] where entry.stageIndex >= 0 {
+                                let d = worldDraws[entry.drawIndex]
+                                let s = Self.worldStage(d, entry.stageIndex)
+                                hashes.insert(Self.worldBatchHash(draw: d, stage: s, pass: pass))
+                            }
+                            worldBatchGroupCounts[pass] = hashes.count
                         }
                     }
 
+                    var cWorldBatches = UnsafeBufferPointer<Q3MetalWorldBatchCmd>(start: nil, count: 0)
+                    var cWorldBatchIndexBuffer: MTLBuffer?
+                    let batchBuildStart = CACurrentMediaTime()
+                    let cBatchCount = Int(Q3MetalRenderer_BuildWorldBatches((1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4)))
+                    worldBatchBuildMs = (CACurrentMediaTime() - batchBuildStart) * 1000.0
+                    let cBatchIndexCount = Int(Q3MetalRenderer_GetWorldBatchIndexCount())
+                    if cBatchCount > 0,
+                       cBatchIndexCount > 0,
+                       let cBatchPointer = Q3MetalRenderer_GetWorldBatches(),
+                       let cBatchIndexPointer = Q3MetalRenderer_GetWorldBatchIndices(),
+                       let device = view.device,
+                       let batchBuffer = ensureWorldBatchIndexBuffer(device: device,
+                                                                      indexCount: cBatchIndexCount,
+                                                                      slot: Int(debugFrameCounter % 3)) {
+                        let byteCount = cBatchIndexCount * MemoryLayout<UInt32>.stride
+                        let batchCopyStart = CACurrentMediaTime()
+                        memcpy(batchBuffer.contents(), cBatchIndexPointer, byteCount)
+                        worldBatchCopyMs = (CACurrentMediaTime() - batchCopyStart) * 1000.0
+                        cWorldBatches = UnsafeBufferPointer(start: cBatchPointer, count: cBatchCount)
+                        cWorldBatchIndexBuffer = batchBuffer
+                    }
+
+                    var lastWorldPipelineState: MTLRenderPipelineState?
+                    var lastWorldDepthStencilState: MTLDepthStencilState?
+                    var lastWorldCullMode: MTLCullMode?
+                    var lastWorldFragmentTexture0: MTLTexture?
+                    var lastWorldFragmentTexture1: MTLTexture?
+
+                    func invalidateWorldStateCache() {
+                        lastWorldPipelineState = nil
+                        lastWorldDepthStencilState = nil
+                        lastWorldCullMode = nil
+                        lastWorldFragmentTexture0 = nil
+                        lastWorldFragmentTexture1 = nil
+                    }
+
+                    func setWorldPipelineStateCached(_ state: MTLRenderPipelineState) {
+                        if lastWorldPipelineState !== state {
+                            encoder.setRenderPipelineState(state)
+                            lastWorldPipelineState = state
+                        }
+                    }
+
+                    func setWorldDepthStencilStateCached(_ state: MTLDepthStencilState?) {
+                        if lastWorldDepthStencilState !== state {
+                            encoder.setDepthStencilState(state)
+                            lastWorldDepthStencilState = state
+                        }
+                    }
+
+                    func setWorldCullModeCached(_ mode: MTLCullMode) {
+                        if lastWorldCullMode != mode {
+                            encoder.setCullMode(mode)
+                            lastWorldCullMode = mode
+                        }
+                    }
+
+                    func setWorldFragmentTextureCached(_ texture: MTLTexture?, index: Int) {
+                        if index == 0 {
+                            if lastWorldFragmentTexture0 !== texture {
+                                encoder.setFragmentTexture(texture, index: index)
+                                lastWorldFragmentTexture0 = texture
+                            }
+                        } else if index == 1 {
+                            if lastWorldFragmentTexture1 !== texture {
+                                encoder.setFragmentTexture(texture, index: index)
+                                lastWorldFragmentTexture1 = texture
+                            }
+                        } else {
+                            encoder.setFragmentTexture(texture, index: index)
+                        }
+                    }
+
+                    func encodeNormalWorldDraw(_ draw: Q3MetalWorldDrawCmd,
+                                               _ stage: Q3MetalWorldStage,
+                                               _ worldPass: Int,
+                                               _ activeIndexBuffer: MTLBuffer,
+                                               _ activeIndexOffset: Int,
+                                               _ activeIndexCount: Int) -> Bool {
+                        guard let lightmapTexture = texture(for: draw.lightmapTextureHandle, device: view.device),
+                              let baseTexture = texture(for: stage.textureHandle, device: view.device) else {
+                            return false
+                        }
+                        let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+                        let drawHasLightmapStage = Self.worldDrawHasLightmapStage(draw)
+                        let noFog = UInt32(Q3_METAL_NO_FOG)
+                        var fogCD = SIMD4<Float>(0, 0, 0, 0)
+                        var fogParams = SIMD4<Float>(0, 0, 0, 0)
+                        var fogSurface = SIMD4<Float>(0, 0, 0, 0)
+                        if draw.fogIndex != noFog {
+                            let count = Q3MetalRenderer_GetWorldFogCount()
+                            if Int(draw.fogIndex) < count,
+                               let fogs = Q3MetalRenderer_GetWorldFogs() {
+                                let f = fogs.advanced(by: Int(draw.fogIndex)).pointee
+                                fogCD = SIMD4(f.color.0, f.color.1, f.color.2, f.distance)
+                                fogParams = SIMD4(f.tcScale, f.hasSurface != 0 ? 1.0 : 0.0, 0, 0)
+                                fogSurface = SIMD4(f.surface.0, f.surface.1, f.surface.2, f.surface.3)
+                            }
+                        }
+
+                        let blendMode = Self.worldBlendClass(for: stage)
+                        let drawPass = Self.worldRenderPass(for: stage)
+                        guard drawPass == worldPass, stageCount > 0 else { return false }
+                        let blendedDepthState = (stage.useLightmap == 0 && stage.depthWrite != 0)
+                            ? depthStencilState
+                            : additiveDepthStencilState
+                        if drawPass == 4, let worldAdditiveFullPipelineState {
+                            encoder.setRenderPipelineState(worldAdditiveFullPipelineState)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
+                        } else if drawPass == 3, let worldAdditivePipelineState {
+                            encoder.setRenderPipelineState(worldAdditivePipelineState)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
+                        } else if drawPass == 2, let worldAlphaPipelineState {
+                            encoder.setRenderPipelineState(worldAlphaPipelineState)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(blendedDepthState, device: view.device))
+                        } else if drawPass == 1, let worldFilterPipelineState {
+                            encoder.setRenderPipelineState(worldFilterPipelineState)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(blendedDepthState, device: view.device))
+                        } else {
+                            encoder.setRenderPipelineState(worldPipelineState)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
+                        }
+                        encoder.setCullMode(Self.metalCullMode(for: stage.cullMode))
+                        let alphaTest = Self.alphaTestThreshold(for: stage.alphaFunc)
+                        let chain = Self.fillTcMods(stage)
+                        let (tv0, tv1) = Self.tcGenVectors(stage)
+                        var drawUniforms = WorldDrawUniforms(
+                            tcGen: stage.useLightmap != 0 ? Float(4) : Float(stage.tcGen),
+                            tcModCount: chain.count,
+                            rgbGen: Float(stage.rgbGen),
+                            alphaGen: Float(stage.alphaGen),
+                            blendMode: Float(blendMode),
+                            timeSeconds: timeSeconds,
+                            rgbWaveFunc: stage.rgbWaveFunc,
+                            alphaWaveFunc: stage.alphaWaveFunc,
+                            tcModType: chain.types,
+                            tcModParams0: chain.p0,
+                            tcModParams1: chain.p1,
+                            tcModParams2: chain.p2,
+                            tcModParams3: chain.p3,
+                            rgbWaveParams: SIMD4(stage.rgbWaveBase, stage.rgbWaveAmp, stage.rgbWavePhase, stage.rgbWaveFreq),
+                            alphaWaveParams: SIMD4(stage.alphaWaveBase, stage.alphaWaveAmp, stage.alphaWavePhase, stage.alphaWaveFreq),
+                            rgbConstColor: SIMD4(1, 1, 1, 1),
+                            entityColor: SIMD4(1, 1, 1, 1),
+                            fogColorDistance: fogCD,
+                            fogParams: fogParams,
+                            fogSurface: fogSurface,
+                            tcGenVec0: tv0,
+                            tcGenVec1: tv1,
+                            deformWaveFunc: stage.deformWaveFunc,
+                            deformWaveDiv: stage.deformWaveDiv != 0 ? stage.deformWaveDiv : 1.0,
+                            deformWaveBase: stage.deformWaveBase,
+                            deformWaveAmp: stage.deformWaveAmp,
+                            deformWavePhase: stage.deformWavePhase,
+                            deformWaveFreq: stage.deformWaveFreq,
+                            deformMoveFunc: stage.deformMoveFunc,
+                            deformMoveVector: SIMD3(stage.deformMoveVector.0,
+                                                    stage.deformMoveVector.1,
+                                                    stage.deformMoveVector.2),
+                            deformMoveBase: stage.deformMoveBase,
+                            deformMoveAmp: stage.deformMoveAmp,
+                            deformMovePhase: stage.deformMovePhase,
+                            deformMoveFreq: stage.deformMoveFreq,
+                            autospriteMode: stage.autospriteMode,
+                            debugMode: Coordinator.worldDebugMode,
+                            forceWhiteVertColor: 0,
+                            alphaTestThreshold: alphaTest,
+                            fogOnly: 0,
+                            stageUsesLightmap: stage.useLightmap != 0 ? 1.0 : 0.0,
+                            drawHasLightmapStage: drawHasLightmapStage ? 1.0 : 0.0,
+                            _pad0: (draw.flags & combinedLightmapBit) != 0 ? 1.0 : 0.0
+                        )
+                        encoder.setFragmentTexture(baseTexture, index: 0)
+                        encoder.setFragmentTexture(lightmapTexture, index: 1)
+                        encoder.setFragmentBytes(&drawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 0)
+                        encoder.setVertexBytes(&drawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 2)
+                        encoder.drawIndexedPrimitives(
+                            type: .triangle,
+                            indexCount: activeIndexCount,
+                            indexType: .uint32,
+                            indexBuffer: activeIndexBuffer,
+                            indexBufferOffset: activeIndexOffset
+                        )
+                        return true
+                    }
+
+                    let worldEncodeStart = CACurrentMediaTime()
                     for worldPass in 0..<6 {
-                        for drawIndex in worldDrawIndicesByPass[worldPass] {
+                        let passEntries = worldPassEntriesByPass[worldPass]
+                        let useCWorldBatchesForPass = cWorldBatchIndexBuffer != nil && worldPass <= 4
+                        if false && worldPass <= 1 && !passEntries.contains(where: { $0.stageIndex < 0 }) {
+                            var batches: [WorldIndexBatch] = []
+                            batches.reserveCapacity(128)
+                            var buckets: [UInt64: [Int]] = [:]
+                            buckets.reserveCapacity(128)
+                            var entryBatchIndices = [Int](repeating: -1, count: passEntries.count)
+                            var totalBatchIndexCount = 0
+
+                            for (entryOrdinal, entry) in passEntries.enumerated() {
+                                let draw = worldDraws[entry.drawIndex]
+                                guard entry.stageIndex >= 0,
+                                      entry.stageIndex < min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES)),
+                                      draw.indexCount > 0 else { continue }
+                                let stage = Self.worldStage(draw, entry.stageIndex)
+                                let key = Self.worldBatchHash(draw: draw, stage: stage, pass: worldPass)
+                                var batchIndex: Int? = nil
+                                if let candidates = buckets[key] {
+                                    for candidate in candidates {
+                                        let b = batches[candidate]
+                                        let bd = worldDraws[b.drawIndex]
+                                        let bs = Self.worldStage(bd, b.stageIndex)
+                                        if Self.worldDrawsCanBatch(bd,
+                                                                   stage: bs,
+                                                                   nextDraw: draw,
+                                                                   nextStage: stage,
+                                                                   pass: worldPass) {
+                                            batchIndex = candidate
+                                            break
+                                        }
+                                    }
+                                }
+                                if batchIndex == nil {
+                                    let newIndex = batches.count
+                                    batches.append(WorldIndexBatch(drawIndex: entry.drawIndex,
+                                                                  stageIndex: entry.stageIndex,
+                                                                  firstMergedIndex: 0,
+                                                                  indexCount: 0))
+                                    buckets[key, default: []].append(newIndex)
+                                    batchIndex = newIndex
+                                }
+                                let srcCount = Int(draw.indexCount)
+                                if let bi = batchIndex {
+                                    entryBatchIndices[entryOrdinal] = bi
+                                    batches[bi].indexCount += srcCount
+                                    totalBatchIndexCount += srcCount
+                                }
+                            }
+
+                            if !batches.isEmpty,
+                               let device = view.device,
+                               let batchedIndexBuffer = ensureWorldBatchIndexBuffer(device: device,
+                                                                                    indexCount: totalBatchIndexCount,
+                                                                                    slot: Int(debugFrameCounter % 3)) {
+                                var runningIndex = 0
+                                for batchIndex in batches.indices {
+                                    batches[batchIndex].firstMergedIndex = runningIndex
+                                    runningIndex += batches[batchIndex].indexCount
+                                }
+                                var batchWriteCursors = batches.map { $0.firstMergedIndex }
+                                worldBatchIndexScratch.removeAll(keepingCapacity: true)
+                                worldBatchIndexScratch.reserveCapacity(totalBatchIndexCount)
+                                if totalBatchIndexCount > 0 {
+                                    worldBatchIndexScratch.append(contentsOf: repeatElement(0, count: totalBatchIndexCount))
+                                }
+                                if totalBatchIndexCount > 0 {
+                                    worldBatchIndexScratch.withUnsafeMutableBufferPointer { dst in
+                                        guard let dstBase = dst.baseAddress else { return }
+                                        for (entryOrdinal, entry) in passEntries.enumerated() {
+                                            let bi = entryBatchIndices[entryOrdinal]
+                                            guard bi >= 0 else { continue }
+                                            let draw = worldDraws[entry.drawIndex]
+                                            let srcCount = Int(draw.indexCount)
+                                            guard srcCount > 0 else { continue }
+                                            let writeIndex = batchWriteCursors[bi]
+                                            memcpy(dstBase.advanced(by: writeIndex),
+                                                   indicesPointer.advanced(by: Int(draw.firstIndex)),
+                                                   srcCount * MemoryLayout<UInt32>.stride)
+                                            batchWriteCursors[bi] = writeIndex + srcCount
+                                        }
+                                    }
+                                }
+                                let byteCount = totalBatchIndexCount * MemoryLayout<UInt32>.stride
+                                if byteCount > 0 {
+                                    worldBatchIndexScratch.withUnsafeBytes { src in
+                                        memcpy(batchedIndexBuffer.contents(), src.baseAddress!, byteCount)
+                                    }
+                                }
+                                for batch in batches where batch.indexCount > 0 {
+                                    let draw = worldDraws[batch.drawIndex]
+                                    let stage = Self.worldStage(draw, batch.stageIndex)
+                                    if encodeNormalWorldDraw(draw,
+                                                             stage,
+                                                             worldPass,
+                                                             batchedIndexBuffer,
+                                                             batch.firstMergedIndex * MemoryLayout<UInt32>.stride,
+                                                             batch.indexCount) {
+                                        worldEncodedDrawCalls += 1
+                                        worldEncodedDrawCallsByPass[worldPass] += 1
+                                    }
+                                }
+                                continue
+                            }
+                        }
+                        var entryCursor = 0
+                        while entryCursor < passEntries.count {
+                        let entry = passEntries[entryCursor]
+                        let drawIndex = entry.drawIndex
                         let draw = worldDraws[drawIndex]
                         let isSky = (draw.flags & skyFlagBit) != 0
                         if (draw.flags & fogOnlyBit) != 0 && worldPass != 5 {
+                            entryCursor += 1
                             continue
                         }
                         if isSky {
                             // Only emit sky during the opaque pass to avoid
                             // duplicated draws across 4 pass iterations.
-                            guard worldPass == 0 else { continue }
-                            guard let skyPipelineState, let skyDepthStencilState else { continue }
+                            if worldPass != 0 {
+                                entryCursor += 1
+                                continue
+                            }
+                            guard let skyPipelineState, let skyDepthStencilState else {
+                                entryCursor += 1
+                                continue
+                            }
                             let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
-                            guard stageCount > 0 else { continue }
+                            guard stageCount > 0 else {
+                                entryCursor += 1
+                                continue
+                            }
 
                             // One-shot diagnostic: log the sky draw's stage
                             // layout so we can confirm killsky (stage0=base,
@@ -1924,6 +2444,7 @@ struct MetalView: UIViewRepresentable {
                             // depth-write off). Subsequent stages are overlays
                             // — killsky spec sheet stage 1 is GL_ONE/GL_ONE
                             // additive. Use the stage's blendMode to decide.
+                            var skyDrawCalls = 0
                             for stageIndex in 0..<stageCount {
                                 let stage = Self.worldStage(draw, stageIndex)
                                 guard let skyStageTexture = texture(for: stage.textureHandle, device: view.device) else {
@@ -1991,14 +2512,27 @@ struct MetalView: UIViewRepresentable {
                                     indexBuffer: worldIndexBuffer,
                                     indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride
                                 )
+                                skyDrawCalls += 1
                             }
+                            worldEncodedDrawCalls += skyDrawCalls
+                            worldEncodedDrawCallsByPass[worldPass] += skyDrawCalls
+                            invalidateWorldStateCache()
+                            entryCursor += 1
+                            continue
+                        }
+                        if useCWorldBatchesForPass {
+                            entryCursor += 1
                             continue
                         }
                         guard let lightmapTexture = texture(for: draw.lightmapTextureHandle, device: view.device) else {
+                            entryCursor += 1
                             continue
                         }
                         let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
-                        guard stageCount > 0 else { continue }
+                        guard stageCount > 0 else {
+                            entryCursor += 1
+                            continue
+                        }
                         /* Identity flag: true if any stage in this draw
                          * binds the lightmap. C-side no longer sets
                          * Q3_METAL_WORLD_DRAWFLAG_LIGHTMAP_MULTIPLY, so
@@ -2024,7 +2558,10 @@ struct MetalView: UIViewRepresentable {
                             /* Render any FOG_ONLY draw on pass 5. */
                             guard fogCD.w > 0,
                                   (draw.flags & fogOnlyBit) != 0,
-                                  let worldAlphaPipelineState else { continue }
+                                  let worldAlphaPipelineState else {
+                                entryCursor += 1
+                                continue
+                            }
                             let stage = Self.worldStage(draw, 0)
                             let chain = Self.fillTcMods(stage)
                             let (tv0, tv1) = Self.tcGenVectors(stage)
@@ -2085,14 +2622,26 @@ struct MetalView: UIViewRepresentable {
                                 indexBuffer: worldIndexBuffer,
                                 indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride
                             )
+                            worldEncodedDrawCalls += 1
+                            worldEncodedDrawCallsByPass[worldPass] += 1
+                            invalidateWorldStateCache()
+                            entryCursor += 1
                             continue
                         }
-                        for stageIndex in 0..<stageCount {
+                        let stageIndex = entry.stageIndex
+                        guard stageIndex >= 0 && stageIndex < stageCount else {
+                            entryCursor += 1
+                            continue
+                        }
                             let stage = Self.worldStage(draw, stageIndex)
                             let blendMode = Self.worldBlendClass(for: stage)
                             let drawPass = Self.worldRenderPass(for: stage)
-                            guard drawPass == worldPass else { continue }
+                            guard drawPass == worldPass else {
+                                entryCursor += 1
+                                continue
+                            }
                             guard let baseTexture = texture(for: stage.textureHandle, device: view.device) else {
+                                entryCursor += 1
                                 continue
                             }
                             // Per-stage depth-write override. Q3 shaders
@@ -2112,25 +2661,25 @@ struct MetalView: UIViewRepresentable {
                             if drawPass == 4, let worldAdditiveFullPipelineState {
                                 /* GL_ONE/GL_ONE — distinct pipeline from
                                  * alpha-modulated additive. */
-                                encoder.setRenderPipelineState(worldAdditiveFullPipelineState)
-                                encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
+                                setWorldPipelineStateCached(worldAdditiveFullPipelineState)
+                                setWorldDepthStencilStateCached(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
                             } else if drawPass == 3, let worldAdditivePipelineState {
-                                encoder.setRenderPipelineState(worldAdditivePipelineState)
-                                encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
+                                setWorldPipelineStateCached(worldAdditivePipelineState)
+                                setWorldDepthStencilStateCached(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
                             } else if drawPass == 2, let worldAlphaPipelineState {
-                                encoder.setRenderPipelineState(worldAlphaPipelineState)
-                                encoder.setDepthStencilState(ensuredDepthStencilState(blendedDepthState, device: view.device))
+                                setWorldPipelineStateCached(worldAlphaPipelineState)
+                                setWorldDepthStencilStateCached(ensuredDepthStencilState(blendedDepthState, device: view.device))
                             } else if drawPass == 1, let worldFilterPipelineState {
-                                encoder.setRenderPipelineState(worldFilterPipelineState)
-                                encoder.setDepthStencilState(ensuredDepthStencilState(blendedDepthState, device: view.device))
+                                setWorldPipelineStateCached(worldFilterPipelineState)
+                                setWorldDepthStencilStateCached(ensuredDepthStencilState(blendedDepthState, device: view.device))
                             } else {
-                                encoder.setRenderPipelineState(worldPipelineState)
-                                encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
+                                setWorldPipelineStateCached(worldPipelineState)
+                                setWorldDepthStencilStateCached(ensuredDepthStencilState(depthStencilState, device: view.device))
                             }
                             // STEP 6: per-stage cull mode. Replaces the
                             // previous hard-coded setCullMode(.none) which
                             // forced every world surface to two-sided.
-                            encoder.setCullMode(Self.metalCullMode(for: stage.cullMode))
+                            setWorldCullModeCached(Self.metalCullMode(for: stage.cullMode))
                             let alphaTest = Self.alphaTestThreshold(for: stage.alphaFunc)
                             let chain = Self.fillTcMods(stage)
                             // Fog lookup. draw.fogIndex is Q3_METAL_NO_FOG
@@ -2195,41 +2744,96 @@ struct MetalView: UIViewRepresentable {
                                 fogOnly: 0,
                                 stageUsesLightmap: stage.useLightmap != 0 ? 1.0 : 0.0,
                                 drawHasLightmapStage: drawHasLightmapStage ? 1.0 : 0.0,
-                                _pad0: 0.0
+                                _pad0: (draw.flags & combinedLightmapBit) != 0 ? 1.0 : 0.0
                             )
-                            encoder.setFragmentTexture(baseTexture, index: 0)
-                            encoder.setFragmentTexture(lightmapTexture, index: 1)
+                            setWorldFragmentTextureCached(baseTexture, index: 0)
+                            setWorldFragmentTextureCached(lightmapTexture, index: 1)
                             encoder.setFragmentBytes(&drawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 0)
                             // Vertex shader reads deformWave + timeSeconds
                             // from WorldDrawUniforms. Bound at vertex
                             // buffer index 2 (0 = vertex buffer,
                             // 1 = WorldUniforms).
                             encoder.setVertexBytes(&drawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 2)
+
+                            var mergedIndexCount = Int(draw.indexCount)
+                            var nextEntryCursor = entryCursor + 1
+                            while nextEntryCursor < passEntries.count {
+                                let nextEntry = passEntries[nextEntryCursor]
+                                guard nextEntry.stageIndex >= 0 else { break }
+                                let nextDraw = worldDraws[nextEntry.drawIndex]
+                                guard nextEntry.stageIndex < min(Int(nextDraw.stageCount), Int(Q3_METAL_MAX_STAGES)) else { break }
+                                let nextStage = Self.worldStage(nextDraw, nextEntry.stageIndex)
+                                guard Self.worldDrawsCanMerge(draw,
+                                                              stage: stage,
+                                                              nextDraw: nextDraw,
+                                                              nextStage: nextStage,
+                                                              pass: worldPass,
+                                                              mergedIndexCount: mergedIndexCount) else {
+                                    break
+                                }
+                                mergedIndexCount += Int(nextDraw.indexCount)
+                                nextEntryCursor += 1
+                            }
+
                             encoder.drawIndexedPrimitives(
                                 type: .triangle,
-                                indexCount: Int(draw.indexCount),
+                                indexCount: mergedIndexCount,
                                 indexType: .uint32,
                                 indexBuffer: worldIndexBuffer,
                                 indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride
                             )
-                        }
+                            worldEncodedDrawCalls += 1
+                            worldEncodedDrawCallsByPass[worldPass] += 1
+                            entryCursor = nextEntryCursor
                     }
+                        if useCWorldBatchesForPass, let batchIndexBuffer = cWorldBatchIndexBuffer {
+                            for batch in cWorldBatches where Int(batch.renderPass) == worldPass && batch.indexCount > 0 {
+                                let stageIndex = Int(batch.stageIndex)
+                                guard stageIndex >= 0 && stageIndex < min(Int(batch.draw.stageCount), Int(Q3_METAL_MAX_STAGES)) else {
+                                    continue
+                                }
+                                let stage = Self.worldStage(batch.draw, stageIndex)
+                                if encodeNormalWorldDraw(batch.draw,
+                                                         stage,
+                                                         worldPass,
+                                                         batchIndexBuffer,
+                                                         Int(batch.firstIndex) * MemoryLayout<UInt32>.stride,
+                                                         Int(batch.indexCount)) {
+                                    worldEncodedDrawCalls += 1
+                                    worldEncodedDrawCallsByPass[worldPass] += 1
+                                }
+                            }
+                        }
                     } // end worldPass loop
+                    worldEncodeMs = (CACurrentMediaTime() - worldEncodeStart) * 1000.0
                 }
 
                 debugFrameCounter &+= 1
                 if debugFrameCounter % 60 == 0 {
+                    let now = CACurrentMediaTime()
+                    let frameDelta = debugFrameCounter &- lastPerfLogFrame
+                    let dt = max(now - lastPerfLogTime, 0.0001)
+                    let avgFps = Double(frameDelta) / dt
+                    let avgMs = 1000.0 / max(avgFps, 0.0001)
+                    lastPerfLogFrame = debugFrameCounter
+                    lastPerfLogTime = now
                     let axis0 = SIMD3<Float>(sceneView.viewAxis.0, sceneView.viewAxis.1, sceneView.viewAxis.2)
                     let axis1 = SIMD3<Float>(sceneView.viewAxis.3, sceneView.viewAxis.4, sceneView.viewAxis.5)
                     let axis2 = SIMD3<Float>(sceneView.viewAxis.6, sceneView.viewAxis.7, sceneView.viewAxis.8)
                     let fovX = String(format: "%.2f", sceneView.fovX)
                     let fovY = String(format: "%.2f", sceneView.fovY)
+                    let frameCpuMs = (CACurrentMediaTime() - drawFrameStart) * 1000.0
                     print(
                         "[Metal] world frame \(debugFrameCounter) " +
                         "vieworg=(\(sceneView.viewOrigin.0), \(sceneView.viewOrigin.1), \(sceneView.viewOrigin.2)) " +
                         "axis0=\(formatVector(axis0)) axis1=\(formatVector(axis1)) axis2=\(formatVector(axis2)) " +
                         "fov=(\(fovX), \(fovY)) " +
-                        "draws=\(snapshot.worldCommandCount) verts=\(snapshot.worldVertexCount) indices=\(snapshot.worldIndexCount)"
+                        String(format: "fps=%.1f ms=%.2f q3Ms=%.2f drawableMs=%.2f frameCpuMs=%.2f ", avgFps, avgMs, q3FrameMs, drawableAcquireMs, frameCpuMs) +
+                        "draws=\(snapshot.worldCommandCount) entries=\(worldPassEntryCount) encoded=\(worldEncodedDrawCalls) " +
+                        "passEntries=\(worldPassEntryCounts) passEncoded=\(worldEncodedDrawCallsByPass) " +
+                        String(format: "batchMs=%.2f copyMs=%.2f encodeMs=%.2f ", worldBatchBuildMs, worldBatchCopyMs, worldEncodeMs) +
+                        "batchGroups=\(worldBatchGroupCounts) " +
+                        "verts=\(snapshot.worldVertexCount) indices=\(snapshot.worldIndexCount)"
                     )
                     print("[Metal] world MVP \(formatMatrix(viewProjection))")
                 }
