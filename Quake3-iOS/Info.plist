@@ -20,6 +20,8 @@
 	<string>1</string>
 	<key>CADisableMinimumFrameDuration</key>
 	<true/>
+	<key>CADisableMinimumFrameDurationOnPhone</key>
+	<true/>
 	<key>GCSupportsGameMode</key>
 	<true/>
 	<key>UILaunchScreen</key>

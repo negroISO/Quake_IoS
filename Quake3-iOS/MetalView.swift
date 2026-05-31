@@ -20,8 +20,10 @@ struct MetalView: UIViewRepresentable {
         let maxFPS = max(UIScreen.main.maximumFramesPerSecond, 120)
         #endif
         view.preferredFramesPerSecond = maxFPS
+        print("[Metal] display config screenMaxFPS=\(UIScreen.main.maximumFramesPerSecond) preferredFPS=\(view.preferredFramesPerSecond) lowPower=\(ProcessInfo.processInfo.isLowPowerModeEnabled ? 1 : 0) nativeBounds=\(UIScreen.main.nativeBounds) nativeScale=\(UIScreen.main.nativeScale)")
         view.enableSetNeedsDisplay = false
-        view.isPaused = false
+        view.isPaused = true
+        context.coordinator.configureFramePacer(for: view, preferredFPS: maxFPS)
         // Lock the MTKView's drawable to the engine's logical render
         // resolution so the AVI muxer captures pixels at exactly the
         // resolution Q3's r_customwidth/r_customheight set. Without
@@ -52,6 +54,42 @@ struct MetalView: UIViewRepresentable {
     }
 
     final class Coordinator: NSObject, MTKViewDelegate {
+        private weak var pacedView: MTKView?
+        private var displayLink: CADisplayLink?
+
+        deinit {
+            displayLink?.invalidate()
+        }
+
+        func configureFramePacer(for view: MTKView, preferredFPS: Int) {
+            pacedView = view
+            displayLink?.invalidate()
+
+            let link = CADisplayLink(target: self, selector: #selector(displayLinkDidFire(_:)))
+            #if os(iOS)
+            if #available(iOS 15.0, *) {
+                let minimum = Float(min(60, preferredFPS))
+                let maximum = Float(preferredFPS)
+                link.preferredFrameRateRange = CAFrameRateRange(minimum: minimum,
+                                                                maximum: maximum,
+                                                                preferred: maximum)
+                print("[Metal] display link range min=\(minimum) max=\(maximum) preferred=\(maximum)")
+            } else {
+                link.preferredFramesPerSecond = preferredFPS
+                print("[Metal] display link preferredFPS=\(link.preferredFramesPerSecond)")
+            }
+            #else
+            link.preferredFramesPerSecond = preferredFPS
+            print("[Metal] display link preferredFPS=\(link.preferredFramesPerSecond)")
+            #endif
+            link.add(to: .main, forMode: .common)
+            displayLink = link
+        }
+
+        @objc private func displayLinkDidFire(_ link: CADisplayLink) {
+            pacedView?.draw()
+        }
+
         struct GPUVertex {
             var position: SIMD2<Float>
             var texCoord: SIMD2<Float>
