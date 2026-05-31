@@ -37,6 +37,32 @@ If a visual issue exists, fix the generic mismatch against ioq3/Kenny behavior.
 #include "../renderer/tr_common.h"
 #include "../clean_frontend/q3_stage.h"
 #include "metal_renderer_shared.h"
+#include "ios_local.h"
+#include <os/log.h>
+#include <stdio.h>
+
+/* Append a line to ~/Documents/q3_diag.log inside the app sandbox. */
+static void Q3_FileLogf(const char *fmt, ...) {
+    static char path[1024] = {0};
+    if (path[0] == '\0') {
+        const char *home = getenv("HOME");
+        if (home == NULL) home = ".";
+        snprintf(path, sizeof(path), "%s/Documents/q3_diag.log", home);
+    }
+    FILE *f = fopen(path, "a");
+    if (!f) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
+
+#define Q3_OSLOG(fmt, ...) do { \
+    os_log(OS_LOG_DEFAULT, "[Q3] " fmt, ##__VA_ARGS__); \
+    Q3_FileLogf("[Q3] " fmt, ##__VA_ARGS__); \
+} while (0)
 
 #define LL(x) x=LittleLong(x)
 
@@ -50,14 +76,16 @@ typedef struct {
     qboolean inUse;
     qboolean isWhite;
     qboolean failed;
+    qboolean isLightmap;
     uint32_t generation;
     qhandle_t handle;
     int width;
     int height;
     byte *rgbaBytes;
     char name[MAX_QPATH];
-    int blendMode; /* 0=opaque, 1=additive, 2=alpha, 3=filter; propagated
-                    * from the shader-map entry that resolved this texture. */
+    int blendMode; /* 0=opaque, 1=alpha-add, 2=alpha, 3=filter,
+                    * 4=subtract, 5=full-add; propagated from the
+                    * shader-map entry that resolved this texture. */
     int alphaFunc; /* 0=none, 1=GT0, 2=GE128, 3=LT128 */
     int tcGenEnv;  /* 1 if the resolved shader uses `tcGen environment`
                     * (chrome/reflective like powerups/quad, shell shaders).
@@ -104,6 +132,44 @@ typedef struct {
 } metalTexture_t;
 
 refimport_t ri;
+
+static void MetalTelemetryPrintf(const char *type, int printLevel, const char *format, ...) {
+    char message[2048];
+    size_t len;
+    va_list args;
+
+    if (format == NULL) {
+        return;
+    }
+
+    va_start(args, format);
+    Q_vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+
+    if (ri.Printf != NULL) {
+        ri.Printf(printLevel, "%s", message);
+    }
+
+    len = strlen(message);
+    while (len > 0 && (message[len - 1] == '\n' || message[len - 1] == '\r')) {
+        message[--len] = '\0';
+    }
+
+    /* Also surface to os_log + sandbox file so host-side tools see us. */
+    if (message[0] != '\0') {
+        if (type != NULL && type[0] != '\0') {
+            os_log(OS_LOG_DEFAULT, "[Q3][%{public}s] %{public}s", type, message);
+            Q3_FileLogf("[Q3][%s] %s", type, message);
+        } else {
+            os_log(OS_LOG_DEFAULT, "[Q3] %{public}s", message);
+            Q3_FileLogf("[Q3] %s", message);
+        }
+    }
+
+    if (type != NULL && type[0] != '\0' && message[0] != '\0') {
+        Q3DebugTelemetry_Log(type, message);
+    }
+}
 
 static glconfig_t s_glConfig;
 static Q3MetalFrameSnapshot s_frameSnapshot;
@@ -553,6 +619,47 @@ static void RawBlendFromMode(int blendMode, uint32_t *src, uint32_t *dst) {
     if (dst != NULL) *dst = d;
 }
 
+static qboolean MetalStageBlendIsOpaqueForFog(const Q3MetalStage *stage) {
+    uint32_t src;
+    uint32_t dst;
+    if (stage == NULL) {
+        return qtrue;
+    }
+    src = stage->rawSrcBlend;
+    dst = stage->rawDstBlend;
+    if (src == Q3_GL_ONE && dst == Q3_GL_ZERO) {
+        return qtrue;
+    }
+    /* ioq3 still treats lightmap/filter stages as part of an opaque
+     * surface.  Do not classify GL_DST_COLOR/GL_ZERO or
+     * GL_ZERO/GL_SRC_COLOR as translucent just because they are blended. */
+    if ((src == Q3_GL_DST_COLOR && dst == Q3_GL_ZERO) ||
+        (src == Q3_GL_ZERO && dst == Q3_GL_SRC_COLOR)) {
+        return qtrue;
+    }
+    return qfalse;
+}
+
+static qboolean MetalShaderShouldEmitFogPass(const metalShaderMap_t *entry,
+                                             int emittedStages) {
+    int i;
+    if (emittedStages <= 0) {
+        return qfalse;
+    }
+    if (entry == NULL || entry->stageCount <= 0) {
+        return qtrue;
+    }
+    if (entry->hasFog) {
+        return qtrue;
+    }
+    for (i = 0; i < entry->stageCount; ++i) {
+        if (!MetalStageBlendIsOpaqueForFog(&entry->stages[i])) {
+            return qfalse;
+        }
+    }
+    return qtrue;
+}
+
 static qboolean MetalVerboseAuditEnabled(void) {
     const char *v = getenv("Q3_VERBOSE_AUDIT");
     return (v != NULL && v[0] == '1');
@@ -592,7 +699,7 @@ static void EmitMetalStageAudit(const char *shaderName, const metalShaderMap_t *
     }
     for (s = 0; s < entry->stageCount; ++s) {
         const Q3MetalStage *st = &entry->stages[s];
-        ri.Printf(PRINT_ALL,
+        MetalTelemetryPrintf("metal_stage_audit", PRINT_ALL,
             "[metal-stage-audit] shader=%s stage=%d img=%s lm=%d srcBlend=%s dstBlend=%s rgbGen=%s alphaFunc=%d tcGen=%s tcMods=%d depthW=%d cull=%s\n",
             shaderName,
             s,
@@ -633,7 +740,7 @@ static void EmitMetalDrawPlan(const char *shaderName,
         return;
     }
     tex = FindTextureByHandle(textureHandle);
-    ri.Printf(PRINT_ALL,
+    MetalTelemetryPrintf("metal_draw_plan", PRINT_ALL,
         "[metal-draw-plan] shader=%s stage=%d pass=%d implicitLightmapBase=%d depthTest=1 depthWrite=%d texture=%s fog=%d cull=%s\n",
         shaderName,
         stageIndex,
@@ -771,6 +878,7 @@ static qhandle_t RegisterRawTexture(const char *name, byte *rgba, int width, int
     texture->width = width;
     texture->height = height;
     texture->rgbaBytes = rgba;
+    texture->isLightmap = (!Q_stricmpn(name, "*lightmap", 9)) ? qtrue : qfalse;
     return texture->handle;
 }
 
@@ -1011,6 +1119,10 @@ static void AddWorldDrawStage(Q3MetalWorldDrawCmd *draw,
     stage->alphaWaveAmp = src->alphaWaveAmp;
     stage->alphaWavePhase = src->alphaWavePhase;
     stage->alphaWaveFreq = src->alphaWaveFreq;
+    stage->rgbConstColor[0] = (src->rgbGen == 4) ? src->rgbConstColor[0] : 1.0f;
+    stage->rgbConstColor[1] = (src->rgbGen == 4) ? src->rgbConstColor[1] : 1.0f;
+    stage->rgbConstColor[2] = (src->rgbGen == 4) ? src->rgbConstColor[2] : 1.0f;
+    stage->alphaConst = (src->alphaGen == 4) ? src->alphaConst : 1.0f;
 }
 
 /* Fallback for draws with no parsed .shader entry — construct a minimal
@@ -1026,9 +1138,46 @@ static void AddWorldDrawStageSimple(Q3MetalWorldDrawCmd *draw,
     tmp.blendMode = blendMode;
     RawBlendFromMode(blendMode, &tmp.rawSrcBlend, &tmp.rawDstBlend);
     tmp.rgbGen = rgbGen;
+    tmp.rgbConstColor[0] = 1.0f;
+    tmp.rgbConstColor[1] = 1.0f;
+    tmp.rgbConstColor[2] = 1.0f;
+    tmp.alphaConst = 1.0f;
     tmp.alphaFunc = alphaFunc;
     tmp.cullMode = METAL_SHADER_CULL_BACK;
     AddWorldDrawStage(draw, textureHandle, &tmp);
+}
+
+/* True iff `entry` already has at least one stage with useLightmap=1.
+ * Used to decide whether to inject an implicit lightmap-multiply pass
+ * for shaders that don't explicitly declare `map $lightmap`. */
+static qboolean shaderHasExplicitLightmapStage(const metalShaderMap_t *entry) {
+    int i;
+    if (entry == NULL) return qfalse;
+    for (i = 0; i < entry->stageCount; ++i) {
+        if (entry->stages[i].useLightmap) return qtrue;
+    }
+    return qfalse;
+}
+
+/* True iff this is a "normal diffuse world" shader that should receive
+ * the implicit lightmap multiply pass. Excludes emissive light fixtures
+ * (additive blend), alpha-blended decals, and effect shaders so the
+ * implicit pass doesn't crush ceiling lights into darkness. Stock Q3's
+ * R_StageIteratorGeneric adds the implicit lightmap on first-stage-
+ * opaque shaders only. */
+static qboolean shaderShouldInjectImplicitLightmap(const metalShaderMap_t *entry) {
+    int i;
+    if (entry == NULL || entry->stageCount <= 0) return qtrue; /* unknown shader → default to lit */
+    if (shaderHasExplicitLightmapStage(entry)) return qfalse;
+    /* Skip when any stage uses a non-opaque blend: additive, alpha-
+     * modulated additive, alpha, filter, subtract, full-add. Q3 light
+     * fixtures and glow surfaces author themselves like this and are
+     * meant to be fullbright. */
+    for (i = 0; i < entry->stageCount; ++i) {
+        int bm = (int)entry->stages[i].blendMode;
+        if (bm != 0) return qfalse; /* 0 = opaque GL_ONE/GL_ZERO */
+    }
+    return qtrue;
 }
 
 static void AddWorldDrawLightmapBaseStage(Q3MetalWorldDrawCmd *draw,
@@ -1344,7 +1493,7 @@ static qhandle_t RegisterTexture(const char *name) {
             /* Demoted to DEVELOPER — PRINT_ALL drowned out actual
              * diagnostics. Use `\developer 1` from the console to
              * re-enable per-asset request tracing. */
-            ri.Printf(PRINT_DEVELOPER, "Metal asset request: '%s'\n", name);
+            MetalTelemetryPrintf("metal_asset_request", PRINT_DEVELOPER, "Metal asset request: '%s'\n", name);
         }
     }
 
@@ -1511,7 +1660,7 @@ static qhandle_t RegisterTexture(const char *name) {
                 else if (!Q_stricmpn(name, "gfx/",         4))  cat = "gfx";
                 else if (!Q_stricmpn(name, "models/",      7))  cat = "model";
                 else if (!Q_stricmpn(name, "textures/",    9))  cat = "world";
-                ri.Printf(PRINT_WARNING,
+                MetalTelemetryPrintf("metal_asset_miss", PRINT_WARNING,
                     "[asset-miss] cat=%s name='%s' shader=%s mapPath='%s' stages=%d\n",
                     cat, name,
                     entry ? "found" : "notfound",
@@ -1550,7 +1699,7 @@ static qhandle_t RegisterTexture(const char *name) {
     texture->alphaConst = ShaderMap_GetAlphaConst(name);
     ShaderMap_GetTcMods(name, &texture->tcModCount, texture->tcMods);
     if (Q_stricmp(name, resolvedName)) {
-        ri.Printf(PRINT_ALL, "Metal stub: loaded '%s' from '%s' (%dx%d)\n", name, resolvedName, width, height);
+        MetalTelemetryPrintf("metal_asset_loaded", PRINT_ALL, "Metal stub: loaded '%s' from '%s' (%dx%d)\n", name, resolvedName, width, height);
     }
     return texture->handle;
 }
@@ -1647,7 +1796,7 @@ static void EmitMetalEntityStageAudit(const char *shaderName, const char *source
     }
     for (s = 0; s < entry->stageCount; ++s) {
         const Q3MetalStage *st = &entry->stages[s];
-        ri.Printf(PRINT_ALL,
+        MetalTelemetryPrintf("metal_entity_stage_audit", PRINT_ALL,
             "[metal-entity-stage-audit] shader=%s source=%s stage=%d img=%s lm=%d srcBlend=%s dstBlend=%s rgbGen=%s alphaFunc=%d tcGen=%s tcMods=%d depthW=%d cull=%s\n",
             auditName,
             (source != NULL && source[0] != '\0') ? source : "entity",
@@ -2109,15 +2258,21 @@ static void LoadWorldLightmaps(const dheader_t *header, const char *mapName) {
     {
         int mapOverbright = ri.Cvar_VariableIntegerValue("r_mapOverBrightBits");
         int frameOverbright = ri.Cvar_VariableIntegerValue("r_overBrightBits");
-        /* +1 absorbs the GL_RGB_SCALE=2 stock Q3 applies to the lightmap
-         * texture unit. With the lightmap now a real second-pass stage
-         * blending via GL_DST_COLOR/GL_ZERO (no shader-side `lightmap*2`
-         * hack), the loader bakes the full 4x boost in. Empirically
-         * the best q3dm4 MAE so far (22.71). Plain (no +1) scored 23.37;
-         * adding a uniform fragment-side scalar regressed (compounds
-         * across base + lightmap stages). The proper lightgrid +
-         * RB_CalcDiffuseColor path is the long-term fix. */
-        int shift = mapOverbright - frameOverbright + 1;
+        /* CANONICAL PC Q3 reference math: shift = mapOverbright - frameOverbright.
+         * At stock cvars (mapOverbright=2, overBright=1) this is a single
+         * left-shift = 2x boost per channel, which matches the GL_RGB_SCALE=2
+         * that PC Q3 applied at the lightmap texture unit. The earlier `+1`
+         * added an extra 2x on top to compensate for fragment-side scaling
+         * that's been removed elsewhere — but it pushed the world ~2x brighter
+         * than PC reference. Easy to spot in q3dm1: the previous "+1" path
+         * blew out the rocket arena ceiling lights into pure white. PC stock
+         * keeps them as a hot but distinct yellow.
+         *
+         * OLED-side visibility lift happens via r_gamma=1.15 in the cmdline
+         * (small midtone bump, doesn't wash anything out). Lightmap math
+         * stays at the PC reference shift so highlights don't clip and
+         * darker corners still have the right relative contrast curve. */
+        int shift = mapOverbright - frameOverbright;
         if (shift < 0) shift = 0; /* we never downshift — behaviour matches stock path 122-138 */
         for (i = 0; i < lightmapCount; ++i) {
             byte *rgba = ri.Malloc(LIGHTMAP_WIDTH * LIGHTMAP_HEIGHT * 4);
@@ -3782,8 +3937,23 @@ static qboolean LoadWorldMapData(const char *name) {
                 }
                 drawMultiplier = 1;
             } else {
+                int _fogNum = LittleLong(surface->fogNum);
                 if (_fe != NULL && _fe->stageCount > 1) {
                     drawMultiplier = _fe->stageCount;
+                }
+                if (_fogNum >= 0 && _fogNum < s_worldFogCount &&
+                    s_worldFogs[_fogNum].hasColor) {
+                    drawMultiplier += 1;
+                }
+                /* Reserve one extra draw slot for the implicit-lightmap
+                 * pass that the emission loop may inject when the shader
+                 * has no explicit `map $lightmap` stage. Conservatively
+                 * reserved unconditionally so the s_world.draws[]
+                 * allocator never under-sizes — overhead is bounded
+                 * (a few KB) and avoids a memory-corruption crash from
+                 * drawCursor++ exceeding the malloc'd extent. */
+                if (shaderShouldInjectImplicitLightmap(_fe)) {
+                    drawMultiplier += 1;
                 }
             }
         }
@@ -4110,14 +4280,13 @@ static qboolean LoadWorldMapData(const char *name) {
                                                    firstIndexForDraw,
                                                    indexCountForDraw,
                                                    hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
-                                                   worldFlags |
-                                                       /* LIGHTMAP_MULTIPLY removed: lightmap is now a
-                                                        * real second-pass stage emitted in this same
-                                                        * loop with its own parsed blendFunc filter
-                                                        * (GL_DST_COLOR/GL_ZERO via worldFilterPipelineState).
-                                                        * Stage-driven, not flag-driven. */
-                                                       ((_emitted == 0)
-                                                           ? Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY : 0u),
+                                                   /* LIGHTMAP_MULTIPLY removed (real second-pass
+                                                    * lightmap stage). FOG_OVERLAY removed (fog now
+                                                    * emitted as a separate post-stage draw with
+                                                    * FOG_ONLY — see EmitWorldFogPassDraw call
+                                                    * after this surface's stages). Stage rendering
+                                                    * is fog-free; ioq3 RB_FogPass equivalent. */
+                                                   worldFlags,
                                                    fogIndex);
                                     if (s_world.animShaderSlots && s_pendingAnimSlot >= 0 &&
                                         _st->animFrameCount > 0) {
@@ -4145,7 +4314,8 @@ static qboolean LoadWorldMapData(const char *name) {
                                                    firstIndexForDraw,
                                                    indexCountForDraw,
                                                    hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
-                                                   worldFlags | Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY,
+                                                   /* FOG_OVERLAY removed — fog is post-stage now. */
+                                                   worldFlags,
                                                    fogIndex);
                                     if (s_world.animShaderSlots && s_pendingAnimSlot >= 0) {
                                         s_world.animShaderSlots[_dstIdx] = s_pendingAnimSlot;
@@ -4163,8 +4333,69 @@ static qboolean LoadWorldMapData(const char *name) {
                                                           &_simple,
                                                           _tex,
                                                           qfalse);
+                                        _emitted += 1;
                                     }
                                 }
+                            }
+                            /* Implicit lightmap pass — stock Q3's
+                             * R_StageIteratorGeneric adds a GL_DST_COLOR/GL_ZERO
+                             * lightmap multiply on top of every world surface
+                             * that has a baked lightmap but no explicit
+                             * `map $lightmap` stage in its .shader. Without
+                             * this, floors/walls with single-stage diffuse-
+                             * only shaders render at full unshaded brightness
+                             * (the q3dm4 floor symptom). */
+                            if (hasLightmap && lightmapHandle != 0 && _emitted > 0 &&
+                                shaderShouldInjectImplicitLightmap(_e)) {
+                                uint32_t _ldst = drawCursor++;
+                                SetupWorldDraw(&s_world.draws[_ldst],
+                                               firstIndexForDraw,
+                                               indexCountForDraw,
+                                               lightmapHandle,
+                                               worldFlags,
+                                               fogIndex);
+                                AddWorldDrawLightmapBaseStage(&s_world.draws[_ldst],
+                                                              lightmapHandle,
+                                                              _e,
+                                                              /*blendMode=*/3,
+                                                              /*depthWrite=*/0);
+                            }
+                            /* RB_FogPass equivalent: separate fog-only draw at
+                             * the end of this surface's stage list when the
+                             * surface is inside a fog volume. Mirrors ioq3
+                             * `if (shader->fogPass) RB_FogPass()` post-stage
+                             * compositing. Swift worldPass==5 picks it up via
+                             * the FOG_ONLY flag and renders with alpha blend
+                             * (src_alpha / one_minus_src_alpha), read-only depth. */
+                            {
+                                static int s_fogGateLogged = 0;
+                                qboolean shouldEmit = MetalShaderShouldEmitFogPass(_e, _emitted);
+                                qboolean wouldFog = (fogIndex != Q3_METAL_NO_FOG) && shouldEmit;
+                                if (s_fogGateLogged < 8) {
+                                    ri.Printf(PRINT_ALL,
+                                              "[FOG-DBG] surface fogIndex=%d emitted=%d should=%d -> %s\n",
+                                              (int)fogIndex, _emitted, (int)shouldEmit,
+                                              wouldFog ? "FOG-DRAW" : "skip");
+                                    s_fogGateLogged += 1;
+                                }
+                            }
+                            if (fogIndex != Q3_METAL_NO_FOG &&
+                                MetalShaderShouldEmitFogPass(_e, _emitted)) {
+                                Q3MetalStage _fogStage;
+                                uint32_t _fdst;
+                                Com_Memset(&_fogStage, 0, sizeof(_fogStage));
+                                _fogStage.blendMode = 2;
+                                RawBlendFromMode(_fogStage.blendMode, &_fogStage.rawSrcBlend, &_fogStage.rawDstBlend);
+                                _fogStage.cullMode = (_e != NULL) ? _e->cullMode : METAL_SHADER_CULL_BACK;
+                                _fogStage.depthWrite = 0;
+                                _fdst = drawCursor++;
+                                SetupWorldDraw(&s_world.draws[_fdst],
+                                               firstIndexForDraw,
+                                               indexCountForDraw,
+                                               EnsureWhiteTexture(),
+                                               worldFlags | Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY,
+                                               fogIndex);
+                                AddWorldDrawStage(&s_world.draws[_fdst], EnsureWhiteTexture(), &_fogStage);
                             }
                         }
                     }
@@ -4263,10 +4494,10 @@ static qboolean LoadWorldMapData(const char *name) {
                                        firstIndexForDraw,
                                        indexCountForDraw,
                                        hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
-                                       worldFlags |
-                                           /* LIGHTMAP_MULTIPLY removed — see comment in patch path above. */
-                                           ((_emitted == 0)
-                                               ? Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY : 0u),
+                                       /* LIGHTMAP_MULTIPLY + FOG_OVERLAY both removed — see
+                                        * comment in patch path above; fog emits as a separate
+                                        * post-stage draw via EmitWorldFogPassDraw. */
+                                       worldFlags,
                                        fogIndex);
                         if (s_world.animShaderSlots && s_pendingAnimSlot >= 0 &&
                             _st->animFrameCount > 0) {
@@ -4294,7 +4525,8 @@ static qboolean LoadWorldMapData(const char *name) {
                                        firstIndexForDraw,
                                        indexCountForDraw,
                                        hasLightmap ? lightmapHandle : EnsureWhiteTexture(),
-                                       worldFlags | Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY,
+                                       /* FOG_OVERLAY removed — fog is post-stage now. */
+                                       worldFlags,
                                        fogIndex);
                         if (s_world.animShaderSlots && s_pendingAnimSlot >= 0) {
                             s_world.animShaderSlots[_dstIdx] = s_pendingAnimSlot;
@@ -4312,8 +4544,47 @@ static qboolean LoadWorldMapData(const char *name) {
                                               &_simple,
                                               _tex,
                                               qfalse);
+                            _emitted += 1;
                         }
                     }
+                }
+                /* Implicit lightmap pass (see explanation at first emission
+                 * site above). Tris/planar surfaces follow the same rule. */
+                if (hasLightmap && lightmapHandle != 0 && _emitted > 0 &&
+                    shaderShouldInjectImplicitLightmap(_e)) {
+                    uint32_t _ldst = drawCursor++;
+                    SetupWorldDraw(&s_world.draws[_ldst],
+                                   firstIndexForDraw,
+                                   indexCountForDraw,
+                                   lightmapHandle,
+                                   worldFlags,
+                                   fogIndex);
+                    AddWorldDrawLightmapBaseStage(&s_world.draws[_ldst],
+                                                  lightmapHandle,
+                                                  _e,
+                                                  /*blendMode=*/3,
+                                                  /*depthWrite=*/0);
+                }
+                /* RB_FogPass equivalent: see patches path above. Tris/planar
+                 * surfaces follow the same post-stage fog emission rule —
+                 * one FOG_ONLY draw per surface inside a fog volume. */
+                if (fogIndex != Q3_METAL_NO_FOG &&
+                    MetalShaderShouldEmitFogPass(_e, _emitted)) {
+                    Q3MetalStage _fogStage;
+                    uint32_t _fdst;
+                    Com_Memset(&_fogStage, 0, sizeof(_fogStage));
+                    _fogStage.blendMode = 2;
+                    RawBlendFromMode(_fogStage.blendMode, &_fogStage.rawSrcBlend, &_fogStage.rawDstBlend);
+                    _fogStage.cullMode = (_e != NULL) ? _e->cullMode : METAL_SHADER_CULL_BACK;
+                    _fogStage.depthWrite = 0;
+                    _fdst = drawCursor++;
+                    SetupWorldDraw(&s_world.draws[_fdst],
+                                   firstIndexForDraw,
+                                   indexCountForDraw,
+                                   EnsureWhiteTexture(),
+                                   worldFlags | Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY,
+                                   fogIndex);
+                    AddWorldDrawStage(&s_world.draws[_fdst], EnsureWhiteTexture(), &_fogStage);
                 }
             }
         }
@@ -4325,6 +4596,25 @@ static qboolean LoadWorldMapData(const char *name) {
     s_world.indexCount = indexCursor;
     s_world.drawCount = drawCursor;
     Q_strncpyz(s_world.name, name, sizeof(s_world.name));
+
+    {
+        uint32_t di;
+        uint32_t fogOnlyDraws = 0;
+        uint32_t fogVolumeDraws = 0;
+        for (di = 0; di < s_world.drawCount; ++di) {
+            if ((s_world.draws[di].flags & Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY) != 0) {
+                fogOnlyDraws += 1;
+                if ((s_world.draws[di].flags & Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY) != 0) {
+                    fogVolumeDraws += 1;
+                }
+            }
+        }
+        if (fogOnlyDraws > 0) {
+            ri.Printf(PRINT_ALL,
+                      "Metal world: %u fog pass draws (%u fog-volume surfaces)\n",
+                      fogOnlyDraws, fogVolumeDraws);
+        }
+    }
 
     /* Post-load: bake per-quad center into autospriteCenter for every
      * vertex that belongs to an autosprite-flagged draw. Q3 emits
@@ -4456,6 +4746,14 @@ static qboolean LoadWorldMapData(const char *name) {
               "Metal world: loaded '%s' with %u verts, %u indices, %u draws (%u planar, %u patch, %u trisoup, %u sky, %d flares)\n",
               name, s_world.vertexCount, s_world.indexCount, s_world.drawCount,
               planarDraws, patchDraws, triSoupDraws, skyDraws, s_worldFlareCount);
+    Q3_FileLogf("[Q3] Metal world: loaded '%s' verts=%u indices=%u draws=%u (cap=%d) planar=%u patch=%u trisoup=%u sky=%u flares=%d",
+                name, s_world.vertexCount, s_world.indexCount, s_world.drawCount,
+                Q3_METAL_MAX_DRAWS,
+                planarDraws, patchDraws, triSoupDraws, skyDraws, s_worldFlareCount);
+    if (s_world.drawCount >= Q3_METAL_MAX_DRAWS) {
+        Q3_FileLogf("[Q3] Metal world: WARNING drawCount=%u >= cap=%d — surfaces past cap may corrupt or drop",
+                    s_world.drawCount, Q3_METAL_MAX_DRAWS);
+    }
     if (skippedNoDrawSurfaces > 0) {
         ri.Printf(PRINT_ALL, "Metal world: skipped %u nodraw surfaces in '%s'\n", skippedNoDrawSurfaces, name);
     }
@@ -8343,6 +8641,7 @@ int Q3MetalRenderer_GetTextureInfo(uint32_t textureHandle, Q3MetalTextureInfo *o
     outInfo->height = (uint32_t)texture->height;
     outInfo->generation = texture->generation;
     outInfo->rgbaBytes = texture->rgbaBytes;
+    outInfo->flags = texture->isLightmap ? Q3_METAL_TEXTURE_FLAG_LIGHTMAP : 0u;
     outInfo->tcModCount = (uint32_t)texture->tcModCount;
     {
         int i;

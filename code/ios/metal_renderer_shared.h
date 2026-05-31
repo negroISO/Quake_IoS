@@ -64,11 +64,12 @@ typedef struct {
     uint32_t firstVertex;
     uint32_t vertexCount;
     uint32_t textureHandle;
-    /* 0=opaque, 1=additive (src=one, dst=one), 2=alpha (src-over),
-     * 3=filter (src=dst_color, dst=zero, i.e. multiply). Propagated from
-     * the shader's resolved blend so 2D stages like the loading-screen
-     * `levelShotDetail` overlay multiply against the levelshot instead of
-     * washing it out as plain alpha-over. */
+    /* 0=opaque, 1=alpha-modulated additive (src=src_alpha,dst=one),
+     * 2=alpha (src-over), 3=filter/multiply, 4=subtract,
+     * 5=full additive (src=one,dst=one). Propagated from the shader's
+     * resolved blend so 2D stages like the loading-screen `levelShotDetail`
+     * overlay multiply against the levelshot instead of washing it out as
+     * plain alpha-over. */
     uint32_t blendMode;
 } Q3MetalDrawCmd;
 
@@ -81,7 +82,7 @@ typedef struct {
 
 typedef struct {
     uint32_t textureHandle;
-    uint32_t blendMode;   /* 0=opaque,1=add,2=alpha,3=filter */
+    uint32_t blendMode;   /* 0=opaque,1=alpha-add,2=alpha,3=filter,4=subtract,5=full-add */
     uint32_t srcBlend;    /* Raw GL blend factor from q3_stage. */
     uint32_t dstBlend;    /* Raw GL blend factor from q3_stage. */
     uint32_t depthFunc;   /* 0=lessEqual, 1=equal */
@@ -120,12 +121,10 @@ typedef struct {
     float    deformMoveAmp;
     float    deformMovePhase;
     float    deformMoveFreq;
-    /* deformVertexes autosprite / autoSprite2 (shader-level). Tag-only
-     * for the moment — the camera-aligned billboard transform that
-     * matches ioq3 RB_AutospriteDeform / RB_Autosprite2Deform is a
-     * follow-up commit that will introduce per-vertex quad centers
-     * and a camera basis uniform. Until then surfaces render as
-     * authored quads.
+    /* deformVertexes autosprite / autoSprite2 (shader-level).
+     * World vertices carry baked per-quad centers/long axes and the
+     * Metal vertex shader applies the camera-aligned transform to match
+     * ioq3 RB_AutospriteDeform / RB_Autosprite2Deform.
      * 0 = none, 1 = autosprite, 2 = autoSprite2. */
     uint32_t autospriteMode;
     uint32_t rgbGen;      /* 0=identity,1=vertex,2=lightingDiffuse,3=wave,
@@ -153,11 +152,17 @@ typedef struct {
     float alphaWaveAmp;
     float alphaWavePhase;
     float alphaWaveFreq;
+    /* Per-stage constant color/alpha for rgbGen const / alphaGen const.
+     * World and entity fragments use parser-local mode 4 for these.
+     * Defaults should be (1,1,1,1) so non-const stages are no-ops. */
+    float rgbConstColor[3];
+    float alphaConst;
 } Q3MetalWorldStage;
 
 #define Q3_METAL_MAX_STAGES 8
 
 #define Q3_METAL_MAX_LIGHTS 32
+#define Q3_METAL_TEXTURE_FLAG_LIGHTMAP 0x00000001u
 
 /* Dynamic light (point). Emitted by cgame for muzzle flashes, rocket/plasma
  * glow, explosion flashes, lightning halos. Fragment shaders add a radial
@@ -343,6 +348,7 @@ typedef struct {
     uint32_t height;
     uint32_t generation;
     const uint8_t *rgbaBytes;
+    uint32_t flags; /* Q3_METAL_TEXTURE_FLAG_* */
     /* Stage 0 tcMod chain for this texture's resolved shader.
      * Entity pipeline reads this to apply scroll/rotate on the quad
      * shell / regen / battlesuit shaders — matches ioquake3's

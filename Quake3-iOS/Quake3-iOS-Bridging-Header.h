@@ -37,4 +37,8 @@ void Q3Sys_CharEvent(int ch);
 int CL_VideoRecording(void);
 void Q3MetalRenderer_StoreVideoFrame(const unsigned char *bgra, int width, int height);
 
+/* Native C/Obj-C renderer telemetry bridge. Implemented in Swift by
+ * DebugTelemetry.swift and callable from the Metal renderer. */
+void Q3DebugTelemetry_Log(const char *type, const char *message);
+
 #endif

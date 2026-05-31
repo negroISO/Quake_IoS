@@ -107,7 +107,9 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #define Q_NEWLINE "\n"
 #define PATH_SEP '/'
 #define PATH_SEP_FOREIGN '\\'
+#ifndef DLL_EXT
 #define DLL_EXT ".so"
+#endif
 
 #if defined (__i386__)
 #define ARCH_STRING "i386"
@@ -117,11 +119,14 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #endif // __i386__
 
 #if defined (__x86_64__) || defined (__amd64__)
+#ifndef ARCH_STRING
 #define ARCH_STRING "x86_64"
+#endif
 #define Q3_LITTLE_ENDIAN
 #undef idx64
 #define idx64 1
 #endif // __x86_64__ || __amd64__
+
 
 #if defined (__arm__)
 #define ARCH_STRING "arm"
@@ -131,7 +136,9 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #endif // __arm__
 
 #if defined (__aarch64__)
+#ifndef ARCH_STRING
 #define ARCH_STRING "aarch64"
+#endif
 #define Q3_LITTLE_ENDIAN
 #undef arm64
 #define arm64 1

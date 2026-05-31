@@ -55,7 +55,6 @@
 		37686A17B777FC941F37F2DE /* cl_ui.c in Sources */ = {isa = PBXBuildFile; fileRef = 64509FD02DEB921A7979F036 /* cl_ui.c */; };
 		39CB50402A4E9476686DFDE2 /* metal_renderer_stub.c in Sources */ = {isa = PBXBuildFile; fileRef = A829066F48EC957F7F46B575 /* metal_renderer_stub.c */; };
 		39FFE03E1A2F39065362304D /* l_script.c in Sources */ = {isa = PBXBuildFile; fileRef = 2BAEBF1BD00157496D23138E /* l_script.c */; };
-		3A01C0DE0000000000000001 /* q3_stage.c in Sources */ = {isa = PBXBuildFile; fileRef = 3A01C0DE0000000000000003 /* q3_stage.c */; };
 		3DAFCE140E9A740F2CFCA6B1 /* huffman_static.c in Sources */ = {isa = PBXBuildFile; fileRef = 65F2F2635EB76FCEE400DCF9 /* huffman_static.c */; };
 		3DD3766ED5C734AA6A78FC0A /* block.c in Sources */ = {isa = PBXBuildFile; fileRef = 3CA6EFCE1472E38EE44115A7 /* block.c */; };
 		41D5A79FF6D76CEA942BC424 /* cg_effects.c in Sources */ = {isa = PBXBuildFile; fileRef = 3687CEC782967F86B248E896 /* cg_effects.c */; settings = {COMPILER_FLAGS = "-DCGAME_NATIVE=1 -Wno-strict-prototypes -Wno-pointer-sign"; }; };
@@ -63,7 +62,6 @@
 		43058DF8C993EA9EB9F33FAA /* cmd.c in Sources */ = {isa = PBXBuildFile; fileRef = FA68CE331D7394E76B180E13 /* cmd.c */; };
 		443D5ED629C877A6EAA59AC6 /* snd_adpcm.c in Sources */ = {isa = PBXBuildFile; fileRef = 7D5CBEF0BCB79DCEDAF57E19 /* snd_adpcm.c */; };
 		4665DA1B2C281DE4C038DB06 /* MetalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 88E516AF1355E11FE7A7FD28 /* MetalView.swift */; };
-		4665DA1B2C281DE4C038DB07 /* Q3MetalStateMap.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A01C0DE0000000000000005 /* Q3MetalStateMap.swift */; };
 		4681157CF5CDEC093DABC017 /* l_struct.c in Sources */ = {isa = PBXBuildFile; fileRef = 37A7AD7D116A551C8FFF36B2 /* l_struct.c */; };
 		468F4B7B4A648E3D09C85120 /* sv_game.c in Sources */ = {isa = PBXBuildFile; fileRef = 467F925E8F727F04638A9BF5 /* sv_game.c */; };
 		46BA05CE058B5BDDA643DB58 /* cg_playerstate.c in Sources */ = {isa = PBXBuildFile; fileRef = 90E4E7DC3B39D84E1A5D24B2 /* cg_playerstate.c */; settings = {COMPILER_FLAGS = "-DCGAME_NATIVE=1 -Wno-strict-prototypes -Wno-pointer-sign"; }; };
@@ -90,8 +88,10 @@
 		5EC3390E46625FA244DCB6F7 /* jerror.c in Sources */ = {isa = PBXBuildFile; fileRef = FF74FD8BBFA305F901969E77 /* jerror.c */; };
 		5EFA7655160872E3CF768C93 /* huffman.c in Sources */ = {isa = PBXBuildFile; fileRef = 9A016534BC02287B5673659D /* huffman.c */; };
 		5FC21AA3F6919270E277DC4E /* sv_filter.c in Sources */ = {isa = PBXBuildFile; fileRef = B5D25120565B04C5A523521C /* sv_filter.c */; };
+		5FC4133FCC928C5EA7D6E8F8 /* Q3MetalStateMap.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16A2E95B180E4A27CB1D25B3 /* Q3MetalStateMap.swift */; };
 		604502D6B26311220B48C22B /* be_ai_gen.c in Sources */ = {isa = PBXBuildFile; fileRef = 0C0E9584F687BF79EA00B217 /* be_ai_gen.c */; };
 		60DDD73890C5531CFBD6BA2F /* jcdctmgr.c in Sources */ = {isa = PBXBuildFile; fileRef = 2C87540B2341A77172F0D916 /* jcdctmgr.c */; };
+		65B72BC9CD0820A63AA24B09 /* q3_stage.c in Sources */ = {isa = PBXBuildFile; fileRef = 535182FB70512EBC40B08335 /* q3_stage.c */; };
 		6645D3D30374F9E7FB9074A5 /* jctrans.c in Sources */ = {isa = PBXBuildFile; fileRef = C8E0CA5569562DBB05E70541 /* jctrans.c */; };
 		67527C57B400576CDD2FCAB5 /* jchuff.c in Sources */ = {isa = PBXBuildFile; fileRef = EAC6DD14372299DA2E9B6708 /* jchuff.c */; };
 		67F5FB044B6AB470F5701B8C /* cvar.c in Sources */ = {isa = PBXBuildFile; fileRef = C686BDA3B8DB9F5E9C8B178A /* cvar.c */; };
@@ -185,6 +185,7 @@
 		EE56A784B984301A0E41B12F /* jfdctfst.c in Sources */ = {isa = PBXBuildFile; fileRef = 01C6F20055663B726442C93E /* jfdctfst.c */; };
 		EED7489F2625E861B4BA1F49 /* be_ai_weap.c in Sources */ = {isa = PBXBuildFile; fileRef = AA446FB465BE94F72948D0B6 /* be_ai_weap.c */; };
 		EF5BCD618E6073F03805EC65 /* synthesis.c in Sources */ = {isa = PBXBuildFile; fileRef = DD89112374200B457472FDA3 /* synthesis.c */; };
+		EFAFB491964ACA677D203241 /* DebugTelemetry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 65A51EF49A651B0585D8BEA7 /* DebugTelemetry.swift */; };
 		F0C118778493B106DFD39624 /* files.c in Sources */ = {isa = PBXBuildFile; fileRef = BCCE8D4D566DC071EC8E58AE /* files.c */; };
 		F16E5D60E6B9F979CF442D0B /* bg_pmove.c in Sources */ = {isa = PBXBuildFile; fileRef = E06B8B2138ED5E2CB0D46677 /* bg_pmove.c */; };
 		F1DE376D636964393529B937 /* snd_codec_ogg.c in Sources */ = {isa = PBXBuildFile; fileRef = 6601DC505412B41880855E46 /* snd_codec_ogg.c */; };
@@ -223,6 +224,7 @@
 		0CB08AA293475C4A901FBFD1 /* be_aas_cluster.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = be_aas_cluster.h; sourceTree = "<group>"; };
 		0D2259EFB1A6896486A21EF1 /* be_aas_reach.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = be_aas_reach.c; sourceTree = "<group>"; };
 		0D7F462AC9831E7A9F67A699 /* jinclude.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = jinclude.h; sourceTree = "<group>"; };
+		0DB3C0C76075F02F6CA91B9B /* q3_stage.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = q3_stage.h; sourceTree = "<group>"; };
 		0DB9409693F004ED3308AD6C /* codec.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = codec.h; sourceTree = "<group>"; };
 		0E0B3B9C0E068EEE7D8C0A23 /* l_libvar.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = l_libvar.h; sourceTree = "<group>"; };
 		0E4498ADCB3AE2AA8F92B901 /* psych_44.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = psych_44.h; sourceTree = "<group>"; };
@@ -240,6 +242,7 @@
 		146D64E8FE1EB3EB5886FC25 /* vorbisenc.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vorbisenc.h; sourceTree = "<group>"; };
 		14D7DE132B65EDBBFE1DA920 /* cg_draw.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = cg_draw.c; sourceTree = "<group>"; };
 		163E47040C329A658DE94003 /* jaricom.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = jaricom.c; sourceTree = "<group>"; };
+		16A2E95B180E4A27CB1D25B3 /* Q3MetalStateMap.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Q3MetalStateMap.swift; sourceTree = "<group>"; };
 		16FDF29543E8821F4A9A0AC3 /* jdcoefct.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = jdcoefct.c; sourceTree = "<group>"; };
 		171EF12724EED24A9334AC45 /* sv_snapshot.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = sv_snapshot.c; sourceTree = "<group>"; };
 		175FF2F5F2FD80428A506E80 /* q_shared.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = q_shared.h; sourceTree = "<group>"; };
@@ -294,20 +297,17 @@
 		3D5D5F8A80A1635E2325C250 /* jidctflt.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = jidctflt.c; sourceTree = "<group>"; };
 		3DB75E541CF7DB102F0AA1D3 /* be_aas_optimize.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = be_aas_optimize.h; sourceTree = "<group>"; };
 		3DC106CD30021E44C0E27C82 /* setup_32.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = setup_32.h; sourceTree = "<group>"; };
-		3F175305E092A16FBA69F38C /* libjpeg-changes.diff */ = {isa = PBXFileReference; path = "libjpeg-changes.diff"; sourceTree = "<group>"; };
+		3F175305E092A16FBA69F38C /* libjpeg-changes.diff */ = {isa = PBXFileReference; lastKnownFileType = text; path = "libjpeg-changes.diff"; sourceTree = "<group>"; };
 		3F4C653F1C1259F5BD0CF61F /* residue_44.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = residue_44.h; sourceTree = "<group>"; };
 		3F95A45FAD7F0E551431BD11 /* residue_44p51.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = residue_44p51.h; sourceTree = "<group>"; };
 		3FDA683D37C52CD981976290 /* be_aas_main.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = be_aas_main.c; sourceTree = "<group>"; };
 		403070B14A8CBF864A3CC165 /* cg_main.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = cg_main.c; sourceTree = "<group>"; };
 		4100A27C781C7AB90E9F7DC8 /* mdct.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = mdct.h; sourceTree = "<group>"; };
-		3A01C0DE0000000000000003 /* q3_stage.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = q3_stage.c; sourceTree = "<group>"; };
-		3A01C0DE0000000000000004 /* q3_stage.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = q3_stage.h; sourceTree = "<group>"; };
-		3A01C0DE0000000000000005 /* Q3MetalStateMap.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Q3MetalStateMap.swift; sourceTree = "<group>"; };
 		44B6D5C1E0E90613355CEB09 /* jpeglib.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = jpeglib.h; sourceTree = "<group>"; };
 		45311376687BBBC1B284279A /* cm_patch.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = cm_patch.c; sourceTree = "<group>"; };
 		45A92960FE2D42C45BE88E48 /* bitrate.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = bitrate.h; sourceTree = "<group>"; };
 		45FCA2215445E4D69564A076 /* residue_44u.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = residue_44u.h; sourceTree = "<group>"; };
-		46730952512DD30A1113A24C /* Quake3-iOS.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = "Quake3-iOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		46730952512DD30A1113A24C /* Quake3-iOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Quake3-iOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		467F925E8F727F04638A9BF5 /* sv_game.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = sv_game.c; sourceTree = "<group>"; };
 		46F268AA29956562BCF97F9F /* psy.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = psy.h; sourceTree = "<group>"; };
 		472606AFE6CF6222F4A814DF /* qcommon.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = qcommon.h; sourceTree = "<group>"; };
@@ -323,19 +323,20 @@
 		4EC692968EE35E3D481A8C6B /* be_interface.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = be_interface.h; sourceTree = "<group>"; };
 		4ED53AE731C8D4BCE5B24F3E /* setup_44p51.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = setup_44p51.h; sourceTree = "<group>"; };
 		4F41838780E47305CCC4A9DB /* jcmarker.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = jcmarker.c; sourceTree = "<group>"; };
-		4F796B9C3C41114C938D6D65 /* dirty-files */ = {isa = PBXFileReference; path = "dirty-files"; sourceTree = "<group>"; };
+		4F796B9C3C41114C938D6D65 /* dirty-files */ = {isa = PBXFileReference; lastKnownFileType = text; path = "dirty-files"; sourceTree = "<group>"; };
 		508BCC2DCDC63D5891993661 /* codebook.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = codebook.h; sourceTree = "<group>"; };
 		519231DDABC6A8773BCB59E4 /* jcparam.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = jcparam.c; sourceTree = "<group>"; };
 		51FD1A0BBB75688B492F7777 /* tr_image_tga.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = tr_image_tga.c; sourceTree = "<group>"; };
 		527C0ACA4EBC01A22A50D36F /* be_aas_sample.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = be_aas_sample.c; sourceTree = "<group>"; };
 		52A7F207A02C898CD53D9056 /* os_types.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = os_types.h; sourceTree = "<group>"; };
 		531ABDEBF57A0211505D91D7 /* be_ai_goal.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = be_ai_goal.h; sourceTree = "<group>"; };
+		535182FB70512EBC40B08335 /* q3_stage.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = q3_stage.c; sourceTree = "<group>"; };
 		540611D90D5BB04F8E8D3930 /* lookup_data.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = lookup_data.h; sourceTree = "<group>"; };
 		5570CEAC7C7D52506C5BB976 /* bitrate.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = bitrate.c; sourceTree = "<group>"; };
 		55B41D3AF9FFB9BC33DABACA /* cg_consolecmds.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = cg_consolecmds.c; sourceTree = "<group>"; };
 		567EA27AA20FAE24FCAD6003 /* keycodes.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = keycodes.h; sourceTree = "<group>"; };
 		5759A510807AE6F11B8B5427 /* jconfig.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = jconfig.h; sourceTree = "<group>"; };
-		5764191E004EAED87E2353B4 /* COPYING */ = {isa = PBXFileReference; path = COPYING; sourceTree = "<group>"; };
+		5764191E004EAED87E2353B4 /* COPYING */ = {isa = PBXFileReference; lastKnownFileType = text; path = COPYING; sourceTree = "<group>"; };
 		583104C3F23778E23A10E33F /* l_crc.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = l_crc.c; sourceTree = "<group>"; };
 		5933FC512FBBC3D8602420B0 /* l_utils.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = l_utils.h; sourceTree = "<group>"; };
 		5AAAE72E2018098E33B62D54 /* crctable.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = crctable.h; sourceTree = "<group>"; };
@@ -351,12 +352,13 @@
 		63EA1BB37C5C7A35A4655990 /* jdatasrc.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = jdatasrc.c; sourceTree = "<group>"; };
 		64509FD02DEB921A7979F036 /* cl_ui.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = cl_ui.c; sourceTree = "<group>"; };
 		64CCF113A78F3A8AFE5BD691 /* be_ai_goal.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = be_ai_goal.c; sourceTree = "<group>"; };
+		65A51EF49A651B0585D8BEA7 /* DebugTelemetry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugTelemetry.swift; sourceTree = "<group>"; };
 		65F2F2635EB76FCEE400DCF9 /* huffman_static.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = huffman_static.c; sourceTree = "<group>"; };
 		6601DC505412B41880855E46 /* snd_codec_ogg.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = snd_codec_ogg.c; sourceTree = "<group>"; };
 		672DF626CB5043B88376746D /* tr_font.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = tr_font.c; sourceTree = "<group>"; };
 		67AC44F4FD2D1552572680D8 /* tr_public.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = tr_public.h; sourceTree = "<group>"; };
 		67D1504E8B8AC35CAB46279A /* jdarith.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = jdarith.c; sourceTree = "<group>"; };
-		682486FAB747BF17B6326DAA /* README */ = {isa = PBXFileReference; path = README; sourceTree = "<group>"; };
+		682486FAB747BF17B6326DAA /* README */ = {isa = PBXFileReference; lastKnownFileType = text; path = README; sourceTree = "<group>"; };
 		6AA613B519FB57F9F6FB4790 /* setup_44.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = setup_44.h; sourceTree = "<group>"; };
 		6AE676A154892EE9812BB555 /* qfiles.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = qfiles.h; sourceTree = "<group>"; };
 		6AF21139679F9E7FC929A172 /* Quake3-iOS-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Quake3-iOS-Bridging-Header.h"; sourceTree = "<group>"; };
@@ -466,7 +468,7 @@
 		CACF78AE5823B426C1ECD6C7 /* window.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = window.h; sourceTree = "<group>"; };
 		CC07108D423757144E8083FB /* psych_11.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = psych_11.h; sourceTree = "<group>"; };
 		CC4AF53CEFF71643A97E075B /* residue_16.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = residue_16.h; sourceTree = "<group>"; };
-		CC809E1C2087FC3FE3F9C08D /* COPYING */ = {isa = PBXFileReference; path = COPYING; sourceTree = "<group>"; };
+		CC809E1C2087FC3FE3F9C08D /* COPYING */ = {isa = PBXFileReference; lastKnownFileType = text; path = COPYING; sourceTree = "<group>"; };
 		CCEFC4BC8348FE11DBAB37D7 /* be_aas_routealt.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = be_aas_routealt.h; sourceTree = "<group>"; };
 		CD62104F1A937699925D197D /* cm_local.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = cm_local.h; sourceTree = "<group>"; };
 		CD8443065242DDCE907219F4 /* be_aas_optimize.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = be_aas_optimize.c; sourceTree = "<group>"; };
@@ -668,15 +670,6 @@
 				D7250275701E4FFC6798CB9F /* modes */,
 			);
 			path = lib;
-			sourceTree = "<group>";
-		};
-		3A01C0DE0000000000000002 /* clean_frontend */ = {
-			isa = PBXGroup;
-			children = (
-				3A01C0DE0000000000000003 /* q3_stage.c */,
-				3A01C0DE0000000000000004 /* q3_stage.h */,
-			);
-			path = clean_frontend;
 			sourceTree = "<group>";
 		};
 		41F3AC3A3D57721807BC54D7 /* uncoupled */ = {
@@ -914,8 +907,8 @@
 			children = (
 				8D3035D05932C4DB81A3D80A /* botlib */,
 				64560CA4FF0420EB56D28155 /* cgame */,
+				E1766AED0BB9889E527E81E8 /* clean_frontend */,
 				8E5D52D7FF86A22338A21155 /* client */,
-				3A01C0DE0000000000000002 /* clean_frontend */,
 				A4AF12E807C1DD875E55B2D4 /* game */,
 				EE506E26A002102936D9288B /* ios */,
 				200067CEEC3BC251DE013968 /* libjpeg */,
@@ -1046,6 +1039,15 @@
 			path = libogg;
 			sourceTree = "<group>";
 		};
+		E1766AED0BB9889E527E81E8 /* clean_frontend */ = {
+			isa = PBXGroup;
+			children = (
+				535182FB70512EBC40B08335 /* q3_stage.c */,
+				0DB3C0C76075F02F6CA91B9B /* q3_stage.h */,
+			);
+			path = clean_frontend;
+			sourceTree = "<group>";
+		};
 		E9AB08191456DDEAC3AFEA2E /* books */ = {
 			isa = PBXGroup;
 			children = (
@@ -1071,9 +1073,10 @@
 			isa = PBXGroup;
 			children = (
 				821B19B90747068CAC27A35B /* Assets.xcassets */,
+				65A51EF49A651B0585D8BEA7 /* DebugTelemetry.swift */,
 				2C8B120A0EBCD9CEE983C412 /* LaunchMenuView.swift */,
 				88E516AF1355E11FE7A7FD28 /* MetalView.swift */,
-				3A01C0DE0000000000000005 /* Q3MetalStateMap.swift */,
+				16A2E95B180E4A27CB1D25B3 /* Q3MetalStateMap.swift */,
 				12703A83024DC702F9413C41 /* Quake3_iOSApp.swift */,
 				6AF21139679F9E7FC929A172 /* Quake3-iOS-Bridging-Header.h */,
 			);
@@ -1089,6 +1092,7 @@
 			buildPhases = (
 				706E1033C199ECF8C156C2AB /* Sources */,
 				05014A794D7ADC41D2C38AF5 /* Resources */,
+				8A4E9C8F6D784C51A7E37B12 /* Stage baseq3 data */,
 			);
 			buildRules = (
 			);
@@ -1108,7 +1112,7 @@
 			isa = PBXProject;
 			attributes = {
 				BuildIndependentTargetsInParallel = YES;
-				LastUpgradeCheck = 1430;
+				LastUpgradeCheck = 2650;
 				TargetAttributes = {
 					2EBB30EEA47617C34D42A543 = {
 						DevelopmentTeam = 72MB2RMPTC;
@@ -1147,14 +1151,38 @@
 		};
 /* End PBXResourcesBuildPhase section */
 
+/* Begin PBXShellScriptBuildPhase section */
+		8A4E9C8F6D784C51A7E37B12 /* Stage baseq3 data */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Stage baseq3 data";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"${SRCROOT}/scripts/stage_baseq3.sh\"\n";
+			showEnvVarsInLog = 0;
+		};
+/* End PBXShellScriptBuildPhase section */
+
 /* Begin PBXSourcesBuildPhase section */
 		706E1033C199ECF8C156C2AB /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				EFAFB491964ACA677D203241 /* DebugTelemetry.swift in Sources */,
 				13E1EBA63D1082D3878C8049 /* LaunchMenuView.swift in Sources */,
 				4665DA1B2C281DE4C038DB06 /* MetalView.swift in Sources */,
-				4665DA1B2C281DE4C038DB07 /* Q3MetalStateMap.swift in Sources */,
+				5FC4133FCC928C5EA7D6E8F8 /* Q3MetalStateMap.swift in Sources */,
 				FAE1E11980EB55CB99AC1EFC /* Quake3_iOSApp.swift in Sources */,
 				D38C90BB2B1D4064FE9E7C4C /* analysis.c in Sources */,
 				36E64738B68D9C670599B04A /* be_aas_bspq3.c in Sources */,
@@ -1298,12 +1326,12 @@
 				2FCA20DA19A0C9809553CD7F /* md5.c in Sources */,
 				0F15366889727F3B0F941332 /* mdct.c in Sources */,
 				39CB50402A4E9476686DFDE2 /* metal_renderer_stub.c in Sources */,
-				3A01C0DE0000000000000001 /* q3_stage.c in Sources */,
 				99F9976A1626D46EA7332C7E /* msg.c in Sources */,
 				D1F5B010A1A96058C8DAD196 /* net_chan.c in Sources */,
 				78718236CEC13C5556B92B1C /* net_ip.c in Sources */,
 				DF9350EDA5170B3FA48501A8 /* psy.c in Sources */,
 				28BC7DE65418E5F870F31F5A /* puff.c in Sources */,
+				65B72BC9CD0820A63AA24B09 /* q3_stage.c in Sources */,
 				1BCF86A6D1A3FAAB83AD2BD9 /* q_math.c in Sources */,
 				1311809BC661959BF7D5586B /* q_shared.c in Sources */,
 				AF580CC25067B8B495EFD658 /* registry.c in Sources */,
@@ -1384,8 +1412,10 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = 72MB2RMPTC;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
 				GCC_DYNAMIC_NO_PIC = NO;
 				GCC_NO_COMMON_BLOCKS = YES;
@@ -1406,6 +1436,7 @@
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 				SWIFT_VERSION = 6.0;
@@ -1420,7 +1451,6 @@
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 72MB2RMPTC;
 				GCC_C_LANGUAGE_STANDARD = c11;
 				GCC_OPTIMIZATION_LEVEL = 0;
 				GCC_PREPROCESSOR_DEFINITIONS = (
@@ -1435,8 +1465,9 @@
 					"MACOS_X=1",
 					"USE_LOCAL_HEADERS=1",
 					"ARCH_STRING=\\\"arm64\\\"",
-					"DLL_EXT=\\\".dylib\\\"",
+				"DLL_EXT=\\\".dylib\\\"",
 				);
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = (
 					"$(SRCROOT)/code",
@@ -1455,8 +1486,13 @@
 				INFOPLIST_GENERATION_MODE = GeneratedByXcode;
 				"INFOPLIST_KEY_LSRequiresIPhoneOS[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_LSRequiresIPhoneOS[sdk=iphonesimulator*]" = YES;
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Streams debug telemetry to your Mac during development.";
 				"INFOPLIST_KEY_UIRequiresFullScreen[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIRequiresFullScreen[sdk=iphonesimulator*]" = YES;
+				"INFOPLIST_KEY_UISupportedInterfaceOrientations[sdk=iphoneos*]" = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				"INFOPLIST_KEY_UISupportedInterfaceOrientations[sdk=iphonesimulator*]" = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				"INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad[sdk=iphoneos*]" = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				"INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad[sdk=iphonesimulator*]" = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -1470,10 +1506,15 @@
 					"-Wno-sign-conversion",
 					"-Wno-incompatible-pointer-types",
 					"-Wno-deprecated-declarations",
+					"-Wno-comma",
+					"-Wno-unreachable-code",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.quake3ios.app;
 				SDKROOT = iphoneos;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator xros xrsimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SWIFT_OBJC_BRIDGING_HEADER = "Quake3-iOS/Quake3-iOS-Bridging-Header.h";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 				TARGETED_DEVICE_FAMILY = "1,2,7";
@@ -1516,8 +1557,10 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = 72MB2RMPTC;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
 				GCC_NO_COMMON_BLOCKS = YES;
 				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
@@ -1531,6 +1574,7 @@
 				MTL_FAST_MATH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_COMPILATION_MODE = wholemodule;
 				SWIFT_OPTIMIZATION_LEVEL = "-O";
 				SWIFT_VERSION = 6.0;
@@ -1545,7 +1589,6 @@
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 72MB2RMPTC;
 				GCC_C_LANGUAGE_STANDARD = c11;
 				GCC_OPTIMIZATION_LEVEL = s;
 				GCC_PREPROCESSOR_DEFINITIONS = (
@@ -1560,8 +1603,9 @@
 					"MACOS_X=1",
 					"USE_LOCAL_HEADERS=1",
 					"ARCH_STRING=\\\"arm64\\\"",
-					"DLL_EXT=\\\".dylib\\\"",
+				"DLL_EXT=\\\".dylib\\\"",
 				);
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = (
 					"$(SRCROOT)/code",
@@ -1580,8 +1624,13 @@
 				INFOPLIST_GENERATION_MODE = GeneratedByXcode;
 				"INFOPLIST_KEY_LSRequiresIPhoneOS[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_LSRequiresIPhoneOS[sdk=iphonesimulator*]" = YES;
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Streams debug telemetry to your Mac during development.";
 				"INFOPLIST_KEY_UIRequiresFullScreen[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIRequiresFullScreen[sdk=iphonesimulator*]" = YES;
+				"INFOPLIST_KEY_UISupportedInterfaceOrientations[sdk=iphoneos*]" = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				"INFOPLIST_KEY_UISupportedInterfaceOrientations[sdk=iphonesimulator*]" = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				"INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad[sdk=iphoneos*]" = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				"INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad[sdk=iphonesimulator*]" = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -1595,10 +1644,15 @@
 					"-Wno-sign-conversion",
 					"-Wno-incompatible-pointer-types",
 					"-Wno-deprecated-declarations",
+					"-Wno-comma",
+					"-Wno-unreachable-code",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.quake3ios.app;
 				SDKROOT = iphoneos;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator xros xrsimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SWIFT_OBJC_BRIDGING_HEADER = "Quake3-iOS/Quake3-iOS-Bridging-Header.h";
 				SWIFT_OPTIMIZATION_LEVEL = "-O";
 				TARGETED_DEVICE_FAMILY = "1,2,7";

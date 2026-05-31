@@ -672,18 +672,44 @@ void Quake3_Init(const char *basePath) {
      * registry (in-binary, not QVM), so vm_cgame doesn't really
      * matter, but we set it for symmetry. */
     const char *matchProfileName = getenv("Q3_MATCH_PROFILE");
+    BOOL matchProfile960 = (matchProfileName && !strcmp(matchProfileName, "metal_960_25"));
     BOOL matchProfile1280 = (matchProfileName && !strcmp(matchProfileName, "metal_1280_25"));
     BOOL matchProfileNative = (matchProfileName && !strcmp(matchProfileName, "native_ipad_25"));
-    BOOL matchProfile = (matchProfile1280 || matchProfileNative);
-    int matchWidth = 1280;
-    int matchHeight = 960;
-    if (matchProfileNative) {
-        CGSize nativeSize = [UIScreen mainScreen].nativeBounds.size;
-        matchWidth = (int)MAX(nativeSize.width, nativeSize.height);
-        matchHeight = (int)MIN(nativeSize.width, nativeSize.height);
+    BOOL matchProfile = (matchProfile960 || matchProfile1280 || matchProfileNative);
+    CGSize nativeSize = [UIScreen mainScreen].nativeBounds.size;
+    int nativeWidth = (int)MAX(nativeSize.width, nativeSize.height);
+    int nativeHeight = (int)MIN(nativeSize.width, nativeSize.height);
+    if (nativeWidth <= 0 || nativeHeight <= 0) {
+        nativeWidth = 1280;
+        nativeHeight = 720;
+    }
+    {
+        const char *maxDrawableEnv = getenv("Q3_MAX_DRAWABLE_WIDTH");
+        int maxDrawableWidth = maxDrawableEnv ? atoi(maxDrawableEnv) : 0;
+        if (maxDrawableWidth > 0 && nativeWidth > maxDrawableWidth) {
+            nativeHeight = MAX(1, (nativeHeight * maxDrawableWidth) / nativeWidth);
+            nativeWidth = maxDrawableWidth;
+        }
+    }
+    int matchWidth = nativeWidth;
+    int matchHeight = nativeHeight;
+    if (matchProfile960) {
+        matchWidth = 960;
+        matchHeight = 444;
+    } else if (matchProfile1280) {
+        matchWidth = 1280;
+        matchHeight = 960;
     }
 
-    char cmdline[1024] = "+set vm_ui 1 +set vm_game 1 +set vm_cgame 1";
+    // com_zoneMegs / com_hunkMegs / com_soundMegs are CVAR_LATCH — they
+    // must be set on the command line, BEFORE Z_Init allocates. Setting
+    // them in q3config.cfg is a no-op (the cvars persist, but Z_Init has
+    // already used the default DEF_COMZONEMEGS=12 by the time the config
+    // parses). Heavy custom maps (nv15, ts_q3dm13, ztn3dm1) overflow 12 MB
+    // of zone during cgame init and crash in Z_CheckHeap with "next block
+    // doesn't have proper back link". Bumping to 64/256/16 covers the
+    // heaviest community maps with margin on iPhone 17 Pro (12 GB unified).
+    char cmdline[1024] = "+set com_zoneMegs 64 +set com_hunkMegs 256 +set com_soundMegs 16 +set vm_ui 1 +set vm_game 1 +set vm_cgame 1";
     if (matchProfile) {
         char matchCmds[768];
         snprintf(matchCmds, sizeof(matchCmds),
@@ -705,6 +731,16 @@ void Quake3_Init(const char *basePath) {
                  " +set r_depthbits 24"
                  " +set r_overBrightBits 1"
                  " +set r_mapOverBrightBits 2"
+                 // OLED visibility lift. PC stock r_gamma is 1.0 which
+                 // can look murky on OLED panels (perfect-black crushes
+                 // dim shadow detail). 1.15 lifts midtones just enough
+                 // to read low-light corridors without washing out the
+                 // bright lights. r_intensity stays at 1.0 — bumping
+                 // that compounds across base + lightmap stages and
+                 // overshoots fast.
+                 " +set r_gamma 1.15"
+                 " +set r_intensity 1.0"
+                 " +set r_ignorehwgamma 1"
                  " +set com_maxfps 25"
                  " +set com_maxfpsUnfocused 25"
                  " +set timescale 1"
@@ -748,26 +784,16 @@ void Quake3_Init(const char *basePath) {
      * subsystems are up. */
     IN_Init();
     NSLog(@"[Q3-INIT] IN_Init returned; queuing boot cbuf");
-    /* Per-device resolution. iPhone stays at 960x444 (matches the
-     * reference AVI dimensions used by the demo-four capture +
-     * vision-LLM diff pipeline). iPad uses 1280x960 — exact 4:3,
-     * matching iPad Pro 13"'s native 2752x2064 (also 4:3) so the
-     * Metal layer scales 1280x960 → native without aspect
-     * distortion. 1280x1024 (5:4) caused the visible squish/
-     * letterbox. Q3's renderer + FOV math were also built around
-     * 4:3, so this keeps yfov honest. Detected at runtime via
-     * UIUserInterfaceIdiom so a single binary handles both. */
-    BOOL isPad = ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad);
+    /* Normal simulator/device runs use native landscape pixels. The old
+     * fixed capture sizes are still available through Q3_MATCH_PROFILE so
+     * reference-video diffs remain deterministic when needed. */
     char resCmds[96];
     if (matchProfile) {
         snprintf(resCmds, sizeof(resCmds), "seta r_customwidth %d; seta r_customheight %d; ", matchWidth, matchHeight);
     } else {
-        snprintf(resCmds, sizeof(resCmds), "%s",
-                 isPad
-                 ? "seta r_customwidth 1280; seta r_customheight 960; "
-                 : "seta r_customwidth 960; seta r_customheight 444; ");
+        snprintf(resCmds, sizeof(resCmds), "seta r_customwidth %d; seta r_customheight %d; ", nativeWidth, nativeHeight);
     }
-    NSLog(@"[Q3-INIT] resolution: %s", matchProfile ? resCmds : (isPad ? "iPad 1280x960 (4:3)" : "iPhone 960x444"));
+    NSLog(@"[Q3-INIT] resolution: %s", resCmds);
     Cbuf_AddText(resCmds);
     Cbuf_AddText("seta r_mode -1; ");
     Cbuf_AddText(matchProfile
@@ -785,18 +811,18 @@ void Quake3_Init(const char *basePath) {
         "seta cg_marks 1; "
         "seta cg_brassTime 2500; "
         "seta r_picmip 0; "
+        "seta r_textureMode GL_LINEAR_MIPMAP_NEAREST; "
         "seta r_texturebits 32; "
         "seta r_colorbits 32; "
         "seta r_depthbits 24; "
         "seta r_overBrightBits 1; "
         "seta r_mapOverBrightBits 2; "
+        "seta r_gamma 1.15; "
+        "seta r_intensity 1.0; "
+        "seta r_ignorehwgamma 1; "
         "seta r_dynamiclight 1; "
         "seta metal_render_audit 0; "
         "seta metal_cgame_instr 0; "
-        /* com_maxfps 25 matches the reference AVI frame rate so demo
-         * replay advances deterministically frame-for-frame with
-         * reference — no warmup alignment skew. */
-        "seta com_maxfps 25; "
         "seta r_swapinterval 0; "
         /* Disable sound so the AVI muxer skips the audio stream (our
          * sim build doesn't wire up CoreAudio — dma.speed stays 0,
@@ -826,6 +852,55 @@ void Quake3_Init(const char *basePath) {
          * (~50 RegisterShader calls); does not affect the demo
          * playback or AVI capture. */
         "test_menu_assets\n");
+    Cbuf_AddText(matchProfile
+                 ? "seta com_maxfps 25; seta com_maxfpsUnfocused 25; "
+                 : "seta com_maxfps 120; seta com_maxfpsUnfocused 120; ");
+
+    /* MAX GRAPHICS — applied only in normal play (skipped when a
+     * reference-video Q3_MATCH_PROFILE capture is active so the AVI
+     * remains bit-identical to prior CI captures). Wins the cvar set
+     * race against default.cfg + q3config.cfg because Cbuf_AddText
+     * runs after both have loaded. User can still override any of
+     * these via the in-game console (~ key) or by writing q3config.cfg.
+     *
+     * Geometry — finer bezier patch subdivisions (Q3 default 80!)
+     *   r_subdivisions 4    -> ~20x more triangles on curved surfaces
+     *   r_lodbias    -2     -> never drop LOD on alias models / patches
+     *   r_lodCurveError    -> hold patch detail at distance
+     * Textures — disable mip downscale, force trilinear, kill DXT
+     * compression for crisp world art; max anisotropy if the Metal
+     * stub honours it.
+     * Lighting / shadows — keep stencil shadows (cg_shadows 3),
+     * full dynamic lights, lightmaps (not vertex lighting), keep the
+     * existing OLED midtone lift via r_gamma 1.15.
+     * Effects — sun shafts, mark decals, lingering shell brass.
+     * No FPS cap — iPhone 17 Pro Max ProMotion floor handled
+     * separately in MetalView. */
+    if (!matchProfile) {
+        Cbuf_AddText(
+            "seta r_picmip 0; "
+            "seta r_skymip 0; "
+            "seta r_roundImagesDown 0; "
+            "seta r_textureMode GL_LINEAR_MIPMAP_LINEAR; "
+            "seta r_ext_compress_textures 0; "
+            "seta r_detailtextures 1; "
+            "seta r_ext_texture_filter_anisotropic 1; "
+            "seta r_ext_max_anisotropy 16; "
+            "seta r_subdivisions 4; "
+            "seta r_lodbias -2; "
+            "seta r_lodCurveError 10000; "
+            "seta r_lodscale 5; "
+            "seta r_vertexLight 0; "
+            "seta cg_shadows 3; "
+            "seta cg_marks 1; "
+            "seta cg_brassTime 10000; "
+            "seta cg_simpleItems 0; "
+            "seta r_drawSun 1; "
+            "seta r_fastsky 0; "
+            "seta r_finish 0; "
+            "seta cl_maxpackets 100; "
+        );
+    }
     /* The actual launch command (e.g. "demo four", "map q3dm6", or
      * a custom demo from the SwiftUI launch menu) is queued from the
      * Swift app shell after Quake3_Init returns, via Q3Exec_Command.

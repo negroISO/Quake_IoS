@@ -20,3 +20,6 @@ build/
 CLAUDE.md
 brain.db
 **/.claude/auto-memory/
+
+# Local GPU captures / traces
+debug_captures/

@@ -32,5 +32,6 @@ void Q3Gamepad_SetState(float leftX, float leftY, float rightX, float rightY,
 #define Q3_PAD_RIGHT_THUMB    (1u << 15)
 
 void Q3Gamepad_SetButtons(unsigned int buttonMask);
+void Q3DebugTelemetry_Log(const char *type, const char *message);
 
 #endif

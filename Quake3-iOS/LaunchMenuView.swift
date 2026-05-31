@@ -1,4 +1,5 @@
 import SwiftUI
+import Foundation
 
 /// Pre-game launch menu. Appears before the engine boots; on tap it
 /// signals the parent App to switch to MetalView and queue the chosen
@@ -12,6 +13,8 @@ import SwiftUI
 /// - The stock `four` demo from pak0 (always assumed present —
 ///   pak0 ships demos/four.dm_66)
 struct LaunchMenuView: View {
+    private static let telemetrySource = "quake3-ios"
+
     /// Set by a tap. Parent App watches this and, when non-nil,
     /// boots the engine with the chosen Q3 command (e.g.
     /// "demo nv15demo" or "map q3dm6").
@@ -62,13 +65,13 @@ struct LaunchMenuView: View {
                         // Stock demo always available
                         DemoButton(title: "Demo: four (Q3 default)",
                                    subtitle: "Stock pak0 — Camping Grounds (q3dm6)") {
-                            launchCommand = "demo four"
+                            choose(command: "demo four", label: "Demo: four (Q3 default)")
                         }
 
                         ForEach(demoFiles) { d in
                             DemoButton(title: "Demo: \(d.name)",
                                        subtitle: d.source) {
-                                launchCommand = "demo \(d.name)"
+                                choose(command: "demo \(d.name)", label: "Demo: \(d.name)")
                             }
                         }
 
@@ -81,15 +84,15 @@ struct LaunchMenuView: View {
                         // setup screen.
                         DemoButton(title: "Map: q3dm1",
                                    subtitle: "Arena Gate") {
-                            launchCommand = "map q3dm1"
+                            choose(command: "map q3dm1", label: "Map: q3dm1")
                         }
                         DemoButton(title: "Map: q3dm6",
                                    subtitle: "Camping Grounds") {
-                            launchCommand = "map q3dm6"
+                            choose(command: "map q3dm6", label: "Map: q3dm6")
                         }
                         DemoButton(title: "Map: nv15",
                                    subtitle: "Area 15 — Nvidia Bunker (custom pk3)") {
-                            launchCommand = "map nv15"
+                            choose(command: "map nv15", label: "Map: nv15")
                         }
                     }
                     .padding(.horizontal, 24)
@@ -101,8 +104,21 @@ struct LaunchMenuView: View {
             }
         }
         .task {
-            demoFiles = Self.discoverDemos()
+            let demos = Self.discoverDemos()
+            demoFiles = demos
+            DebugTelemetry.shared.log(source: Self.telemetrySource, type: "menu_ready", fields: [
+                "demoCount": demos.count,
+                "demos": demos.map(\.name)
+            ])
         }
+    }
+
+    private func choose(command: String, label: String) {
+        NSLog("[Q3-MENU] selected %@", command)
+        DebugTelemetry.shared.log(source: Self.telemetrySource, type: "menu_tap", message: label, fields: [
+            "command": command
+        ])
+        launchCommand = command
     }
 
     /// Walks the bundle's `Resources/baseq3/demos` and the Documents'
@@ -151,33 +167,33 @@ private struct DemoButton: View {
     let action: () -> Void
 
     var body: some View {
-        Button(action: action) {
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
-                        .font(.system(size: 17, weight: .bold, design: .monospaced))
-                        .foregroundColor(.white)
-                    Text(subtitle)
-                        .font(.system(size: 12, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.6))
-                }
-                Spacer()
-                Image(systemName: "chevron.right")
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.system(size: 17, weight: .bold, design: .monospaced))
+                    .foregroundColor(.white)
+                Text(subtitle)
+                    .font(.system(size: 12, design: .monospaced))
                     .foregroundColor(.white.opacity(0.6))
             }
-            .padding(.horizontal, 18)
-            .padding(.vertical, 14)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color.black.opacity(0.55))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(Color(red: 0.7, green: 0.15, blue: 0.1).opacity(0.85), lineWidth: 1.5)
-            )
-            .contentShape(Rectangle())
+            Spacer()
+            Image(systemName: "chevron.right")
+                .foregroundColor(.white.opacity(0.6))
         }
-        .buttonStyle(.plain)
+        .padding(.horizontal, 18)
+        .padding(.vertical, 14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.black.opacity(0.55))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color(red: 0.7, green: 0.15, blue: 0.1).opacity(0.85), lineWidth: 1.5)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture(perform: action)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isButton)
     }
 }

@@ -1,15 +1,36 @@
 import SwiftUI
+import Foundation
 import os
+import Darwin
+
+private final class Quake3OrientationDelegate: NSObject, UIApplicationDelegate {
+    func application(_ application: UIApplication,
+                     supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
+        return .landscape
+    }
+}
 
 @main
 struct Quake3_iOSApp: App {
     static let log = OSLog(subsystem: "com.quake3ios.app", category: "boot")
+    private static let telemetrySource = "quake3-ios"
+    @UIApplicationDelegateAdaptor(Quake3OrientationDelegate.self) private var orientationDelegate
+
     init() {
         // Disable stdout buffering so [Swift] print()s land in
         // devicectl --console immediately rather than getting eaten
         // by USB line-buffering when the app crashes mid-init.
         setbuf(stdout, nil)
         NSLog("[Q3-BOOT] App init")
+#if DEBUG
+        let telemetryHost = ProcessInfo.processInfo.environment["Q3_TELEMETRY_HOST"] ?? "192.168.0.197"
+        let telemetryPort = UInt16(ProcessInfo.processInfo.environment["Q3_TELEMETRY_PORT"] ?? "8765") ?? 8765
+        DebugTelemetry.shared.connect(host: telemetryHost, port: telemetryPort, source: Self.telemetrySource)
+        DebugTelemetry.shared.log(source: Self.telemetrySource, type: "boot", message: "app init", fields: [
+            "host": telemetryHost,
+            "port": Int(telemetryPort)
+        ])
+#endif
     }
     /// nil = launch menu visible. Non-nil = engine should boot and
     /// queue this Q3 console command (e.g. "demo four", "map q3dm6").
@@ -21,6 +42,21 @@ struct Quake3_iOSApp: App {
     /// is blocked.
     @State private var engineLoading = false
 
+    @MainActor
+    private static func requestLandscapeSceneGeometry() {
+        guard let scene = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .first else {
+            return
+        }
+        scene.windows.first?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+        if #available(iOS 16.0, *) {
+            scene.requestGeometryUpdate(.iOS(interfaceOrientations: .landscapeRight)) { error in
+                NSLog("[Q3-BOOT] landscape request failed: %@", String(describing: error))
+            }
+        }
+    }
+
     var body: some Scene {
         WindowGroup {
             ZStack(alignment: .topLeading) {
@@ -31,15 +67,27 @@ struct Quake3_iOSApp: App {
                         .ignoresSafeArea()
                         .task {
                             NSLog("[Q3-BOOT] .task entered (engineStarted=%d)", engineStarted ? 1 : 0)
-                            guard !engineStarted else { return }
+                            DebugTelemetry.shared.log(source: Self.telemetrySource, type: "engine_task_entered", fields: [
+                                "engineStarted": engineStarted,
+                                "launchCommand": launchCommand ?? ""
+                            ])
+                            guard !engineStarted else {
+                                DebugTelemetry.shared.log(source: Self.telemetrySource, type: "engine_task_skipped", message: "engine already started")
+                                return
+                            }
                             engineStarted = true
                             engineLoading = true
+                            DebugTelemetry.shared.log(source: Self.telemetrySource, type: "engine_loading", message: "true")
                             NSLog("[Q3-BOOT] yielding 200ms for LoadingOverlay paint")
                             try? await Task.sleep(nanoseconds: 200_000_000)
                             NSLog("[Q3-BOOT] starting GameControllerBridge")
+                            DebugTelemetry.shared.log(source: Self.telemetrySource, type: "controller_bridge_start")
                             GameControllerBridge.shared.start()
                             let basePath = Bundle.main.resourcePath ?? ""
                             NSLog("[Q3-BOOT] dispatching Quake3_Init to background queue")
+                            DebugTelemetry.shared.log(source: Self.telemetrySource, type: "engine_init_dispatch", fields: [
+                                "basePath": basePath
+                            ])
                             print("[Swift] Starting Quake3 engine, basePath: \(basePath)")
                             // Run Quake3_Init on a background queue so the
                             // main thread stays responsive. iOS will SIGKILL
@@ -52,23 +100,29 @@ struct Quake3_iOSApp: App {
                             // requirements until rendering begins. The
                             // MTKView's draw(in:) keeps rendering the
                             // LoadingOverlay while we wait.
+                            let telemetrySource = Self.telemetrySource
                             await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
                                 DispatchQueue.global(qos: .userInitiated).async {
                                     NSLog("[Q3-BOOT] (bg) calling Quake3_Init")
+                                    DebugTelemetry.shared.log(source: telemetrySource, type: "engine_init_begin")
                                     Quake3_Init(basePath)
                                     NSLog("[Q3-BOOT] (bg) Quake3_Init returned")
+                                    DebugTelemetry.shared.log(source: telemetrySource, type: "engine_init_end")
                                     cont.resume()
                                 }
                             }
                             NSLog("[Q3-BOOT] back on main; engine ready")
+                            DebugTelemetry.shared.log(source: Self.telemetrySource, type: "engine_ready")
                             print("[Swift] Engine initialized")
                             if let cmd = launchCommand {
                                 let line = cmd + "\n"
                                 NSLog("[Q3-BOOT] queuing command: %@", cmd)
+                                DebugTelemetry.shared.log(source: Self.telemetrySource, type: "command_queue", message: cmd)
                                 line.withCString { Q3Exec_Command($0) }
                                 print("[Swift] Queued: \(cmd)")
                             }
                             engineLoading = false
+                            DebugTelemetry.shared.log(source: Self.telemetrySource, type: "engine_loading", message: "false")
                             NSLog("[Q3-BOOT] engineLoading=false; SwiftUI should hide overlay")
                         }
 
@@ -79,6 +133,9 @@ struct Quake3_iOSApp: App {
             }
             .statusBarHidden(true)
             .persistentSystemOverlays(.hidden)
+            .onAppear {
+                Self.requestLandscapeSceneGeometry()
+            }
         }
     }
 }

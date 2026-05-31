@@ -52,7 +52,7 @@ void MSG_InitOOB( msg_t *buf, byte *data, int length ) {
 void MSG_Clear( msg_t *buf ) {
 	buf->cursize = 0;
 	buf->overflowed = qfalse;
-	buf->bit = 0;					//<- in bits
+	buf->bit = 0;					// in bits
 }
 
 
