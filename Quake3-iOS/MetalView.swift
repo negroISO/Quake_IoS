@@ -2324,26 +2324,17 @@ struct MetalView: UIViewRepresentable {
                 blue: Double(snapshot.clearColor.2),
                 alpha: Double(snapshot.clearColor.3)
             )
-            /* Explicit read-modify-write guarantees for GL_DST_COLOR/GL_ZERO
-             * (filter) and GL_ZERO/GL_ONE_MINUS_SRC_COLOR (subtract) decals:
+            /* Start every frame from Q3's requested clear colour. A
+             * CAMetalLayer drawable's previous contents are undefined, and
+             * transparent/additive passes (sky overlays, flares, UI, filter
+             * decals) can expose pixels the opaque world did not overwrite.
              *
-             *   - loadAction = .load   → preserves the attachment's current
-             *     contents at encoder begin so destinationColor is well-
-             *     defined for the first blend. The world pass (emitted
-             *     immediately after encoder creation) overwrites every
-             *     visible pixel before any filter/subtract decal draws, so
-             *     there is no visual difference vs .clear for normal frames;
-             *     using .load is the stricter contract required by the
-             *     GL_DST_COLOR/GL_ZERO read-modify-write spec.
-             *
-             *   - storeAction = .store → preserve final pixels for present.
-             *     Never .dontCare, never a resolve-only path.
-             *
-             * Scene polys (bullet marks, shadow blobs, blood decals) render
-             * in the SAME render encoder as the world + entities, so
-             * destinationColor continuity holds across all draws. No blit,
-             * no resolve, no intermediate texture between world and decals. */
-            descriptor.colorAttachments[0].loadAction = .load
+             * GL_DST_COLOR/GL_ZERO and other read-modify-write stages still
+             * see valid destinationColor because they execute later in the
+             * same encoder, after the world/sky passes have populated the
+             * framebuffer. Keeping .load here leaked stale drawable pixels
+             * into sky/additive/UI captures as intermittent "light" patches. */
+            descriptor.colorAttachments[0].loadAction = .clear
             descriptor.colorAttachments[0].storeAction = .store
 
             /* Sanity: the drawable texture MUST NOT be memoryless — filter
