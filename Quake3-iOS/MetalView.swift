@@ -1176,7 +1176,13 @@ struct MetalView: UIViewRepresentable {
                 float s = sin(timeSeconds * params.w) * params.y;
                 return uv + float2(s, s);
             } else if (type == 3) {
-                float a = fmod(params.x * timeSeconds, 2.0 * 3.14159265);
+                /* tcMod rotate stores degrees/second in Q3 shader scripts.
+                 * Metal was treating that value as radians/second, making
+                 * q3dm4 additive energy/light stages spin ~57x too fast and
+                 * alias into bright streaks/moire. Mirror RB_CalcRotateTexCoords
+                 * by converting to radians here. */
+                float degrees = fmod(params.x * timeSeconds, 360.0);
+                float a = degrees * (3.14159265 / 180.0);
                 float c = cos(a);
                 float s = sin(a);
                 float2 p = uv - 0.5;
