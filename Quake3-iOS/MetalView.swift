@@ -2194,7 +2194,14 @@ struct MetalView: UIViewRepresentable {
                 guard span.x > 1, span.y > 1, span.z > 1 else { continue }
 
                 let surface = SIMD4<Float>(fog.surface.0, fog.surface.1, fog.surface.2, fog.surface.3)
-                if ProcessInfo.processInfo.environment["Q3_METAL_FOG_RAYBOX_INSIDE_ONLY"] == "1" {
+                /* The ray-box is a true in-fog volume integration pass.
+                 * It must only run while the eye is actually inside the fog
+                 * brush.  When run from outside, the AABB projects across
+                 * adjacent rooms and looks like the fog "takes over" the map
+                 * as the demo camera moves.  Stock Q3's outside view is
+                 * already covered by the per-surface fog/cap passes above;
+                 * keep an explicit override only for GPU-capture A/B. */
+                if ProcessInfo.processInfo.environment["Q3_METAL_FOG_RAYBOX_ALLOW_OUTSIDE"] != "1" {
                     if fog.hasSurface != 0 {
                         let eyeT = simd_dot(cameraPos, SIMD3<Float>(surface.x, surface.y, surface.z)) - surface.w
                         if eyeT < 0 { continue }
