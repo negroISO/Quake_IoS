@@ -2178,7 +2178,6 @@ struct MetalView: UIViewRepresentable {
                                                znear: 0.0,
                                                zfar: 1.0))
             fogEncoder.setRenderPipelineState(fogVolumePipelineState)
-            fogEncoder.setDepthStencilState(ensuredDepthStencilState(alwaysPassDepthStencilState, device: device))
             fogEncoder.setCullMode(.none)
             fogEncoder.setFrontFacing(.clockwise)
             fogEncoder.setFragmentTexture(depthTexture, index: 0)
@@ -3794,7 +3793,12 @@ struct MetalView: UIViewRepresentable {
 
             let fogVolumePipelineDescriptor = MTLRenderPipelineDescriptor()
             fogVolumePipelineDescriptor.colorAttachments[0].pixelFormat = view.colorPixelFormat
-            fogVolumePipelineDescriptor.depthAttachmentPixelFormat = view.depthStencilPixelFormat
+            /* The ray-box fog pass samples the scene depth texture but does
+             * not bind a depth attachment.  Leaving a depth pixel format here
+             * trips Metal validation on Simulator/debug devices:
+             * "renderPipelineState pixelFormat must be Invalid, as no
+             * texture is set." */
+            fogVolumePipelineDescriptor.depthAttachmentPixelFormat = .invalid
             fogVolumePipelineDescriptor.vertexFunction = library.makeFunction(name: "q3_fog_volume_vertex")
             fogVolumePipelineDescriptor.fragmentFunction = library.makeFunction(name: "q3_fog_volume_fragment")
             fogVolumePipelineDescriptor.colorAttachments[0].isBlendingEnabled = true
