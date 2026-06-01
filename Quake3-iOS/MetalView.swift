@@ -3391,7 +3391,23 @@ struct MetalView: UIViewRepresentable {
                 }
             }
 
-            if let sceneView = Q3MetalRenderer_GetSceneView()?.pointee,
+            let mainSceneViewForLatePasses = Q3MetalRenderer_GetSceneView()?.pointee
+            var mainFlaresDrawnBeforeFog = false
+            if wantsFogRayBox, let sceneView = mainSceneViewForLatePasses {
+                /* Draw BSP flare billboards before the depth-limited fog
+                 * volume pass so fog attenuates light sprites just like the
+                 * already-encoded world/entities. Keeping flares in the
+                 * postFog encoder made Q3.entity.additive appear as an
+                 * unfogged light artifact, and that persisted into Q3.ui
+                 * because UI is simply later in the same framebuffer. */
+                mainFlaresDrawnBeforeFog = encodeMainFlarePass(
+                    encoder: encoder,
+                    sceneView: sceneView,
+                    snapshot: snapshot,
+                    device: view.device)
+            }
+
+            if let sceneView = mainSceneViewForLatePasses,
                let device = view.device,
                let sceneDepth,
                wantsFogRayBox {
@@ -3508,30 +3524,15 @@ struct MetalView: UIViewRepresentable {
                     height: Int(view.drawableSize.height)))
             }
 
-            /* Flare pass. Camera-facing additive billboards at each MST_FLARE
-             * BSP surface (map-compiler light entities). Scene-constant per
-             * map, recomputed per frame because quad corners are camera-
-             * relative. Depth-test on with depth-write off — flares occlude
-             * correctly behind walls but don't punch into the z-buffer. */
-            if let sceneView = Q3MetalRenderer_GetSceneView()?.pointee,
-               Q3MetalRenderer_GetFlareCount() > 0,
-               Q3MetalRenderer_GetFlareTextureHandle() != 0,
-               let flarePipeline = entityAdditivePipelineState,
-               let flareDepth = additiveEntityDepthStencilState,
-               let flareTexture = texture(for: Q3MetalRenderer_GetFlareTextureHandle(), device: view.device) {
-                let flareViewProjection = makeWorldViewProjection(sceneView)
-                var flareUniforms = EntityUniforms(viewProjection: flareViewProjection)
-                encoder.setRenderPipelineState(flarePipeline)
-                encoder.setDepthStencilState(flareDepth)
-                encoder.setCullMode(.none)
-                encoder.setFragmentSamplerState(worldSamplerState, index: 0)
-                encoder.setFragmentTexture(flareTexture, index: 0)
-                // Dlights still bound from entity pass; flare fragment path
-                // shares q3_entity_fragment which reads buffer(2). Rebind
-                // defensively in case a future pass clears it.
-                Self.bindDlightBlock(snapshot: snapshot, encoder: encoder, index: 2)
-
-                drawFlarePass(encoder: encoder, sceneView: sceneView, uniforms: &flareUniforms, device: view.device)
+            /* Flare pass. When fog ray-box is active, main-scene flares
+             * were already drawn before fog so they are attenuated by the
+             * volume integration pass. Without fog, draw them here just
+             * before UI as before. */
+            if !mainFlaresDrawnBeforeFog, let sceneView = mainSceneViewForLatePasses {
+                _ = encodeMainFlarePass(encoder: encoder,
+                                        sceneView: sceneView,
+                                        snapshot: snapshot,
+                                        device: view.device)
             }
 
             let vertexCount = Int(snapshot.vertexCount)
@@ -4277,6 +4278,49 @@ struct MetalView: UIViewRepresentable {
                 SIMD4<Float>(0, 0, 1, 0),
                 SIMD4<Float>(-1, 1, 0, 1)
             ))
+        }
+
+        /* Encodes the main scene's camera-facing additive flare billboards.
+         * Returns true only when a flare draw was actually encoded. When the
+         * depth-limited fog ray-box is active this must run before that fog
+         * pass so the fog attenuates light sprites instead of letting them
+         * punch bright Q3.entity.additive artifacts through the final Q3.ui
+         * framebuffer state. */
+        @discardableResult
+        private func encodeMainFlarePass(encoder: MTLRenderCommandEncoder,
+                                         sceneView: Q3MetalSceneView,
+                                         snapshot: Q3MetalFrameSnapshot,
+                                         device: MTLDevice?) -> Bool {
+            guard Q3MetalRenderer_GetFlareCount() > 0,
+                  Q3MetalRenderer_GetFlareTextureHandle() != 0,
+                  let flarePipeline = entityAdditivePipelineState,
+                  let flareDepth = additiveLessDepthStencilState ?? additiveEntityDepthStencilState,
+                  let flareTexture = texture(for: Q3MetalRenderer_GetFlareTextureHandle(), device: device) else {
+                return false
+            }
+
+            let flareViewProjection = makeWorldViewProjection(sceneView)
+            var flareUniforms = EntityUniforms(viewProjection: flareViewProjection)
+            flareUniforms.cameraPos = SIMD3<Float>(sceneView.viewOrigin.0,
+                                                   sceneView.viewOrigin.1,
+                                                   sceneView.viewOrigin.2)
+            flareUniforms.suppressDlights = 1
+
+            encoder.setRenderPipelineState(flarePipeline)
+            encoder.setDepthStencilState(flareDepth)
+            encoder.setCullMode(.none)
+            encoder.setFragmentSamplerState(worldSamplerState, index: 0)
+            encoder.setFragmentTexture(flareTexture, index: 0)
+            // q3_entity_fragment declares the dlight block at buffer(2).
+            // It is suppressed for flares, but binding defensively keeps
+            // capture/validation state consistent with other entity draws.
+            Self.bindDlightBlock(snapshot: snapshot, encoder: encoder, index: 2)
+
+            drawFlarePass(encoder: encoder,
+                          sceneView: sceneView,
+                          uniforms: &flareUniforms,
+                          device: device)
+            return true
         }
 
         /* Build and draw camera-facing additive billboards for each BSP flare.
