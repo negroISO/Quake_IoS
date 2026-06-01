@@ -434,6 +434,9 @@ typedef struct {
     float tcScale;
     uint32_t hasSurface;
     float surface[4];
+    uint32_t hasBounds;
+    float boundsMin[3];
+    float boundsMax[3];
 } Q3MetalWorldFog;
 int Q3MetalRenderer_GetWorldFogCount(void);
 const Q3MetalWorldFog *Q3MetalRenderer_GetWorldFogs(void);

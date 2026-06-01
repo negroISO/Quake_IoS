@@ -153,6 +153,20 @@ struct MetalView: UIViewRepresentable {
             var _padU: Float = 0
         }
 
+        struct FogVolumeUniforms {
+            var viewProjection: simd_float4x4
+            var inverseViewProjection: simd_float4x4
+            var cameraPos: SIMD3<Float>
+            var _pad: Float = 0
+            var fogColorDistance: SIMD4<Float>
+            var boundsMin: SIMD4<Float>
+            var boundsMax: SIMD4<Float>
+            // xyz = fog.surface, w = fog.surface[3]
+            var fogSurface: SIMD4<Float>
+            // Reserved for future depth-limited fog tuning.
+            var fogParams: SIMD4<Float>
+        }
+
         struct WorldDrawUniforms {
             var tcGen: Float
             var tcModCount: Int32
@@ -835,6 +849,96 @@ struct MetalView: UIViewRepresentable {
             float _padU;
         };
 
+        struct FogVolumeUniforms {
+            float4x4 viewProjection;
+            float4x4 inverseViewProjection;
+            packed_float3 cameraPos;
+            float _pad;
+            float4 fogColorDistance;
+            float4 boundsMin;
+            float4 boundsMax;
+            float4 fogSurface;
+            float4 fogParams;
+        };
+
+        struct FogVolumeOut {
+            float4 position [[position]];
+            float2 ndc;
+        };
+
+        float3 q3ResolvedFogColor(float3 fogRGB) {
+            if (dot(fogRGB, fogRGB) < 0.001) {
+                /* q3dm4's xdensegreyfog resolves through the script path as
+                 * black fogparms, but stock visuals are a grey x-density fog.
+                 * Use the grey fallback consistently for the boundary sheet,
+                 * per-surface fog pass, entities, and the eye-inside ray-box. */
+                return float3(0.36);
+            }
+            return fogRGB;
+        }
+
+        vertex FogVolumeOut q3_fog_volume_vertex(uint vertexID [[vertex_id]],
+                                                 constant FogVolumeUniforms &uniforms [[buffer(1)]]) {
+            const float2 positions[3] = {
+                float2(-1.0, -1.0),
+                float2( 3.0, -1.0),
+                float2(-1.0,  3.0)
+            };
+            FogVolumeOut out;
+            float2 p = positions[vertexID];
+            out.position = float4(p, 0.0, 1.0);
+            out.ndc = p;
+            return out;
+        }
+
+        fragment float4 q3_fog_volume_fragment(FogVolumeOut in [[stage_in]],
+                                               constant FogVolumeUniforms &uniforms [[buffer(1)]],
+                                               depth2d<float> sceneDepth [[texture(0)]]) {
+            constexpr sampler depthSampler(coord::normalized, address::clamp_to_edge, filter::nearest);
+            float2 depthSize = float2(float(sceneDepth.get_width()), float(sceneDepth.get_height()));
+            float2 uv = (in.position.xy + float2(0.5)) / max(depthSize, float2(1.0));
+            float sceneZ = sceneDepth.sample(depthSampler, uv);
+
+            float3 bmin = uniforms.boundsMin.xyz;
+            float3 bmax = uniforms.boundsMax.xyz;
+            float4 farH = uniforms.inverseViewProjection * float4(in.ndc.xy, 1.0, 1.0);
+            float3 farWorld = farH.xyz / max(farH.w, 1e-6);
+            float3 origin = float3(uniforms.cameraPos);
+            float3 dir = normalize(farWorld - origin);
+            float3 safeDir = select(float3(1e-6), dir, abs(dir) > float3(1e-6));
+            float3 invDir = 1.0 / safeDir;
+            float3 t0 = (bmin - origin) * invDir;
+            float3 t1 = (bmax - origin) * invDir;
+            float3 tsmaller = min(t0, t1);
+            float3 tbigger = max(t0, t1);
+            float tEnter = max(max(tsmaller.x, tsmaller.y), tsmaller.z);
+            float tExit = min(min(tbigger.x, tbigger.y), tbigger.z);
+            float start = max(tEnter, 0.0);
+
+            /* Clamp the ray-box integration to the scene depth.  The earlier
+             * full-screen ray-box drew the whole fog box even when a wall or
+             * ceiling was in front of it, making the mist look like a huge
+             * misaligned box.  Reconstructing the visible world point keeps
+             * the same true-volume behavior but stops at the first rendered
+             * surface, matching how OpenGL Q3 fog is occluded by BSP depth. */
+            float sceneT = 1.0e20;
+            if (sceneZ < 0.999999) {
+                float4 sceneH = uniforms.inverseViewProjection * float4(in.ndc.xy, sceneZ, 1.0);
+                float3 sceneWorld = sceneH.xyz / max(sceneH.w, 1e-6);
+                sceneT = max(dot(sceneWorld - origin, dir), 0.0);
+            }
+            float end = min(tExit, sceneT);
+            float segment = max(end - start, 0.0);
+            if (segment <= 0.0) {
+                return float4(0.0);
+            }
+
+            float density = uniforms.fogParams.x > 0.0 ? uniforms.fogParams.x : 0.0013;
+            float alpha = saturate(1.0 - exp(-segment * density));
+            float3 fogRGB = q3ResolvedFogColor(uniforms.fogColorDistance.xyz);
+            return float4(fogRGB, alpha);
+        }
+
         struct WorldVertexOut {
             float4 position [[position]];
             float2 texCoord;
@@ -1110,6 +1214,7 @@ struct MetalView: UIViewRepresentable {
          * the actual image sample via bilinear filtering and the
          * fogSurface plane clip, matching what stock GL produces.
          * Ported from /tmp/q3_deepseek_overscope.patch. */
+
         float q3FogDirectFactor(float sCoord, float tCoord) {
             float s = sCoord - (1.0 / 512.0);
             float t = tCoord;
@@ -1157,8 +1262,12 @@ struct MetalView: UIViewRepresentable {
                 drawUniforms.fogParams.x <= 0.0) {
                 return out;
             }
-            float3 forward = normalize(cross(float3(uniforms.cameraUp),
-                                             float3(uniforms.cameraRight)));
+            /* WorldUniforms stores screen-right and up.  Q3 fog S is
+             * forward distance from the eye.  right×up = forward; the
+             * old up×right returned -forward, driving S negative for
+             * visible geometry and making stock per-surface fog vanish. */
+            float3 forward = normalize(cross(float3(uniforms.cameraRight),
+                                             float3(uniforms.cameraUp)));
             float s = dot(worldPos - float3(uniforms.cameraPos), forward) *
                       drawUniforms.fogParams.x + (1.0 / 512.0);
             float t = 31.0 / 32.0;
@@ -1493,11 +1602,19 @@ struct MetalView: UIViewRepresentable {
             }
             if (drawUniforms.fogOnly > 0.5) {
                 if (drawUniforms.fogColorDistance.w <= 0.0) {
-                    /* DEBUG: teal when fogColorDistance is zero. */
-                    return float4(0.0, 0.8, 0.7, 0.6);
+                    return float4(0.0);
                 }
                 float f = q3FogFactor(in.worldPos, uniforms, drawUniforms);
-                return float4(drawUniforms.fogColorDistance.xyz, f);
+                if (drawUniforms._pad0 > 0.5) {
+                    /* Explicit fog-volume boundary sheets (xdensegreyfog in
+                     * q3dm4) are authored to be visible as the fog body. The
+                     * stock fog-image math can go nearly zero on the exact
+                     * clip plane, which made the grey sheet disappear once the
+                     * debug magenta was removed. Preserve the earlier debug
+                     * coverage/depth behavior, but use the real grey color. */
+                    f = max(f, 0.58);
+                }
+                return float4(q3ResolvedFogColor(drawUniforms.fogColorDistance.xyz), saturate(f));
             }
 
             // NOTE: No unconditional alpha-test discard here.
@@ -1726,7 +1843,7 @@ struct MetalView: UIViewRepresentable {
             }
             if (uniforms.fogColorDistance.w > 0.0) {
                 float f = q3EntityFogFactor(in.worldPos, uniforms);
-                base.rgb = mix(base.rgb, uniforms.fogColorDistance.xyz, f);
+                base.rgb = mix(base.rgb, q3ResolvedFogColor(uniforms.fogColorDistance.xyz), f);
             }
             return base;
         }
@@ -1853,6 +1970,9 @@ struct MetalView: UIViewRepresentable {
         private var worldPipelineState: MTLRenderPipelineState?
         private var worldFilterPipelineState: MTLRenderPipelineState?
         private var worldAlphaPipelineState: MTLRenderPipelineState?
+        private var fogVolumePipelineState: MTLRenderPipelineState?
+        private var sceneDepthTexture: MTLTexture?
+        private var sceneDepthTextureSize = MTLSize(width: 0, height: 0, depth: 1)
         /* Alpha-modulated additive (GL_SRC_ALPHA/GL_ONE) — blendMode=1. */
         private var worldAdditivePipelineState: MTLRenderPipelineState?
         /* Full-intensity additive (GL_ONE/GL_ONE) — blendMode=5. NEVER
@@ -1906,6 +2026,159 @@ struct MetalView: UIViewRepresentable {
             fallbackDepthStencilState = device.makeDepthStencilState(descriptor: desc)
             return fallbackDepthStencilState
         }
+
+        private func ensureSceneDepthTexture(device: MTLDevice, width: Int, height: Int) -> MTLTexture? {
+            let w = max(width, 1)
+            let h = max(height, 1)
+            if let sceneDepthTexture,
+               sceneDepthTextureSize.width == w,
+               sceneDepthTextureSize.height == h {
+                return sceneDepthTexture
+            }
+            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float,
+                                                                width: w,
+                                                                height: h,
+                                                                mipmapped: false)
+            desc.usage = [.renderTarget, .shaderRead]
+            desc.storageMode = .private
+            let tex = device.makeTexture(descriptor: desc)
+            tex?.label = "Q3.scene.depth.shaderRead"
+            sceneDepthTexture = tex
+            sceneDepthTextureSize = MTLSize(width: w, height: h, depth: 1)
+            return tex
+        }
+
+        private func hasRenderableFogVolume() -> Bool {
+            /* Stock Q3 fog is the BSP fog overlay plus per-surface fog pass.
+             * The ray-box pass is only safe when the eye is actually inside a
+             * fog brush (see encodeFogVolumeRayBox); otherwise the brush AABB
+             * reads as a rectangular fog slab over adjacent rooms. Keep a kill
+             * switch for A/B, but default on with the inside-volume gate. */
+            guard ProcessInfo.processInfo.environment["Q3_METAL_DISABLE_RAYBOX_FOG"] != "1" else { return false }
+            guard fogVolumePipelineState != nil,
+                  let fogs = Q3MetalRenderer_GetWorldFogs() else { return false }
+            let fogCount = Int(Q3MetalRenderer_GetWorldFogCount())
+            guard fogCount > 0 else { return false }
+            for fogIndex in 0..<fogCount {
+                let fog = fogs.advanced(by: fogIndex).pointee
+                if fog.distance > 0, fog.hasBounds != 0 {
+                    let rawMin = SIMD3<Float>(fog.boundsMin.0, fog.boundsMin.1, fog.boundsMin.2)
+                    let rawMax = SIMD3<Float>(fog.boundsMax.0, fog.boundsMax.1, fog.boundsMax.2)
+                    let span = simd_max(rawMin, rawMax) - simd_min(rawMin, rawMax)
+                    if span.x > 1, span.y > 1, span.z > 1 { return true }
+                }
+            }
+            return false
+        }
+
+        private func makeLoadedRenderPassDescriptor(colorTexture: MTLTexture,
+                                                    depthTexture: MTLTexture?) -> MTLRenderPassDescriptor {
+            let pass = MTLRenderPassDescriptor()
+            pass.colorAttachments[0].texture = colorTexture
+            pass.colorAttachments[0].loadAction = .load
+            pass.colorAttachments[0].storeAction = .store
+            if let depthTexture {
+                pass.depthAttachment.texture = depthTexture
+                pass.depthAttachment.loadAction = .load
+                pass.depthAttachment.storeAction = .store
+            }
+            return pass
+        }
+
+        private func encodeFogVolumeRayBox(commandBuffer: MTLCommandBuffer,
+                                           colorTexture: MTLTexture,
+                                           depthTexture: MTLTexture,
+                                           device: MTLDevice,
+                                           sceneView: Q3MetalSceneView) {
+            guard let fogVolumePipelineState,
+                  let fogs = Q3MetalRenderer_GetWorldFogs() else { return }
+            let fogCount = Int(Q3MetalRenderer_GetWorldFogCount())
+            guard fogCount > 0 else { return }
+
+            let viewProjection = makeWorldViewProjection(sceneView)
+            let cameraPos = SIMD3<Float>(sceneView.viewOrigin.0,
+                                         sceneView.viewOrigin.1,
+                                         sceneView.viewOrigin.2)
+
+            if !fogVolumeLogged {
+                var parts: [String] = []
+                for fogIndex in 0..<fogCount {
+                    let fog = fogs.advanced(by: fogIndex).pointee
+                    parts.append("#\(fogIndex) dist=\(fog.distance) hasBounds=\(fog.hasBounds) min=(\(fog.boundsMin.0),\(fog.boundsMin.1),\(fog.boundsMin.2)) max=(\(fog.boundsMax.0),\(fog.boundsMax.1),\(fog.boundsMax.2)) hasSurface=\(fog.hasSurface) surface=(\(fog.surface.0),\(fog.surface.1),\(fog.surface.2),\(fog.surface.3))")
+                }
+                print("[Metal] fog volume depth-limited ray-box pass count=\(fogCount) \(parts.joined(separator: " | "))")
+                fogVolumeLogged = true
+            }
+
+            let fogPass = makeLoadedRenderPassDescriptor(colorTexture: colorTexture, depthTexture: nil)
+            guard let fogEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: fogPass) else { return }
+            fogEncoder.label = "Q3.fog.depthLimitedRayBox"
+            fogEncoder.setViewport(MTLViewport(originX: 0,
+                                               originY: 0,
+                                               width: Double(colorTexture.width),
+                                               height: Double(colorTexture.height),
+                                               znear: 0.0,
+                                               zfar: 1.0))
+            fogEncoder.setRenderPipelineState(fogVolumePipelineState)
+            fogEncoder.setDepthStencilState(ensuredDepthStencilState(alwaysPassDepthStencilState, device: device))
+            fogEncoder.setCullMode(.none)
+            fogEncoder.setFrontFacing(.clockwise)
+            fogEncoder.setFragmentTexture(depthTexture, index: 0)
+
+            for fogIndex in 0..<fogCount {
+                let fog = fogs.advanced(by: fogIndex).pointee
+                guard fog.distance > 0, fog.hasBounds != 0 else { continue }
+
+                let rawMin = SIMD3<Float>(fog.boundsMin.0, fog.boundsMin.1, fog.boundsMin.2)
+                let rawMax = SIMD3<Float>(fog.boundsMax.0, fog.boundsMax.1, fog.boundsMax.2)
+                let bmin = simd_min(rawMin, rawMax)
+                let bmax = simd_max(rawMin, rawMax)
+                let span = bmax - bmin
+                guard span.x > 1, span.y > 1, span.z > 1 else { continue }
+
+                let surface = SIMD4<Float>(fog.surface.0, fog.surface.1, fog.surface.2, fog.surface.3)
+                if fog.hasSurface != 0 {
+                    let eyeT = simd_dot(cameraPos, SIMD3<Float>(surface.x, surface.y, surface.z)) - surface.w
+                    if eyeT < 0 {
+                        /* When the camera is outside/above a Q3 fog volume,
+                         * stock ioq3 does not draw a physical screen-space fog
+                         * box over every surface behind it; it draws the fog
+                         * boundary/surface pass and fogged BSP surfaces.  Keep
+                         * the ray-box only for eye-inside/below-plane views so
+                         * q3dm4 has volume when inside the pit without the
+                         * overextended grey box when looking in from above. */
+                        continue
+                    }
+                }
+                let boundsMargin: Float = 0.5
+                guard cameraPos.x >= bmin.x - boundsMargin,
+                      cameraPos.x <= bmax.x + boundsMargin,
+                      cameraPos.y >= bmin.y - boundsMargin,
+                      cameraPos.y <= bmax.y + boundsMargin,
+                      cameraPos.z >= bmin.z - boundsMargin,
+                      cameraPos.z <= bmax.z + boundsMargin else {
+                    /* AABB ray integration is a good approximation only when
+                     * the viewer is inside the fog brush. From outside, q3dm4
+                     * should show the authored fog boundary/surface pass; a
+                     * full-screen ray through the brush bounds is what made the
+                     * device build look like an oversized misaligned box. */
+                    continue
+                }
+                var uniforms = FogVolumeUniforms(
+                    viewProjection: viewProjection,
+                    inverseViewProjection: simd_inverse(viewProjection),
+                    cameraPos: cameraPos,
+                    fogColorDistance: SIMD4<Float>(fog.color.0, fog.color.1, fog.color.2, fog.distance),
+                    boundsMin: SIMD4<Float>(bmin.x, bmin.y, bmin.z, 0),
+                    boundsMax: SIMD4<Float>(bmax.x, bmax.y, bmax.z, 0),
+                    fogSurface: surface,
+                    fogParams: SIMD4<Float>(0.0013, 0, 0, 0))
+                fogEncoder.setVertexBytes(&uniforms, length: MemoryLayout<FogVolumeUniforms>.stride, index: 1)
+                fogEncoder.setFragmentBytes(&uniforms, length: MemoryLayout<FogVolumeUniforms>.stride, index: 1)
+                fogEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+            }
+            fogEncoder.endEncoding()
+        }
         private var textureCache: [UInt32: (generation: UInt32, texture: MTLTexture)] = [:]
         private var vertexBuffer: MTLBuffer?
         private var vertexBufferCapacity = 0
@@ -1917,6 +2190,7 @@ struct MetalView: UIViewRepresentable {
         private var entityIndexBuffer: MTLBuffer?
         private var entityIndexBufferCapacity = 0
         private var debugFrameCounter: UInt32 = 0
+        private var fogVolumeLogged = false
         private var frameTimeOrigin = CACurrentMediaTime()
         private var lastPerfLogTime = CACurrentMediaTime()
         private var lastPerfLogFrame: UInt32 = 0
@@ -2028,7 +2302,20 @@ struct MetalView: UIViewRepresentable {
                 print("[Metal] FATAL: drawable is memoryless — destinationColor will be undefined. Filter/subtract blends will not work.")
             }
 
-            guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
+            let wantsFogRayBox = hasRenderableFogVolume()
+            let sceneDepth = wantsFogRayBox ? view.device.flatMap { device in
+                ensureSceneDepthTexture(device: device,
+                                        width: Int(view.drawableSize.width),
+                                        height: Int(view.drawableSize.height))
+            } : nil
+            if let sceneDepth {
+                descriptor.depthAttachment.texture = sceneDepth
+                descriptor.depthAttachment.loadAction = .clear
+                descriptor.depthAttachment.storeAction = .store
+                descriptor.depthAttachment.clearDepth = 1.0
+            }
+
+            guard var encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
                 return
             }
             encoder.label = "Q3.render"
@@ -2662,11 +2949,24 @@ struct MetalView: UIViewRepresentable {
                                 fogOnly: 1,
                                 stageUsesLightmap: 0,
                                 drawHasLightmapStage: 0,
-                                _pad0: 0
+                                _pad0: (draw.flags & fogOverlayBit) != 0 ? 1.0 : 0.0
                             )
                             encoder.setRenderPipelineState(worldAlphaPipelineState)
-                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveLessDepthStencilState, device: view.device))
-                            encoder.setCullMode(Self.metalCullMode(for: stage.cullMode))
+                            let fogOverlayDraw = (draw.flags & fogOverlayBit) != 0
+                            /* Regular fog passes and explicit fog-volume
+                             * boundary sheets use LEQUAL so BSP depth occludes
+                             * them. The previous always-pass state was safe only
+                             * while the shader hid boundary sheets; once visible
+                             * again, always-pass made the fog plane bleed through
+                             * walls and read as a misaligned rectangle. */
+                            encoder.setDepthStencilState(ensuredDepthStencilState(
+                                additiveDepthStencilState,
+                                device: view.device))
+                            if fogOverlayDraw {
+                                encoder.setCullMode(.none)
+                            } else {
+                                encoder.setCullMode(Self.metalCullMode(for: stage.cullMode))
+                            }
                             encoder.setFragmentTexture(lightmapTexture, index: 0)
                             encoder.setFragmentTexture(lightmapTexture, index: 1)
                             encoder.setFragmentBytes(&fogUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 0)
@@ -3046,6 +3346,34 @@ struct MetalView: UIViewRepresentable {
                 }
             }
 
+            if let sceneView = Q3MetalRenderer_GetSceneView()?.pointee,
+               let device = view.device,
+               let sceneDepth,
+               wantsFogRayBox {
+                encoder.endEncoding()
+                encodeFogVolumeRayBox(commandBuffer: commandBuffer,
+                                      colorTexture: drawable.texture,
+                                      depthTexture: sceneDepth,
+                                      device: device,
+                                      sceneView: sceneView)
+                let postFogPass = makeLoadedRenderPassDescriptor(colorTexture: drawable.texture,
+                                                                 depthTexture: sceneDepth)
+                guard let postFogEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: postFogPass) else {
+                    return
+                }
+                encoder = postFogEncoder
+                encoder.label = "Q3.render.postFog"
+                encoder.setViewport(MTLViewport(originX: 0,
+                                                originY: 0,
+                                                width: Double(view.drawableSize.width),
+                                                height: Double(view.drawableSize.height),
+                                                znear: 0.0,
+                                                zfar: 1.0))
+                encoder.setScissorRect(MTLScissorRect(x: 0, y: 0,
+                                                       width: Int(view.drawableSize.width),
+                                                       height: Int(view.drawableSize.height)))
+            }
+
             /* Multi-scene HUD sub-scenes. Scene 0 is the main world view
              * handled by the blocks above. Scenes 1..sceneCount are HUD
              * portrait heads, rotating ammo pickups, scoreboard faces,
@@ -3414,6 +3742,25 @@ struct MetalView: UIViewRepresentable {
                 worldAlphaPipelineState = try device.makeRenderPipelineState(descriptor: worldAlphaPipelineDescriptor)
             } catch {
                 print("[Metal] Failed to create alpha world pipeline: \\(error)")
+            }
+
+            let fogVolumePipelineDescriptor = MTLRenderPipelineDescriptor()
+            fogVolumePipelineDescriptor.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            fogVolumePipelineDescriptor.depthAttachmentPixelFormat = view.depthStencilPixelFormat
+            fogVolumePipelineDescriptor.vertexFunction = library.makeFunction(name: "q3_fog_volume_vertex")
+            fogVolumePipelineDescriptor.fragmentFunction = library.makeFunction(name: "q3_fog_volume_fragment")
+            fogVolumePipelineDescriptor.colorAttachments[0].isBlendingEnabled = true
+            fogVolumePipelineDescriptor.colorAttachments[0].rgbBlendOperation = .add
+            fogVolumePipelineDescriptor.colorAttachments[0].alphaBlendOperation = .add
+            fogVolumePipelineDescriptor.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+            fogVolumePipelineDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
+            fogVolumePipelineDescriptor.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+            fogVolumePipelineDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            fogVolumePipelineDescriptor.label = "Q3.fog.depthLimitedRayBox"
+            do {
+                fogVolumePipelineState = try device.makeRenderPipelineState(descriptor: fogVolumePipelineDescriptor)
+            } catch {
+                print("[Metal] Failed to create fog-volume pipeline: \\(error)")
             }
 
             /* Alpha-modulated additive (blendMode=1): GL_SRC_ALPHA/GL_ONE. */

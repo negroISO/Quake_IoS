@@ -390,10 +390,18 @@ typedef enum {
 	VM_COUNT
 } vmIndex_t;
 
-// we don't need more than 4 arguments (counting callnum) for vmMain, at least in Vanilla Quake3
-#define MAX_VMMAIN_CALL_ARGS 4
+/*
+ * Native vmMain exports in game/cgame/ui all use the full id Tech 3 ABI:
+ * command + 12 integer arguments.  iOS links native cgame directly, so the
+ * function pointer type must match the real signature on arm64; calling the
+ * 13-argument CG_vmMain through a 4-argument pointer is undefined behavior and
+ * can read past the caller's stack frame during shutdown.
+ */
+#define MAX_VMMAIN_CALL_ARGS 13
 
-typedef intptr_t (QDECL *vmMainFunc_t)( int command, int arg0, int arg1, int arg2 );
+typedef intptr_t (QDECL *vmMainFunc_t)( int command, int arg0, int arg1,
+		int arg2, int arg3, int arg4, int arg5, int arg6, int arg7,
+		int arg8, int arg9, int arg10, int arg11 );
 
 typedef intptr_t (*syscall_t)( intptr_t *parms );
 typedef intptr_t (QDECL *dllSyscall_t)( intptr_t callNum, ... );

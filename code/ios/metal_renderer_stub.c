@@ -4100,6 +4100,44 @@ static void MetalWorldAppendSurfaceDraws(bspMsurface_t *surf,
     s_world.visibleDrawCount += range.drawCount;
 }
 
+static qboolean MetalWorldVisibleDrawAlreadyHas(const Q3MetalWorldDrawCmd *draw) {
+    uint32_t i;
+
+    if (draw == NULL || s_world.visibleDraws == NULL) return qfalse;
+
+    for (i = 0; i < s_world.visibleDrawCount; ++i) {
+        const Q3MetalWorldDrawCmd *visible = &s_world.visibleDraws[i];
+        if (visible->firstIndex == draw->firstIndex &&
+            visible->indexCount == draw->indexCount &&
+            visible->flags == draw->flags &&
+            visible->fogIndex == draw->fogIndex &&
+            visible->lightmapTextureHandle == draw->lightmapTextureHandle) {
+            return qtrue;
+        }
+    }
+    return qfalse;
+}
+
+static void MetalWorldAppendFogOverlayDraws(void) {
+    uint32_t di;
+
+    if (s_world.draws == NULL || s_world.visibleDraws == NULL) return;
+
+    for (di = 0; di < s_world.drawCount; ++di) {
+        const Q3MetalWorldDrawCmd *draw = &s_world.draws[di];
+        if ((draw->flags & Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY) == 0) {
+            continue;
+        }
+        if (MetalWorldVisibleDrawAlreadyHas(draw)) {
+            continue;
+        }
+        if (s_world.visibleDrawCount >= s_world.visibleDrawCapacity) {
+            return;
+        }
+        s_world.visibleDraws[s_world.visibleDrawCount++] = *draw;
+    }
+}
+
 static void MetalWorldRecursiveNode(bspMnode_t *node,
                                     int planeBits,
                                     const cplane_t frustum[4],
@@ -4160,6 +4198,13 @@ static void MetalWorldBuildVisibleDraws(const vec3_t vieworg,
     MetalWorldBuildFrustum(frustum, vieworg, axis0, axis1, axis2, fovX, fovY);
     surfaceStamp = MetalWorldNextSurfaceStamp();
     MetalWorldRecursiveNode(s_bspWorld.nodes, 15, frustum, vieworg, surfaceStamp);
+    /* Fog-volume overlay surfaces are authored as boundary sheets for the
+     * whole volume, not normal wall/floor detail. PVS/frustum surface culling
+     * can drop the one q3dm4 fog sheet after the demo camera starts moving,
+     * which makes fog flash for a few startup frames and then disappear.
+     * Keep explicit fog overlays resident in the visible stream; depth test and
+     * one-sided culling in Swift still prevent them from drawing through walls. */
+    MetalWorldAppendFogOverlayDraws();
 
     if (s_world.visibleDrawCount > 0) {
         s_world.visibleDrawsValid = qtrue;
@@ -4751,6 +4796,13 @@ static qboolean LoadWorldMapData(const char *name) {
                 s_worldFogsPublic[fi].surface[1] = s_worldFogs[fi].surface[1];
                 s_worldFogsPublic[fi].surface[2] = s_worldFogs[fi].surface[2];
                 s_worldFogsPublic[fi].surface[3] = s_worldFogs[fi].surface[3];
+                s_worldFogsPublic[fi].hasBounds = s_worldFogs[fi].hasBounds ? 1u : 0u;
+                s_worldFogsPublic[fi].boundsMin[0] = s_worldFogs[fi].bounds[0][0];
+                s_worldFogsPublic[fi].boundsMin[1] = s_worldFogs[fi].bounds[0][1];
+                s_worldFogsPublic[fi].boundsMin[2] = s_worldFogs[fi].bounds[0][2];
+                s_worldFogsPublic[fi].boundsMax[0] = s_worldFogs[fi].bounds[1][0];
+                s_worldFogsPublic[fi].boundsMax[1] = s_worldFogs[fi].bounds[1][1];
+                s_worldFogsPublic[fi].boundsMax[2] = s_worldFogs[fi].bounds[1][2];
                 withColor += 1;
             }
             /* Unresolved volumes leave s_worldFogsPublic[fi] at the
