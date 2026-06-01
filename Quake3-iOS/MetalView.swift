@@ -3476,6 +3476,7 @@ struct MetalView: UIViewRepresentable {
                     encoder.setCullMode(.none)
                     encoder.setVertexBuffer(entityVertexBuffer, offset: 0, index: 0)
                     encoder.setVertexBytes(&subUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
+                    encoder.setFragmentBytes(&subUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
                     encoder.setFragmentSamplerState(worldSamplerState, index: 0)
                     Self.bindDlightBlock(snapshot: snapshot, encoder: encoder, index: 2)
 
@@ -4349,6 +4350,7 @@ struct MetalView: UIViewRepresentable {
 
             encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
             encoder.setVertexBytes(&uniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
+            encoder.setFragmentBytes(&uniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
             encoder.drawIndexedPrimitives(
                 type: .triangle,
                 indexCount: indices.count,
