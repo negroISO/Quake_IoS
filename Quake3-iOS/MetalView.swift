@@ -981,9 +981,18 @@ struct MetalView: UIViewRepresentable {
          * Called unconditionally by world + entity fragments except where the
          * stage blend mode explicitly masks it (filter/multiply would darken
          * the screen if we added to already-multiplied output). */
-        float3 applyDlights(float3 lit, float3 worldPos, constant DLightBlock &block) {
+        float3 applyDlights(float3 lit,
+                            float3 worldPos,
+                            float3 surfaceNormal,
+                            constant DLightBlock &block) {
             uint count = min(block.count, 32u);
             float3 accum = float3(0.0);
+            float3 n = surfaceNormal;
+            float nLen = length(n);
+            bool hasNormal = nLen > 1e-4;
+            if (hasNormal) {
+                n /= nLen;
+            }
             for (uint i = 0; i < count; ++i) {
                 MSLLight L = block.lights[i];
                 float r = max(L.radius, 1.0);
@@ -991,13 +1000,22 @@ struct MetalView: UIViewRepresentable {
                 float dist = length(d);
                 float atten = saturate(1.0 - dist / r);
                 atten = atten * atten;
-                accum += float3(L.color) * atten;
+                if (hasNormal && dist > 1e-4) {
+                    /* Q3 dynamic lights are projected onto surfaces in an
+                     * extra pass, not added as omnidirectional ambient. A
+                     * normal-facing term prevents rocket/flame dlights from
+                     * flooding through back sides and adjacent thin geometry
+                     * while still leaving a small wrap term for curved meshes. */
+                    float facing = saturate(dot(n, normalize(-d)));
+                    atten *= (0.15 + 0.85 * facing);
+                }
+                accum += float3(L.color) * atten * 0.65;
             }
             /* Clamp accumulated contribution so stacked explosions don't
-             * white out the scene. 1.5 keeps a strong punch for nearby
-             * rockets + muzzle flashes without saturating the base lit
-             * color beyond what the eye reads as "bright". */
-            accum = min(accum, float3(1.5));
+             * white out the scene. Dynamic lights are a polish layer over
+             * baked lightmaps, not a replacement for Q3's projected dlight
+             * pass. */
+            accum = min(accum, float3(0.85));
             return lit + accum;
         }
 
@@ -1607,12 +1625,34 @@ struct MetalView: UIViewRepresentable {
                 float f = q3FogFactor(in.worldPos, uniforms, drawUniforms);
                 if (drawUniforms._pad0 > 0.5) {
                     /* Explicit fog-volume boundary sheets (xdensegreyfog in
-                     * q3dm4) are authored to be visible as the fog body. The
-                     * stock fog-image math can go nearly zero on the exact
-                     * clip plane, which made the grey sheet disappear once the
-                     * debug magenta was removed. Preserve the earlier debug
-                     * coverage/depth behavior, but use the real grey color. */
-                    f = max(f, 0.58);
+                     * q3dm4) are authored as the visible fog cap, not as an
+                     * opaque box. Only keep a low floor on faces whose normal
+                     * is parallel to the fog surface plane. Side faces keep
+                     * the stock fog-image value so the volume does not read as
+                     * a hard rectangular wall when the camera moves inside or
+                     * below the pit. */
+                    float capFloor = 0.0;
+                    if (drawUniforms.fogParams.y > 0.5) {
+                        float3 fogN = drawUniforms.fogSurface.xyz;
+                        float fogNLen = length(fogN);
+                        if (fogNLen > 1e-4) {
+                            fogN /= fogNLen;
+                            float3 n = in.worldNormal;
+                            float nLen = length(n);
+                            if (nLen > 1e-4) {
+                                n /= nLen;
+                            } else {
+                                float3 dx = dfdx(in.worldPos);
+                                float3 dy = dfdy(in.worldPos);
+                                n = normalize(cross(dx, dy));
+                            }
+                            float capAlign = abs(dot(n, fogN));
+                            capFloor = (capAlign > 0.70) ? 0.24 : 0.0;
+                        }
+                    } else {
+                        capFloor = 0.18;
+                    }
+                    f = max(f, capFloor);
                 }
                 return float4(q3ResolvedFogColor(drawUniforms.fogColorDistance.xyz), saturate(f));
             }
@@ -1688,7 +1728,13 @@ struct MetalView: UIViewRepresentable {
              * additive blends; we don't have that separate iteration so
              * we gate inline. */
             if (!additiveStage) {
-                lit = applyDlights(lit, in.worldPos, dlights);
+                float3 dlightN = in.worldNormal;
+                if (length(dlightN) <= 1e-4) {
+                    float3 dx = dfdx(in.worldPos);
+                    float3 dy = dfdy(in.worldPos);
+                    dlightN = normalize(cross(dx, dy));
+                }
+                lit = applyDlights(lit, in.worldPos, dlightN, dlights);
             }
             return float4(lit, texel.a * va);
         }
@@ -1839,7 +1885,13 @@ struct MetalView: UIViewRepresentable {
             }
             float4 base = float4(baseRgb, baseA);
             if (uniforms.suppressDlights == 0u) {
-                base.rgb = applyDlights(base.rgb, in.worldPos, dlights);
+                float3 dlightN = in.normal;
+                if (length(dlightN) <= 1e-4) {
+                    float3 dx = dfdx(in.worldPos);
+                    float3 dy = dfdy(in.worldPos);
+                    dlightN = normalize(cross(dx, dy));
+                }
+                base.rgb = applyDlights(base.rgb, in.worldPos, dlightN, dlights);
             }
             if (uniforms.fogColorDistance.w > 0.0) {
                 float f = q3EntityFogFactor(in.worldPos, uniforms);
@@ -2137,33 +2189,23 @@ struct MetalView: UIViewRepresentable {
                 guard span.x > 1, span.y > 1, span.z > 1 else { continue }
 
                 let surface = SIMD4<Float>(fog.surface.0, fog.surface.1, fog.surface.2, fog.surface.3)
-                if fog.hasSurface != 0 {
-                    let eyeT = simd_dot(cameraPos, SIMD3<Float>(surface.x, surface.y, surface.z)) - surface.w
-                    if eyeT < 0 {
-                        /* When the camera is outside/above a Q3 fog volume,
-                         * stock ioq3 does not draw a physical screen-space fog
-                         * box over every surface behind it; it draws the fog
-                         * boundary/surface pass and fogged BSP surfaces.  Keep
-                         * the ray-box only for eye-inside/below-plane views so
-                         * q3dm4 has volume when inside the pit without the
-                         * overextended grey box when looking in from above. */
+                if ProcessInfo.processInfo.environment["Q3_METAL_FOG_RAYBOX_INSIDE_ONLY"] == "1" {
+                    if fog.hasSurface != 0 {
+                        let eyeT = simd_dot(cameraPos, SIMD3<Float>(surface.x, surface.y, surface.z)) - surface.w
+                        if eyeT < 0 { continue }
+                    }
+                    let boundsMargin: Float = 0.5
+                    guard cameraPos.x >= bmin.x - boundsMargin,
+                          cameraPos.x <= bmax.x + boundsMargin,
+                          cameraPos.y >= bmin.y - boundsMargin,
+                          cameraPos.y <= bmax.y + boundsMargin,
+                          cameraPos.z >= bmin.z - boundsMargin,
+                          cameraPos.z <= bmax.z + boundsMargin else {
                         continue
                     }
                 }
-                let boundsMargin: Float = 0.5
-                guard cameraPos.x >= bmin.x - boundsMargin,
-                      cameraPos.x <= bmax.x + boundsMargin,
-                      cameraPos.y >= bmin.y - boundsMargin,
-                      cameraPos.y <= bmax.y + boundsMargin,
-                      cameraPos.z >= bmin.z - boundsMargin,
-                      cameraPos.z <= bmax.z + boundsMargin else {
-                    /* AABB ray integration is a good approximation only when
-                     * the viewer is inside the fog brush. From outside, q3dm4
-                     * should show the authored fog boundary/surface pass; a
-                     * full-screen ray through the brush bounds is what made the
-                     * device build look like an oversized misaligned box. */
-                    continue
-                }
+                let fogDistance = max(fog.distance, 1.0)
+                let rayDensity = min(max(2.0 / fogDistance, 0.00035), 0.0014)
                 var uniforms = FogVolumeUniforms(
                     viewProjection: viewProjection,
                     inverseViewProjection: simd_inverse(viewProjection),
@@ -2172,7 +2214,7 @@ struct MetalView: UIViewRepresentable {
                     boundsMin: SIMD4<Float>(bmin.x, bmin.y, bmin.z, 0),
                     boundsMax: SIMD4<Float>(bmax.x, bmax.y, bmax.z, 0),
                     fogSurface: surface,
-                    fogParams: SIMD4<Float>(0.0013, 0, 0, 0))
+                    fogParams: SIMD4<Float>(rayDensity, 0, 0, 0))
                 fogEncoder.setVertexBytes(&uniforms, length: MemoryLayout<FogVolumeUniforms>.stride, index: 1)
                 fogEncoder.setFragmentBytes(&uniforms, length: MemoryLayout<FogVolumeUniforms>.stride, index: 1)
                 fogEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
@@ -3278,7 +3320,7 @@ struct MetalView: UIViewRepresentable {
                         let ec = draw.entityColor
                         entityUniforms.entityColor = SIMD4<Float>(ec.0, ec.1, ec.2, ec.3)
                         entityUniforms.timeSeconds = draw.shaderTime
-                        entityUniforms.suppressDlights = (drawPass == 5) ? 1 : 0
+                        entityUniforms.suppressDlights = (drawPass == 3 || drawPass == 5) ? 1 : 0
                         /* Per TASK PART 3: no rgbGen/alphaGen override for
                          * scene polys — the shader's resolved genMode
                          * flows through verbatim from packEntityRgbGen. */
