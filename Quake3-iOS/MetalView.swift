@@ -541,7 +541,9 @@ struct MetalView: UIViewRepresentable {
                 let pp = m.params
                 let v: SIMD4<Float>
                 if m.type == 3 {
-                    v = SIMD4<Float>(-pp.0 * .pi / 180.0, 0, 0, 0)
+                    /* applyTcMod(type=3) owns the degrees→radians
+                     * conversion. Pack signed degrees/sec here only. */
+                    v = SIMD4<Float>(-pp.0, 0, 0, 0)
                 } else {
                     v = SIMD4<Float>(pp.0, pp.1, pp.2, pp.3)
                 }
@@ -571,9 +573,9 @@ struct MetalView: UIViewRepresentable {
          * into the fragment-side slots of the provided EntityUniforms.
          * Scope is scroll (type=1) and rotate (type=3) only — any other
          * type is cleared to 0 so applyTcMod becomes a no-op. Rotate's
-         * speed gets converted from degrees/sec to radians/sec AND
-         * negated to match ioquake3's `degs = -degsPerSecond * timeScale`
-         * sign convention (so CW rotation looks like Q3's quad shell). */
+         * speed stays in degrees/sec; applyTcMod does the single
+         * degrees→radians conversion. We only negate to match ioquake3's
+         * `degs = -degsPerSecond * timeScale` sign convention. */
         private static func packEntityTcMods(handle: UInt32, into uniforms: inout EntityUniforms) {
             uniforms.tcModCount = 0
             uniforms.tcModType = SIMD4<Float>(0, 0, 0, 0)
@@ -595,9 +597,9 @@ struct MetalView: UIViewRepresentable {
                 case 1: /* scroll: params.xy = s/t speed, unchanged */
                     types[i] = 1
                     packed[i] = SIMD4(pp.0, pp.1, 0, 0)
-                case 3: /* rotate: degrees/sec → radians/sec, negated */
+                case 3: /* rotate: signed degrees/sec; MSL converts once */
                     types[i] = 3
-                    packed[i] = SIMD4(-pp.0 * .pi / 180.0, 0, 0, 0)
+                    packed[i] = SIMD4(-pp.0, 0, 0, 0)
                 case 4: /* scale: params.xy = s/t scale factors, unchanged */
                     types[i] = 4
                     packed[i] = SIMD4(pp.0, pp.1, 0, 0)
@@ -1176,11 +1178,7 @@ struct MetalView: UIViewRepresentable {
                 float s = sin(timeSeconds * params.w) * params.y;
                 return uv + float2(s, s);
             } else if (type == 3) {
-                /* tcMod rotate stores degrees/second in Q3 shader scripts.
-                 * Metal was treating that value as radians/second, making
-                 * q3dm4 additive energy/light stages spin ~57x too fast and
-                 * alias into bright streaks/moire. Mirror RB_CalcRotateTexCoords
-                 * by converting to radians here. */
+                /* Params are signed degrees/second. Convert exactly once. */
                 float degrees = fmod(params.x * timeSeconds, 360.0);
                 float a = degrees * (3.14159265 / 180.0);
                 float c = cos(a);
@@ -1801,9 +1799,8 @@ struct MetalView: UIViewRepresentable {
             }
             /* Apply stage 0 tcMod chain after tcGen (matches upstream
              * order: tcGen first, then each tcMod directive sequentially).
-             * Scope: scroll (type=1) and rotate (type=3) only — rotate
-             * param.x is packed as `-degs * π/180` so applyTcMod's
-             * cos/sin treat it as radians/sec with CW sign. */
+             * Rotate param.x is packed as signed degrees/sec; applyTcMod
+             * does the single degrees→radians conversion. */
             int entityModCount = uniforms.tcModCount;
             if (entityModCount > 0) texCoord = applyTcMod(texCoord, in.worldPos, int(uniforms.tcModType.x + 0.5), uniforms.tcModParams0, uniforms.timeSeconds);
             if (entityModCount > 1) texCoord = applyTcMod(texCoord, in.worldPos, int(uniforms.tcModType.y + 0.5), uniforms.tcModParams1, uniforms.timeSeconds);
@@ -3258,7 +3255,13 @@ struct MetalView: UIViewRepresentable {
                 encoder.setVertexBuffer(entityVertexBuffer, offset: 0, index: 0)
                 encoder.setVertexBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
                 encoder.setFragmentBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
-                encoder.setFragmentSamplerState(worldSamplerState, index: 0)
+                // Q3 entity additive/clampmap stages need clampToEdge to
+                // prevent dlight projection discs, muzzle-flash sprites,
+                // and tcGen-environment refraction samples from tiling
+                // (concentric ring artifact across the framebuffer). World
+                // surfaces still use the .repeat sampler at line ~2415;
+                // entities go through uiSamplerState (clampToEdge).
+                encoder.setFragmentSamplerState(uiSamplerState, index: 0)
 
                 // Dlights for entities (viewmodel, players, pickups lit by
                 // nearby muzzle flash / rocket glow). Same block as world pass.
@@ -3491,7 +3494,11 @@ struct MetalView: UIViewRepresentable {
                     encoder.setVertexBuffer(entityVertexBuffer, offset: 0, index: 0)
                     encoder.setVertexBytes(&subUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
                     encoder.setFragmentBytes(&subUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
-                    encoder.setFragmentSamplerState(worldSamplerState, index: 0)
+                    // HUD sub-scene entity samples need clampToEdge — see
+                    // comment at the world-scene entity bind above. Same
+                    // reason: dlight/sprite/refraction stages tile under
+                    // .repeat. Sub-scenes run inside Q3.render.postFog.
+                    encoder.setFragmentSamplerState(uiSamplerState, index: 0)
                     Self.bindDlightBlock(snapshot: snapshot, encoder: encoder, index: 2)
 
                     let first = Int(scene.entityCommandFirst)
@@ -4257,7 +4264,12 @@ struct MetalView: UIViewRepresentable {
             guard let texture = device.makeTexture(descriptor: descriptor) else {
                 return nil
             }
-            texture.label = "Q3.tex.\(handle)"
+            if let namePtr = Q3MetalRenderer_GetTextureName(handle) {
+                let name = String(cString: namePtr)
+                texture.label = name.isEmpty ? "Q3.tex.\(handle)" : "Q3.tex.\(handle):\(name)"
+            } else {
+                texture.label = "Q3.tex.\(handle)"
+            }
 
             let bytesPerRow = Int(info.width) * 4
             texture.replace(
@@ -4309,7 +4321,12 @@ struct MetalView: UIViewRepresentable {
             encoder.setRenderPipelineState(flarePipeline)
             encoder.setDepthStencilState(flareDepth)
             encoder.setCullMode(.none)
-            encoder.setFragmentSamplerState(worldSamplerState, index: 0)
+            // Flare disc texture (Q3 tr.flareShader image) must clampToEdge
+            // — with .repeat the falloff disc tiles across the framebuffer
+            // and the rings persist through the fog volume into Q3.ui (see
+            // fog-fix comment at encodeMainFlarePass call site). uiSampler
+            // is the existing clampToEdge sampler created at line ~4031.
+            encoder.setFragmentSamplerState(uiSamplerState, index: 0)
             encoder.setFragmentTexture(flareTexture, index: 0)
             // q3_entity_fragment declares the dlight block at buffer(2).
             // It is suppressed for flares, but binding defensively keeps

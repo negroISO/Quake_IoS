@@ -8508,6 +8508,9 @@ static void RE_RenderScene(const refdef_t *fd) {
                         dst->color[1] = (float)src->modulate.rgba[1] / 255.0f;
                         dst->color[2] = (float)src->modulate.rgba[2] / 255.0f;
                         dst->color[3] = (float)src->modulate.rgba[3] / 255.0f;
+                        dst->normal[0] = 0.0f;
+                        dst->normal[1] = 0.0f;
+                        dst->normal[2] = 0.0f;
                     }
                     for (ti = 0; ti < nv - 2; ++ti) {
                         s_entityIndices[entityIndexCursor + ti * 3 + 0] = baseVertex;
@@ -9315,6 +9318,14 @@ int Q3MetalRenderer_GetTextureInfo(uint32_t textureHandle, Q3MetalTextureInfo *o
     outInfo->rgbConstColor[2] = texture->rgbConstColor[2];
     outInfo->alphaConst = texture->alphaConst;
     return 1;
+}
+
+const char *Q3MetalRenderer_GetTextureName(uint32_t textureHandle) {
+    metalTexture_t *texture = FindTextureByHandle((qhandle_t)textureHandle);
+    if (texture == NULL) {
+        return NULL;
+    }
+    return texture->name;
 }
 
 refexport_t *GetRefAPI(int apiVersion, refimport_t *rimp) {

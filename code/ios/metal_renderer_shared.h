@@ -450,6 +450,7 @@ const Q3MetalFlare *Q3MetalRenderer_GetFlares(void);
 uint32_t Q3MetalRenderer_GetFlareTextureHandle(void);
 const Q3MetalSceneView *Q3MetalRenderer_GetSceneView(void);
 int Q3MetalRenderer_GetTextureInfo(uint32_t textureHandle, Q3MetalTextureInfo *outInfo);
+const char *Q3MetalRenderer_GetTextureName(uint32_t textureHandle);
 
 #ifdef __cplusplus
 }
