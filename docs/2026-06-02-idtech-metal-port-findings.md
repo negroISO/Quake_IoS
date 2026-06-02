@@ -247,18 +247,65 @@ of emit — in the draw-pass routing, pipeline state, or MSL itself.
 - This session's Q3 commit: `2e2273f` on branch `metal-renderer-fresh`
   in `/Users/targus/Documents/Quake_IoS/`.
 
-## Items deferred to follow-up
+## Items completed in this session (addendum)
 
-- **`deformVertexes bulge` MSL implementation** for q3dm4 organic
-  tube/vein decorations. Needs `deformBulgeFunc` + `deformBulgeWidth/
-  Height/Speed` plumbed through `Q3MetalWorldStage`, `WorldDrawUniforms`,
-  and the MSL world vertex shader. Different deform type from wave;
-  produces an animated rippling pattern across the surface controlled
-  by bulgeWidth / bulgeHeight / bulgeSpeed. Currently silently ignored.
-- **Q3 async WAL texture upload port** from Q2 (Q2 commits `868b72f` +
-  `2fec194`): iPad Pro 13" M4 200s xctrace measured median 119 FPS
-  async-on vs 71 FPS off in Q2, pool warm with 0 misses across 10,640
-  presents. Q3 entity texture cache could see similar gains.
+- **`deformVertexes bulge` plumbing** — landed in commit `980b8d8`. Was
+  previously a parse-and-discard at `metal_renderer_stub.c:6342` (three
+  `(void)COM_ParseExt(...)` calls and a comment that literally said
+  "Skip"). Same plumbing shape as deformWave: parser file-scope locals
+  → stage stamp at shader close → `Q3MetalWorldStage` field copy →
+  `WorldDrawUniforms` field propagation at 4 world stage→uniforms init
+  sites → MSL `q3_world_vertex` block right after the existing
+  deformWave block. Math: `phase = st.s * bulgeWidth + time * bulgeSpeed;
+  scale = sin(phase) * bulgeHeight; pos += normal * scale`. Gated on
+  `bulgeWidth != 0 || bulgeHeight != 0` because canonical Q3 shaders
+  only specify bulge when actively using it.
+
+  **Pattern lesson for Q2 + Doom3:** any shader-pipeline feature
+  currently implemented as "parser parses then throws away" needs the
+  full parser → struct → uniforms → shader plumbing. Search any port
+  for `parse-and-discard` style stubs to find similar gaps. In our
+  Q3 case the comment "// 3 args. Skip." was the smoking gun.
+
+- **Async WAL texture upload Phase 1** — landed in commit `a93aa8a`.
+  Port of Q2 commits 868b72f + 2fec194. Architecture:
+  - Dedicated background `MTLCommandQueue` ("Q3.tex.asyncUpload")
+  - Staging buffer pool: 4 × 4 MiB `.storageModeShared` MTLBuffers,
+    NSLock-guarded acquire/release, lazy-init on first upload
+  - Destination MTLTexture is `.storageMode = .private` (GPU-only, ~2×
+    bandwidth headroom vs `.shared` on Apple Silicon)
+  - Backpressure: inflight count capped at 4 via NSLock + Set; at
+    capacity falls back to synchronous `.replace` with rate-limited
+    warning (5 s gap)
+  - **Cache-immediate-insert**: `textureCache[handle]` is populated
+    BEFORE the blit completes. Metal's implicit resource tracking
+    serialises the GPU draw queue after the upload queue when both
+    reference the same `MTLTexture` object, so first-bind draws render
+    correctly even if the blit is still in flight.
+
+  **Pattern lesson for Q2 + Doom3:** the `texture(for:device:)`
+  resolver pattern (single function called by every renderer pass to
+  hand out cached `MTLTexture` for a given engine-side handle) is
+  the natural insertion point for any async upload Phase 1. Don't
+  scatter texture creation across renderer files; keep one resolver
+  and put the async path inside it. Phase 2 (map-load frame-spread
+  prewarm) needs an engine-side registration-sequence counter +
+  bulk-fetch bridge accessor — defer until Phase 1 perf is measured.
+
+## Items still deferred
+
+- **Async WAL Phase 2 — map-load prewarm**: needs a
+  `Q3MetalRenderer_CopyWorldTextureIDs` bridge accessor (analog of
+  Q2's `Q2IOS_CopyWorldWALTextureIDs`) and a Q3-side registration-
+  sequence counter (`Q2IOS_GetMapRegistrationSequence` analog). Phase 1
+  alone delivers most of the gain; Phase 2 smooths remaining hitches
+  from first-bind storms when player enters a new map area. Q2
+  measured 0 misses / 0 starved across 10,640 presents with both
+  phases combined.
 - **HUD/menu rendering quality pass** — Q3 HUD uses 640×480 virtual
   coords scaled to drawable. May want explicit aspect-correction at
   widescreen vs the current naive scale.
+- **MD3 lat/long normal decode for entities with deformBulge**: bulge
+  needs per-vertex normal; entity path already provides it for chrome
+  shells, but if any non-MD3 entity (sprite/beam) ends up needing
+  bulge, the dfdx/dfdy face-normal fallback would kick in.
