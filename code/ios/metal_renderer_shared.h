@@ -121,6 +121,16 @@ typedef struct {
     float    deformMoveAmp;
     float    deformMovePhase;
     float    deformMoveFreq;
+    /* deformVertexes bulge <bulgeWidth> <bulgeHeight> <bulgeSpeed>.
+     * Mirrors ioq3 RB_DeformTessGeometry DEFORM_BULGE. Math:
+     *   phase  = st.s * bulgeWidth + time * bulgeSpeed
+     *   scale  = sin(phase) * bulgeHeight
+     *   pos   += normal * scale
+     * Drives q3dm4's gothic_block / wallhead organic tube/vein
+     * decorations. bulgeWidth = 0 means no bulge (MSL skips block). */
+    float    deformBulgeWidth;
+    float    deformBulgeHeight;
+    float    deformBulgeSpeed;
     /* deformVertexes autosprite / autoSprite2 (shader-level).
      * World vertices carry baked per-quad centers/long axes and the
      * Metal vertex shader applies the camera-aligned transform to match

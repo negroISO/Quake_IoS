@@ -460,6 +460,18 @@ typedef struct {
     float deformMoveAmp;
     float deformMovePhase;
     float deformMoveFreq;
+    /* deformVertexes bulge <bulgeWidth> <bulgeHeight> <bulgeSpeed>.
+     * Mirrors ioq3 RB_DeformTessGeometry DEFORM_BULGE case in
+     * tr_shade_calc.c. Math (per ioq3):
+     *   phase  = st.s * bulgeWidth + time * bulgeSpeed
+     *   scale  = sin(phase) * bulgeHeight
+     *   pos   += normal * scale
+     * Used by q3dm4's organic ceiling tube/vein decorations
+     * (gothic_block / wallhead family). bulgeWidth = 0 means no
+     * bulge (MSL skips the block). */
+    float deformBulgeWidth;
+    float deformBulgeHeight;
+    float deformBulgeSpeed;
     /* deformVertexes autosprite (1) / autoSprite2 (2). Tag-only for
      * the moment — pipeline awareness lands here so a follow-up
      * commit can wire the camera-aligned transform without touching
@@ -1089,6 +1101,11 @@ static void AddWorldDrawStage(Q3MetalWorldDrawCmd *draw,
     stage->deformMoveAmp   = src->deformMoveAmp;
     stage->deformMovePhase = src->deformMovePhase;
     stage->deformMoveFreq  = src->deformMoveFreq;
+    /* deformVertexes bulge — q3dm4 organic tube/vein decorations.
+     * See Q3MetalWorldStage struct comment in shared.h for math. */
+    stage->deformBulgeWidth  = src->deformBulgeWidth;
+    stage->deformBulgeHeight = src->deformBulgeHeight;
+    stage->deformBulgeSpeed  = src->deformBulgeSpeed;
     /* deformVertexes autosprite/autoSprite2 mode. Tag-only — propagated
      * to a draw flag below so Swift can route to a future autosprite
      * vertex shader path. The actual camera-aligned billboard transform
@@ -6145,6 +6162,13 @@ static void ParseShaderText(const char *text) {
         float deformMoveAmp;
         float deformMovePhase;
         float deformMoveFreq;
+        /* Top-level deformVertexes bulge — parsed at depth==1, stamped
+         * onto every stage on shader close. bulgeWidth=0 means no
+         * bulge (MSL skips the block). Used by q3dm4's gothic_block /
+         * wallhead organic tube decorations. */
+        float deformBulgeWidth;
+        float deformBulgeHeight;
+        float deformBulgeSpeed;
         /* deformVertexes autosprite/autoSprite2 (1/2). 0 = no autosprite. */
         int topAutospriteMode;
         char skyBoxBase[MAX_QPATH];
@@ -6188,6 +6212,9 @@ static void ParseShaderText(const char *text) {
         deformMoveAmp = 0.0f;
         deformMovePhase = 0.0f;
         deformMoveFreq = 0.0f;
+        deformBulgeWidth = 0.0f;
+        deformBulgeHeight = 0.0f;
+        deformBulgeSpeed = 0.0f;
         topAutospriteMode = 0;
         skyBoxBase[0] = '\0';
         gotSkyParms = qfalse;
@@ -6328,10 +6355,22 @@ static void ParseShaderText(const char *text) {
                             Q3cShaderGraph_AddDeform(&cleanGraph, Q3C_DEFORM_WAVE, args, 8);
                         }
                     } else if (!Q_stricmp(modeBuf, "bulge")) {
-                        /* `bulge <bulgewidth> <bulgeheight> <bulgespeed>` — 3 args. Skip. */
-                        (void)COM_ParseExt(&p, qfalse);
-                        (void)COM_ParseExt(&p, qfalse);
-                        (void)COM_ParseExt(&p, qfalse);
+                        /* `bulge <bulgewidth> <bulgeheight> <bulgespeed>` —
+                         * captured into shader-level locals and stamped
+                         * onto every stage on shader close (mirrors the
+                         * deformWave pattern at line ~6960). q3dm4's
+                         * gothic_block/wallhead organic tube decorations
+                         * need this; without it the MSL world vertex
+                         * shader's bulge block stays branchless. */
+                        char widthBuf[MAX_TOKEN_CHARS];
+                        char heightBuf[MAX_TOKEN_CHARS];
+                        char speedBuf[MAX_TOKEN_CHARS];
+                        Q_strncpyz(widthBuf,  COM_ParseExt(&p, qfalse), sizeof(widthBuf));
+                        Q_strncpyz(heightBuf, COM_ParseExt(&p, qfalse), sizeof(heightBuf));
+                        Q_strncpyz(speedBuf,  COM_ParseExt(&p, qfalse), sizeof(speedBuf));
+                        deformBulgeWidth  = (float)atof(widthBuf);
+                        deformBulgeHeight = (float)atof(heightBuf);
+                        deformBulgeSpeed  = (float)atof(speedBuf);
                     } else if (!Q_stricmp(modeBuf, "move")) {
                         char xBuf[MAX_TOKEN_CHARS], yBuf[MAX_TOKEN_CHARS], zBuf[MAX_TOKEN_CHARS];
                         char funcBuf[MAX_TOKEN_CHARS], baseBuf[MAX_TOKEN_CHARS];
@@ -6956,6 +6995,9 @@ static void ParseShaderText(const char *text) {
                     last->stages[s].deformMoveAmp   = deformMoveAmp;
                     last->stages[s].deformMovePhase = deformMovePhase;
                     last->stages[s].deformMoveFreq  = deformMoveFreq;
+                    last->stages[s].deformBulgeWidth  = deformBulgeWidth;
+                    last->stages[s].deformBulgeHeight = deformBulgeHeight;
+                    last->stages[s].deformBulgeSpeed  = deformBulgeSpeed;
                     last->stages[s].autospriteMode  = topAutospriteMode;
                 }
                 last->isPortal = gotPortal;

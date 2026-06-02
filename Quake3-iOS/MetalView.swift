@@ -222,6 +222,13 @@ struct MetalView: UIViewRepresentable {
             var deformMoveAmp: Float = 0
             var deformMovePhase: Float = 0
             var deformMoveFreq: Float = 0
+            // deformVertexes bulge — per-vertex ST-coord-driven sine
+            // displacement along normal. Used by q3dm4's gothic_block
+            // organic tubes. bulgeWidth=0 means no bulge.
+            // Math: phase = st.s*width + time*speed; pos += n * sin(phase) * height.
+            var deformBulgeWidth: Float = 0
+            var deformBulgeHeight: Float = 0
+            var deformBulgeSpeed: Float = 0
             // deformVertexes autosprite/autoSprite2 mode. 0 = none,
             // 1 = autosprite (full billboard), 2 = autoSprite2
             // (elongated; transform pending).
@@ -1138,6 +1145,11 @@ struct MetalView: UIViewRepresentable {
             float deformMoveAmp;
             float deformMovePhase;
             float deformMoveFreq;
+            // deformVertexes bulge — see Swift WorldDrawUniforms / world
+            // vertex shader for math + rationale.
+            float deformBulgeWidth;
+            float deformBulgeHeight;
+            float deformBulgeSpeed;
             // deformVertexes autosprite mode (1=autosprite, 2=autoSprite2,
             // 0=none).
             uint  autospriteMode;
@@ -1537,6 +1549,32 @@ struct MetalView: UIViewRepresentable {
                                            drawUniforms.deformWaveFreq,
                                            drawUniforms.timeSeconds);
                     worldPos += n * scale;
+                }
+            }
+            /* deformVertexes bulge — per-vertex ST-coord-driven sine
+             * displacement along normal. Closes the q3dm4 gothic_block /
+             * wallhead organic tube/vein decoration gap (PC has them
+             * undulating; iOS rendered them static because bulge was
+             * silently unimplemented). Mirrors ioq3 RB_DeformTessGeometry
+             * DEFORM_BULGE case from tr_shade_calc.c:
+             *   phase = st.s * bulgeWidth + time * bulgeSpeed
+             *   scale = sin(phase) * bulgeHeight
+             *   pos  += normal * scale
+             * Gated on bulgeWidth > 0 because canonical Q3 shaders only
+             * specify bulge when actively using it (no default == 0
+             * sentinel needed for the func bit). Uses the same per-vertex
+             * normal as the wave deform above; same length-check guard
+             * for sprite/beam vertices that didn't fill the normal slot. */
+            if (drawUniforms.deformBulgeWidth != 0.0 ||
+                drawUniforms.deformBulgeHeight != 0.0) {
+                float3 nb = inVertex.normal;
+                float nbLen = length(nb);
+                if (nbLen > 1e-4) {
+                    nb /= nbLen;
+                    float bulgePhase = inVertex.texCoord.x * drawUniforms.deformBulgeWidth +
+                                       drawUniforms.timeSeconds * drawUniforms.deformBulgeSpeed;
+                    float bulgeScale = sin(bulgePhase) * drawUniforms.deformBulgeHeight;
+                    worldPos += nb * bulgeScale;
                 }
             }
             if (drawUniforms.deformMoveFunc != 0u) {
@@ -2887,6 +2925,9 @@ struct MetalView: UIViewRepresentable {
                             deformMoveAmp: stage.deformMoveAmp,
                             deformMovePhase: stage.deformMovePhase,
                             deformMoveFreq: stage.deformMoveFreq,
+                            deformBulgeWidth: stage.deformBulgeWidth,
+                            deformBulgeHeight: stage.deformBulgeHeight,
+                            deformBulgeSpeed: stage.deformBulgeSpeed,
                             autospriteMode: stage.autospriteMode,
                             debugMode: Coordinator.worldDebugMode,
                             forceWhiteVertColor: 0,
@@ -3116,6 +3157,9 @@ struct MetalView: UIViewRepresentable {
                                     deformMoveAmp: stage.deformMoveAmp,
                                     deformMovePhase: stage.deformMovePhase,
                                     deformMoveFreq: stage.deformMoveFreq,
+                                    deformBulgeWidth: stage.deformBulgeWidth,
+                                    deformBulgeHeight: stage.deformBulgeHeight,
+                                    deformBulgeSpeed: stage.deformBulgeSpeed,
                                     debugMode: 0,
                                     forceWhiteVertColor: 0,
                                     alphaTestThreshold: 0,
@@ -3217,6 +3261,9 @@ struct MetalView: UIViewRepresentable {
                                 deformMoveAmp: stage.deformMoveAmp,
                                 deformMovePhase: stage.deformMovePhase,
                                 deformMoveFreq: stage.deformMoveFreq,
+                                deformBulgeWidth: stage.deformBulgeWidth,
+                                deformBulgeHeight: stage.deformBulgeHeight,
+                                deformBulgeSpeed: stage.deformBulgeSpeed,
                                 autospriteMode: stage.autospriteMode,
                                 debugMode: 0,
                                 forceWhiteVertColor: 0,
@@ -3365,6 +3412,9 @@ struct MetalView: UIViewRepresentable {
                                 deformMoveAmp: stage.deformMoveAmp,
                                 deformMovePhase: stage.deformMovePhase,
                                 deformMoveFreq: stage.deformMoveFreq,
+                                deformBulgeWidth: stage.deformBulgeWidth,
+                                deformBulgeHeight: stage.deformBulgeHeight,
+                                deformBulgeSpeed: stage.deformBulgeSpeed,
                                 autospriteMode: stage.autospriteMode,
                                 debugMode: Coordinator.worldDebugMode,
                                 /* forceWhiteVertColor no longer consumed
