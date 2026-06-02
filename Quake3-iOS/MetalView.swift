@@ -2490,6 +2490,29 @@ struct MetalView: UIViewRepresentable {
             fogEncoder.endEncoding()
         }
         private var textureCache: [UInt32: (generation: UInt32, texture: MTLTexture)] = [:]
+        // === Async texture upload (Phase 1) — port of Q2 commits
+        // 868b72f + 2fec194. Dedicated background MTLCommandQueue +
+        // staging buffer pool + .private MTLTexture pattern. iPad Pro
+        // 13" M4 measured median 119 FPS async-on vs 71 FPS off on Q2
+        // demo loops (rogue/demo1+demo2, 200 s xctrace). Backpressure:
+        // inflight count capped at 4 via NSLock + Set; at capacity
+        // falls back to synchronous .replace path with a rate-limited
+        // warning. Lightmap subregion updates intentionally stay
+        // synchronous (covered separately at the Q3 lightmap update
+        // site; lightmaps update every frame and are tiny).
+        private lazy var asyncUploadQueue: MTLCommandQueue? = {
+            let q = commandQueue?.device.makeCommandQueue()
+            q?.label = "Q3.tex.asyncUpload"
+            return q
+        }()
+        private static let asyncMaxInflight: Int = 4
+        private static let asyncStagingBufferBytes: Int = 4 * 1024 * 1024
+        private var asyncStagingPool: [MTLBuffer] = []
+        private var asyncStagingPoolFreeIndices: [Int] = []
+        private let asyncStagingLock: NSLock = NSLock()
+        private let asyncInflightLock: NSLock = NSLock()
+        private var asyncInflightIDs: Set<UInt32> = []
+        private var asyncFallbackWarnLastTime: CFTimeInterval = 0
         private var vertexBuffer: MTLBuffer?
         private var vertexBufferCapacity = 0
         private var worldVertexBuffer: MTLBuffer?
@@ -4597,6 +4620,119 @@ struct MetalView: UIViewRepresentable {
             return entityVertexBuffer
         }
 
+        /// Acquire a staging MTLBuffer from the pool. Returns the buffer
+        /// plus pool index (or -1 for one-off oversized allocations).
+        /// Caller MUST release the pool index in addCompletedHandler.
+        private func acquireAsyncStagingBuffer(minBytes: Int, device: MTLDevice) -> (MTLBuffer, Int)? {
+            // Oversized request → one-off buffer (caller releases via the
+            // automatic ARC drop; we return -1 to skip pool release).
+            if minBytes > Coordinator.asyncStagingBufferBytes {
+                guard let buf = device.makeBuffer(length: minBytes, options: .storageModeShared) else {
+                    return nil
+                }
+                return (buf, -1)
+            }
+            asyncStagingLock.lock()
+            defer { asyncStagingLock.unlock() }
+            // Lazy-init pool on first use.
+            if asyncStagingPool.isEmpty {
+                for i in 0..<Coordinator.asyncMaxInflight {
+                    guard let buf = device.makeBuffer(
+                        length: Coordinator.asyncStagingBufferBytes,
+                        options: .storageModeShared
+                    ) else {
+                        // Partial init — give up gracefully; caller will
+                        // fall back to sync path on next call.
+                        return nil
+                    }
+                    buf.label = "Q3.tex.async-staging[\(i)]"
+                    asyncStagingPool.append(buf)
+                    asyncStagingPoolFreeIndices.append(i)
+                }
+                print("[Q3-ASYNC-TEX] async-staging-pool ready: \(Coordinator.asyncMaxInflight) buffers x \(Coordinator.asyncStagingBufferBytes) bytes")
+            }
+            guard let idx = asyncStagingPoolFreeIndices.popLast() else {
+                return nil  // pool starved — caller falls back to sync
+            }
+            return (asyncStagingPool[idx], idx)
+        }
+
+        private func releaseAsyncStagingBuffer(poolIndex: Int) {
+            guard poolIndex >= 0 else { return }
+            asyncStagingLock.lock()
+            asyncStagingPoolFreeIndices.append(poolIndex)
+            asyncStagingLock.unlock()
+        }
+
+        /// Returns true when the async path was started; false → caller
+        /// must fall back to synchronous .replace upload.
+        private func asyncUploadTexture(
+            handle: UInt32,
+            destTexture: MTLTexture,
+            rgbaBytes: UnsafePointer<UInt8>,
+            width: Int,
+            height: Int,
+            bytesPerRow: Int,
+            device: MTLDevice
+        ) -> Bool {
+            guard let uploadQueue = asyncUploadQueue else { return false }
+            // Backpressure: if inflight at cap, fall back to sync.
+            asyncInflightLock.lock()
+            let inflightCount = asyncInflightIDs.count
+            if inflightCount >= Coordinator.asyncMaxInflight {
+                asyncInflightLock.unlock()
+                let now = CACurrentMediaTime()
+                if now - asyncFallbackWarnLastTime > 5.0 {
+                    asyncFallbackWarnLastTime = now
+                    print("[Q3-ASYNC-TEX] inflight at cap (\(inflightCount)) — sync fallback")
+                }
+                return false
+            }
+            asyncInflightIDs.insert(handle)
+            asyncInflightLock.unlock()
+            // Acquire staging buffer.
+            let totalBytes = bytesPerRow * height
+            guard let (staging, poolIndex) = acquireAsyncStagingBuffer(
+                minBytes: totalBytes, device: device
+            ) else {
+                asyncInflightLock.lock()
+                asyncInflightIDs.remove(handle)
+                asyncInflightLock.unlock()
+                return false
+            }
+            // Copy CPU bytes into staging (shared storage = direct memcpy).
+            staging.contents().copyMemory(from: rgbaBytes, byteCount: totalBytes)
+            guard let cb = uploadQueue.makeCommandBuffer(),
+                  let blit = cb.makeBlitCommandEncoder() else {
+                releaseAsyncStagingBuffer(poolIndex: poolIndex)
+                asyncInflightLock.lock()
+                asyncInflightIDs.remove(handle)
+                asyncInflightLock.unlock()
+                return false
+            }
+            blit.label = "Q3.tex.async-blit[\(handle)]"
+            blit.copy(
+                from: staging, sourceOffset: 0,
+                sourceBytesPerRow: bytesPerRow,
+                sourceBytesPerImage: totalBytes,
+                sourceSize: MTLSize(width: width, height: height, depth: 1),
+                to: destTexture,
+                destinationSlice: 0, destinationLevel: 0,
+                destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
+            )
+            blit.endEncoding()
+            // Release pool index + inflight slot when blit completes.
+            cb.addCompletedHandler { [weak self] _ in
+                guard let self else { return }
+                self.releaseAsyncStagingBuffer(poolIndex: poolIndex)
+                self.asyncInflightLock.lock()
+                self.asyncInflightIDs.remove(handle)
+                self.asyncInflightLock.unlock()
+            }
+            cb.commit()
+            return true
+        }
+
         private func texture(for handle: UInt32, device: MTLDevice?) -> MTLTexture? {
             guard let device else { return nil }
 
@@ -4615,6 +4751,49 @@ struct MetalView: UIViewRepresentable {
                 return cached.texture
             }
 
+            // Try async path first; storage mode .private (GPU-only) for
+            // async blit destination. Falls back to .managed/.shared +
+            // sync .replace if async path declines (inflight cap hit,
+            // pool init failed, command buffer create failed).
+            let asyncDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .rgba8Unorm,
+                width: Int(info.width),
+                height: Int(info.height),
+                mipmapped: false
+            )
+            asyncDescriptor.usage = .shaderRead
+            asyncDescriptor.storageMode = .private
+
+            if let asyncTex = device.makeTexture(descriptor: asyncDescriptor) {
+                if let namePtr = Q3MetalRenderer_GetTextureName(handle) {
+                    let name = String(cString: namePtr)
+                    asyncTex.label = name.isEmpty ? "Q3.tex.\(handle)" : "Q3.tex.\(handle):\(name)"
+                } else {
+                    asyncTex.label = "Q3.tex.\(handle)"
+                }
+                let bytesPerRow = Int(info.width) * 4
+                if asyncUploadTexture(
+                    handle: handle,
+                    destTexture: asyncTex,
+                    rgbaBytes: rgbaBytes,
+                    width: Int(info.width),
+                    height: Int(info.height),
+                    bytesPerRow: bytesPerRow,
+                    device: device
+                ) {
+                    // Cache IMMEDIATELY — Metal implicit resource tracking
+                    // ensures the blit completes before any draw using
+                    // this texture executes on the GPU. Subsequent
+                    // texture() calls return the cached handle, and the
+                    // draw queue serialises after the async upload queue
+                    // by virtue of using the same MTLTexture object.
+                    textureCache[handle] = (generation: info.generation, texture: asyncTex)
+                    return asyncTex
+                }
+            }
+
+            // Sync fallback path. Storage mode default (.managed on Mac,
+            // .shared on iOS) so .replace can write directly.
             let descriptor = MTLTextureDescriptor.texture2DDescriptor(
                 pixelFormat: .rgba8Unorm,
                 width: Int(info.width),
