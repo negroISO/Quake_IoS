@@ -1315,12 +1315,26 @@ static void AddWorldDrawLightmapBaseStage(Q3MetalWorldDrawCmd *draw,
     AddWorldDrawStage(draw, lightmapHandle, &tmp);
 }
 
+/* Forward-decl so SetEntityDrawColor can invoke the helper defined
+ * immediately below it. Both functions are static and adjacent — the
+ * forward decl keeps the diff tight without reordering large blocks. */
+static void CopyTextureTcModsToDrawCmd(uint32_t cursor, qhandle_t textureHandle);
+
 /* Copy refEntity_t.shader.rgba into the per-draw entityColor slot so
  * MSL rgbGen=entity / alphaGen=entity / oneMinusEntity branches can
  * reach it without fishing it back out of the per-vertex color (which
  * has Lambert diffuse already baked in). Mirrors the shader.rgba[3]==0
- * → default-white convention used by the per-vertex color path. */
-static void SetEntityDrawColor(uint32_t cursor, const refEntity_t *e) {
+ * → default-white convention used by the per-vertex color path.
+ *
+ * textureHandle is the draw cmd's bound texture — used to copy the
+ * texture's stage-0 tcMod chain into the per-entity draw cmd so the
+ * Swift entity vertex shader can apply scroll/scale/rotate UV
+ * transforms. Without this hop the customShader entity draws had no
+ * UV animation: quad shell chrome / regen shimmer / battlesuit pulse
+ * all rendered static instead of scrolling. Pass 0 if the caller
+ * cannot supply a texture handle — the tcMod chain falls back to
+ * count=0 (identity transform). */
+static void SetEntityDrawColor(uint32_t cursor, const refEntity_t *e, qhandle_t textureHandle) {
     if (e != NULL && e->shader.rgba[3] != 0) {
         s_entityDraws[cursor].entityColor[0] = (float)e->shader.rgba[0] / 255.0f;
         s_entityDraws[cursor].entityColor[1] = (float)e->shader.rgba[1] / 255.0f;
@@ -1334,6 +1348,33 @@ static void SetEntityDrawColor(uint32_t cursor, const refEntity_t *e) {
     }
     s_entityDraws[cursor].shaderTime =
         (float)cls.realtime * 0.001f - (e != NULL ? e->shaderTime.f : 0.0f);
+    /* tcMod chain copy via the helper below. Order doesn't matter since
+     * tcMod fields are independent of entityColor / shaderTime. */
+    CopyTextureTcModsToDrawCmd(cursor, textureHandle);
+}
+
+/* Copy a texture's stage-0 tcMod chain into the per-entity draw cmd so
+ * the Swift entity vertex shader can apply scroll/scale/rotate/stretch
+ * UV transforms. Without this hop, customShader entity draws had no UV
+ * animation — quad shell chrome stayed static, regen/battlesuit shimmers
+ * didn't animate. Mirrors the per-stage tcMod plumbing already present
+ * on Q3MetalWorldStage for the world pipeline. Called adjacent to
+ * SetEntityDrawColor at every entity emit site. Safe to call on draws
+ * whose texture has no tcMods (count stays 0, shader applies identity). */
+static void CopyTextureTcModsToDrawCmd(uint32_t cursor, qhandle_t textureHandle) {
+    const metalTexture_t *tex = FindTextureByHandle(textureHandle);
+    int n, i;
+    if (tex == NULL) {
+        s_entityDraws[cursor].tcModCount = 0;
+        return;
+    }
+    n = (int)tex->tcModCount;
+    if (n < 0) n = 0;
+    if (n > Q3_MAX_TCMODS) n = Q3_MAX_TCMODS;
+    s_entityDraws[cursor].tcModCount = (uint32_t)n;
+    for (i = 0; i < n; ++i) {
+        s_entityDraws[cursor].tcMods[i] = tex->tcMods[i];
+    }
 }
 
 /* Heuristic: should alpha be synthesized when a JPG fallback is loaded
@@ -8099,7 +8140,8 @@ static void RE_RenderScene(const refdef_t *fd) {
                         s_entityDraws[entityDrawCursor].indexCount = 6;
                         s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)sceneEntity->entity.customShader;
                         s_entityDraws[entityDrawCursor].flags = spriteFlags;
-                        SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity);
+                        SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity,
+                                           (qhandle_t)sceneEntity->entity.customShader);
                     }
                     entityDrawCursor += 1;
                     continue;
@@ -8150,7 +8192,8 @@ static void RE_RenderScene(const refdef_t *fd) {
                     EmitMetalEntityStageAuditForHandle(
                         (qhandle_t)sceneEntity->entity.customShader,
                         "lightning");
-                    SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity);
+                    SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity,
+                                       (qhandle_t)sceneEntity->entity.customShader);
                     entityDrawCursor += 1;
                     continue;
                 }
@@ -8193,7 +8236,8 @@ static void RE_RenderScene(const refdef_t *fd) {
                     EmitMetalEntityStageAuditForHandle(
                         (qhandle_t)sceneEntity->entity.customShader,
                         "rail_core");
-                    SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity);
+                    SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity,
+                                       (qhandle_t)sceneEntity->entity.customShader);
                     entityDrawCursor += 1;
                     continue;
                 }
@@ -8248,7 +8292,8 @@ static void RE_RenderScene(const refdef_t *fd) {
                         Q3_METAL_ENTITY_DRAWFLAG_NOCULL |
                         Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE_FULL;
                     EmitMetalEntityStageAuditForHandle(texHandle, "beam");
-                    SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity);
+                    SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity,
+                                       (qhandle_t)texHandle);
                     entityDrawCursor += 1;
                     continue;
                 }
@@ -8330,7 +8375,8 @@ static void RE_RenderScene(const refdef_t *fd) {
                     EmitMetalEntityStageAuditForHandle(
                         (qhandle_t)sceneEntity->entity.customShader,
                         "rail_rings");
-                    SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity);
+                    SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity,
+                                       (qhandle_t)sceneEntity->entity.customShader);
                     entityDrawCursor += 1;
                     continue;
                 }
@@ -8582,7 +8628,7 @@ static void RE_RenderScene(const refdef_t *fd) {
                             s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)stageHandle;
                             s_entityDraws[entityDrawCursor].flags =
                                 EntityFlagsForTexture(stageHandle, baseDrawFlags, qfalse);
-                            SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity);
+                            SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity, stageHandle);
                             entityDrawCursor += 1;
                         }
                     } else {
@@ -8590,7 +8636,7 @@ static void RE_RenderScene(const refdef_t *fd) {
                         s_entityDraws[entityDrawCursor].indexCount = entityIndexCursor - firstIndex;
                         s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)textureHandle;
                         s_entityDraws[entityDrawCursor].flags = drawFlags;
-                        SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity);
+                        SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity, textureHandle);
                         entityDrawCursor += 1;
                     }
 
@@ -8696,7 +8742,7 @@ static void RE_RenderScene(const refdef_t *fd) {
                      * concept here. Default the per-draw entityColor to
                      * white so any oneMinusEntity/entity stage on the
                      * shader returns identity. */
-                    SetEntityDrawColor(entityDrawCursor, NULL);
+                    SetEntityDrawColor(entityDrawCursor, NULL, (qhandle_t)poly->shader);
 
                     entityVertexCursor += (uint32_t)nv;
                     entityIndexCursor += (uint32_t)((nv - 2) * 3);

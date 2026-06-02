@@ -237,6 +237,15 @@ typedef struct {
     float entityColor[4];
     float shaderTime;
     uint32_t fogIndex;
+    /* Stage 0 tcMod chain copied from the texture's shader-map entry
+     * (RegisterTexture → ShaderMap_GetTcMods at line ~1830). Without
+     * this, customShader entity draws (quad shell `powerups/quadWeapon`,
+     * regen, battlesuit) had no UV animation — chrome reflection from
+     * tcGen environment landed but stayed static. Mirrors the per-stage
+     * tcMod fields on Q3MetalWorldStage. Applied in q3_entity_vertex
+     * MSL after tcGen UV computation, before vertex output. */
+    uint32_t tcModCount;
+    Q3TcMod tcMods[Q3_MAX_TCMODS];
 } Q3MetalEntityDrawCmd;
 
 enum {

@@ -731,7 +731,14 @@ void Quake3_Init(const char *basePath) {
      * current Metal renderer ignores them. */
     char cmdline[1024] = "+set com_zoneMegs 64 +set com_hunkMegs 256 +set com_soundMegs 16 +set vm_ui 1 +set vm_game 1 +set vm_cgame 1"
         " +set r_overBrightBits 1"
-        " +set r_mapOverBrightBits 3"
+        /* mapOverBrightBits=3 (×4 lightmap shift) was causing q3dm4's fog
+         * volume to render heavily blue-cast — likely because the shift
+         * amplifies any small blue component in the BSP fog color before
+         * it reaches q3ResolvedFogColor's grey-fallback gate (dot < 0.001).
+         * Reverting to PC reference 2 (×2 shift) — visibility lift now
+         * comes entirely from the postprocess tone curve below. If the
+         * world looks dim, bump r_postprocess_intensity from 1.5 → 1.7. */
+        " +set r_mapOverBrightBits 2"
         " +set r_intensity 1.0"
         " +set r_gamma 1.25"
         " +set r_ignorehwgamma 1"
@@ -859,7 +866,7 @@ void Quake3_Init(const char *basePath) {
          * cvar->integer. See cmdline comment above for rationale on
          * mapOverBrightBits=3 (vs PC's 2). */
         "seta r_overBrightBits 1; "
-        "seta r_mapOverBrightBits 3; "
+        "seta r_mapOverBrightBits 2; "
         "seta r_gamma 1.25; "
         "seta r_intensity 1.0; "
         "seta r_ignorehwgamma 1; "

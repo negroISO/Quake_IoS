@@ -576,6 +576,12 @@ struct MetalView: UIViewRepresentable {
          * speed stays in degrees/sec; applyTcMod does the single
          * degrees→radians conversion. We only negate to match ioquake3's
          * `degs = -degsPerSecond * timeScale` sign convention. */
+        /// Per-process one-time set of texture names we've already logged
+        /// the tcMod-extraction result for. Filtered to powerup-shell-family
+        /// names so the log stays small. Logs whether tcMods were found,
+        /// types, and params — pinpoints which link in the texture →
+        /// uniforms chain breaks when the chrome scroll doesn't animate.
+        nonisolated(unsafe) private static var loggedTcModShaderNames: Set<String> = []
         private static func packEntityTcMods(handle: UInt32, into uniforms: inout EntityUniforms) {
             uniforms.tcModCount = 0
             uniforms.tcModType = SIMD4<Float>(0, 0, 0, 0)
@@ -584,7 +590,28 @@ struct MetalView: UIViewRepresentable {
             uniforms.tcModParams2 = SIMD4<Float>(0, 0, 0, 0)
             uniforms.tcModParams3 = SIMD4<Float>(0, 0, 0, 0)
             var info = Q3MetalTextureInfo()
-            guard Q3MetalRenderer_GetTextureInfo(handle, &info) == 1 else { return }
+            let infoOk = Q3MetalRenderer_GetTextureInfo(handle, &info) == 1
+            // Diagnostic: log the tcMod chain for powerup-shell shaders so
+            // we can see exactly what the entity pipeline sees at runtime.
+            // Logs at most once per shader name to keep volume bounded.
+            if let cName = Q3MetalRenderer_GetTextureName(handle) {
+                let name = String(cString: cName).lowercased()
+                if (name.contains("quad") || name.contains("regen") || name.contains("battle")
+                    || name.contains("invuln") || name.contains("haste"))
+                    && !Self.loggedTcModShaderNames.contains(name) {
+                    Self.loggedTcModShaderNames.insert(name)
+                    if infoOk {
+                        let mods = [info.tcMods.0, info.tcMods.1, info.tcMods.2, info.tcMods.3]
+                        NSLog("[Q3-TCMOD] '%@' handle=%u infoOk=1 tcModCount=%u type[0]=%d params[0]=(%.3f,%.3f,%.3f,%.3f)",
+                              name, handle, info.tcModCount, Int32(mods[0].type),
+                              mods[0].params.0, mods[0].params.1, mods[0].params.2, mods[0].params.3)
+                    } else {
+                        NSLog("[Q3-TCMOD] '%@' handle=%u infoOk=0 — Q3MetalRenderer_GetTextureInfo bailed (rgbaBytes likely NULL)",
+                              name, handle)
+                    }
+                }
+            }
+            guard infoOk else { return }
             let count = Int(min(info.tcModCount, 4))
             if count == 0 { return }
             let chain = [info.tcMods.0, info.tcMods.1, info.tcMods.2, info.tcMods.3]
