@@ -132,7 +132,29 @@ void NORETURN Sys_Quit(void) {
 
 void Sys_Print(const char *msg) {
     if (msg && msg[0]) {
+        /* Keep stdout for any future shell-piped CI workflow. */
         fputs(msg, stdout);
+        /* On iOS app sandboxes, stdout is not connected to anything by
+         * default — fputs landed in the void, so neither Console.app nor
+         * idevicesyslog could see Com_Printf / ri.Printf output (every
+         * [METAL-SHADER] diagnostic dump came up empty when grepped from
+         * the device syslog). NSLog routes the same text into Apple
+         * System Log, which Console.app + idevicesyslog both consume.
+         * Cost: ~microseconds per call — negligible vs Q3 frame budget,
+         * and only Com_Printf gates flow through here (mixer / renderer
+         * inner loops never call Sys_Print). Strip trailing newline
+         * because NSLog appends its own. */
+        size_t len = strlen(msg);
+        if (len > 0 && msg[len - 1] == '\n') {
+            char trimmed[2048];
+            size_t copy = len - 1;
+            if (copy >= sizeof(trimmed)) copy = sizeof(trimmed) - 1;
+            memcpy(trimmed, msg, copy);
+            trimmed[copy] = '\0';
+            NSLog(@"%s", trimmed);
+        } else {
+            NSLog(@"%s", msg);
+        }
     }
 }
 

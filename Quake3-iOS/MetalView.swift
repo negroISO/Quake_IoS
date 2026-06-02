@@ -3595,6 +3595,24 @@ struct MetalView: UIViewRepresentable {
                             entityUniforms.alphaTestThreshold = 0.004
                         }
                         encoder.setFragmentBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
+                        /* CRITICAL: also bind to the vertex stage. Before
+                         * this, entityUniforms was bound ONCE before the
+                         * loop (line ~3498) with the initial state where
+                         * deformWaveFunc=0, then per-draw updates from
+                         * packEntityDeform / packEntityTcMods / etc. only
+                         * pushed to setFragmentBytes. The vertex shader
+                         * kept reading the stale outside-loop uniforms —
+                         * so q3_entity_vertex's `if (uniforms.deformWaveFunc
+                         * != 0u)` outer guard always failed for chrome
+                         * shell entities (powerups/quadWeapon, regen,
+                         * battlesuit, battleWeapon, redflag, blueflag),
+                         * silently skipping the +base unit halo expansion.
+                         * Diagnosed via 10× multiplier producing zero
+                         * visible effect — proved the block never entered.
+                         * Fragment-only path was a footgun: tcGen env +
+                         * chrome appearance worked because those uniforms
+                         * are fragment-side; deformWave is vertex-side. */
+                        encoder.setVertexBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
                         if drawPass == 5, let entityAdditiveFullPipelineState {
                             /* GL_ONE/GL_ONE — NEVER shared with the alpha-
                              * modulated additive pipeline per strict spec. */
@@ -4340,7 +4358,27 @@ struct MetalView: UIViewRepresentable {
 
             let additiveLessDepthDescriptor = MTLDepthStencilDescriptor()
             additiveLessDepthDescriptor.isDepthWriteEnabled = false
-            additiveLessDepthDescriptor.depthCompareFunction = .less
+            /* WAS .less — caused the powerups/quadWeapon chrome shell (and
+             * all other shell-shader entities: powerups/quad, regen,
+             * battlesuit, battleWeapon) to fail the depth test against
+             * the underlying model. Sequence: (1) gun renders with depth
+             * write → writes depth Z at gun surface; (2) chrome shell
+             * renders with deformWave +0.5 unit offset → vertex shader
+             * pushes shell verts toward camera; (3) under RF_DEPTHHACK
+             * (which compresses the viewmodel's depth range to a tiny
+             * near-z slice via viewport zRange / depth bias), the
+             * 0.5-world-unit deform offset projects to *the same NDC
+             * depth* as the gun surface; (4) `.less` requires strictly
+             * less → equal-z FAILS → chrome rejected, invisible.
+             * PC Q3 uses GL_LEQUAL for blend passes (ioq3 default
+             * GLS_DEPTHFUNC_LEQUAL) so equal-z passes through. Matching
+             * that fixes the chrome-shell invisibility while still
+             * preventing additive effects from drawing through closer
+             * solid geometry. Diff confirmed via /tmp/metalshader.log
+             * QUAD-EMIT trace: chrome shell IS emitted every frame with
+             * blendMode=5 ADDITIVE_FULL, tcGenEnv=1, deformWaveFunc=1
+             * — all flags correct, only depth compare was rejecting it. */
+            additiveLessDepthDescriptor.depthCompareFunction = .lessEqual
             additiveLessDepthStencilState = device.makeDepthStencilState(descriptor: additiveLessDepthDescriptor)
 
             // Depth-hack state for first-person viewmodel (STEP 8).

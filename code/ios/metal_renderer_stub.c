@@ -6963,6 +6963,145 @@ static void ParseShaderText(const char *text) {
                 last->hasLightmapStage = gotLightmapStage;
                 last->hasFlare = gotFlare;
                 last->isSky = gotSky;
+                /* === [METAL-SHADER] PC-port comparison instrumentation ====
+                 * Mirrors the [QE-SHADER] dump baked into Quake3e's
+                 * renderer/tr_shader.c FinishShader (see Q2_too_ios
+                 * project notes 2026-06-02). Filtered to powerup-shell
+                 * family so we can diff our parsed state against PC
+                 * reference line-by-line.
+                 *
+                 * Output goes BOTH to ri.Printf (→ NSLog → Console.app)
+                 * AND to a fixed sandbox file the user can pull via
+                 *   xcrun devicectl device copy from ... Documents/baseq3/metalshader.log
+                 * because iOS 18+ broke idevicesyslog (Apple restricted
+                 * the syslog stream path libimobiledevice uses). The
+                 * file is reopened in append mode each shader so
+                 * partial captures survive a crash. */
+                {
+                    const char *qname = last->shaderName;
+                    int isShell = (qname && qname[0] &&
+                                   (Q_stristr(qname, "powerup") ||
+                                    Q_stristr(qname, "quad")    ||
+                                    Q_stristr(qname, "regen")   ||
+                                    Q_stristr(qname, "battle")  ||
+                                    Q_stristr(qname, "invuln")  ||
+                                    Q_stristr(qname, "haste"))) ? 1 : 0;
+                    if (isShell) {
+                        /* File mirror via plain stdio + $HOME-resolved
+                         * sandbox path. The iOS app sandbox sets HOME to
+                         * the app's container, so this writes to
+                         *   <container>/Documents/baseq3/metalshader.log
+                         * which is exactly the path we pull via
+                         *   xcrun devicectl device copy from ... \
+                         *     --source Documents/baseq3/metalshader.log
+                         * Append mode means a single demo session can
+                         * accumulate dumps across multiple shader registrations
+                         * (powerups + battle + regen + ...). FS_WriteFile
+                         * from refimport_t is all-or-nothing so this
+                         * direct stdio path is simpler. */
+                        static FILE *s_metalShaderLogFP = NULL;
+                        if (s_metalShaderLogFP == NULL) {
+                            const char *home = getenv("HOME");
+                            if (home != NULL && home[0]) {
+                                char path[1024];
+                                Com_sprintf(path, sizeof(path),
+                                            "%s/Documents/baseq3/metalshader.log", home);
+                                s_metalShaderLogFP = fopen(path, "a");
+                            }
+                        }
+                        if (s_metalShaderLogFP != NULL) {
+                            int sl, tm;
+                            fprintf(s_metalShaderLogFP,
+                                "[METAL-SHADER] name='%s' stages=%d deformWaveFunc=%d\n",
+                                qname, last->stageCount, deformWaveFunc);
+                            if (deformWaveFunc != 0) {
+                                float spread = (deformWaveDiv != 0.0f) ? (1.0f / deformWaveDiv) : 0.0f;
+                                fprintf(s_metalShaderLogFP,
+                                    "[METAL-SHADER]   deform={WAVE base=%.3f amp=%.3f phase=%.3f freq=%.3f spread=%.3f fn=%d}\n",
+                                    deformWaveBase, deformWaveAmp, deformWavePhase,
+                                    deformWaveFreq, spread, deformWaveFunc);
+                            }
+                            for (sl = 0; sl < last->stageCount; ++sl) {
+                                const Q3MetalStage *st = &last->stages[sl];
+                                const char *tcGenName = "?";
+                                switch (st->tcGen) {
+                                    case 0: tcGenName = "TEXTURE"; break;
+                                    case 1: tcGenName = "ENVIRONMENT"; break;
+                                    case 2: tcGenName = "VECTOR"; break;
+                                }
+                                fprintf(s_metalShaderLogFP,
+                                    "[METAL-SHADER]   stage[%d] blendMode=%d srcBlend=0x%x dstBlend=0x%x tcGen=%s tcMods=%d rgbGen=%d alphaGen=%d\n",
+                                    sl, st->blendMode, st->rawSrcBlend, st->rawDstBlend,
+                                    tcGenName, st->tcModCount,
+                                    st->rgbGen, st->alphaGen);
+                                for (tm = 0; tm < st->tcModCount && tm < Q3_MAX_TCMODS; ++tm) {
+                                    const Q3TcMod *m = &st->tcMods[tm];
+                                    const char *tmName = "?";
+                                    switch (m->type) {
+                                        case 1: tmName = "SCROLL"; break;
+                                        case 2: tmName = "SCALE"; break;
+                                        case 3: tmName = "ROTATE"; break;
+                                        case 4: tmName = "STRETCH"; break;
+                                        case 5: tmName = "TURB"; break;
+                                        case 6: tmName = "ENTITY_TRANSLATE"; break;
+                                        case 7: tmName = "TRANSFORM"; break;
+                                    }
+                                    fprintf(s_metalShaderLogFP,
+                                        "[METAL-SHADER]     tcMod[%d]={%s p=(%.3f,%.3f,%.3f,%.3f)}\n",
+                                        tm, tmName, m->params[0], m->params[1],
+                                        m->params[2], m->params[3]);
+                                }
+                            }
+                            fflush(s_metalShaderLogFP);
+                        }
+
+                        int sl;
+                        ri.Printf(PRINT_ALL,
+                                  "[METAL-SHADER] name='%s' stages=%d deformWaveFunc=%d\n",
+                                  qname, last->stageCount, deformWaveFunc);
+                        if (deformWaveFunc != 0) {
+                            float spread = (deformWaveDiv != 0.0f) ? (1.0f / deformWaveDiv) : 0.0f;
+                            ri.Printf(PRINT_ALL,
+                                      "[METAL-SHADER]   deform={WAVE base=%.3f amp=%.3f phase=%.3f freq=%.3f spread=%.3f fn=%d}\n",
+                                      deformWaveBase, deformWaveAmp, deformWavePhase,
+                                      deformWaveFreq, spread, deformWaveFunc);
+                        }
+                        for (sl = 0; sl < last->stageCount; ++sl) {
+                            const Q3MetalStage *st = &last->stages[sl];
+                            int tm;
+                            const char *tcGenName = "?";
+                            switch (st->tcGen) {
+                                case 0: tcGenName = "TEXTURE"; break;
+                                case 1: tcGenName = "ENVIRONMENT"; break;
+                                case 2: tcGenName = "VECTOR"; break;
+                            }
+                            ri.Printf(PRINT_ALL,
+                                      "[METAL-SHADER]   stage[%d] blendMode=%d srcBlend=0x%x dstBlend=0x%x tcGen=%s tcMods=%d rgbGen=%d alphaGen=%d\n",
+                                      sl, st->blendMode, st->rawSrcBlend, st->rawDstBlend,
+                                      tcGenName, st->tcModCount,
+                                      st->rgbGen, st->alphaGen);
+                            for (tm = 0; tm < st->tcModCount && tm < Q3_MAX_TCMODS; ++tm) {
+                                const Q3TcMod *m = &st->tcMods[tm];
+                                const char *tmName = "?";
+                                switch (m->type) {
+                                    case 1: tmName = "SCROLL"; break;
+                                    case 2: tmName = "SCALE"; break;
+                                    case 3: tmName = "ROTATE"; break;
+                                    case 4: tmName = "STRETCH"; break;
+                                    case 5: tmName = "TURB"; break;
+                                    case 6: tmName = "ENTITY_TRANSLATE"; break;
+                                    case 7: tmName = "TRANSFORM"; break;
+                                }
+                                ri.Printf(PRINT_ALL,
+                                          "[METAL-SHADER]     tcMod[%d]={%s p=(%.3f,%.3f,%.3f,%.3f)}\n",
+                                          tm, tmName,
+                                          m->params[0], m->params[1],
+                                          m->params[2], m->params[3]);
+                            }
+                        }
+                    }
+                }
+                /* === end [METAL-SHADER] instrumentation ================== */
                 /* [multi-stage-audit] one-shot print for any shader with
                  * stageCount >= 2. Bounded to first 32 unique shaders
                  * (deduped by shaderName). Lets us see exactly which
@@ -8490,6 +8629,52 @@ static void RE_RenderScene(const refdef_t *fd) {
                     baseDrawFlags = drawFlags;
                     {
                         drawFlags = EntityFlagsForTexture(textureHandle, drawFlags, qtrue);
+                        /* === [QUAD-EMIT] runtime trace for chrome-shell draws ===
+                         * When the entity uses a customShader whose texture name
+                         * contains "quad" (powerups/quadWeapon for the viewmodel
+                         * chrome shell), log everything the entity draw cmd will
+                         * carry so we can diff what cgame emitted vs what reached
+                         * the Swift entity loop. Logged to the same Documents/
+                         * baseq3/metalshader.log file as [METAL-SHADER] dumps so
+                         * one devicectl pull captures both. */
+                        if (sceneEntity->entity.customShader != 0) {
+                            const metalTexture_t *tex = FindTextureByHandle(textureHandle);
+                            const char *texName = (tex != NULL) ? tex->name : "(no-tex)";
+                            if (Q_stristr(texName, "quad") || Q_stristr(texName, "powerup") ||
+                                Q_stristr(texName, "battle") || Q_stristr(texName, "regen")) {
+                                static FILE *s_quadEmitFP = NULL;
+                                if (s_quadEmitFP == NULL) {
+                                    const char *home = getenv("HOME");
+                                    if (home != NULL && home[0]) {
+                                        char path[1024];
+                                        Com_sprintf(path, sizeof(path),
+                                                    "%s/Documents/baseq3/metalshader.log", home);
+                                        s_quadEmitFP = fopen(path, "a");
+                                    }
+                                }
+                                if (s_quadEmitFP != NULL) {
+                                    static int s_quadEmitCount = 0;
+                                    if (s_quadEmitCount < 20) {
+                                        fprintf(s_quadEmitFP,
+                                            "[QUAD-EMIT] tex='%s' handle=%u customShader=%d "
+                                            "blendMode=%d tcModCount=%d "
+                                            "tcGenEnv=%d deformWaveFunc=%d deformWaveBase=%.3f "
+                                            "baseFlags=0x%x finalFlags=0x%x renderfx=0x%x\n",
+                                            texName, textureHandle, sceneEntity->entity.customShader,
+                                            tex ? tex->blendMode : -1,
+                                            tex ? (int)tex->tcModCount : -1,
+                                            tex ? tex->tcGenEnv : -1,
+                                            tex ? (int)tex->deformWaveFunc : -1,
+                                            tex ? tex->deformWaveBase : 0.0f,
+                                            baseDrawFlags, drawFlags,
+                                            sceneEntity->entity.renderfx);
+                                        fflush(s_quadEmitFP);
+                                        s_quadEmitCount++;
+                                    }
+                                }
+                            }
+                        }
+                        /* === end [QUAD-EMIT] runtime trace ====================== */
                         if (shaderNameForStages != NULL) {
                             EmitMetalEntityStageAudit(shaderNameForStages, "model");
                         } else {
