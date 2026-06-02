@@ -517,9 +517,35 @@ static int CG_CalcFov( void ) {
 		}
 	}
 
-	x = cg.refdef.width / tan( fov_x / 360 * M_PI );
-	fov_y = atan2( cg.refdef.height, x );
-	fov_y = fov_y * 360 / M_PI;
+	/* Hor+ FOV (iOS port): Q3 stock formula is Vert- — locks fov_x to
+	 * cg_fov and computes fov_y from aspect, which at iPhone landscape
+	 * (~2.16:1) crushes vertical FOV down to ~54° vs the 4:3 stock 73°,
+	 * and the viewmodel (positioned in world coords tuned for that 73°)
+	 * falls below the visible frustum bottom.
+	 *
+	 * Fix: treat cg_fov as the 4:3 REFERENCE horizontal FOV. Derive the
+	 * reference vertical FOV at 4:3, keep it fixed across aspects, then
+	 * regrow horizontal FOV from the actual aspect. This is the canonical
+	 * Hor+ recipe used by ioquake3, Quake Live, and Quake3e — world
+	 * widens left/right on widescreen instead of cropping vertically.
+	 *
+	 * Effect:
+	 *   - cg_fov 90 at 4:3:    fov_x=90,   fov_y=73.74° (unchanged)
+	 *   - cg_fov 90 at 2.16:1: fov_x=116°, fov_y=73.74° (same vertical)
+	 * Viewmodel stays at its tuned vertical position regardless of aspect.
+	 *
+	 * Underwater warp below adjusts both axes after this, unchanged. */
+	{
+		const float aspect_ref = 4.0f / 3.0f;
+		float aspect = (cg.refdef.height > 0)
+			? (float)cg.refdef.width / (float)cg.refdef.height
+			: aspect_ref;
+		float fov_x_ref_rad = fov_x * (M_PI / 180.0f);
+		float fov_y_rad     = 2.0f * atan( tan(fov_x_ref_rad * 0.5f) / aspect_ref );
+		float fov_x_rad     = 2.0f * atan( tan(fov_y_rad * 0.5f) * aspect );
+		fov_x = fov_x_rad * (180.0f / M_PI);
+		fov_y = fov_y_rad * (180.0f / M_PI);
+	}
 
 	// warp if underwater
 	contents = CG_PointContents( cg.refdef.vieworg, -1 );

@@ -1550,6 +1550,8 @@ static void ShaderMap_GetAlphaWave(const char *name, int *func, float *base, flo
 static void ShaderMap_GetRgbConst(const char *name, float outRgb[3]);
 static float ShaderMap_GetAlphaConst(const char *name);
 static void ShaderMap_GetTcMods(const char *name, int *outCount, Q3TcMod *outMods);
+static void ShaderMap_GetDeformWave(const char *name, int *func, float *div, float *base,
+                                    float *amp, float *phase, float *freq);
 static int s_pendingAnimSlot;
 static float s_pendingScrollS;
 static float s_pendingScrollT;
@@ -1828,6 +1830,15 @@ static qhandle_t RegisterTexture(const char *name) {
     ShaderMap_GetRgbConst(name, texture->rgbConstColor);
     texture->alphaConst = ShaderMap_GetAlphaConst(name);
     ShaderMap_GetTcMods(name, &texture->tcModCount, texture->tcMods);
+    /* Shader-level deformVertexes wave (entity halo). The shader-map's
+     * stage 0 carries the parsed values; without this propagation,
+     * customShader textures (powerups/quadWeapon, powerups/quad, regen,
+     * battlesuit) leave texture->deformWaveFunc at 0 and the entity
+     * vertex shader skips the offset → halo collapses into silhouette. */
+    ShaderMap_GetDeformWave(name, &texture->deformWaveFunc,
+                            &texture->deformWaveDiv, &texture->deformWaveBase,
+                            &texture->deformWaveAmp, &texture->deformWavePhase,
+                            &texture->deformWaveFreq);
     if (Q_stricmp(name, resolvedName)) {
         MetalTelemetryPrintf("metal_asset_loaded", PRINT_ALL, "Metal stub: loaded '%s' from '%s' (%dx%d)\n", name, resolvedName, width, height);
     }
@@ -5890,6 +5901,34 @@ static void ShaderMap_GetRgbWave(const char *name, int *func, float *base, float
     if (amp)   *amp   = entry->stages[0].rgbWaveAmp;
     if (phase) *phase = entry->stages[0].rgbWavePhase;
     if (freq)  *freq  = entry->stages[0].rgbWaveFreq;
+}
+
+/* Fetch the shader-level deformVertexes wave parameters from stage 0
+ * of the resolved shader-map entry. The legacy parser at the registration
+ * site stamps these onto every stage (line ~6865) after Q3cShaderGraph_
+ * AddDeform captures them at depth==1, so stage 0 is always representative.
+ * RegisterTexture calls this so the texture (which is what cgame's
+ * customShader resolves to) carries the deform info to the entity uniforms
+ * — without this hop, ApplyCleanStageToMetalStage's narrower copy drops
+ * the deform fields and the quad shell collapses into the gun silhouette. */
+static void ShaderMap_GetDeformWave(const char *name, int *func, float *div, float *base,
+                                    float *amp, float *phase, float *freq) {
+    const metalShaderMap_t *entry;
+    if (func)  *func  = 0;
+    if (div)   *div   = 1.0f;
+    if (base)  *base  = 0.0f;
+    if (amp)   *amp   = 0.0f;
+    if (phase) *phase = 0.0f;
+    if (freq)  *freq  = 0.0f;
+    if (name == NULL || name[0] == '\0') return;
+    entry = ShaderMap_LookupEntry(name);
+    if (entry == NULL || entry->stageCount <= 0) return;
+    if (func)  *func  = (int)entry->stages[0].deformWaveFunc;
+    if (div)   *div   = entry->stages[0].deformWaveDiv;
+    if (base)  *base  = entry->stages[0].deformWaveBase;
+    if (amp)   *amp   = entry->stages[0].deformWaveAmp;
+    if (phase) *phase = entry->stages[0].deformWavePhase;
+    if (freq)  *freq  = entry->stages[0].deformWaveFreq;
 }
 
 static void ShaderMap_GetAlphaWave(const char *name, int *func, float *base, float *amp,

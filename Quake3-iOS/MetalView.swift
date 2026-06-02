@@ -2460,9 +2460,21 @@ struct MetalView: UIViewRepresentable {
                 let nativeSize = UIScreen.main.nativeBounds.size
                 target = CGSize(width: max(nativeSize.width, nativeSize.height),
                                 height: min(nativeSize.width, nativeSize.height))
-            } else {
+            } else if profile != nil {
+                // matchProfile960 / matchProfile1280 — keep deterministic
+                // sizes so AVI captures still bit-diff against prior runs.
                 target = CGSize(width: isPad ? 1280 : 960,
                                 height: isPad ? 960 : 444)
+            } else {
+                // Normal play. Was hardcoded 960×444 on iPhone / 1280×960 on
+                // iPad — both 3× smaller linearly than native, scaled up by
+                // Core Animation = soft, especially on Pro Max OLED. Use 2×
+                // of the legacy capture size on each axis (1920×888 iPhone,
+                // 2560×1920 iPad) — same aspect (~2.16:1 / 4:3) so no
+                // pillarbox/letterbox, ~4× pixel density vs legacy, well
+                // within A19 Pro / M-series GPU headroom on Q3 workloads.
+                target = CGSize(width: isPad ? 2560 : 1920,
+                                height: isPad ? 1920 : 888)
             }
             print("[Metal] Drawable size: \(size) (target \(target))")
             if size.width.isFinite && size.height.isFinite

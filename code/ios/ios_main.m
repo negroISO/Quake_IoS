@@ -734,7 +734,20 @@ void Quake3_Init(const char *basePath) {
         " +set r_mapOverBrightBits 3"
         " +set r_intensity 1.0"
         " +set r_gamma 1.25"
-        " +set r_ignorehwgamma 1";
+        " +set r_ignorehwgamma 1"
+        /* Widescreen FOV with Hor+ patch applied to CG_CalcFov (see
+         * code/cgame/cg_view.c). cg_fov is now interpreted as the 4:3
+         * REFERENCE horizontal FOV — vertical FOV is preserved across
+         * aspect ratios, horizontal expands naturally for widescreen.
+         * Q3 stock default is 90; we keep it stock so:
+         *   - 4:3 viewport: fov_x=90,   fov_y=73.7° (exactly PC ref)
+         *   - 2.16:1 phone: fov_x=116°, fov_y=73.7° (gun stays in frame,
+         *                                            world wider as expected)
+         * Vert- of stock Q3 would have crushed fov_y to ~54° at 2.16:1
+         * and pushed the viewmodel off-screen — the Hor+ patch fixes
+         * that and lets cg_fov default to its canonical 90 value. */
+        " +set cg_fov 90"
+        " +set cg_zoomfov 22";
     if (matchProfile) {
         char matchCmds[768];
         snprintf(matchCmds, sizeof(matchCmds),
@@ -850,6 +863,10 @@ void Quake3_Init(const char *basePath) {
         "seta r_gamma 1.25; "
         "seta r_intensity 1.0; "
         "seta r_ignorehwgamma 1; "
+        /* Widescreen FOV — see cmdline comment above. 95 = compromise
+         * value chosen because this fork has no cg_gunFov separator. */
+        "seta cg_fov 95; "
+        "seta cg_zoomfov 22; "
         "seta r_dynamiclight 1; "
         "seta metal_render_audit 0; "
         "seta metal_cgame_instr 0; "
