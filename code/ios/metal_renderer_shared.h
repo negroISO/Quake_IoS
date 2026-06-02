@@ -157,6 +157,17 @@ typedef struct {
      * Defaults should be (1,1,1,1) so non-const stages are no-ops. */
     float rgbConstColor[3];
     float alphaConst;
+    /* Q3 shader script `map` vs `clampmap` directive at parse time:
+     * 0 = repeat (map ... / animMap ... / default)
+     * 1 = clamp to edge (clampmap ...)
+     * Determines which MTLSamplerState the Swift draw loop binds for this
+     * stage: worldSamplerState (.repeat) for 0, uiSamplerState
+     * (.clampToEdge) for 1. Q3 reference uses GL_REPEAT for `map` and
+     * GL_CLAMP_TO_EDGE for `clampmap`. Threading this per-stage replaces
+     * the coarser all-entity-clamp hack at MetalView.swift:3267/3504/4330,
+     * which killed the quad-damage breathing shell on viewmodels (tcGen
+     * environment + map texture needs repeat to wrap seamlessly). */
+    uint32_t wrapClampMode;
 } Q3MetalWorldStage;
 
 #define Q3_METAL_MAX_STAGES 8
@@ -303,7 +314,14 @@ enum {
      * borders of rlboom/plasma/muzzle-flash sprites contribute fully
      * to the framebuffer, producing the hard rectangular explosion
      * quad visible in close-range combat. */
-    Q3_METAL_ENTITY_DRAWFLAG_ATEST_GT0 = 1u << 9
+    Q3_METAL_ENTITY_DRAWFLAG_ATEST_GT0 = 1u << 9,
+    /* Q3 `clampmap` directive on the stage that emitted this entity draw.
+     * Set: Swift draw loop binds uiSamplerState (.clampToEdge). Unset:
+     * binds worldSamplerState (.repeat). Per-stage routing replaces the
+     * coarse all-entity-clamp at MetalView.swift:3267/3504/4330 which
+     * killed the quad-damage breathing shell on viewmodels (tcGen
+     * environment + `map` directive needs repeat to wrap seamlessly). */
+    Q3_METAL_ENTITY_DRAWFLAG_CLAMPMAP = 1u << 10
 };
 
 typedef struct {
@@ -404,6 +422,21 @@ typedef struct {
     /* Stage 0 alphaGen const — only read when alphaGen == 4
      * (AGEN_CONST). Default 1.0 (no-op). */
     float alphaConst;
+    /* deformVertexes wave parameters (shader-level, stamped on every
+     * stage by the parser). Drives the q3_entity_vertex normal-axis
+     * offset that puts the powerups/quadWeapon shell OUTSIDE the gun
+     * silhouette (halo) instead of inside it. Mirrors id-quake2
+     * DeformVertex_Wave (tr_shade_calc.c) and the existing world
+     * pipeline deform block. func == 0 → no deform (branch skipped).
+     * For powerups/quadWeapon canonical content: func=1 (sin) div=100
+     * base=0.5 amp=0 phase=0 freq=0 → constant +0.5 unit halo.
+     * For powerups/quad (player): same shape with base=3.0 → +3 unit. */
+    uint32_t deformWaveFunc;
+    float deformWaveDiv;
+    float deformWaveBase;
+    float deformWaveAmp;
+    float deformWavePhase;
+    float deformWaveFreq;
 } Q3MetalTextureInfo;
 
 typedef struct {

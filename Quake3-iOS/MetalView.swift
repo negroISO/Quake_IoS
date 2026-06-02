@@ -675,6 +675,34 @@ struct MetalView: UIViewRepresentable {
                 info.alphaConst)
         }
 
+        /* Route deformVertexes wave parameters (shader-level, stage 0)
+         * to the entity vertex shader. Without this, customShader chrome
+         * shells (powerups/quadWeapon, powerups/quad, regen, battlesuit)
+         * render at the model's exact position and collapse into the
+         * silhouette — user-visible bug: missing breathing halo around
+         * the gun when quad damage is active. Default-zero func means
+         * the vertex shader skips the deform branch entirely (per-vertex
+         * cost: one int compare, branch-predictor-friendly). */
+        private static func packEntityDeform(handle: UInt32, into uniforms: inout EntityUniforms) {
+            uniforms.deformWaveFunc = 0
+            uniforms.deformWaveDiv = 1.0
+            uniforms.deformWaveBase = 0
+            uniforms.deformWaveAmp = 0
+            uniforms.deformWavePhase = 0
+            uniforms.deformWaveFreq = 0
+            var info = Q3MetalTextureInfo()
+            guard Q3MetalRenderer_GetTextureInfo(handle, &info) == 1 else { return }
+            uniforms.deformWaveFunc = info.deformWaveFunc
+            /* Guard against pathological zero/negative div from a malformed
+             * shader; div is used as 1/div in the MSL kernel. Canonical Q3
+             * powerups shaders use div=100. */
+            uniforms.deformWaveDiv = max(info.deformWaveDiv, 1e-4)
+            uniforms.deformWaveBase = info.deformWaveBase
+            uniforms.deformWaveAmp = info.deformWaveAmp
+            uniforms.deformWavePhase = info.deformWavePhase
+            uniforms.deformWaveFreq = info.deformWaveFreq
+        }
+
         struct EntityUniforms {
             var viewProjection: simd_float4x4
             /* Camera origin in world space — used by q3_entity_fragment
@@ -753,6 +781,24 @@ struct MetalView: UIViewRepresentable {
              * lights to the source texture itself double-brightens muzzle
              * flashes and projectile cores. */
             var suppressDlights: UInt32 = 0
+            /* deformVertexes wave (shader-level, stage 0). When
+             * deformWaveFunc != 0, q3_entity_vertex offsets the vertex
+             * along its normal by:
+             *   spread = 1 / div
+             *   off    = (pos.x + pos.y + pos.z) * spread
+             *   scale  = wave(func, base, amp, phase + off, freq, time)
+             *   pos   += normal * scale
+             * Mirrors the world pipeline's deform block (line ~1444).
+             * Drives the powerups/quadWeapon halo (+0.5 unit constant
+             * offset), powerups/quad (+3 unit), regen / battlesuit
+             * shells. func index: 1=sin 2=triangle 3=square 4=sawtooth
+             * 5=inverseSawtooth — same as evalWave. */
+            var deformWaveFunc: UInt32 = 0
+            var deformWaveDiv: Float = 1.0
+            var deformWaveBase: Float = 0
+            var deformWaveAmp: Float = 0
+            var deformWavePhase: Float = 0
+            var deformWaveFreq: Float = 0
         }
 
         /* Fragment-side dlight block bound at buffer(2) for both world and
@@ -1333,6 +1379,19 @@ struct MetalView: UIViewRepresentable {
             float4 color;
             float3 normal;
         };
+        // NOTE 2026-06-01: tried packed_float3 swap here to match the
+        // tightly-packed C Q3MetalEntityVertex (48 bytes vs MSL float3-
+        // padded 56). The Geometry tab on a flare draw clearly showed
+        // negative-w vertices producing radial bursts, so the misalignment
+        // hypothesis seemed right. But the packed_float3 build turned fog
+        // green and killed rocket-explosion brightness — so something
+        // upstream is already compensating for the stride mismatch (the
+        // CPU upload path probably re-lays the vertices to MSL-aligned
+        // 56 bytes before binding, or there's a hidden vertex descriptor).
+        // The diagonal "light ray" turned out to be a real BSP lens flare
+        // (light_flare entity), not a geometry bug. If we ever DO need
+        // to revisit struct alignment, audit how Q3MetalRenderer_Get*
+        // buffers are uploaded first.
 
         struct EntityUniforms {
             float4x4 viewProjection;
@@ -1362,6 +1421,15 @@ struct MetalView: UIViewRepresentable {
             float4 fogParams;
             float4 fogSurface;
             uint suppressDlights;
+            /* deformVertexes wave (shader-level). Applied in
+             * q3_entity_vertex when deformWaveFunc != 0. Matches the
+             * world pipeline's deform formula exactly. */
+            uint  deformWaveFunc;
+            float deformWaveDiv;
+            float deformWaveBase;
+            float deformWaveAmp;
+            float deformWavePhase;
+            float deformWaveFreq;
         };
 
         float q3EntityFogFactor(float3 worldPos,
@@ -1748,10 +1816,49 @@ struct MetalView: UIViewRepresentable {
                                                 uint vertexID [[vertex_id]]) {
             EntityVertexOut out;
             EntityVertexIn inVertex = vertices[vertexID];
-            out.position = uniforms.viewProjection * float4(inVertex.position, 1.0);
+            float3 worldPos = inVertex.position;
+            /* deformVertexes wave (shader-level). Mirrors the world
+             * pipeline's deform block (search "deformVertexes wave:
+             * shader-level position deform" in q3_world_vertex). Critical
+             * for the powerups/quad family of shell shaders — without
+             * this offset, customShader passes render at the model's
+             * exact silhouette and collapse into invisibility instead
+             * of forming the breathing halo around the gun / player.
+             *
+             *   spread = 1 / div
+             *   off    = (pos.x + pos.y + pos.z) * spread
+             *   scale  = wave(func, base, amp, phase + off, freq, t)
+             *   pos   += normal * scale
+             *
+             * Branch is uniform across the draw — predictor-friendly.
+             * Vertices with degenerate normals (sprites/beams that left
+             * the normal slot at 0) skip the offset so chrome sprites
+             * don't collapse. */
+            if (uniforms.deformWaveFunc != 0u) {
+                float3 n = inVertex.normal;
+                float nLen = length(n);
+                if (nLen > 1e-4) {
+                    n /= nLen;
+                    float spread = 1.0 / max(uniforms.deformWaveDiv, 1e-4);
+                    float off = (worldPos.x + worldPos.y + worldPos.z) * spread;
+                    float scale = evalWave(uniforms.deformWaveFunc,
+                                           uniforms.deformWaveBase,
+                                           uniforms.deformWaveAmp,
+                                           uniforms.deformWavePhase + off,
+                                           uniforms.deformWaveFreq,
+                                           uniforms.timeSeconds);
+                    worldPos += n * scale;
+                }
+            }
+            out.position = uniforms.viewProjection * float4(worldPos, 1.0);
             out.texCoord = inVertex.texCoord;
             out.color = inVertex.color;
-            out.worldPos = inVertex.position;
+            /* Emit POST-deform world position so the fragment's tcGen
+             * environment reflection vector projects from the expanded
+             * shell surface rather than the original gun surface —
+             * keeps the chrome reflection consistent with the visual
+             * silhouette the player sees. */
+            out.worldPos = worldPos;
             out.normal = inVertex.normal;
             return out;
         }
@@ -2065,6 +2172,93 @@ struct MetalView: UIViewRepresentable {
         private var additiveLessDepthStencilState: MTLDepthStencilState?
         private var depthHackDepthStencilState: MTLDepthStencilState?
         private var fallbackDepthStencilState: MTLDepthStencilState?
+
+        /* Final-image postprocess tone curve — port of Q2 MetalPostprocess.
+         * In-place compute kernel on the drawable: rgb = saturate(rgb *
+         * intensity); rgb = pow(rgb, gamma). Encoded after the main render
+         * encoder ends and before commandBuffer.present(). Gated by
+         * Q3_PostprocessEnabled() — when off, the compute pipeline is
+         * never compiled (lazy init in ensurePostprocessPipeline). */
+        private var postprocessPipelineState: MTLComputePipelineState?
+        private var postprocessEncodeCount: Int = 0
+        private var postprocessLogPrintedOnce: Bool = false
+
+        private struct PostprocessUniforms {
+            var intensity: Float
+            var gamma: Float
+        }
+
+        @MainActor
+        private func ensurePostprocessPipeline(device: MTLDevice) -> MTLComputePipelineState? {
+            if let postprocessPipelineState { return postprocessPipelineState }
+            let src = """
+            #include <metal_stdlib>
+            using namespace metal;
+
+            struct PPUniforms {
+                float intensity;
+                float gamma;
+            };
+
+            kernel void q3_postprocess(texture2d<float, access::read_write> drawable [[texture(0)]],
+                                       constant PPUniforms &u [[buffer(0)]],
+                                       uint2 tid [[thread_position_in_grid]]) {
+                uint w = drawable.get_width();
+                uint h = drawable.get_height();
+                if (tid.x >= w || tid.y >= h) return;
+                float4 c = drawable.read(tid);
+                float3 rgb = saturate(c.rgb * u.intensity);
+                rgb = pow(rgb, float3(u.gamma));
+                drawable.write(float4(rgb, c.a), tid);
+            }
+            """
+            do {
+                let lib = try device.makeLibrary(source: src, options: nil)
+                guard let fn = lib.makeFunction(name: "q3_postprocess") else {
+                    print("[MTL_POSTPROC] makeFunction failed")
+                    return nil
+                }
+                let pso = try device.makeComputePipelineState(function: fn)
+                postprocessPipelineState = pso
+                if !postprocessLogPrintedOnce {
+                    print("[MTL_POSTPROC] q3_postprocess pipeline ready")
+                    postprocessLogPrintedOnce = true
+                }
+                return pso
+            } catch {
+                print("[MTL_POSTPROC] compile failed: \(error)")
+                return nil
+            }
+        }
+
+        @MainActor
+        private func encodePostprocess(commandBuffer: MTLCommandBuffer,
+                                       drawable: CAMetalDrawable) {
+            guard Q3_PostprocessEnabled() != 0 else { return }
+            guard let device = commandBuffer.device as MTLDevice?,
+                  let pso = ensurePostprocessPipeline(device: device),
+                  let enc = commandBuffer.makeComputeCommandEncoder() else {
+                return
+            }
+            enc.label = "Q3.postprocess"
+            enc.setComputePipelineState(pso)
+            enc.setTexture(drawable.texture, index: 0)
+            var u = PostprocessUniforms(intensity: Q3_PostprocessIntensity(),
+                                        gamma: Q3_PostprocessGamma())
+            enc.setBytes(&u, length: MemoryLayout<PostprocessUniforms>.size, index: 0)
+            let w = drawable.texture.width
+            let h = drawable.texture.height
+            let threadsPerThreadgroup = MTLSize(width: 8, height: 8, depth: 1)
+            let threadgroups = MTLSize(width: (w + 7) / 8,
+                                       height: (h + 7) / 8,
+                                       depth: 1)
+            enc.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerThreadgroup)
+            enc.endEncoding()
+            postprocessEncodeCount += 1
+            if postprocessEncodeCount == 1 || postprocessEncodeCount % 120 == 0 {
+                print("[MTL_POSTPROC] encode #\(postprocessEncodeCount) intensity=\(u.intensity) gamma=\(u.gamma) size=\(w)x\(h)")
+            }
+        }
 
         private func ensuredDepthStencilState(_ preferred: MTLDepthStencilState?, device: MTLDevice?) -> MTLDepthStencilState? {
             if let preferred { return preferred }
@@ -3255,13 +3449,17 @@ struct MetalView: UIViewRepresentable {
                 encoder.setVertexBuffer(entityVertexBuffer, offset: 0, index: 0)
                 encoder.setVertexBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
                 encoder.setFragmentBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
-                // Q3 entity additive/clampmap stages need clampToEdge to
-                // prevent dlight projection discs, muzzle-flash sprites,
-                // and tcGen-environment refraction samples from tiling
-                // (concentric ring artifact across the framebuffer). World
-                // surfaces still use the .repeat sampler at line ~2415;
-                // entities go through uiSamplerState (clampToEdge).
-                encoder.setFragmentSamplerState(uiSamplerState, index: 0)
+                // Q3 per-stage wrap routing — sampler is bound per-draw
+                // inside the loop below based on the new
+                // Q3_METAL_ENTITY_DRAWFLAG_CLAMPMAP bit (sourced from the
+                // Q3 .shader `clampmap` vs `map` directive). World samp
+                // (.repeat) is the default for `map` stages (quad damage
+                // breathing field, scrolling chrome shells); ui samp
+                // (.clampToEdge) for `clampmap` stages (dlight projection
+                // discs, HUD pics). Seed with repeat — the prior
+                // single-bind-clampToEdge here killed the quad shell.
+                encoder.setFragmentSamplerState(worldSamplerState, index: 0)
+                var entityLastSamplerWasClamp: Bool = false
 
                 // Dlights for entities (viewmodel, players, pickups lit by
                 // nearby muzzle flash / rocket glow). Same block as world pass.
@@ -3320,6 +3518,10 @@ struct MetalView: UIViewRepresentable {
                         Self.packEntityTcMods(handle: draw.textureHandle, into: &entityUniforms)
                         Self.packEntityAlphaFunc(handle: draw.textureHandle, into: &entityUniforms)
                         Self.packEntityRgbGen(handle: draw.textureHandle, into: &entityUniforms)
+                        /* deformVertexes wave (shell shaders: quad, quadWeapon,
+                         * regen, battlesuit). Per-draw because each customShader
+                         * carries its own div/base/amp. */
+                        Self.packEntityDeform(handle: draw.textureHandle, into: &entityUniforms)
                         /* Per-draw refEntity_t.shaderRGBA fed through to MSL
                          * for rgbGen=entity / oneMinusEntity (5/6) and
                          * alphaGen=entity / oneMinusEntity (5/6). */
@@ -3368,6 +3570,19 @@ struct MetalView: UIViewRepresentable {
                         } else if drawPass == 2, let entityAlphaPipelineState {
                             encoder.setRenderPipelineState(entityAlphaPipelineState)
                             encoder.setDepthStencilState(ensuredDepthStencilState(additiveEntityDepthStencilState, device: view.device))
+                            // NOTE 2026-06-01: tried swapping to depthStencilState
+                            // (write=YES) so the fog volume could see alpha
+                            // entities. Symptom did exist (health/armor floating
+                            // above fog) but the fix had cross-pass side effects
+                            // — fog turned green, rocket-explosion brightness
+                            // dropped. The Q3.entity.alpha pipeline is shared
+                            // by multi-stage shaders where some stages also
+                            // route through additive blending; writing depth on
+                            // an alpha stage occluded subsequent additive stages
+                            // of the same entity. Proper fix requires per-stage
+                            // depth control (write depth only on the OPAQUE
+                            // base stage of multi-stage entity shaders, leave
+                            // additive overlay stages with write=NO). Defer.
                         } else if drawPass == 1, let entityFilterPipelineState {
                             encoder.setRenderPipelineState(entityFilterPipelineState)
                             encoder.setDepthStencilState(ensuredDepthStencilState(additiveEntityDepthStencilState, device: view.device))
@@ -3382,6 +3597,20 @@ struct MetalView: UIViewRepresentable {
                             encoder.setDepthStencilState(ensuredDepthStencilState(state, device: view.device))
                         }
                         encoder.setFragmentTexture(texture, index: 0)
+                        // Per-draw sampler routing from the new
+                        // Q3_METAL_ENTITY_DRAWFLAG_CLAMPMAP bit. The flag
+                        // is set by EntityFlagsForTexture from
+                        // metalTexture_t.wrapClampMode, in turn set by
+                        // CopyStageMetadataToTexture from the parser's
+                        // Q3MetalStage.wrapClampMode (the C-side mirror of
+                        // the Q3 `clampmap` vs `map` directive). Memoized
+                        // to skip redundant binds across consecutive
+                        // same-wrap draws.
+                        let wantClamp = (draw.flags & UInt32(Q3_METAL_ENTITY_DRAWFLAG_CLAMPMAP)) != 0
+                        if wantClamp != entityLastSamplerWasClamp {
+                            encoder.setFragmentSamplerState(wantClamp ? uiSamplerState : worldSamplerState, index: 0)
+                            entityLastSamplerWasClamp = wantClamp
+                        }
                         encoder.drawIndexedPrimitives(
                             type: .triangle,
                             indexCount: Int(draw.indexCount),
@@ -3590,6 +3819,12 @@ struct MetalView: UIViewRepresentable {
             }
 
             encoder.endEncoding()
+            // Final-image postprocess tone curve (port of Q2 MetalPostprocess).
+            // Compute kernel does saturate(rgb*intensity); pow(rgb, gamma).
+            // Encoded after all render encoders, before present. Gated by
+            // r_postprocess (default 1). No-op when cvar=0 — pipeline is
+            // lazy-built only when needed.
+            encodePostprocess(commandBuffer: commandBuffer, drawable: drawable)
             // Cache drawable.texture BEFORE present(). Reading
             // drawable.texture after commandBuffer.present(drawable)
             // logs "[CAMetalLayerDrawable texture] should not be called

@@ -129,6 +129,32 @@ typedef struct {
      * ioquake3's RB_CalcScrollTexCoords + RB_CalcRotateTexCoords order. */
     int tcModCount;
     Q3TcMod tcMods[Q3_MAX_TCMODS];
+    /* Stage 0 `clampmap` directive: 0=repeat (default `map`), 1=clamp
+     * (`clampmap`). Read by EntityFlagsForTexture; entity draws bind
+     * uiSamplerState (.clampToEdge) when set, worldSamplerState
+     * (.repeat) when clear. Caveat: this is stamped per-texture from
+     * stage 0, so a texture used by both a `map` stage and a `clampmap`
+     * stage in different shaders will reflect whichever shader
+     * registered last. Acceptable for current Q3 content where wrap mode
+     * is texture-content driven (dlight discs always clampmap, scrolling
+     * patterns always map). Full per-stage routing would also write the
+     * flag at entity-emit time from the stage that produced the draw,
+     * but the helper-based path keeps EntityFlagsForTexture self-
+     * contained for now. */
+    int wrapClampMode;
+    /* deformVertexes wave (stage 0) — propagated to entity draws via
+     * Q3MetalRenderer_GetTextureInfo so chrome shell shaders (powerups/
+     * quad, quadWeapon, regen, battlesuit) apply the proper normal-axis
+     * vertex offset. Without this the shell shader renders at the gun
+     * model's exact position and collapses inside the silhouette;
+     * canonical powerups/quadWeapon uses base=0.5 → +0.5 unit halo,
+     * powerups/quad uses base=3.0 → +3 unit halo. func==0 → no deform. */
+    int deformWaveFunc;
+    float deformWaveDiv;
+    float deformWaveBase;
+    float deformWaveAmp;
+    float deformWavePhase;
+    float deformWaveFreq;
 } metalTexture_t;
 
 refimport_t ri;
@@ -475,6 +501,10 @@ typedef struct {
     float animFps;
     char animFrames[METAL_ANIMMAP_MAX_FRAMES][MAX_QPATH];
     qhandle_t animTextures[METAL_ANIMMAP_MAX_FRAMES];
+    /* Q3 shader script wrap directive: 0 = repeat (default / `map`),
+     * 1 = clamp to edge (`clampmap`). Propagated to Q3MetalWorldStage
+     * so the Swift draw loop binds the matching MTLSamplerState. */
+    int wrapClampMode;
 } Q3MetalStage;
 
 enum {
@@ -1156,6 +1186,13 @@ static void AddWorldDrawStage(Q3MetalWorldDrawCmd *draw,
     stage->rgbConstColor[1] = (src->rgbGen == 4) ? src->rgbConstColor[1] : 1.0f;
     stage->rgbConstColor[2] = (src->rgbGen == 4) ? src->rgbConstColor[2] : 1.0f;
     stage->alphaConst = (src->alphaGen == 4) ? src->alphaConst : 1.0f;
+    /* Q3 `clampmap` directive — propagated from the parser through
+     * Q3MetalStage. Swift draw loop reads stage.wrapClampMode to pick
+     * between worldSamplerState (.repeat) and uiSamplerState
+     * (.clampToEdge). Replaces the coarse all-entity-clamp hack from
+     * MetalView.swift lines 3267/3504/4330 that killed the quad-damage
+     * breathing shell on viewmodels. */
+    stage->wrapClampMode = (uint32_t)src->wrapClampMode;
 }
 
 /* Fallback for draws with no parsed .shader entry — construct a minimal
@@ -1838,6 +1875,13 @@ static void CopyStageMetadataToTexture(metalTexture_t *texture, const Q3MetalSta
     texture->alphaConst = stage->alphaConst;
     texture->tcModCount = stage->tcModCount;
     for (i = 0; i < Q3_MAX_TCMODS; ++i) texture->tcMods[i] = stage->tcMods[i];
+    texture->wrapClampMode = stage->wrapClampMode;
+    texture->deformWaveFunc  = (int)stage->deformWaveFunc;
+    texture->deformWaveDiv   = stage->deformWaveDiv;
+    texture->deformWaveBase  = stage->deformWaveBase;
+    texture->deformWaveAmp   = stage->deformWaveAmp;
+    texture->deformWavePhase = stage->deformWavePhase;
+    texture->deformWaveFreq  = stage->deformWaveFreq;
 }
 
 static qhandle_t RegisterEntityStageTexture(const char *shaderName, int stageIndex) {
@@ -1934,6 +1978,32 @@ static uint32_t EntityFlagsForTexture(qhandle_t textureHandle, uint32_t flags, q
         }
     }
     if (tex->tcGenEnv) flags |= Q3_METAL_ENTITY_DRAWFLAG_TCGEN_ENV;
+    /* Sampler-wrap routing. Three triggers force clampToEdge:
+     *   1. Explicit `clampmap` directive in the shader script
+     *      (wrapClampMode == 1). Always clamps. HUD icons, dlight
+     *      projection discs, deliberate clamp content.
+     *   2. Animated tcMod (scroll / rotate / etc) on a non-environment
+     *      `tcGen base` stage. These are 2D-billboard sprites where the
+     *      animated UVs WILL go outside [0,1] and Q3 reference relies on
+     *      transparent border padding to fade out via clamp. With repeat
+     *      the wrap exposes the sprite quad's polygon edges (visible
+     *      on plasma bolts, gauntlet fx, muzzle-flash sprites).
+     *   3. (rule 2 explicitly EXCLUDES tcGen environment) Chrome shells
+     *      with animated tcMod (quad damage breathing shell, megahealth
+     *      orb) MUST stay on repeat — the envmap is seamless and clamp
+     *      would freeze the shimmer at the edge texel.
+     *
+     * Logic table:
+     *   wrapClampMode=1                  → CLAMP (rule 1)
+     *   tcMods>0 && !tcGenEnv            → CLAMP (rule 2)
+     *   tcMods>0 &&  tcGenEnv            → repeat (chrome shell)
+     *   tcMods=0 (static)                → repeat (typical world / model
+     *                                       textures, also any unanimated
+     *                                       clampmap stage handled by rule 1) */
+    if (tex->wrapClampMode ||
+        (tex->tcModCount > 0 && !tex->tcGenEnv)) {
+        flags |= Q3_METAL_ENTITY_DRAWFLAG_CLAMPMAP;
+    }
     return flags;
 }
 
@@ -5760,6 +5830,7 @@ static void ApplyCleanStageToMetalStage(const Q3cShaderStage *clean,
     stage->depthFunc = clean->depthFunc;
     stage->depthWrite = clean->depthWrite ? 1 : stage->depthWrite;
     stage->alphaFunc = (int)clean->alphaFunc;
+    stage->wrapClampMode = (int)clean->wrapClampMode;
 }
 
 static int ShaderMap_GetAlphaFunc(const char *name) {
@@ -6268,6 +6339,20 @@ static void ParseShaderText(const char *text) {
 
             {
                 if (!Q_stricmp(token, "map") || !Q_stricmp(token, "clampmap")) {
+                    /* Q3 shader scripts distinguish `map` (repeat wrap) from
+                     * `clampmap` (clamp-to-edge wrap). Reference ioquake3
+                     * sets bundle->wrapClampMode = WRAP_CLAMP for clampmap
+                     * and WRAP_REPEAT (default 0) for map. Threading this
+                     * per-stage lets the Swift draw loop pick the right
+                     * MTLSamplerState — dlight projection discs, HUD
+                     * elements, and `clampmap` decorations get clamp;
+                     * environment-mapped chrome shells (quad damage),
+                     * tiled detail textures, and standard `map` stages
+                     * get repeat. */
+                    int isClampMap = !Q_stricmp(token, "clampmap");
+                    if (cleanStage != NULL) {
+                        cleanStage->wrapClampMode = (uint32_t)(isClampMap ? 1 : 0);
+                    }
                     token = COM_ParseExt(&p, qfalse);
                     if (token[0]) {
                         if (!Q_stricmp(token, "$lightmap")) {
@@ -9317,6 +9402,12 @@ int Q3MetalRenderer_GetTextureInfo(uint32_t textureHandle, Q3MetalTextureInfo *o
     outInfo->rgbConstColor[1] = texture->rgbConstColor[1];
     outInfo->rgbConstColor[2] = texture->rgbConstColor[2];
     outInfo->alphaConst = texture->alphaConst;
+    outInfo->deformWaveFunc  = (uint32_t)texture->deformWaveFunc;
+    outInfo->deformWaveDiv   = texture->deformWaveDiv;
+    outInfo->deformWaveBase  = texture->deformWaveBase;
+    outInfo->deformWaveAmp   = texture->deformWaveAmp;
+    outInfo->deformWavePhase = texture->deformWavePhase;
+    outInfo->deformWaveFreq  = texture->deformWaveFreq;
     return 1;
 }
 
@@ -9326,6 +9417,55 @@ const char *Q3MetalRenderer_GetTextureName(uint32_t textureHandle) {
         return NULL;
     }
     return texture->name;
+}
+
+/* Final-image postprocess tone curve — port of Q2's MetalPostprocess.
+ *
+ * Compute kernel applied in-place on the drawable after all renderer
+ * encoders complete and before commandBuffer.present(). Two ops, in order:
+ *     rgb = saturate(rgb * intensity);
+ *     rgb = pow(rgb, gamma);
+ *
+ * Defaults tuned for OLED iPhone after the lightmap pre-shift was raised
+ * to ×4 (r_mapOverBrightBits 3). intensity 1.5 lifts midtones a further
+ * ~15% perceived without doubling up on the lightmap. gamma 0.95 = mild
+ * brighten in the shoulder, leaves blacks alone.
+ *
+ * These three accessors are idempotent: ri.Cvar_Get registers on first
+ * call, returns the existing cvar on subsequent calls. Range clamps are
+ * defensive — keeps a user dialing extreme values from blowing out or
+ * crushing the image entirely.
+ *
+ * NULL-guard for early call: Swift `drawFrame` can fire during the
+ * `[Q3-BOOT] yielding 200ms for LoadingOverlay paint` window, BEFORE
+ * GetRefAPI populates the static `ri` refimport_t (file-scope zero-init
+ * until GetRefAPI runs). Calling `ri.Cvar_Get` then dereferences a NULL
+ * function pointer → EXC_BAD_ACCESS at address 0x0. Returning the
+ * cvar-default value when `ri.Cvar_Get == NULL` lets the postprocess
+ * pipeline lazy-init harmlessly on the first real frame; once GetRefAPI
+ * runs, subsequent calls register the cvar and read its live value. */
+int Q3_PostprocessEnabled(void) {
+    if (ri.Cvar_Get == NULL) return 1;
+    cvar_t *cv = ri.Cvar_Get("r_postprocess", "1", CVAR_ARCHIVE);
+    return cv ? cv->integer : 1;
+}
+
+float Q3_PostprocessIntensity(void) {
+    if (ri.Cvar_Get == NULL) return 1.5f;
+    cvar_t *cv = ri.Cvar_Get("r_postprocess_intensity", "1.5", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 1.5f;
+    if (v < 0.5f) v = 0.5f;
+    if (v > 3.0f) v = 3.0f;
+    return v;
+}
+
+float Q3_PostprocessGamma(void) {
+    if (ri.Cvar_Get == NULL) return 0.95f;
+    cvar_t *cv = ri.Cvar_Get("r_postprocess_gamma", "0.95", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.95f;
+    if (v < 0.5f) v = 0.5f;
+    if (v > 2.5f) v = 2.5f;
+    return v;
 }
 
 refexport_t *GetRefAPI(int apiVersion, refimport_t *rimp) {

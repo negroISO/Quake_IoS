@@ -709,7 +709,32 @@ void Quake3_Init(const char *basePath) {
     // of zone during cgame init and crash in Z_CheckHeap with "next block
     // doesn't have proper back link". Bumping to 64/256/16 covers the
     // heaviest community maps with margin on iPhone 17 Pro (12 GB unified).
-    char cmdline[1024] = "+set com_zoneMegs 64 +set com_hunkMegs 256 +set com_soundMegs 16 +set vm_ui 1 +set vm_game 1 +set vm_cgame 1";
+    /* Brightness cvars MUST land on the cmdline +set path, not via
+     * post-init Cbuf seta. r_mapOverBrightBits is CVAR_LATCH — `seta`
+     * after Com_Init only updates latchedString; cvar->integer keeps
+     * the old value until vid_restart. Cmdline +set runs through
+     * Com_StartupVariable BEFORE the renderer's Cvar_Get registers
+     * the cvar, so the +set value IS the registered initial value
+     * (no latch needed). This means the lightmap pre-shift at first
+     * BSP load (metal_renderer_stub.c:2421) reads the value we want.
+     *
+     * Bumped values vs PC reference (chosen for OLED iPhone vs PC CRT
+     * reference look — user reported world too dark vs LvL HD captures):
+     *   r_mapOverBrightBits 3  (PC default 2) — shift = 3-1 = 2,
+     *                            gives ×4 lightmap vs PC's ×2.
+     *                            Hue-preserving normalize in load
+     *                            shift code clamps blowouts.
+     *   r_overBrightBits   1  (PC default 1) — kept stock so the
+     *                            shift formula stays sane.
+     * r_gamma / r_intensity / r_ignorehwgamma are also set so they're
+     * in place IF a postprocess gamma kernel is added later, but the
+     * current Metal renderer ignores them. */
+    char cmdline[1024] = "+set com_zoneMegs 64 +set com_hunkMegs 256 +set com_soundMegs 16 +set vm_ui 1 +set vm_game 1 +set vm_cgame 1"
+        " +set r_overBrightBits 1"
+        " +set r_mapOverBrightBits 3"
+        " +set r_intensity 1.0"
+        " +set r_gamma 1.25"
+        " +set r_ignorehwgamma 1";
     if (matchProfile) {
         char matchCmds[768];
         snprintf(matchCmds, sizeof(matchCmds),
@@ -815,9 +840,14 @@ void Quake3_Init(const char *basePath) {
         "seta r_texturebits 32; "
         "seta r_colorbits 32; "
         "seta r_depthbits 24; "
+        /* Brightness archived values — kept in sync with the cmdline
+         * +set block above so q3config.cfg persists the new defaults
+         * and any future vid_restart commits the latched values to
+         * cvar->integer. See cmdline comment above for rationale on
+         * mapOverBrightBits=3 (vs PC's 2). */
         "seta r_overBrightBits 1; "
-        "seta r_mapOverBrightBits 2; "
-        "seta r_gamma 1.15; "
+        "seta r_mapOverBrightBits 3; "
+        "seta r_gamma 1.25; "
         "seta r_intensity 1.0; "
         "seta r_ignorehwgamma 1; "
         "seta r_dynamiclight 1; "

@@ -69,6 +69,12 @@ typedef struct {
     uint32_t depthWrite;
     uint32_t alphaFunc;
     uint32_t isLightmap;
+    /* Q3 shader script wrap directive: 0 = repeat (default / `map ...`),
+     * 1 = clamp to edge (`clampmap ...`). Threaded through to Q3MetalWorldStage
+     * by ApplyCleanStageToMetalStage; the Swift draw loop binds the matching
+     * MTLSamplerState per draw so e.g. dlight projection discs clamp while
+     * tcGen environment chrome shells (quad damage breathing field) repeat. */
+    uint32_t wrapClampMode;
 } Q3cShaderStage;
 
 typedef struct {
