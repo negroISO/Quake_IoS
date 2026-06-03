@@ -2334,13 +2334,21 @@ struct MetalView: UIViewRepresentable {
                 float3 worldN = normalize(T * nMap.x + B * nMap.y + N * nMap.z);
 
                 // Half-Lambert against a fixed key-light direction.
-                // 0.3, 0.5, 0.7 is a 3-point cheat: slight rim from
-                // above-back-right that flatters most viewmodel poses.
+                // 0.3, 0.5, 0.7 = soft rim from above-back-right.
+                //
+                // Multiplier range tuned to (0.78..1.18) per user
+                // feedback 2026-06-03: rotating world pickups (ammo
+                // boxes, dropped weapons) hit Mikkelsen TBN derivative
+                // instability when the geometry rotates each frame,
+                // producing high-contrast jagged shading at the
+                // previous (0.6..1.2) range. Tighter range keeps the
+                // viewmodel relief visible but prevents the
+                // "shattered glass" look on spinning pickups.
                 float3 sunDir = normalize(float3(0.3, 0.5, 0.7));
                 float NdotL = dot(worldN, sunDir) * 0.5 + 0.5;
                 float halfLambert = NdotL * NdotL;
 
-                base.rgb *= (0.6 + halfLambert * 0.6);
+                base.rgb *= (0.78 + halfLambert * 0.40);
             }
             return base;
         }

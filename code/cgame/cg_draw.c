@@ -761,16 +761,13 @@ static float CG_DrawFPS( float y ) {
 		s = va( "%ifps", fps );
 		w = CG_DrawStrlen( s ) * BIGCHAR_WIDTH;
 
-		/* iOS: anchor at top-LEFT (virtual x=5) instead of top-right
-		 * (virtual x=635 - w). On our 2.16:1 widescreen aspect the stock
-		 * right-anchor formula clipped the "fps" suffix off the panel
-		 * edge (CG_AdjustFrom640 stretches x → 2868 but the BIGCHAR_WIDTH
-		 * scaling doesn't fully compensate). Left-anchor at x=5 lands
-		 * safely inside the visible area on every aspect ratio, and is
-		 * the more conventional placement for AVI capture / perf compare.
-		 * (void)w — width was only used for the old right-anchor. */
-		(void)w;
-		CG_DrawBigString( 5, y + 2, s, 1.0F);
+		/* iOS: anchor at top-CENTER (virtual x = (640 - w) / 2) per
+		 * user request 2026-06-03. Previous placement was top-left
+		 * (x=5); before that, stock Q3 used right-anchor (x=635 - w)
+		 * which clipped the "fps" suffix on 2.16:1 widescreen.
+		 * Top-center reads cleanly on every aspect ratio and is the
+		 * conventional Q3 perf-counter placement. */
+		CG_DrawBigString( (640 - w) / 2, y + 2, s, 1.0F);
 	}
 
 	return y + BIGCHAR_HEIGHT + 4;
