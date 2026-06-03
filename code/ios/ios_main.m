@@ -780,11 +780,14 @@ void Quake3_Init(const char *basePath) {
          *     Adds a touch of color punch on top of the remaster's HD assets.
          *   r_ignorehwgamma 1 — bypass hardware gamma ramp (we do software
          *     gamma via postprocess instead). */
-        " +set r_mapOverBrightBits 1"
-        " +set r_intensity 1.4"
-        " +set r_gamma 1.2"
-        " +set r_picmip 0"
-        " +set r_mapGreyScale -0.25"
+        /* PURE 1999 VANILLA cvars for PBR-baseline work. The remaster
+         * tuning above is preserved in comments — flip these back to
+         * 1.4 / 1.2 / -0.25 once PBR Phase 1 is locked in. */
+        " +set r_mapOverBrightBits 2"
+        " +set r_intensity 1.0"
+        " +set r_gamma 1.0"
+        " +set r_picmip 1"
+        " +set r_mapGreyScale 0"
         " +set r_ignorehwgamma 1"
         /* Widescreen FOV with Hor+ patch applied to CG_CalcFov (see
          * code/cgame/cg_view.c). cg_fov is the 4:3 REFERENCE horizontal
@@ -808,8 +811,11 @@ void Quake3_Init(const char *basePath) {
          * Both are CVAR_ARCHIVE so they ALSO persist into q3config.cfg
          * on writeconfig, but baking on the cmdline guarantees they
          * apply from the very first frame even before config load. */
-        " +set r_subdivisions -1"
-        " +set r_lodbias -1";
+        /* Vanilla-stock geometry knobs (PBR-baseline lockdown):
+         *   r_subdivisions 4  (stock default; lower = smoother curves)
+         *   r_lodbias       0 (stock default; negative = always-highest LOD) */
+        " +set r_subdivisions 4"
+        " +set r_lodbias 0";
     if (matchProfile) {
         char matchCmds[768];
         snprintf(matchCmds, sizeof(matchCmds),
@@ -1000,20 +1006,21 @@ void Quake3_Init(const char *basePath) {
          * via trap_R_AddPolyToScene → RE_AddPolyToScene. */
         "seta cg_marks 1; "
         "seta cg_brassTime 2500; "
-        "seta r_picmip 0; "
+        /* PURE 1999 VANILLA seta values — must match the cmdline +set
+         * block above. PBR-baseline lockdown: anything that "polishes"
+         * the look gets reset to stock Q3 1.32 default. Flip back to
+         * picmip 0 + gamma 1.25 + intensity 1.0 + LINEAR_NEAREST etc.
+         * once PBR Phase 1 is signed off. */
+        "seta r_picmip 1; "
         "seta r_textureMode GL_LINEAR_MIPMAP_NEAREST; "
         "seta r_texturebits 32; "
         "seta r_colorbits 32; "
         "seta r_depthbits 24; "
-        /* Brightness archived values — kept in sync with the cmdline
-         * +set block above so q3config.cfg persists the new defaults
-         * and any future vid_restart commits the latched values to
-         * cvar->integer. See cmdline comment above for rationale on
-         * mapOverBrightBits=3 (vs PC's 2). */
         "seta r_overBrightBits 1; "
         "seta r_mapOverBrightBits 2; "
-        "seta r_gamma 1.25; "
+        "seta r_gamma 1.0; "
         "seta r_intensity 1.0; "
+        "seta r_mapGreyScale 0; "
         "seta r_ignorehwgamma 1; "
         /* Widescreen FOV — see cmdline comment above. 95 = compromise
          * value chosen because this fork has no cg_gunFov separator. */
@@ -1021,8 +1028,8 @@ void Quake3_Init(const char *basePath) {
         "seta cg_zoomfov 22; "
         /* Max-quality geometry — mirrors the cmdline +set block above
          * so the values land in q3config.cfg on writeconfig. */
-        "seta r_subdivisions -1; "
-        "seta r_lodbias -1; "
+        "seta r_subdivisions 4; "
+        "seta r_lodbias 0; "
         "seta r_dynamiclight 1; "
         "seta metal_render_audit 0; "
         "seta metal_cgame_instr 0; "
