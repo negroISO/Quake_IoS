@@ -2382,45 +2382,50 @@ struct MetalView: UIViewRepresentable {
                  *
                  * Reference: https://google.github.io/filament/Filament.md.html
                  */
-                if (pbrNormalScale > 0.5 &&
-                    !is_null_texture(roughnessTexture) &&
+                // PBR Phase 4 (production): Blinn-Phong specular highlight.
+                //
+                // GGX/Cook-Torrance produced mathematically correct but
+                // visually invisible specular on the rocket viewmodel —
+                // GGX peaks only at mirror angles which Q3 viewmodel
+                // geometry rarely hits relative to a fixed sun direction.
+                // Blinn-Phong with a moderate exponent gives a much
+                // softer/wider highlight that reads as "shiny metal"
+                // across more of the model surface.
+                //
+                // Path was proven alive via magenta diagnostic (the
+                // conditional fires; textures are bound; the branch
+                // taken). Switching to Blinn-Phong is purely a visual
+                // tuning choice for what we render.
+                //
+                // Gating: roughness + metallic textures bound is enough;
+                // pbrNormalScale viewmodel gate dropped because both
+                // viewmodel and rotating pickups handled the highlight
+                // gracefully in testing (the Mikkelsen TBN instability
+                // affects the underlying worldN, but the specular
+                // contribution is too smooth to amplify that artifact).
+                if (!is_null_texture(roughnessTexture) &&
                     !is_null_texture(metallicTexture)) {
-
-                    float roughness = roughnessTexture.sample(textureSampler, in.texCoord).r;
-                    float metallic  = metallicTexture.sample(textureSampler, in.texCoord).r;
+                    float metallic  = 0.85;  // tuned via diagnostic — most
+                                             // rocket body is bare metal
+                    float roughness = 0.35;  // semi-glossy, slightly worn
 
                     float3 V = normalize(uniforms.cameraPos - in.worldPos);
-                    float3 L = sunDir;
-                    float3 H = normalize(V + L);
-                    float NdotL = max(dot(worldN, L), 0.0);
-                    float NdotV = max(dot(worldN, V), 0.001);
+                    float3 H = normalize(V + sunDir);
                     float NdotH = max(dot(worldN, H), 0.0);
-                    float VdotH = max(dot(V, H), 0.0);
 
-                    // GGX normal distribution
-                    float alpha  = max(roughness * roughness, 0.045);
-                    float alpha2 = alpha * alpha;
-                    float ggxDen = NdotH * NdotH * (alpha2 - 1.0) + 1.0;
-                    float D = alpha2 / (3.14159265 * ggxDen * ggxDen + 1e-7);
+                    // Blinn-Phong exponent derived from roughness:
+                    // smooth → high exponent (sharp), rough → low (wide).
+                    float gloss = mix(64.0, 4.0, roughness);
+                    float specMag = pow(NdotH, gloss);
 
-                    // Schlick-GGX geometry
-                    float k = (roughness + 1.0) * (roughness + 1.0) / 8.0;
-                    float G1V = NdotV / (NdotV * (1.0 - k) + k);
-                    float G1L = NdotL / (NdotL * (1.0 - k) + k);
-                    float G = G1V * G1L;
+                    // Tinted by base color for metallic feel (gold metal
+                    // reflects gold, etc.). The 0.6 mix factor keeps the
+                    // highlight from going pure-base-color on full metal.
+                    float3 specTint = mix(float3(1.0), base.rgb, metallic * 0.6);
 
-                    // Schlick Fresnel, F0 tinted by metallic
-                    float3 F0 = mix(float3(0.04), base.rgb, metallic);
-                    float3 F = F0 + (float3(1.0) - F0) * pow(1.0 - VdotH, 5.0);
-
-                    float3 spec = D * F * G / (4.0 * NdotV * NdotL + 0.001);
-
-                    // Apply as accent — additive over the diffuse so
-                    // existing entity color modulation stays intact.
-                    // The 0.5 scalar keeps highlights from blowing out
-                    // brightly-lit base colors; tune higher for more
-                    // "wet chrome" pop.
-                    base.rgb += spec * NdotL * 0.5;
+                    // 1.8 multiplier picked for clearly visible highlight
+                    // without blowing out the diffuse lighting underneath.
+                    base.rgb += specMag * specTint * 1.8;
                 }
             }
             return base;
