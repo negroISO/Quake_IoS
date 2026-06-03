@@ -2405,27 +2405,42 @@ struct MetalView: UIViewRepresentable {
                 // contribution is too smooth to amplify that artifact).
                 if (!is_null_texture(roughnessTexture) &&
                     !is_null_texture(metallicTexture)) {
-                    float metallic  = 0.85;  // tuned via diagnostic — most
-                                             // rocket body is bare metal
-                    float roughness = 0.35;  // semi-glossy, slightly worn
+                    // Production Phase 4 v3: Blinn-Phong with WIDE
+                    // highlight + Fresnel rim. The earlier gloss=43
+                    // exponent restricted the highlight to a narrow
+                    // mirror-angle band that Q3 viewmodel geometry
+                    // rarely hits relative to a fixed sun. Dropping
+                    // gloss to 6 spreads the highlight across most of
+                    // the model surface.
+                    //
+                    // The Fresnel rim contribution depends only on
+                    // view direction (not sun) — guarantees a visible
+                    // accent on the silhouette/edges regardless of
+                    // worldN/sun alignment. Reads as "wet chrome" or
+                    // "polished metal".
+                    float metallic  = 0.85;
+                    float roughness = 0.40;
 
                     float3 V = normalize(uniforms.cameraPos - in.worldPos);
                     float3 H = normalize(V + sunDir);
                     float NdotH = max(dot(worldN, H), 0.0);
+                    float NdotV = max(dot(worldN, V), 0.0);
 
-                    // Blinn-Phong exponent derived from roughness:
-                    // smooth → high exponent (sharp), rough → low (wide).
-                    float gloss = mix(64.0, 4.0, roughness);
-                    float specMag = pow(NdotH, gloss);
+                    // WIDE Blinn-Phong: gloss 6 (instead of 43) so the
+                    // highlight reads across more pixels.
+                    float spec = pow(NdotH, 6.0);
 
-                    // Tinted by base color for metallic feel (gold metal
-                    // reflects gold, etc.). The 0.6 mix factor keeps the
-                    // highlight from going pure-base-color on full metal.
-                    float3 specTint = mix(float3(1.0), base.rgb, metallic * 0.6);
+                    // Fresnel rim — brightens silhouette edges.
+                    // pow(1-NdotV, 3) peaks where surface normal is
+                    // perpendicular to view, falls off toward face-on.
+                    float rim = pow(1.0 - NdotV, 3.0);
 
-                    // 1.8 multiplier picked for clearly visible highlight
-                    // without blowing out the diffuse lighting underneath.
-                    base.rgb += specMag * specTint * 1.8;
+                    // Metallic tints the highlight by base color.
+                    float3 specTint = mix(float3(1.0), base.rgb + 0.3, metallic * 0.6);
+
+                    // Combined: phong highlight + rim accent, both
+                    // tinted, weighted heavily so it's visibly bright.
+                    base.rgb += (spec * 1.2 + rim * 0.5) * specTint;
                 }
             }
             return base;
