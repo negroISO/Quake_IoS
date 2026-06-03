@@ -2049,13 +2049,18 @@ struct MetalView: UIViewRepresentable {
 
                 float3 worldN = normalize(T * nMap.x + B * nMap.y + N * nMap.z);
 
-                // Subtle fake sun — softer than entity shader since the
-                // BSP lightmap already provides the primary lighting.
+                // Fake sun direction. Stronger contrast than the
+                // initial 0.85..1.15 range — the subtle setting was
+                // not visually noticeable per user feedback. Now
+                // 0.65..1.35 which is more like the entity shader's
+                // 0.6..1.2 range. Still gated below the BSP lightmap's
+                // primary contribution but the relief actually reads
+                // as 3D depth on screen now.
                 float3 sunDir = normalize(float3(0.4, 0.5, 0.6));
                 float NdotL = dot(worldN, sunDir) * 0.5 + 0.5;
                 float halfLambert = NdotL * NdotL;
 
-                lit *= (0.85 + halfLambert * 0.30);
+                lit *= (0.65 + halfLambert * 0.70);
             }
             return float4(lit, texel.a * va);
         }
