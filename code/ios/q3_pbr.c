@@ -237,7 +237,21 @@ static const struct {
     { "plasma_glo",     "plasma"     },
     { "plasma_a",       "plasma"     },
     { "railgun",        "rail"       },
+    /* Vanilla Q3 railgun MD3 references numbered texture variants
+     * (railgun1..4.tga, see pak0). The plain "railgun" stem above
+     * never fires because no MD3 actually uses it — these do. */
+    { "railgun1",       "rail"       },
+    { "railgun2",       "rail"       },
+    { "railgun3",       "rail"       },
+    { "railgun4",       "rail"       },
+    { "f_railgun2",     "rail"       },
+    /* Vanilla grenade launcher MD3 references "grenadel" (the
+     * pak0 directory is models/weapons2/grenadel/, not grenadelauncher). */
+    { "grenadel",       "grenade"    },
     { "grenadelauncher","grenade"    },
+    /* Vanilla BFG MD3 references bfg.TGA + bfg_e.TGA (emissive
+     * companion). Bind both to the same PBR albedo. */
+    { "bfg_e",          "bfg"        },
     { "f_bfg",          "bfg"        },
     { NULL, NULL }
 };
