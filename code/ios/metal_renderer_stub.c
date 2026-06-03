@@ -38,6 +38,7 @@ If a visual issue exists, fix the generic mismatch against ioq3/Kenny behavior.
 #include "../clean_frontend/q3_stage.h"
 #include "metal_renderer_shared.h"
 #include "ios_local.h"
+#include "q3_pbr.h"
 #include <os/log.h>
 #include <stdio.h>
 
@@ -155,6 +156,14 @@ typedef struct {
     float deformWaveAmp;
     float deformWavePhase;
     float deformWaveFreq;
+    /* PBR Phase 1: when r_pbrMaterials is on and the loaded pixels'
+     * XXH3_64bits hash matches an entry in the RTX Remix mod's
+     * mod.usda manifest, pbrMaterial points at the resolved material
+     * record. Swift consumes this via Q3MetalRenderer_GetPBRMaterial
+     * to lazy-load DDS textures and bind them to the PBR fragment
+     * shader. NULL when no match. */
+    uint64_t pbrContentHash;
+    const void *pbrMaterial;  /* opaque pointer to q3_pbr_material_t */
 } metalTexture_t;
 
 refimport_t ri;
@@ -1872,6 +1881,28 @@ static qhandle_t RegisterTexture(const char *name) {
     texture->height = height;
     texture->rgbaBytes = rgba;
     Q_strncpyz(texture->name, name, sizeof(texture->name));
+
+    /* PBR Phase 1: hash the just-loaded BGRA pixels and check the
+     * RTX Remix material table. The cost is one XXH3 pass of the
+     * mip-0 bytes; q3_pbr_lookup is O(1). Gated by r_pbrMaterials so
+     * a default-off ship doesn't pay the hashing cost. Stats:
+     * q3_pbr_stats_t->hashes_seen counts everything we hash,
+     * hashes_matched counts table hits — surface this for tuning. */
+    if (q3_pbr_enabled() && q3_pbr_table_ready() && rgba != NULL) {
+        uint64_t h = q3_pbr_hash_rgba(rgba, width, height);
+        texture->pbrContentHash = h;
+        q3_pbr_stats_inc_hashes_seen();
+        const q3_pbr_material_t *m = q3_pbr_lookup(h);
+        if (m != NULL) {
+            texture->pbrMaterial = m;
+            q3_pbr_stats_inc_hashes_matched();
+            MetalTelemetryPrintf("metal_pbr_hit", PRINT_ALL,
+                "[Q3-PBR] match name='%s' hash=%016llX albedo=%s normal=%s\n",
+                name, (unsigned long long)h,
+                m->albedo ? "yes" : "-",
+                m->normal ? "yes" : "-");
+        }
+    }
     /* Propagate blend mode from the shader-map entry that resolved
      * this texture. Used by entity draw to decide additive pipeline. */
     texture->blendMode = ShaderMap_GetBlendMode(name);
@@ -9762,6 +9793,16 @@ int Q3_PostprocessEnabled(void) {
     return cv ? cv->integer : 1;
 }
 
+/* PBR materials cvar accessor — referenced by code/ios/q3_pbr.c.
+ * Default OFF until the asset pipeline + DDS decoder are wired up;
+ * shipping it default-on with no replacement DDS files in the bundle
+ * would just degrade to "no-op + extra hashing CPU per texture load". */
+int q3_pbr_cvar_enabled(void) {
+    if (ri.Cvar_Get == NULL) return 0;
+    cvar_t *cv = ri.Cvar_Get("r_pbrMaterials", "0", CVAR_ARCHIVE);
+    return cv ? cv->integer : 0;
+}
+
 float Q3_PostprocessIntensity(void) {
     if (ri.Cvar_Get == NULL) return 1.5f;
     cvar_t *cv = ri.Cvar_Get("r_postprocess_intensity", "1.5", CVAR_ARCHIVE);
@@ -9791,6 +9832,24 @@ refexport_t *GetRefAPI(int apiVersion, refimport_t *rimp) {
     }
 
     Com_Memset(&re, 0, sizeof(re));
+
+    /* PBR Phase 1 boot: load the RTX Remix material table (one-shot
+     * per process). JSON via Q3_PBR_JSON; assets-root via Q3_PBR_ASSETS.
+     * Failure is silent — q3_pbr_lookup returns NULL, render path
+     * falls through to existing Lambert. */
+    q3_pbr_set_log(Com_Printf);
+    {
+        const char *json = getenv("Q3_PBR_JSON");
+        const char *root = getenv("Q3_PBR_ASSETS");
+        MetalTelemetryPrintf("metal_pbr_boot", PRINT_ALL,
+            "[Q3-PBR] boot env Q3_PBR_JSON=%s Q3_PBR_ASSETS=%s\n",
+            json ? json : "(unset)", root ? root : "(unset)");
+        if (json && root && json[0] && root[0]) {
+            int n = q3_pbr_table_load(json, root);
+            MetalTelemetryPrintf("metal_pbr_boot", PRINT_ALL,
+                "[Q3-PBR] table_load returned %d materials\n", n);
+        }
+    }
 
     re.Shutdown = RE_Shutdown;
     re.BeginRegistration = RE_BeginRegistration;

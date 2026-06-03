@@ -1,0 +1,108 @@
+/* q3_pbr.h — RTX Remix-compatible PBR material table.
+ *
+ * Phase 1 (raster path): at texture register time we hash the just-loaded
+ * pixels with XXH3_64bits and look up the result in a JSON-loaded
+ * material table extracted from a Quake III Arena RTX Remix mod
+ * (scripts/pbr_extract_hash_table.py). When a hit lands, we attach a
+ * `q3_pbr_material_t` to the metalTexture_t so the Swift renderer can
+ * lazy-load the DDS PBR maps and bind them to the world fragment shader.
+ *
+ * No raytracing in Phase 1 — this is pure PBR rasterization. The same
+ * table can later drive RT material lookup in Phase 2/3 unchanged.
+ *
+ * Hash function:
+ *   xxh3_64( raw_pixel_bytes_of_mip_0_in_BGRA_layout )
+ * This matches the algorithm used by NVIDIA's dxvk-remix. If our hash
+ * doesn't reproduce theirs exactly, q3_pbr_lookup() just returns NULL
+ * — Phase 1 falls back to the existing Lambert path, no regression. */
+
+#ifndef Q3_PBR_H
+#define Q3_PBR_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* A single PBR material entry. Slot pointers are owned by the table and
+ * remain valid for the lifetime of the process. NULL = slot not present
+ * in the mod (use a sensible default in the shader). */
+typedef struct q3_pbr_material_s {
+    /* The 64-bit Remix content hash this entry was keyed by. */
+    uint64_t hash;
+    /* Relative paths under the mod root. NULL when the mod didn't ship
+     * a texture for this slot. Paths are absolute on disk after
+     * q3_pbr_table_resolve_paths(). */
+    const char *albedo;
+    const char *normal;
+    const char *roughness;
+    const char *metallic;
+    const char *emissive;
+    const char *height;
+    /* Optional emissive shading constants (matches the .usda inputs). */
+    float       emissive_intensity;   /* 0 when not set */
+    float       emissive_color_r;
+    float       emissive_color_g;
+    float       emissive_color_b;
+    int         has_emissive_color;   /* 1 if emissive_color_* are set */
+} q3_pbr_material_t;
+
+/* One-shot init. Loads the JSON table produced by
+ * scripts/pbr_extract_hash_table.py and resolves all asset paths to
+ * absolute paths so the Swift loader can fopen them directly.
+ *
+ *   jsonPath  — absolute path to q3rtx_v07_materials.json (or equivalent).
+ *   assetRoot — absolute path to the directory the JSON paths are relative
+ *               to (typically <mod>/rtx-remix/mods/q3rtx_v07/).
+ *
+ * Returns the number of materials loaded, or 0 on any failure. Safe to
+ * call multiple times — subsequent calls free + reload. */
+int q3_pbr_table_load(const char *jsonPath, const char *assetRoot);
+
+/* True if the table has been loaded with at least one material. */
+int q3_pbr_table_ready(void);
+
+/* Hash an RGBA pixel buffer (mip 0) as XXH3_64bits over the BGRA layout
+ * — RTX Remix's hash key. width/height in pixels. rgba points to
+ * width*height*4 bytes ordered R,G,B,A. Returns the 64-bit hash. */
+uint64_t q3_pbr_hash_rgba(const unsigned char *rgba, int width, int height);
+
+/* Look up a material by content hash. Returns NULL if not present.
+ * The returned pointer remains valid until the table is reloaded. */
+const q3_pbr_material_t *q3_pbr_lookup(uint64_t hash);
+
+/* Logging hook — q3_pbr.c is a leaf .c file with no access to
+ * Com_Printf / NSLog. metal_renderer_stub.c wires a callback at boot
+ * so our boot messages reach q3_diag.log alongside the rest of the
+ * telemetry. printf-style; va_args resolved by the impl. */
+typedef void (*q3_pbr_log_fn)(const char *fmt, ...);
+void q3_pbr_set_log(q3_pbr_log_fn fn);
+
+/* Cvar accessor — non-zero when r_pbrMaterials is on. The renderer
+ * gates the PBR shader path on this; q3_pbr_table_load runs
+ * regardless so we can audit hash matches independent of the
+ * shader path. */
+int q3_pbr_enabled(void);
+
+/* Stats for debugging — emitted in NSLog at boot. */
+typedef struct {
+    int materials_total;       /* total entries in JSON */
+    int hashes_seen;           /* distinct hashes we've hashed at register time */
+    int hashes_matched;        /* of hashes_seen, how many had a table entry */
+    int dds_load_requested;    /* PBR texture loads kicked off (Swift side) */
+    int dds_load_failed;       /* loads that failed (missing file, decode err) */
+} q3_pbr_stats_t;
+
+const q3_pbr_stats_t *q3_pbr_stats(void);
+void q3_pbr_stats_inc_hashes_seen(void);
+void q3_pbr_stats_inc_hashes_matched(void);
+void q3_pbr_stats_inc_dds_load_requested(void);
+void q3_pbr_stats_inc_dds_load_failed(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* Q3_PBR_H */

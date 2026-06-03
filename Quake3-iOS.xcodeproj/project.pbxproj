@@ -95,6 +95,7 @@
 		6645D3D30374F9E7FB9074A5 /* jctrans.c in Sources */ = {isa = PBXBuildFile; fileRef = C8E0CA5569562DBB05E70541 /* jctrans.c */; };
 		67527C57B400576CDD2FCAB5 /* jchuff.c in Sources */ = {isa = PBXBuildFile; fileRef = EAC6DD14372299DA2E9B6708 /* jchuff.c */; };
 		67F5FB044B6AB470F5701B8C /* cvar.c in Sources */ = {isa = PBXBuildFile; fileRef = C686BDA3B8DB9F5E9C8B178A /* cvar.c */; };
+		68DF5265E9EC4E4CCCEAEE73 /* q3_pbr.c in Sources */ = {isa = PBXBuildFile; fileRef = F4FDA7E653C6325CC8ACB994 /* q3_pbr.c */; };
 		6B1E9ED73C3BDE6A59BB73F8 /* bitwise.c in Sources */ = {isa = PBXBuildFile; fileRef = 8377D1CE786A2D058EA357C9 /* bitwise.c */; };
 		6BA19297BD6BD81268B769FD /* cg_predict.c in Sources */ = {isa = PBXBuildFile; fileRef = 32E206EF24E8A7656C4C2E16 /* cg_predict.c */; settings = {COMPILER_FLAGS = "-DCGAME_NATIVE=1 -Wno-strict-prototypes -Wno-pointer-sign"; }; };
 		6D2075669FFFE169F08E36BF /* jidctflt.c in Sources */ = {isa = PBXBuildFile; fileRef = 3D5D5F8A80A1635E2325C250 /* jidctflt.c */; };
@@ -259,6 +260,7 @@
 		1F377777F075DE73769C2D60 /* net_chan.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = net_chan.c; sourceTree = "<group>"; };
 		1FD4AFE768876AC121640DEF /* cm_trace.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = cm_trace.c; sourceTree = "<group>"; };
 		20C80346B7D50E334564A449 /* vm.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = vm.c; sourceTree = "<group>"; };
+		22204218869407E6BC54AEA6 /* xxhash.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = xxhash.h; sourceTree = "<group>"; };
 		222CCB5279849001CAC17C4A /* vm_optimize.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = vm_optimize.h; sourceTree = "<group>"; };
 		2575693DDFCE8037554E7288 /* vorbisfile.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = vorbisfile.c; sourceTree = "<group>"; };
 		262B878581D7FD95DF77C710 /* registry.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = registry.h; sourceTree = "<group>"; };
@@ -297,7 +299,7 @@
 		3D5D5F8A80A1635E2325C250 /* jidctflt.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = jidctflt.c; sourceTree = "<group>"; };
 		3DB75E541CF7DB102F0AA1D3 /* be_aas_optimize.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = be_aas_optimize.h; sourceTree = "<group>"; };
 		3DC106CD30021E44C0E27C82 /* setup_32.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = setup_32.h; sourceTree = "<group>"; };
-		3F175305E092A16FBA69F38C /* libjpeg-changes.diff */ = {isa = PBXFileReference; lastKnownFileType = text; path = "libjpeg-changes.diff"; sourceTree = "<group>"; };
+		3F175305E092A16FBA69F38C /* libjpeg-changes.diff */ = {isa = PBXFileReference; path = "libjpeg-changes.diff"; sourceTree = "<group>"; };
 		3F4C653F1C1259F5BD0CF61F /* residue_44.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = residue_44.h; sourceTree = "<group>"; };
 		3F95A45FAD7F0E551431BD11 /* residue_44p51.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = residue_44p51.h; sourceTree = "<group>"; };
 		3FDA683D37C52CD981976290 /* be_aas_main.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = be_aas_main.c; sourceTree = "<group>"; };
@@ -307,7 +309,7 @@
 		45311376687BBBC1B284279A /* cm_patch.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = cm_patch.c; sourceTree = "<group>"; };
 		45A92960FE2D42C45BE88E48 /* bitrate.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = bitrate.h; sourceTree = "<group>"; };
 		45FCA2215445E4D69564A076 /* residue_44u.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = residue_44u.h; sourceTree = "<group>"; };
-		46730952512DD30A1113A24C /* Quake3-iOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Quake3-iOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		46730952512DD30A1113A24C /* Quake3-iOS.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = "Quake3-iOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		467F925E8F727F04638A9BF5 /* sv_game.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = sv_game.c; sourceTree = "<group>"; };
 		46F268AA29956562BCF97F9F /* psy.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = psy.h; sourceTree = "<group>"; };
 		472606AFE6CF6222F4A814DF /* qcommon.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = qcommon.h; sourceTree = "<group>"; };
@@ -323,7 +325,7 @@
 		4EC692968EE35E3D481A8C6B /* be_interface.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = be_interface.h; sourceTree = "<group>"; };
 		4ED53AE731C8D4BCE5B24F3E /* setup_44p51.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = setup_44p51.h; sourceTree = "<group>"; };
 		4F41838780E47305CCC4A9DB /* jcmarker.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = jcmarker.c; sourceTree = "<group>"; };
-		4F796B9C3C41114C938D6D65 /* dirty-files */ = {isa = PBXFileReference; lastKnownFileType = text; path = "dirty-files"; sourceTree = "<group>"; };
+		4F796B9C3C41114C938D6D65 /* dirty-files */ = {isa = PBXFileReference; path = "dirty-files"; sourceTree = "<group>"; };
 		508BCC2DCDC63D5891993661 /* codebook.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = codebook.h; sourceTree = "<group>"; };
 		519231DDABC6A8773BCB59E4 /* jcparam.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = jcparam.c; sourceTree = "<group>"; };
 		51FD1A0BBB75688B492F7777 /* tr_image_tga.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = tr_image_tga.c; sourceTree = "<group>"; };
@@ -336,7 +338,7 @@
 		55B41D3AF9FFB9BC33DABACA /* cg_consolecmds.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = cg_consolecmds.c; sourceTree = "<group>"; };
 		567EA27AA20FAE24FCAD6003 /* keycodes.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = keycodes.h; sourceTree = "<group>"; };
 		5759A510807AE6F11B8B5427 /* jconfig.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = jconfig.h; sourceTree = "<group>"; };
-		5764191E004EAED87E2353B4 /* COPYING */ = {isa = PBXFileReference; lastKnownFileType = text; path = COPYING; sourceTree = "<group>"; };
+		5764191E004EAED87E2353B4 /* COPYING */ = {isa = PBXFileReference; path = COPYING; sourceTree = "<group>"; };
 		583104C3F23778E23A10E33F /* l_crc.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = l_crc.c; sourceTree = "<group>"; };
 		5933FC512FBBC3D8602420B0 /* l_utils.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = l_utils.h; sourceTree = "<group>"; };
 		5AAAE72E2018098E33B62D54 /* crctable.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = crctable.h; sourceTree = "<group>"; };
@@ -358,7 +360,7 @@
 		672DF626CB5043B88376746D /* tr_font.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = tr_font.c; sourceTree = "<group>"; };
 		67AC44F4FD2D1552572680D8 /* tr_public.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = tr_public.h; sourceTree = "<group>"; };
 		67D1504E8B8AC35CAB46279A /* jdarith.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = jdarith.c; sourceTree = "<group>"; };
-		682486FAB747BF17B6326DAA /* README */ = {isa = PBXFileReference; lastKnownFileType = text; path = README; sourceTree = "<group>"; };
+		682486FAB747BF17B6326DAA /* README */ = {isa = PBXFileReference; path = README; sourceTree = "<group>"; };
 		6AA613B519FB57F9F6FB4790 /* setup_44.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = setup_44.h; sourceTree = "<group>"; };
 		6AE676A154892EE9812BB555 /* qfiles.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = qfiles.h; sourceTree = "<group>"; };
 		6AF21139679F9E7FC929A172 /* Quake3-iOS-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Quake3-iOS-Bridging-Header.h"; sourceTree = "<group>"; };
@@ -377,6 +379,7 @@
 		79FED54596C0A4A293EF2A0B /* be_aas_move.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = be_aas_move.h; sourceTree = "<group>"; };
 		7A9F0B4E5347AD55A01DD2B6 /* mdct.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = mdct.c; sourceTree = "<group>"; };
 		7C694BCD32A1D89049E56E48 /* cg_event.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = cg_event.c; sourceTree = "<group>"; };
+		7CA07341428C31864013C817 /* q3_pbr.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = q3_pbr.h; sourceTree = "<group>"; };
 		7D5CBEF0BCB79DCEDAF57E19 /* snd_adpcm.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = snd_adpcm.c; sourceTree = "<group>"; };
 		7E32247932AAA7AE4A2B3127 /* config_types.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = config_types.h; sourceTree = "<group>"; };
 		7F58A81499AA8567433D09F0 /* ios_main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = ios_main.m; sourceTree = "<group>"; };
@@ -468,7 +471,7 @@
 		CACF78AE5823B426C1ECD6C7 /* window.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = window.h; sourceTree = "<group>"; };
 		CC07108D423757144E8083FB /* psych_11.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = psych_11.h; sourceTree = "<group>"; };
 		CC4AF53CEFF71643A97E075B /* residue_16.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = residue_16.h; sourceTree = "<group>"; };
-		CC809E1C2087FC3FE3F9C08D /* COPYING */ = {isa = PBXFileReference; lastKnownFileType = text; path = COPYING; sourceTree = "<group>"; };
+		CC809E1C2087FC3FE3F9C08D /* COPYING */ = {isa = PBXFileReference; path = COPYING; sourceTree = "<group>"; };
 		CCEFC4BC8348FE11DBAB37D7 /* be_aas_routealt.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = be_aas_routealt.h; sourceTree = "<group>"; };
 		CD62104F1A937699925D197D /* cm_local.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = cm_local.h; sourceTree = "<group>"; };
 		CD8443065242DDCE907219F4 /* be_aas_optimize.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = be_aas_optimize.c; sourceTree = "<group>"; };
@@ -514,6 +517,7 @@
 		F2E1867115E43BE5BFDD8E42 /* cm_test.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = cm_test.c; sourceTree = "<group>"; };
 		F33A0D8D77A26093114AE394 /* unzip.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = unzip.h; sourceTree = "<group>"; };
 		F3C27F0FC179BF1BB5B7083D /* tr_noise.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = tr_noise.c; sourceTree = "<group>"; };
+		F4FDA7E653C6325CC8ACB994 /* q3_pbr.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = q3_pbr.c; sourceTree = "<group>"; };
 		F604DE687DBF1837642A84DB /* cg_scoreboard.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = cg_scoreboard.c; sourceTree = "<group>"; };
 		F74D5C8CC3D9829738FE5842 /* cm_public.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = cm_public.h; sourceTree = "<group>"; };
 		F8244303FDF646F17E3BCD0C /* keys.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = keys.h; sourceTree = "<group>"; };
@@ -1029,6 +1033,14 @@
 			path = modes;
 			sourceTree = "<group>";
 		};
+		DA3C89CC611476CEB87EDBB8 /* vendor */ = {
+			isa = PBXGroup;
+			children = (
+				22204218869407E6BC54AEA6 /* xxhash.h */,
+			);
+			path = vendor;
+			sourceTree = "<group>";
+		};
 		DED72B77AD912561B2F18049 /* libogg */ = {
 			isa = PBXGroup;
 			children = (
@@ -1065,6 +1077,9 @@
 				7F58A81499AA8567433D09F0 /* ios_main.m */,
 				0F0B2595581CE59A7DE4F8FA /* metal_renderer_shared.h */,
 				A829066F48EC957F7F46B575 /* metal_renderer_stub.c */,
+				F4FDA7E653C6325CC8ACB994 /* q3_pbr.c */,
+				7CA07341428C31864013C817 /* q3_pbr.h */,
+				DA3C89CC611476CEB87EDBB8 /* vendor */,
 			);
 			path = ios;
 			sourceTree = "<group>";
@@ -1092,7 +1107,7 @@
 			buildPhases = (
 				706E1033C199ECF8C156C2AB /* Sources */,
 				05014A794D7ADC41D2C38AF5 /* Resources */,
-				8A4E9C8F6D784C51A7E37B12 /* Stage baseq3 data */,
+				C294363E705ED20C48E4A45A /* Stage baseq3 data */,
 			);
 			buildRules = (
 			);
@@ -1112,7 +1127,7 @@
 			isa = PBXProject;
 			attributes = {
 				BuildIndependentTargetsInParallel = YES;
-				LastUpgradeCheck = 2650;
+				LastUpgradeCheck = 1430;
 				TargetAttributes = {
 					2EBB30EEA47617C34D42A543 = {
 						DevelopmentTeam = 72MB2RMPTC;
@@ -1152,7 +1167,7 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXShellScriptBuildPhase section */
-		8A4E9C8F6D784C51A7E37B12 /* Stage baseq3 data */ = {
+		C294363E705ED20C48E4A45A /* Stage baseq3 data */ = {
 			isa = PBXShellScriptBuildPhase;
 			alwaysOutOfDate = 1;
 			buildActionMask = 2147483647;
@@ -1169,8 +1184,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "\"${SRCROOT}/scripts/stage_baseq3.sh\"\n";
-			showEnvVarsInLog = 0;
+			shellScript = "#!/bin/sh\nset -eu\n\nAPP_RESOURCES=\"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}\"\nDEST=\"${APP_RESOURCES}/baseq3\"\nmkdir -p \"$DEST\"\n\ncopy_baseq3() {\n  SRC=\"$1\"\n  LABEL=\"$2\"\n  if [ -d \"$SRC\" ]; then\n    echo \"[stage_baseq3] merging $LABEL: $SRC -> $DEST\"\n    /usr/bin/rsync -a --delete-excluded \\\n      --exclude='.DS_Store' \\\n      --exclude='*.bak' \\\n      \"$SRC/\" \"$DEST/\"\n  else\n    echo \"[stage_baseq3] skip missing $LABEL: $SRC\"\n  fi\n}\n\n# Order matters: stock data first, app-local data second, custom Resources last.\n# Later sources can override/add demos and pk3s without deleting earlier files.\ncopy_baseq3 \"${SRCROOT}/baseq3\" \"top-level baseq3\"\ncopy_baseq3 \"${SRCROOT}/Quake3-iOS/baseq3\" \"app baseq3\"\ncopy_baseq3 \"${SRCROOT}/Resources/baseq3\" \"Resources baseq3\"\n\nPK3_COUNT=$(/usr/bin/find \"$DEST\" -maxdepth 1 -type f -name '*.pk3' | /usr/bin/wc -l | /usr/bin/tr -d ' ')\nDEMO_COUNT=0\nif [ -d \"$DEST/demos\" ]; then\n  DEMO_COUNT=$(/usr/bin/find \"$DEST/demos\" -maxdepth 1 -type f -name '*.dm_*' | /usr/bin/wc -l | /usr/bin/tr -d ' ')\nfi\necho \"[stage_baseq3] done: pk3=$PK3_COUNT demos=$DEMO_COUNT dest=$DEST\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -1331,6 +1345,7 @@
 				78718236CEC13C5556B92B1C /* net_ip.c in Sources */,
 				DF9350EDA5170B3FA48501A8 /* psy.c in Sources */,
 				28BC7DE65418E5F870F31F5A /* puff.c in Sources */,
+				68DF5265E9EC4E4CCCEAEE73 /* q3_pbr.c in Sources */,
 				65B72BC9CD0820A63AA24B09 /* q3_stage.c in Sources */,
 				1BCF86A6D1A3FAAB83AD2BD9 /* q_math.c in Sources */,
 				1311809BC661959BF7D5586B /* q_shared.c in Sources */,
@@ -1412,10 +1427,8 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = dwarf;
-				DEVELOPMENT_TEAM = 72MB2RMPTC;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
 				GCC_DYNAMIC_NO_PIC = NO;
 				GCC_NO_COMMON_BLOCKS = YES;
@@ -1436,7 +1449,6 @@
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
-				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 				SWIFT_VERSION = 6.0;
@@ -1451,6 +1463,8 @@
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 72MB2RMPTC;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GCC_C_LANGUAGE_STANDARD = c11;
 				GCC_OPTIMIZATION_LEVEL = 0;
 				GCC_PREPROCESSOR_DEFINITIONS = (
@@ -1465,9 +1479,8 @@
 					"MACOS_X=1",
 					"USE_LOCAL_HEADERS=1",
 					"ARCH_STRING=\\\"arm64\\\"",
-				"DLL_EXT=\\\".dylib\\\"",
+					"DLL_EXT=\\\".dylib\\\"",
 				);
-				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = (
 					"$(SRCROOT)/code",
@@ -1506,15 +1519,10 @@
 					"-Wno-sign-conversion",
 					"-Wno-incompatible-pointer-types",
 					"-Wno-deprecated-declarations",
-					"-Wno-comma",
-					"-Wno-unreachable-code",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.quake3ios.app;
 				SDKROOT = iphoneos;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator xros xrsimulator";
-				SUPPORTS_MACCATALYST = NO;
-				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
-				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SWIFT_OBJC_BRIDGING_HEADER = "Quake3-iOS/Quake3-iOS-Bridging-Header.h";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 				TARGETED_DEVICE_FAMILY = "1,2,7";
@@ -1557,10 +1565,8 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
-				DEVELOPMENT_TEAM = 72MB2RMPTC;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
 				GCC_NO_COMMON_BLOCKS = YES;
 				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
@@ -1574,7 +1580,6 @@
 				MTL_FAST_MATH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
-				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_COMPILATION_MODE = wholemodule;
 				SWIFT_OPTIMIZATION_LEVEL = "-O";
 				SWIFT_VERSION = 6.0;
@@ -1589,6 +1594,8 @@
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 72MB2RMPTC;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GCC_C_LANGUAGE_STANDARD = c11;
 				GCC_OPTIMIZATION_LEVEL = s;
 				GCC_PREPROCESSOR_DEFINITIONS = (
@@ -1603,9 +1610,8 @@
 					"MACOS_X=1",
 					"USE_LOCAL_HEADERS=1",
 					"ARCH_STRING=\\\"arm64\\\"",
-				"DLL_EXT=\\\".dylib\\\"",
+					"DLL_EXT=\\\".dylib\\\"",
 				);
-				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = (
 					"$(SRCROOT)/code",
@@ -1644,15 +1650,10 @@
 					"-Wno-sign-conversion",
 					"-Wno-incompatible-pointer-types",
 					"-Wno-deprecated-declarations",
-					"-Wno-comma",
-					"-Wno-unreachable-code",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.quake3ios.app;
 				SDKROOT = iphoneos;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator xros xrsimulator";
-				SUPPORTS_MACCATALYST = NO;
-				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
-				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SWIFT_OBJC_BRIDGING_HEADER = "Quake3-iOS/Quake3-iOS-Bridging-Header.h";
 				SWIFT_OPTIMIZATION_LEVEL = "-O";
 				TARGETED_DEVICE_FAMILY = "1,2,7";
