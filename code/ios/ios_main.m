@@ -966,13 +966,14 @@ void Quake3_Init(const char *basePath) {
          *                  perf verification of async-tex / deformBulge /
          *                  postprocess passes). Toggle off later if you
          *                  want a clean look. */
-        /* PBR Phase 1: OFF for pure-vanilla baseline lockdown. The
-         * PBR table includes rtx_player_* entries that substitute HD
-         * normal/emissive/metallic on the player models — which gives
-         * bots a "new model" look even with vanilla pak0..pak8 only.
-         * Re-enable (flip to "1") once the vanilla baseline is signed
-         * off and we know what's being replaced. */
-        "seta r_pbrMaterials 0; "
+        /* PBR Phase 1: ON. Vanilla baseline locked in at build 4072 —
+         * confirmed visually before this flip. PBR now substitutes
+         * albedo DDS over vanilla weapon viewmodels + player skins
+         * from the 21-entry materials_by_name table. Normal/emissive/
+         * metallic slots are populated in metalTexture_t.pbrMaterial
+         * but the Swift fragment-bind currently consumes the albedo
+         * channel only (pbrAlbedoTexture in MetalView.swift). */
+        "seta r_pbrMaterials 1; "
         "seta cg_draw2D 1; "
         "seta cg_drawGun 1; "
         "seta cg_drawCrosshair 4; "
