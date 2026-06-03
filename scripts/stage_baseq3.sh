@@ -31,7 +31,7 @@ copy_baseq3 "${SRCROOT}/Resources/baseq3" "Resources baseq3"
 # get moved out. This list catches mods that shouldn't ship in the
 # vanilla bundle even if a stale copy was previously staged. The pk3
 # paths in _disabled-mods/ are the authoritative source archive.
-for pat in 'zzz-Q3A-REMASTERED-*.pk3' 'pak8a.pk3'; do
+for pat in 'zzz-Q3A-REMASTERED-*.pk3' 'nv15.pk3' 'ts_q3dm13.pk3' 'ztn3dm1.pk3'; do
   for stale in "$DEST"/$pat; do
     if [ -f "$stale" ]; then
       echo "[stage_baseq3] pruning disabled pak: $stale"
