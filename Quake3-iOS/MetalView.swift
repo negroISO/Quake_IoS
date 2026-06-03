@@ -2059,6 +2059,7 @@ struct MetalView: UIViewRepresentable {
                                            constant EntityUniforms &uniforms [[buffer(1)]],
                                            constant DLightBlock &dlights [[buffer(2)]],
                                            texture2d<float> colorTexture [[texture(0)]],
+                                           texture2d<float> normalTexture [[texture(1)]],
                                            sampler textureSampler [[sampler(0)]]) {
             // tcGen environment (chrome / reflective shaders: powerups/
             // quad, powerups/regen, battleSuit). Mirrors ioquake3's
@@ -2218,6 +2219,66 @@ struct MetalView: UIViewRepresentable {
             if (uniforms.fogColorDistance.w > 0.0) {
                 float f = q3EntityFogFactor(in.worldPos, uniforms);
                 base.rgb = mix(base.rgb, q3ResolvedFogColor(uniforms.fogColorDistance.xyz), f);
+            }
+            /* PBR Phase 2 — normal-mapped lighting modulation.
+             *
+             * When the Swift binder has a normal map bound to slot 1
+             * (i.e. r_pbrMaterials is on AND the entity's texture handle
+             * mapped to a PBR material with a real .n.rtex.dds normal
+             * slot), apply tangent-space normal-mapped lighting on top
+             * of the existing vertex-color shading.
+             *
+             * Per-pixel TBN basis derived via Mikkelsen's screen-space
+             * derivative trick (Christian Schüler, 2013) — works on Q3
+             * verts that don't carry a tangent attribute:
+             *
+             *   T = (dp2 × N) · duv1.x + (N × dp1) · duv2.x
+             *   B = (dp2 × N) · duv1.y + (N × dp1) · duv2.y
+             *
+             * Lighting model: half-Lambert against a constant sun
+             * direction. Output is a (0.6 .. 1.2) brightness multiplier
+             * over the existing base color — visible 3D relief without
+             * blowing out highlights. Vanilla weapons (no normal map
+             * bound) skip the block entirely via is_null_texture.
+             *
+             * Cost: ~1 extra texture sample + ~12 ALU per fragment
+             * when active, branchless skip when not. Apple Silicon
+             * absorbs both in the fragment budget for the few hundred
+             * pixels a weapon viewmodel occupies. */
+            if (!is_null_texture(normalTexture)) {
+                float3 nMap = normalTexture.sample(textureSampler, in.texCoord).xyz * 2.0 - 1.0;
+
+                float3 N = in.normal;
+                if (length(N) < 1e-4) {
+                    float3 dxN = dfdx(in.worldPos);
+                    float3 dyN = dfdy(in.worldPos);
+                    N = normalize(cross(dxN, dyN));
+                } else {
+                    N = normalize(N);
+                }
+
+                float3 dp1 = dfdx(in.worldPos);
+                float3 dp2 = dfdy(in.worldPos);
+                float2 duv1 = dfdx(in.texCoord);
+                float2 duv2 = dfdy(in.texCoord);
+                float3 dp2perp = cross(dp2, N);
+                float3 dp1perp = cross(N, dp1);
+                float3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+                float3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+                float invmax = rsqrt(max(dot(T, T), dot(B, B)) + 1e-4);
+                T *= invmax;
+                B *= invmax;
+
+                float3 worldN = normalize(T * nMap.x + B * nMap.y + N * nMap.z);
+
+                // Half-Lambert against a fixed key-light direction.
+                // 0.3, 0.5, 0.7 is a 3-point cheat: slight rim from
+                // above-back-right that flatters most viewmodel poses.
+                float3 sunDir = normalize(float3(0.3, 0.5, 0.7));
+                float NdotL = dot(worldN, sunDir) * 0.5 + 0.5;
+                float halfLambert = NdotL * NdotL;
+
+                base.rgb *= (0.6 + halfLambert * 0.6);
             }
             return base;
         }
@@ -2739,7 +2800,9 @@ struct MetalView: UIViewRepresentable {
          * upload is a Phase 2 optimization). DDS textures on Apple
          * Silicon use the native BC1/BC3/BC5/BC7 hardware decoders. */
         private var pbrAlbedoCache: [UInt32: MTLTexture] = [:]
+        private var pbrNormalCache: [UInt32: MTLTexture] = [:]
         private var pbrTriedAndMissed: Set<UInt32> = []
+        private var pbrNormalTried: Set<UInt32> = []
         private lazy var pbrTextureLoader: MTKTextureLoader? = {
             guard let dev = self.commandQueue?.device else { return nil }
             return MTKTextureLoader(device: dev)
@@ -2794,6 +2857,42 @@ struct MetalView: UIViewRepresentable {
                 return nil
             }
         }
+
+        /// Returns the PBR normal map texture for a Q3 handle, or nil
+        /// when the material has no normal slot or the load fails.
+        /// Note: normal maps are NOT sRGB — they encode tangent-space
+        /// vector data, so .SRGB must be false. Without that, the GPU
+        /// would gamma-correct the .xyz fields and the per-pixel normals
+        /// would point in the wrong direction.
+        private func pbrNormalTexture(for handle: UInt32) -> MTLTexture? {
+            if let cached = pbrNormalCache[handle] { return cached }
+            if pbrNormalTried.contains(handle) { return nil }
+            pbrNormalTried.insert(handle)
+            guard let matPtr = Q3MetalRenderer_GetPBRMaterial(handle) else { return nil }
+            let mat = matPtr.pointee
+            guard let normalCStr = mat.normal else { return nil }
+            let path = String(cString: normalCStr)
+            guard let loader = pbrTextureLoader else { return nil }
+            pbrLog("[Q3-PBR-SWIFT] trying-normal handle=\(handle) path=\(path)")
+            let url = URL(fileURLWithPath: path)
+            let opts: [MTKTextureLoader.Option: Any] = [
+                .SRGB:                NSNumber(value: false),  // vector data, NOT color
+                .textureUsage:        NSNumber(value: MTLTextureUsage.shaderRead.rawValue),
+                .textureStorageMode:  NSNumber(value: MTLStorageMode.private.rawValue),
+                .generateMipmaps:     NSNumber(value: false),
+            ]
+            do {
+                let tex = try loader.newTexture(URL: url, options: opts)
+                tex.label = "Q3.pbr.normal.h\(handle)"
+                pbrNormalCache[handle] = tex
+                pbrLog("[Q3-PBR-SWIFT] loaded normal handle=\(handle) size=\(tex.width)x\(tex.height) path=\(path)")
+                return tex
+            } catch {
+                pbrLog("[Q3-PBR-SWIFT] normal DDS load FAILED handle=\(handle) err=\(error.localizedDescription) path=\(path)")
+                return nil
+            }
+        }
+
         private var vertexBuffer: MTLBuffer?
         private var vertexBufferCapacity = 0
         private var worldVertexBuffer: MTLBuffer?
@@ -4078,6 +4177,11 @@ struct MetalView: UIViewRepresentable {
                         // back to the original on miss / DDS-load fail.
                         let pbrTex = pbrAlbedoTexture(for: draw.textureHandle)
                         encoder.setFragmentTexture(pbrTex ?? texture, index: 0)
+                        // PBR Phase 2 — bind normal map to slot 1 if the
+                        // material ships one. Nil bind leaves the slot
+                        // unbound; q3_entity_fragment uses is_null_texture
+                        // to skip the normal-mapped lighting branch.
+                        encoder.setFragmentTexture(pbrNormalTexture(for: draw.textureHandle), index: 1)
                         // Per-draw sampler routing.
                         //
                         // Two ways to land on clampToEdge:
@@ -4240,6 +4344,11 @@ struct MetalView: UIViewRepresentable {
                         // PBR-or-fallback rule as the main entity pass.
                         let pbrTex = pbrAlbedoTexture(for: draw.textureHandle)
                         encoder.setFragmentTexture(pbrTex ?? texture, index: 0)
+                        // PBR Phase 2 — bind normal map to slot 1 if the
+                        // material ships one. Nil bind leaves the slot
+                        // unbound; q3_entity_fragment uses is_null_texture
+                        // to skip the normal-mapped lighting branch.
+                        encoder.setFragmentTexture(pbrNormalTexture(for: draw.textureHandle), index: 1)
                         encoder.drawIndexedPrimitives(
                             type: .triangle,
                             indexCount: Int(draw.indexCount),
