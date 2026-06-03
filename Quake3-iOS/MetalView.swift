@@ -2123,6 +2123,8 @@ struct MetalView: UIViewRepresentable {
                                            constant float &pbrNormalScale [[buffer(3)]],
                                            texture2d<float> colorTexture [[texture(0)]],
                                            texture2d<float> normalTexture [[texture(1)]],
+                                           texture2d<float> roughnessTexture [[texture(3)]],
+                                           texture2d<float> metallicTexture [[texture(4)]],
                                            sampler textureSampler [[sampler(0)]]) {
             // tcGen environment (chrome / reflective shaders: powerups/
             // quad, powerups/regen, battleSuit). Mirrors ioquake3's
@@ -2354,6 +2356,72 @@ struct MetalView: UIViewRepresentable {
                 float lo = mix(0.78, 0.6, pbrNormalScale);
                 float hi = mix(1.18, 1.2, pbrNormalScale);
                 base.rgb *= mix(lo, hi, halfLambert);
+
+                /* PBR Phase 4 — Cook-Torrance specular accent.
+                 *
+                 * When the material ships both a roughness AND a
+                 * metallic map (currently only rocket launcher), add a
+                 * GGX-distributed Fresnel-tinted highlight on top of
+                 * the half-Lambert diffuse modulation above. The
+                 * specular contribution is the "shiny" the user asked
+                 * for — visible bright highlights that move when you
+                 * rotate the camera, tinted by base color on metallic
+                 * surfaces.
+                 *
+                 * Gated by pbrNormalScale so only viewmodel draws get
+                 * it — rotating world pickups would hit the same TBN
+                 * derivative instability that broke the normal-map
+                 * contrast on them.
+                 *
+                 * Cook-Torrance BRDF math:
+                 *   D = GGX normal distribution (alpha=roughness²)
+                 *   G = Schlick-GGX geometry term
+                 *   F = Schlick Fresnel, F0 lerped from 0.04 (dielectric)
+                 *       to base.rgb (metal) by metallic factor
+                 *   spec = D*F*G / (4*NdotV*NdotL + eps)
+                 *
+                 * Reference: https://google.github.io/filament/Filament.md.html
+                 */
+                if (pbrNormalScale > 0.5 &&
+                    !is_null_texture(roughnessTexture) &&
+                    !is_null_texture(metallicTexture)) {
+
+                    float roughness = roughnessTexture.sample(textureSampler, in.texCoord).r;
+                    float metallic  = metallicTexture.sample(textureSampler, in.texCoord).r;
+
+                    float3 V = normalize(uniforms.cameraPos - in.worldPos);
+                    float3 L = sunDir;
+                    float3 H = normalize(V + L);
+                    float NdotL = max(dot(worldN, L), 0.0);
+                    float NdotV = max(dot(worldN, V), 0.001);
+                    float NdotH = max(dot(worldN, H), 0.0);
+                    float VdotH = max(dot(V, H), 0.0);
+
+                    // GGX normal distribution
+                    float alpha  = max(roughness * roughness, 0.045);
+                    float alpha2 = alpha * alpha;
+                    float ggxDen = NdotH * NdotH * (alpha2 - 1.0) + 1.0;
+                    float D = alpha2 / (3.14159265 * ggxDen * ggxDen + 1e-7);
+
+                    // Schlick-GGX geometry
+                    float k = (roughness + 1.0) * (roughness + 1.0) / 8.0;
+                    float G1V = NdotV / (NdotV * (1.0 - k) + k);
+                    float G1L = NdotL / (NdotL * (1.0 - k) + k);
+                    float G = G1V * G1L;
+
+                    // Schlick Fresnel, F0 tinted by metallic
+                    float3 F0 = mix(float3(0.04), base.rgb, metallic);
+                    float3 F = F0 + (float3(1.0) - F0) * pow(1.0 - VdotH, 5.0);
+
+                    float3 spec = D * F * G / (4.0 * NdotV * NdotL + 0.001);
+
+                    // Apply as accent — additive over the diffuse so
+                    // existing entity color modulation stays intact.
+                    // The 0.5 scalar keeps highlights from blowing out
+                    // brightly-lit base colors; tune higher for more
+                    // "wet chrome" pop.
+                    base.rgb += spec * NdotL * 0.5;
+                }
             }
             return base;
         }
@@ -2876,8 +2944,17 @@ struct MetalView: UIViewRepresentable {
          * Silicon use the native BC1/BC3/BC5/BC7 hardware decoders. */
         private var pbrAlbedoCache: [UInt32: MTLTexture] = [:]
         private var pbrNormalCache: [UInt32: MTLTexture] = [:]
+        /// Phase 4 — Cook-Torrance specular needs roughness (sharpness of
+        /// the highlight, 0=mirror to 1=matte) and metallic (0=plastic
+        /// dielectric to 1=metal that tints highlights by base color).
+        /// Both maps load lazily on first bind of a material that has
+        /// them populated in materials_by_name.
+        private var pbrRoughnessCache: [UInt32: MTLTexture] = [:]
+        private var pbrMetallicCache: [UInt32: MTLTexture] = [:]
         private var pbrTriedAndMissed: Set<UInt32> = []
         private var pbrNormalTried: Set<UInt32> = []
+        private var pbrRoughnessTried: Set<UInt32> = []
+        private var pbrMetallicTried: Set<UInt32> = []
         /// Phase 3 — single global normal map applied to ALL world surfaces
         /// when r_pbrMaterials is on. Loads once on first world-fragment
         /// call; nil while still loading or if the DDS is missing. The
@@ -2971,6 +3048,72 @@ struct MetalView: UIViewRepresentable {
                 return tex
             } catch {
                 pbrLog("[Q3-PBR-SWIFT] normal DDS load FAILED handle=\(handle) err=\(error.localizedDescription) path=\(path)")
+                return nil
+            }
+        }
+
+        /// Phase 4 — lazy-load roughness map. Single-channel (R) data:
+        /// 0=mirror polish, 1=fully matte. Like normals, must NOT be
+        /// sRGB (linear scalar data, not gamma-encoded color).
+        private func pbrRoughnessTexture(for handle: UInt32) -> MTLTexture? {
+            if let cached = pbrRoughnessCache[handle] { return cached }
+            if pbrRoughnessTried.contains(handle) { return nil }
+            pbrRoughnessTried.insert(handle)
+            guard let matPtr = Q3MetalRenderer_GetPBRMaterial(handle) else { return nil }
+            let mat = matPtr.pointee
+            guard let rCStr = mat.roughness else { return nil }
+            let path = String(cString: rCStr)
+            guard let loader = pbrTextureLoader else { return nil }
+            pbrLog("[Q3-PBR-SWIFT] trying-roughness handle=\(handle) path=\(path)")
+            let url = URL(fileURLWithPath: path)
+            let opts: [MTKTextureLoader.Option: Any] = [
+                .SRGB:                NSNumber(value: false),
+                .textureUsage:        NSNumber(value: MTLTextureUsage.shaderRead.rawValue),
+                .textureStorageMode:  NSNumber(value: MTLStorageMode.private.rawValue),
+                .generateMipmaps:     NSNumber(value: false),
+            ]
+            do {
+                let tex = try loader.newTexture(URL: url, options: opts)
+                tex.label = "Q3.pbr.roughness.h\(handle)"
+                pbrRoughnessCache[handle] = tex
+                pbrLog("[Q3-PBR-SWIFT] loaded roughness handle=\(handle) size=\(tex.width)x\(tex.height) path=\(path)")
+                return tex
+            } catch {
+                pbrLog("[Q3-PBR-SWIFT] roughness DDS load FAILED handle=\(handle) err=\(error.localizedDescription)")
+                return nil
+            }
+        }
+
+        /// Phase 4 — lazy-load metallic map. Single-channel (R): 0=plastic
+        /// dielectric reflects ~4% incoming light at normal incidence,
+        /// 1=metal reflects ~100% TINTED by the base color (gold reflects
+        /// gold, copper reflects copper). Required for Schlick Fresnel
+        /// F0 lerp in the Cook-Torrance BRDF.
+        private func pbrMetallicTexture(for handle: UInt32) -> MTLTexture? {
+            if let cached = pbrMetallicCache[handle] { return cached }
+            if pbrMetallicTried.contains(handle) { return nil }
+            pbrMetallicTried.insert(handle)
+            guard let matPtr = Q3MetalRenderer_GetPBRMaterial(handle) else { return nil }
+            let mat = matPtr.pointee
+            guard let mCStr = mat.metallic else { return nil }
+            let path = String(cString: mCStr)
+            guard let loader = pbrTextureLoader else { return nil }
+            pbrLog("[Q3-PBR-SWIFT] trying-metallic handle=\(handle) path=\(path)")
+            let url = URL(fileURLWithPath: path)
+            let opts: [MTKTextureLoader.Option: Any] = [
+                .SRGB:                NSNumber(value: false),
+                .textureUsage:        NSNumber(value: MTLTextureUsage.shaderRead.rawValue),
+                .textureStorageMode:  NSNumber(value: MTLStorageMode.private.rawValue),
+                .generateMipmaps:     NSNumber(value: false),
+            ]
+            do {
+                let tex = try loader.newTexture(URL: url, options: opts)
+                tex.label = "Q3.pbr.metallic.h\(handle)"
+                pbrMetallicCache[handle] = tex
+                pbrLog("[Q3-PBR-SWIFT] loaded metallic handle=\(handle) size=\(tex.width)x\(tex.height) path=\(path)")
+                return tex
+            } catch {
+                pbrLog("[Q3-PBR-SWIFT] metallic DDS load FAILED handle=\(handle) err=\(error.localizedDescription)")
                 return nil
             }
         }
@@ -4314,6 +4457,15 @@ struct MetalView: UIViewRepresentable {
                         // rotating geometry.
                         var pbrNormalScaleEntity: Float = wantsDepthHack ? 1.0 : 0.0
                         encoder.setFragmentBytes(&pbrNormalScaleEntity, length: 4, index: 3)
+                        // PBR Phase 4 — Cook-Torrance specular textures.
+                        // Roughness at slot 3, metallic at slot 4. The
+                        // MSL fragment guards both with is_null_texture
+                        // so weapons without the maps (machinegun, etc.)
+                        // skip the specular block entirely. Currently
+                        // only the rocket launcher has both maps wired
+                        // in materials.json.
+                        encoder.setFragmentTexture(pbrRoughnessTexture(for: draw.textureHandle), index: 3)
+                        encoder.setFragmentTexture(pbrMetallicTexture(for: draw.textureHandle), index: 4)
                         // Per-draw sampler routing.
                         //
                         // Two ways to land on clampToEdge:
