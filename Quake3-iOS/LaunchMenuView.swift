@@ -21,6 +21,8 @@ struct LaunchMenuView: View {
     @Binding var launchCommand: String?
 
     @State private var demoFiles: [DemoEntry] = []
+    @State private var selectedQuality: Q3UpscaleQuality = Q3UpscaleQuality.current
+    @State private var selectedFrameInterp: Q3FrameInterpolation = Q3FrameInterpolation.current
 
     struct DemoEntry: Identifiable, Hashable {
         let id = UUID()
@@ -60,6 +62,102 @@ struct LaunchMenuView: View {
 
                 Spacer().frame(height: 8)
 
+                // MetalFX upscale quality picker. Persisted via
+                // UserDefaults; Quake3_iOSApp.swift reads it on engine
+                // boot and calls Q3_SetRenderResolution() so the engine
+                // cmdline gets r_customwidth/height = the chosen input
+                // resolution. The MetalView Coordinator allocates an
+                // offscreen RT + MTLFXSpatialScaler at the same size and
+                // upscales RT → drawable each frame.
+                HStack(spacing: 8) {
+                    ForEach(Q3UpscaleQuality.allCases, id: \.self) { q in
+                        let isSelected = (selectedQuality == q)
+                        Button(action: {
+                            selectedQuality = q
+                            Q3UpscaleQuality.save(q)
+                            NSLog("[Q3-MENU] upscale quality = %@", q.label)
+                        }) {
+                            VStack(spacing: 2) {
+                                Text(q.label)
+                                    .font(.system(size: 13, weight: .heavy, design: .monospaced))
+                                    .foregroundColor(.white)
+                                Text(q == .native ? "1.0×" :
+                                     q == .high   ? "0.75×" :
+                                     q == .medium ? "0.5×"  : "480p")
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundColor(.white.opacity(0.6))
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 8)
+                            .background(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .fill(isSelected ? Color(red: 0.7, green: 0.15, blue: 0.1).opacity(0.85)
+                                                     : Color.black.opacity(0.55))
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .stroke(Color(red: 0.7, green: 0.15, blue: 0.1).opacity(isSelected ? 1.0 : 0.5),
+                                            lineWidth: isSelected ? 2 : 1)
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .frame(maxWidth: 560)
+                .padding(.horizontal, 24)
+
+                Text("MetalFX Upscale Quality")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.55))
+                    .padding(.top, -8)
+
+                // MetalFX Frame Interpolation toggle. Sits directly under
+                // the upscale-quality picker — same style, two buttons
+                // (Off / On). Persists via UserDefaults; the Coordinator
+                // reads Q3FrameInterpolation.current at init and (when
+                // .on) creates an MTLFXFrameInterpolator + emits one
+                // synthesized frame between each rendered pair.
+                HStack(spacing: 8) {
+                    ForEach(Q3FrameInterpolation.allCases, id: \.self) { fi in
+                        let isSelected = (selectedFrameInterp == fi)
+                        Button(action: {
+                            selectedFrameInterp = fi
+                            Q3FrameInterpolation.save(fi)
+                            NSLog("[Q3-MENU] frame interpolation = %@", fi.label)
+                        }) {
+                            VStack(spacing: 2) {
+                                Text(fi.label)
+                                    .font(.system(size: 13, weight: .heavy, design: .monospaced))
+                                    .foregroundColor(.white)
+                                Text(fi == .off ? "1× present" : "2× present")
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundColor(.white.opacity(0.6))
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 8)
+                            .background(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .fill(isSelected ? Color(red: 0.7, green: 0.15, blue: 0.1).opacity(0.85)
+                                                     : Color.black.opacity(0.55))
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .stroke(Color(red: 0.7, green: 0.15, blue: 0.1).opacity(isSelected ? 1.0 : 0.5),
+                                            lineWidth: isSelected ? 2 : 1)
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .frame(maxWidth: 560)
+                .padding(.horizontal, 24)
+
+                Text("MetalFX Frame Interpolation (experimental — no motion vectors yet)")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.45))
+                    .padding(.top, -8)
+                    .multilineTextAlignment(.center)
+
                 ScrollView {
                     VStack(spacing: 12) {
                         // Stock demo always available
@@ -86,13 +184,57 @@ struct LaunchMenuView: View {
                                    subtitle: "Arena Gate") {
                             choose(command: "map q3dm1", label: "Map: q3dm1")
                         }
+                        DemoButton(title: "Map: q3dm4",
+                                   subtitle: "The Place of Many Deaths") {
+                            choose(command: "map q3dm4", label: "Map: q3dm4")
+                        }
                         DemoButton(title: "Map: q3dm6",
                                    subtitle: "Camping Grounds") {
                             choose(command: "map q3dm6", label: "Map: q3dm6")
                         }
+                        DemoButton(title: "Map: q3dm17",
+                                   subtitle: "The Longest Yard") {
+                            choose(command: "map q3dm17", label: "Map: q3dm17")
+                        }
                         DemoButton(title: "Map: nv15",
                                    subtitle: "Area 15 — Nvidia Bunker (custom pk3)") {
                             choose(command: "map nv15", label: "Map: nv15")
+                        }
+
+                        Divider()
+                            .background(Color.white.opacity(0.3))
+                            .padding(.vertical, 8)
+
+                        // Mod rows. Encoded form: "mod:<name>|<command>"
+                        // Quake3_iOSApp.swift parses the prefix → calls
+                        // Q3_SetBootMod(name) before Quake3_Init (which
+                        // bakes +set fs_game <name> into the cmdline).
+                        // VM_FindNative is patched to skip our native
+                        // cgame when fs_game is a non-baseq3 value, so
+                        // the mod's cgame.qvm / qagame.qvm / ui.qvm load
+                        // via the AArch64 QVM JIT path.
+                        Text("MODS")
+                            .font(.system(size: 13, weight: .heavy, design: .monospaced))
+                            .foregroundColor(.red.opacity(0.85))
+                            .tracking(4)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.leading, 8)
+
+                        DemoButton(title: "OSP — q3dm6",
+                                   subtitle: "Orange Smoothie Productions ruleset · bot duel") {
+                            choose(command: "mod:osp|map q3dm6", label: "OSP — q3dm6")
+                        }
+                        DemoButton(title: "Q3Plus — q3dm6",
+                                   subtitle: "Modern competitive overlay + better hud") {
+                            choose(command: "mod:q3plus|map q3dm6", label: "Q3Plus — q3dm6")
+                        }
+                        DemoButton(title: "ExcessivePlus — q3dm17",
+                                   subtitle: "Faster respawn / infinite ammo · bot deathmatch") {
+                            choose(command: "mod:excessiveplus|map q3dm17", label: "ExcessivePlus — q3dm17")
+                        }
+                        DemoButton(title: "SexyFraggers — q3dm6",
+                                   subtitle: "Cosmetic announcer mod") {
+                            choose(command: "mod:sexyfraggers|map q3dm6", label: "SexyFraggers — q3dm6")
                         }
                     }
                     .padding(.horizontal, 24)

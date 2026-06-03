@@ -84,6 +84,78 @@ struct Quake3_iOSApp: App {
                             DebugTelemetry.shared.log(source: Self.telemetrySource, type: "controller_bridge_start")
                             GameControllerBridge.shared.start()
                             let basePath = Bundle.main.resourcePath ?? ""
+
+                            /* MetalFX upscale render-resolution injection.
+                             * The launcher quality picker persists into
+                             * UserDefaults; we read it here BEFORE
+                             * Quake3_Init runs, compute the input render
+                             * size relative to the drawable target
+                             * (iPhone: 1920×888, iPad: 2560×1920), and
+                             * call Q3_SetRenderResolution() so ios_main.m's
+                             * cmdline gets r_customwidth/r_customheight
+                             * matching the offscreen RT the Coordinator
+                             * will allocate. Native quality clears the
+                             * override (0,0) → engine uses the default
+                             * native-target sizing path. */
+                            let quality = Q3UpscaleQuality.current
+                            // True device-native pixel dimensions in
+                            // landscape orientation. iPhone 17 Pro Max =
+                            // 2868×1320, iPad Pro 13" M4 = 2752×2064.
+                            // UIScreen.nativeBounds reports portrait; we
+                            // swap with max/min so width is the long axis.
+                            let nb = UIScreen.main.nativeBounds.size
+                            let outputW = max(nb.width, nb.height)
+                            let outputH = min(nb.width, nb.height)
+                            let outputSize = CGSize(width: outputW, height: outputH)
+                            if quality != .native {
+                                let rs = quality.renderSize(forOutput: outputSize)
+                                let w = Int32(rs.width)
+                                let h = Int32(rs.height)
+                                NSLog("[Q3-BOOT] MetalFX quality=%@ render=%dx%d (output target %dx%d native)",
+                                      quality.label, w, h, Int32(outputW), Int32(outputH))
+                                Q3_SetRenderResolution(w, h)
+                            } else {
+                                // Native quality: render at true device
+                                // pixels — no MetalFX, no Core Animation
+                                // upscale. The drawableSize lock below
+                                // will also pin to native bounds.
+                                let w = Int32(outputW)
+                                let h = Int32(outputH)
+                                NSLog("[Q3-BOOT] MetalFX quality=Native render=%dx%d (true native, no upscale)", w, h)
+                                Q3_SetRenderResolution(w, h)
+                            }
+
+                            // Log frame-interpolation choice so the user
+                            // can confirm UserDefaults / env var was read.
+                            let frameInterp = Q3FrameInterpolation.current
+                            NSLog("[Q3-BOOT] MetalFX frame interpolation = %@", frameInterp.label)
+
+                            /* Parse "mod:<name>|<command>" prefix from
+                             * launchCommand (LaunchMenuView mod rows
+                             * encode this). When present, call
+                             * Q3_SetBootMod BEFORE Quake3_Init so
+                             * ios_main.m can bake +set fs_game <name>
+                             * into the Com_Init cmdline. The actual map
+                             * command (after the pipe) is queued
+                             * post-init below via Q3Exec_Command. */
+                            if let cmd = launchCommand, cmd.hasPrefix("mod:") {
+                                let trimmed = cmd.dropFirst(4)
+                                if let pipeIdx = trimmed.firstIndex(of: "|") {
+                                    let modName = String(trimmed[..<pipeIdx])
+                                    let postCmd = String(trimmed[trimmed.index(after: pipeIdx)...])
+                                    NSLog("[Q3-BOOT] mod-prefix detected mod=%@ post=%@", modName, postCmd)
+                                    DebugTelemetry.shared.log(source: Self.telemetrySource, type: "mod_select", message: modName, fields: [
+                                        "modName": modName,
+                                        "postCommand": postCmd
+                                    ])
+                                    modName.withCString { Q3_SetBootMod($0) }
+                                    // Replace launchCommand with just
+                                    // the post-pipe portion so the
+                                    // post-init queueing block fires
+                                    // the map/demo command unmodified.
+                                    launchCommand = postCmd
+                                }
+                            }
                             NSLog("[Q3-BOOT] dispatching Quake3_Init to background queue")
                             DebugTelemetry.shared.log(source: Self.telemetrySource, type: "engine_init_dispatch", fields: [
                                 "basePath": basePath

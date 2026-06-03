@@ -1809,6 +1809,20 @@ void VM_RegisterNative( const char *name, vmMainFunc_t vmMain, dllEntry_t dllEnt
 static const vmNativeModule_t *VM_FindNative( const char *name ) {
     int i;
     if ( name == NULL ) return NULL;
+    /* iOS: when fs_game points at a mod, refuse to return our vanilla
+     * cgame native handler — the mod ships its own cgame.qvm + qagame.qvm
+     * + ui.qvm with different game logic. Vanilla native would load the
+     * mod's pak3 assets but execute baseq3 cgame code → broken hybrid.
+     * Forcing VM_FindNative to NULL falls VM_Create through to the
+     * qvm load path (AArch64 JIT on iOS), which picks up the mod's
+     * vm/<name>.qvm correctly. Baseq3 / empty fs_game keeps native. */
+    {
+        const char *fsgame = Cvar_VariableString( "fs_game" );
+        if ( fsgame && fsgame[0] != '\0' &&
+             Q_stricmp( fsgame, BASEGAME ) != 0 ) {
+            return NULL;
+        }
+    }
     for ( i = 0; i < s_nativeModuleCount; ++i ) {
         if ( !Q_stricmp( s_nativeModules[i].name, name ) ) {
             return &s_nativeModules[i];

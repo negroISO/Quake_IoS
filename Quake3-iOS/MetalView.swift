@@ -1,8 +1,133 @@
 import SwiftUI
 import MetalKit
+#if canImport(MetalFX)
+import MetalFX
+#endif
 import GameController
 import QuartzCore
 import simd
+
+/// MetalFX upscale quality picker. Persists via UserDefaults; the launcher
+/// menu sets it before Quake3_Init runs. C-side cmdline picks up the input
+/// render resolution via Q3_SetRenderResolution; Coordinator creates an
+/// offscreen RT at that size and uses MTLFXSpatialScaler to upscale to the
+/// drawable each frame. Native quality bypasses the RT — Q3 renders direct
+/// to the drawable as before (no MetalFX overhead).
+enum Q3UpscaleQuality: String, CaseIterable {
+    case native = "native"
+    case high = "high"
+    case medium = "medium"
+    case low = "low"
+
+    static let userDefaultsKey = "q3_upscale_quality"
+
+    static var current: Q3UpscaleQuality {
+        // Env var override (terminal capture workflow, e.g.
+        // `xcrun devicectl ... --environment-variables {"Q3_UPSCALE_QUALITY":"medium"}`).
+        // Takes precedence over UserDefaults so scripts/iphone_q3_avi.sh
+        // can record one .mov per quality without tapping the picker.
+        if let envRaw = ProcessInfo.processInfo.environment["Q3_UPSCALE_QUALITY"]?.lowercased(),
+           let envQ = Q3UpscaleQuality(rawValue: envRaw) {
+            NSLog("[Q3-UPSCALE] using env var Q3_UPSCALE_QUALITY=%@", envRaw)
+            return envQ
+        }
+        let raw = UserDefaults.standard.string(forKey: userDefaultsKey) ?? "native"
+        return Q3UpscaleQuality(rawValue: raw) ?? .native
+    }
+
+    static func save(_ q: Q3UpscaleQuality) {
+        UserDefaults.standard.set(q.rawValue, forKey: userDefaultsKey)
+        UserDefaults.standard.synchronize()
+    }
+
+    var label: String {
+        switch self {
+        case .native: return "Native"
+        case .high:   return "High"
+        case .medium: return "Medium"
+        case .low:    return "Low"
+        }
+    }
+
+    /// Compute Q3's render-input dimensions given the drawable's output
+    /// target dimensions (the existing iPhone/iPad lock — typically
+    /// 1920×888 on iPhone, 2560×1920 on iPad).
+    func renderSize(forOutput out: CGSize) -> CGSize {
+        switch self {
+        case .native:
+            return out
+        case .high:
+            return CGSize(width: floor(out.width * 0.75),
+                          height: floor(out.height * 0.75))
+        case .medium:
+            return CGSize(width: floor(out.width * 0.5),
+                          height: floor(out.height * 0.5))
+        case .low:
+            // 480 vertical px (480p), preserve aspect for width.
+            let h: CGFloat = 480
+            let aspect = (out.height > 0) ? out.width / out.height : 16.0 / 9.0
+            return CGSize(width: floor(h * aspect), height: h)
+        }
+    }
+
+    /// One-line summary suitable for the launcher row subtitle.
+    func subtitle(forOutput out: CGSize) -> String {
+        let r = renderSize(forOutput: out)
+        switch self {
+        case .native:
+            return "Render at \(Int(r.width))×\(Int(r.height)) — no upscale"
+        default:
+            return "Render at \(Int(r.width))×\(Int(r.height)) → MetalFX upscale to \(Int(out.width))×\(Int(out.height))"
+        }
+    }
+}
+
+/// MetalFX frame interpolation toggle. When .on, the renderer creates an
+/// MTLFXFrameInterpolator (iOS 18+) and emits one synthesized in-between
+/// frame between each pair of rendered frames — perceived framerate ~2×.
+///
+/// CAVEAT: the MetalFX frame interpolator wants per-pixel motion vectors
+/// to keep moving objects sharp. Q3 doesn't emit motion vectors yet
+/// (would require per-frame world+entity reprojection like the Q2
+/// MetalTAA path). Without them, the interpolated frame is just an
+/// optical-flow guess from color/depth alone — produces visible ghosting
+/// on fast camera motion. Useful for smooth UI / slow-pan scenes,
+/// distracting in deathmatch. Off by default until motion vectors land.
+enum Q3FrameInterpolation: String, CaseIterable {
+    case off = "off"
+    case on  = "on"
+
+    static let userDefaultsKey = "q3_frame_interpolation"
+
+    static var current: Q3FrameInterpolation {
+        if let envRaw = ProcessInfo.processInfo.environment["Q3_FRAME_INTERPOLATION"]?.lowercased(),
+           let envQ = Q3FrameInterpolation(rawValue: envRaw) {
+            NSLog("[Q3-FRAMEINTERP] using env var Q3_FRAME_INTERPOLATION=%@", envRaw)
+            return envQ
+        }
+        let raw = UserDefaults.standard.string(forKey: userDefaultsKey) ?? "off"
+        return Q3FrameInterpolation(rawValue: raw) ?? .off
+    }
+
+    static func save(_ q: Q3FrameInterpolation) {
+        UserDefaults.standard.set(q.rawValue, forKey: userDefaultsKey)
+        UserDefaults.standard.synchronize()
+    }
+
+    var label: String {
+        switch self {
+        case .off: return "Off"
+        case .on:  return "On (Experimental)"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .off: return "Engine fps presented as-is"
+        case .on:  return "MetalFX inserts synthesized frames · expect ghosting on fast motion"
+        }
+    }
+}
 
 struct MetalView: UIViewRepresentable {
     func makeUIView(context: Context) -> Q3InputView {
@@ -246,6 +371,8 @@ struct MetalView: UIViewRepresentable {
         // 3 = uv1 visualization, 4 = vertex color only. Flip to diagnose
         // lightmap / uv1 issues without touching the build pipeline.
         private static let worldDebugMode: Float = 0
+        /// FOG-DIAG: which fog indices we've already printed (one-shot per unique index).
+        nonisolated(unsafe) static var fogSeen: Set<Int> = []
 
         // One-shot: logs the first sky draw's stage layout once per launch.
         // Confirms killsky_1 + killsky_2 are both wired through as stages.
@@ -1998,14 +2125,34 @@ struct MetalView: UIViewRepresentable {
              * into vertex color C-side). Alpha follows vertex color in
              * both cases so additive/alpha blends stay intact. */
             /* rgbGen selection:
-             *   0 (identity) = texel.rgb (full-bright)
+             *   0 (identity) = texel.rgb * in.color.rgb. This is the
+             *                  "no explicit rgbGen directive" path. PC
+             *                  Q3 defaults alias-model contexts to
+             *                  CGEN_LIGHTING_DIFFUSE here, generating
+             *                  per-vertex Lambert at draw time via
+             *                  RB_CalcDiffuseColor. Our C-side MD3 emit
+             *                  bakes the same `ambient + directed * ndotl
+             *                  * entityColor` into vertex.color (line
+             *                  ~8773 in metal_renderer_stub.c) — so we
+             *                  just multiply by it here. Effect: the
+             *                  viewmodel + player + monster alias models
+             *                  finally react to the BSP lightgrid (dark
+             *                  hallways dim the gun, coloured wall
+             *                  torches tint it, etc.) instead of rendering
+             *                  full-bright regardless of player position.
+             *                  Sprite/beam vertex.color = entity shaderRGBA
+             *                  (set at sprite/beam emit time), so they
+             *                  get correctly tinted via the same path
+             *                  instead of being silently ignored. Was
+             *                  returning bare `texel.rgb` — fixed
+             *                  2026-06-02. PC reference behavior matches.
              *   3 (wave)     = texel.rgb * clamp(base + sin(2π*(phase +
              *                  t*freq)) * amp, 0, 1) — matches
              *                  RB_CalcWaveColor (GF_SIN scope)
              *   default      = texel.rgb * in.color.rgb (Lambert) */
             float3 baseRgb;
             if (uniforms.rgbGenMode == 0u) {
-                baseRgb = texel.rgb;
+                baseRgb = texel.rgb * in.color.rgb;
             } else if (uniforms.rgbGenMode == 3u) {
                 float4 wp = uniforms.rgbGenWaveParams; /* (base, amp, phase, freq) */
                 float glow = clamp(evalWave(uniforms.rgbWaveFunc, wp.x, wp.y, wp.z, wp.w, uniforms.timeSeconds), 0.0, 1.0);
@@ -2186,6 +2333,99 @@ struct MetalView: UIViewRepresentable {
         """
 
         private var commandQueue: MTLCommandQueue?
+
+        /* MetalFX spatial upscale (Q3UpscaleQuality picker).
+         *   - upscaleQuality is read once from UserDefaults at Coordinator
+         *     init. Quake3_iOSApp also calls Q3_SetRenderResolution() before
+         *     Quake3_Init so Q3's cmdline gets r_customwidth/height matching
+         *     upscaleColorTarget's dimensions.
+         *   - When != .native: every frame's main render encoder is pointed
+         *     at upscaleColorTarget instead of the drawable, viewport +
+         *     depth attachment use the RT's size, and after encoder.endEncoding
+         *     the spatialScaler upscales RT → drawable. encodePostprocess
+         *     still runs on the drawable (full-res tone curve).
+         *   - When .native: the RT is nil and we render direct to drawable
+         *     like before. spatialScaler is also nil — no MetalFX overhead. */
+        private var upscaleQuality: Q3UpscaleQuality = Q3UpscaleQuality.current
+        private var upscaleColorTarget: MTLTexture?
+        private var upscaleDepthTarget: MTLTexture?
+        #if canImport(MetalFX)
+        private var spatialScaler: MTLFXSpatialScaler?
+        #endif
+        /// Cached (inputW, inputH, outputW, outputH) the scaler was built
+        /// for; rebuild lazily on any change (drawable resize, quality flip).
+        private var spatialScalerKey: (Int, Int, Int, Int) = (0, 0, 0, 0)
+
+        /// (Re)build the offscreen color + depth RT and the MTLFXSpatialScaler
+        /// for the given input/output dimensions. Returns false if the device
+        /// can't host MetalFX (very old hardware) — caller falls back to direct
+        /// rendering. Called from draw() lazily when upscaleQuality != .native.
+        private func ensureSpatialUpscaleTargets(device: MTLDevice,
+                                                 inputW: Int, inputH: Int,
+                                                 outputW: Int, outputH: Int) -> Bool {
+            #if !canImport(MetalFX)
+            // Simulator builds: MetalFX framework not available in the
+            // iphonesimulator SDK. Fall back to direct rendering (upscale
+            // disabled). Real device builds run the path below.
+            return false
+            #else
+            let key = (inputW, inputH, outputW, outputH)
+            if spatialScaler != nil && spatialScalerKey == key { return true }
+
+            // Color RT (.private, [renderTarget, shaderRead] — Q3 renders
+            // INTO this, MetalFX READS this).
+            let colorDesc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .bgra8Unorm,
+                width: inputW, height: inputH, mipmapped: false)
+            colorDesc.usage = [.renderTarget, .shaderRead]
+            colorDesc.storageMode = .private
+            colorDesc.textureType = .type2D
+            guard let color = device.makeTexture(descriptor: colorDesc) else {
+                print("[MetalFX] ensureSpatialUpscaleTargets: color RT alloc failed (\(inputW)×\(inputH))")
+                return false
+            }
+            color.label = "Q3.upscale.color"
+            upscaleColorTarget = color
+
+            // Depth RT (.private, renderTarget) — same dims as color RT.
+            let depthDesc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .depth32Float,
+                width: inputW, height: inputH, mipmapped: false)
+            depthDesc.usage = [.renderTarget]
+            depthDesc.storageMode = .private
+            depthDesc.textureType = .type2D
+            guard let depth = device.makeTexture(descriptor: depthDesc) else {
+                print("[MetalFX] ensureSpatialUpscaleTargets: depth RT alloc failed (\(inputW)×\(inputH))")
+                return false
+            }
+            depth.label = "Q3.upscale.depth"
+            upscaleDepthTarget = depth
+
+            // MTLFXSpatialScaler descriptor → build a fresh scaler for this
+            // input/output pair. Spatial is the "Lanczos-ish" upscaler;
+            // doesn't need motion vectors (those would feed the Temporal
+            // scaler, which Q3 doesn't have).
+            let scalerDesc = MTLFXSpatialScalerDescriptor()
+            scalerDesc.inputWidth = inputW
+            scalerDesc.inputHeight = inputH
+            scalerDesc.outputWidth = outputW
+            scalerDesc.outputHeight = outputH
+            scalerDesc.colorTextureFormat = .bgra8Unorm
+            scalerDesc.outputTextureFormat = .bgra8Unorm
+            // .perceptual = source/output are display-encoded (gamma-ish).
+            // .linear would be for HDR linear-light buffers.
+            scalerDesc.colorProcessingMode = .perceptual
+            guard let scaler = scalerDesc.makeSpatialScaler(device: device) else {
+                print("[MetalFX] makeSpatialScaler returned nil — device unsupported. Falling back to direct render.")
+                return false
+            }
+            spatialScaler = scaler
+            spatialScalerKey = key
+            print("[MetalFX] spatial scaler ready: \(inputW)×\(inputH) → \(outputW)×\(outputH) (\(upscaleQuality.label))")
+            return true
+            #endif
+        }
+
         private var uiPipelineState: MTLRenderPipelineState?
         private var uiOpaquePipelineState: MTLRenderPipelineState?
         /* Full-intensity additive (GL_ONE/GL_ONE) — blendMode=5. */
@@ -2531,15 +2771,20 @@ struct MetalView: UIViewRepresentable {
                 target = CGSize(width: isPad ? 1280 : 960,
                                 height: isPad ? 960 : 444)
             } else {
-                // Normal play. Was hardcoded 960×444 on iPhone / 1280×960 on
-                // iPad — both 3× smaller linearly than native, scaled up by
-                // Core Animation = soft, especially on Pro Max OLED. Use 2×
-                // of the legacy capture size on each axis (1920×888 iPhone,
-                // 2560×1920 iPad) — same aspect (~2.16:1 / 4:3) so no
-                // pillarbox/letterbox, ~4× pixel density vs legacy, well
-                // within A19 Pro / M-series GPU headroom on Q3 workloads.
-                target = CGSize(width: isPad ? 2560 : 1920,
-                                height: isPad ? 1920 : 888)
+                // Normal play. Lock the drawable to TRUE device-native
+                // pixels so MetalFX's spatial upscale outputs directly to
+                // the panel-pixel grid with NO Core Animation downstream
+                // scale. iPhone 17 Pro Max = 2868×1320 landscape, iPad
+                // Pro 13" M4 = 2752×2064 landscape. UIScreen.nativeBounds
+                // is portrait; swap with max/min for landscape.
+                // Previous build used 1920×888 / 2560×1920 fixed targets
+                // and relied on Core Animation linear-scale to the panel —
+                // soft on OLED. With MetalFX spatial + drawable at native
+                // pixels, the result is 1:1 on the display and crisp.
+                let nb = UIScreen.main.nativeBounds.size
+                let _ = isPad   // pad/phone branch no longer needed
+                target = CGSize(width: max(nb.width, nb.height),
+                                height: min(nb.width, nb.height))
             }
             print("[Metal] Drawable size: \(size) (target \(target))")
             if size.width.isFinite && size.height.isFinite
@@ -2560,7 +2805,38 @@ struct MetalView: UIViewRepresentable {
                 configureRenderer(for: view)
             }
 
-            Q3MetalRenderer_UpdateDrawableSize(Int32(view.drawableSize.width), Int32(view.drawableSize.height))
+            /* MetalFX upscale path: when upscaleQuality != .native, we
+             * render the frame at a lower resolution (renderW × renderH)
+             * into upscaleColorTarget and then MetalFX spatially upscales
+             * to the drawable. The Q3 renderer needs to know its
+             * "effective drawable" is the RT size so projection / viewport
+             * / scissor math is consistent with what we'll actually feed
+             * to MetalFX. Native quality keeps the existing direct path. */
+            let outputW = Int(view.drawableSize.width)
+            let outputH = Int(view.drawableSize.height)
+            let upscaleActive: Bool
+            let renderW: Int
+            let renderH: Int
+            if upscaleQuality != .native, let device = view.device, outputW > 0, outputH > 0 {
+                let rs = upscaleQuality.renderSize(forOutput: view.drawableSize)
+                let rW = max(1, Int(rs.width))
+                let rH = max(1, Int(rs.height))
+                if ensureSpatialUpscaleTargets(device: device, inputW: rW, inputH: rH, outputW: outputW, outputH: outputH) {
+                    upscaleActive = true
+                    renderW = rW
+                    renderH = rH
+                } else {
+                    // MetalFX unavailable on this device — fall back.
+                    upscaleActive = false
+                    renderW = outputW
+                    renderH = outputH
+                }
+            } else {
+                upscaleActive = false
+                renderW = outputW
+                renderH = outputH
+            }
+            Q3MetalRenderer_UpdateDrawableSize(Int32(renderW), Int32(renderH))
 
             /* Acquire the CAMetalLayer drawable before running the Q3
              * simulation/render build. On ProMotion hardware, waiting until
@@ -2605,6 +2881,20 @@ struct MetalView: UIViewRepresentable {
             descriptor.colorAttachments[0].loadAction = .clear
             descriptor.colorAttachments[0].storeAction = .store
 
+            /* MetalFX path: redirect the main color attachment to our
+             * offscreen RT. The descriptor's drawable.texture is left
+             * untouched (we'll fill it via spatial upscale after
+             * encoder.endEncoding). Depth attachment is ALSO swapped to
+             * match the RT's dimensions — Metal rejects a render pass
+             * where color/depth dims disagree. */
+            if upscaleActive, let colorRT = upscaleColorTarget, let depthRT = upscaleDepthTarget {
+                descriptor.colorAttachments[0].texture = colorRT
+                descriptor.depthAttachment.texture = depthRT
+                descriptor.depthAttachment.loadAction = .clear
+                descriptor.depthAttachment.storeAction = .store
+                descriptor.depthAttachment.clearDepth = 1.0
+            }
+
             /* Sanity: the drawable texture MUST NOT be memoryless — filter
              * blending needs a real framebuffer to sample destinationColor
              * from. MTKView with framebufferOnly=false (set in
@@ -2618,10 +2908,13 @@ struct MetalView: UIViewRepresentable {
             let wantsFogRayBox = hasRenderableFogVolume()
             let sceneDepth = wantsFogRayBox ? view.device.flatMap { device in
                 ensureSceneDepthTexture(device: device,
-                                        width: Int(view.drawableSize.width),
-                                        height: Int(view.drawableSize.height))
+                                        width: renderW,
+                                        height: renderH)
             } : nil
-            if let sceneDepth {
+            if let sceneDepth, !upscaleActive {
+                // Native path: drive the descriptor's depth from our scene
+                // depth (drawable-sized). Upscale path already set depth
+                // to upscaleDepthTarget above.
                 descriptor.depthAttachment.texture = sceneDepth
                 descriptor.depthAttachment.loadAction = .clear
                 descriptor.depthAttachment.storeAction = .store
@@ -2633,12 +2926,13 @@ struct MetalView: UIViewRepresentable {
             }
             encoder.label = "Q3.render"
 
-            // FORCE VIEWPORT MATCH — temporary troubleshooting patch
+            // Viewport matches the actual render-target size (RT when
+            // upscaling, drawable when native).
             encoder.setViewport(MTLViewport(
                 originX: 0,
                 originY: 0,
-                width: Double(view.drawableSize.width),
-                height: Double(view.drawableSize.height),
+                width: Double(renderW),
+                height: Double(renderH),
                 znear: 0.0,
                 zfar: 1.0
             ))
@@ -2859,6 +3153,15 @@ struct MetalView: UIViewRepresentable {
                                 fogCD = SIMD4(f.color.0, f.color.1, f.color.2, f.distance)
                                 fogParams = SIMD4(f.tcScale, f.hasSurface != 0 ? 1.0 : 0.0, 0, 0)
                                 fogSurface = SIMD4(f.surface.0, f.surface.1, f.surface.2, f.surface.3)
+                                /* DIAG: log first time each distinct (fogIndex, color)
+                                 * pair shows up so we can determine whether q3dm4's
+                                 * "fog changes between visits" is multiple BSP-authored
+                                 * fog volumes (expected) or a single volume returning
+                                 * varying state (bug). Grep q3_diag.log for FOG-DIAG. */
+                                if Coordinator.fogSeen.insert(Int(draw.fogIndex)).inserted {
+                                    NSLog("[FOG-DIAG] fogIndex=%d color=(%.3f, %.3f, %.3f) distance=%.1f tcScale=%.3f",
+                                          Int(draw.fogIndex), f.color.0, f.color.1, f.color.2, f.distance, f.tcScale)
+                                }
                             }
                         }
 
@@ -3704,16 +4007,28 @@ struct MetalView: UIViewRepresentable {
                             encoder.setDepthStencilState(ensuredDepthStencilState(state, device: view.device))
                         }
                         encoder.setFragmentTexture(texture, index: 0)
-                        // Per-draw sampler routing from the new
-                        // Q3_METAL_ENTITY_DRAWFLAG_CLAMPMAP bit. The flag
-                        // is set by EntityFlagsForTexture from
-                        // metalTexture_t.wrapClampMode, in turn set by
-                        // CopyStageMetadataToTexture from the parser's
-                        // Q3MetalStage.wrapClampMode (the C-side mirror of
-                        // the Q3 `clampmap` vs `map` directive). Memoized
-                        // to skip redundant binds across consecutive
-                        // same-wrap draws.
-                        let wantClamp = (draw.flags & UInt32(Q3_METAL_ENTITY_DRAWFLAG_CLAMPMAP)) != 0
+                        // Per-draw sampler routing.
+                        //
+                        // Two ways to land on clampToEdge:
+                        //   1. Q3_METAL_ENTITY_DRAWFLAG_CLAMPMAP bit — set
+                        //      from the shader's `clampmap` directive via
+                        //      EntityFlagsForTexture → wrapClampMode.
+                        //   2. isScenePoly — force clamp for blast-marks /
+                        //      blood / shadow decals submitted via
+                        //      RE_AddPolyToScene. Q3 decal textures fade
+                        //      to alpha=0 at UV edges; with the world
+                        //      sampler's .repeat wrap, edge UVs (~0.99
+                        //      from the poly clip) sample from the
+                        //      opposite side of the texture (which has
+                        //      alpha=1 near the center), producing the
+                        //      "checkerboard square tile" artifact the
+                        //      user reported on rocket blasts. Decal
+                        //      shaders use `map` not `clampmap`, so the
+                        //      CLAMPMAP flag is off — but Q3's stock
+                        //      ref_gl behaviour is to clamp ALL scene
+                        //      polys regardless.
+                        let wantClamp = isScenePoly ||
+                            (draw.flags & UInt32(Q3_METAL_ENTITY_DRAWFLAG_CLAMPMAP)) != 0
                         if wantClamp != entityLastSamplerWasClamp {
                             encoder.setFragmentSamplerState(wantClamp ? uiSamplerState : worldSamplerState, index: 0)
                             entityLastSamplerWasClamp = wantClamp
@@ -3751,12 +4066,16 @@ struct MetalView: UIViewRepresentable {
                let sceneDepth,
                wantsFogRayBox {
                 encoder.endEncoding()
+                // Substitute upscale RT for drawable when MetalFX is
+                // active — fog must read/write the same texture the main
+                // render targeted, otherwise we'd lose the world geometry.
+                let fogColorTex = (upscaleActive ? upscaleColorTarget : drawable.texture) ?? drawable.texture
                 encodeFogVolumeRayBox(commandBuffer: commandBuffer,
-                                      colorTexture: drawable.texture,
+                                      colorTexture: fogColorTex,
                                       depthTexture: sceneDepth,
                                       device: device,
                                       sceneView: sceneView)
-                let postFogPass = makeLoadedRenderPassDescriptor(colorTexture: drawable.texture,
+                let postFogPass = makeLoadedRenderPassDescriptor(colorTexture: fogColorTex,
                                                                  depthTexture: sceneDepth)
                 guard let postFogEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: postFogPass) else {
                     return
@@ -3765,13 +4084,13 @@ struct MetalView: UIViewRepresentable {
                 encoder.label = "Q3.render.postFog"
                 encoder.setViewport(MTLViewport(originX: 0,
                                                 originY: 0,
-                                                width: Double(view.drawableSize.width),
-                                                height: Double(view.drawableSize.height),
+                                                width: Double(renderW),
+                                                height: Double(renderH),
                                                 znear: 0.0,
                                                 zfar: 1.0))
                 encoder.setScissorRect(MTLScissorRect(x: 0, y: 0,
-                                                       width: Int(view.drawableSize.width),
-                                                       height: Int(view.drawableSize.height)))
+                                                       width: renderW,
+                                                       height: renderH))
             }
 
             /* Multi-scene HUD sub-scenes. Scene 0 is the main world view
@@ -3856,15 +4175,16 @@ struct MetalView: UIViewRepresentable {
                 }
 
                 // Restore full-screen viewport for flare + UI passes
+                // (renderW/H = upscale RT size when MetalFX active).
                 encoder.setViewport(MTLViewport(
                     originX: 0, originY: 0,
-                    width: Double(view.drawableSize.width),
-                    height: Double(view.drawableSize.height),
+                    width: Double(renderW),
+                    height: Double(renderH),
                     znear: 0.0, zfar: 1.0))
                 encoder.setScissorRect(MTLScissorRect(
                     x: 0, y: 0,
-                    width: Int(view.drawableSize.width),
-                    height: Int(view.drawableSize.height)))
+                    width: renderW,
+                    height: renderH))
             }
 
             /* Flare pass. When fog ray-box is active, main-scene flares
@@ -3926,11 +4246,25 @@ struct MetalView: UIViewRepresentable {
             }
 
             encoder.endEncoding()
+
+            #if canImport(MetalFX)
+            /* MetalFX spatial upscale: when active, all main render encoders
+             * above wrote to upscaleColorTarget (renderW × renderH). Encode
+             * the scaler now to fill the drawable with the upscaled image.
+             * MTLFXSpatialScaler is a one-shot pass — it sets up its own
+             * compute pipeline and writes outputTexture directly. */
+            if upscaleActive, let scaler = spatialScaler, let colorRT = upscaleColorTarget {
+                scaler.colorTexture = colorRT
+                scaler.outputTexture = drawable.texture
+                scaler.encode(commandBuffer: commandBuffer)
+            }
+            #endif
+
             // Final-image postprocess tone curve (port of Q2 MetalPostprocess).
             // Compute kernel does saturate(rgb*intensity); pow(rgb, gamma).
-            // Encoded after all render encoders, before present. Gated by
-            // r_postprocess (default 1). No-op when cvar=0 — pipeline is
-            // lazy-built only when needed.
+            // Encoded after all render encoders + upscale, before present.
+            // Always runs on the drawable so the tone curve is applied at
+            // output resolution regardless of upscale state.
             encodePostprocess(commandBuffer: commandBuffer, drawable: drawable)
             // Cache drawable.texture BEFORE present(). Reading
             // drawable.texture after commandBuffer.present(drawable)

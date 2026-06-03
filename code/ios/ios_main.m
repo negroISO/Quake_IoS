@@ -57,6 +57,21 @@ int Sys_Milliseconds(void) {
 
 static char installPath[MAX_OSPATH] = {0};
 
+/* Pre-engine-init mod selection (see Q3_SetBootMod() below). File-scope
+ * static so Quake3_Init() cmdline construction (~line 850) can read it
+ * BEFORE the function definition near Q3Exec_Command. Empty = vanilla. */
+static char g_bootMod[64] = "";
+
+/* Pre-engine-init upscale render resolution. Swift launcher selects the
+ * MetalFX quality level (Native/High/Medium/Low) and computes the input
+ * render dimensions; we inject them as r_customwidth/r_customheight on
+ * the cmdline so Q3's vidWidth/vidHeight + projection match the offscreen
+ * RT Swift will create. Drawable size stays at the existing iPhone target
+ * (1920×888 / 2560×1920) — MetalFX upscales RT → drawable.
+ * 0 = use the default native-target path (no upscale-driven override). */
+static int g_renderResW = 0;
+static int g_renderResH = 0;
+
 const char *Sys_Pwd(void) {
     static char pwd[MAX_OSPATH];
     if (pwd[0] == '\0') {
@@ -753,30 +768,48 @@ void Quake3_Init(const char *basePath) {
      * current Metal renderer ignores them. */
     char cmdline[1024] = "+set com_zoneMegs 64 +set com_hunkMegs 256 +set com_soundMegs 16 +set vm_ui 1 +set vm_game 1 +set vm_cgame 1"
         " +set r_overBrightBits 1"
-        /* mapOverBrightBits=3 (×4 lightmap shift) was causing q3dm4's fog
-         * volume to render heavily blue-cast — likely because the shift
-         * amplifies any small blue component in the BSP fog color before
-         * it reaches q3ResolvedFogColor's grey-fallback gate (dot < 0.001).
-         * Reverting to PC reference 2 (×2 shift) — visibility lift now
-         * comes entirely from the postprocess tone curve below. If the
-         * world looks dim, bump r_postprocess_intensity from 1.5 → 1.7. */
-        " +set r_mapOverBrightBits 2"
-        " +set r_intensity 1.0"
-        " +set r_gamma 1.25"
+        /* Q3A-1.32e-REMASTERED recommended graphics block (2026-06-02):
+         *   r_mapOverBrightBits 1 (PC default 2) — value 3 caused q3dm4 fog
+         *     to blow blue, value 2 looked dim; the remaster uses 1 paired
+         *     with r_intensity 1.4 + r_gamma 1.2 to compensate downstream.
+         *   r_intensity 1.4 (PC default 1.0) — base-texture multiplier;
+         *     compensates for the lower mapOverBrightBits shift.
+         *   r_gamma 1.2 (PC default 1.0) — slight midtone lift.
+         *   r_picmip 0 — full-detail textures (stock default; explicit).
+         *   r_mapGreyScale -0.25 — Quake3e cvar: negative = SATURATION BOOST.
+         *     Adds a touch of color punch on top of the remaster's HD assets.
+         *   r_ignorehwgamma 1 — bypass hardware gamma ramp (we do software
+         *     gamma via postprocess instead). */
+        " +set r_mapOverBrightBits 1"
+        " +set r_intensity 1.4"
+        " +set r_gamma 1.2"
+        " +set r_picmip 0"
+        " +set r_mapGreyScale -0.25"
         " +set r_ignorehwgamma 1"
         /* Widescreen FOV with Hor+ patch applied to CG_CalcFov (see
-         * code/cgame/cg_view.c). cg_fov is now interpreted as the 4:3
-         * REFERENCE horizontal FOV — vertical FOV is preserved across
-         * aspect ratios, horizontal expands naturally for widescreen.
-         * Q3 stock default is 90; we keep it stock so:
-         *   - 4:3 viewport: fov_x=90,   fov_y=73.7° (exactly PC ref)
-         *   - 2.16:1 phone: fov_x=116°, fov_y=73.7° (gun stays in frame,
-         *                                            world wider as expected)
-         * Vert- of stock Q3 would have crushed fov_y to ~54° at 2.16:1
-         * and pushed the viewmodel off-screen — the Hor+ patch fixes
-         * that and lets cg_fov default to its canonical 90 value. */
-        " +set cg_fov 90"
-        " +set cg_zoomfov 22";
+         * code/cgame/cg_view.c). cg_fov is the 4:3 REFERENCE horizontal
+         * FOV — vertical FOV stays consistent across aspect ratios.
+         *
+         * Q3A-1.32e-REMASTERED recommends cg_fov 109 (range 100-130). On
+         * our 2.16:1 phone with Hor+ that derives to fov_x ≈ 132° / fov_y
+         * ≈ 92° — wide / borderline fish-eye but matches the modern Q3
+         * pro-player feel. If too wide for your taste, dial down to 100
+         * (fov_x ≈ 122° / fov_y ≈ 82° on phone).
+         *
+         * cg_zoomfov 75 is the remaster recommendation (range 50-80). The
+         * previous 22 was the canonical Q3 railgun zoom — fine for tight
+         * shots but jarring; 75 gives a gentler half-zoom. */
+        " +set cg_fov 109"
+        " +set cg_zoomfov 75"
+        /* Max-quality geometry knobs requested 2026-06-02. r_subdivisions
+         * controls bezier-patch tessellation (lower = smoother curves);
+         * r_lodbias forces higher-detail LOD pick at all distances
+         * (negative = always prefer the highest-detail model variant).
+         * Both are CVAR_ARCHIVE so they ALSO persist into q3config.cfg
+         * on writeconfig, but baking on the cmdline guarantees they
+         * apply from the very first frame even before config load. */
+        " +set r_subdivisions -1"
+        " +set r_lodbias -1";
     if (matchProfile) {
         char matchCmds[768];
         snprintf(matchCmds, sizeof(matchCmds),
@@ -819,6 +852,23 @@ void Quake3_Init(const char *basePath) {
         Q_strcat(cmdline, sizeof(cmdline),
                  matchCmds);
     }
+    /* fs_game mod selection. g_bootMod is set by Swift via Q3_SetBootMod()
+     * before this function runs (LaunchMenuView mod row tap). When set,
+     * append `+set fs_game <mod>` so Com_Init's FS_Startup discovers the
+     * mod's pak3 cascade in <basepath>/<mod>/ during pak loading. Also
+     * honour the Q3_FS_GAME env var as a fallback (devicectl scripts /
+     * Xcode scheme env). Empty / NULL means stay on baseq3. */
+    {
+        const char *envMod = getenv("Q3_FS_GAME");
+        const char *modSel = (g_bootMod[0] != '\0') ? g_bootMod
+                             : (envMod && envMod[0] ? envMod : NULL);
+        if (modSel != NULL) {
+            char fsGameCmd[96];
+            snprintf(fsGameCmd, sizeof(fsGameCmd), " +set fs_game %s", modSel);
+            Q_strcat(cmdline, sizeof(cmdline), fsGameCmd);
+            NSLog(@"[Q3-INIT] mod-active: fs_game=%s (cgame native will be skipped)", modSel);
+        }
+    }
     NSLog(@"[Q3-INIT] calling Com_Init cmdline='%s'", cmdline);
     Com_Init(cmdline);
     NSLog(@"[Q3-INIT] Com_Init returned");
@@ -826,8 +876,17 @@ void Quake3_Init(const char *basePath) {
         Cvar_Set("com_maxfps", "25");
         Cvar_Set("com_maxfpsUnfocused", "25");
     } else {
-        Cvar_Set("com_maxfps", "120");
-        Cvar_Set("com_maxfpsUnfocused", "120");
+        /* com_maxfps 250 — Q3 "blessed" jump-physics value (msec=4 exactly,
+         * 1000/250 = 4 ms). Was 125 (also blessed) but we never benefit
+         * from sub-display-refresh caps and 125 gated the engine BEFORE
+         * the ProMotion display gated. With 250 the engine pumps until
+         * CADisplayLink fires, giving us the real GPU-bound frame rate
+         * shown by cg_drawFPS — useful for MetalFX quality A/B perf
+         * comparisons. (On the simulator the Mac host display still caps
+         * at 60 Hz regardless — that's CoreAnimation architecture, not
+         * Q3's gate.) */
+        Cvar_Set("com_maxfps", "250");
+        Cvar_Set("com_maxfpsUnfocused", "250");
     }
 
     /* Register the statically-linked native cgame so VM_Create (called
@@ -854,9 +913,21 @@ void Quake3_Init(const char *basePath) {
     /* Normal simulator/device runs use native landscape pixels. The old
      * fixed capture sizes are still available through Q3_MATCH_PROFILE so
      * reference-video diffs remain deterministic when needed. */
+    /* MetalFX upscale render-res override (Swift launcher picker): when
+     * g_renderResW/H were set via Q3_SetRenderResolution() before this
+     * function ran, use them as Q3's logical render resolution. Swift's
+     * MetalView Coordinator will create an offscreen RT at the same size,
+     * run all Q3 drawing into it, then MTLFXSpatialScaler-upscales the
+     * RT into the drawable for present. Drawable size stays at the
+     * existing iPhone/iPad target — only Q3's internal viewport, depth,
+     * + projection math shrink. Native quality keeps the existing path. */
     char resCmds[96];
     if (matchProfile) {
         snprintf(resCmds, sizeof(resCmds), "seta r_customwidth %d; seta r_customheight %d; ", matchWidth, matchHeight);
+    } else if (g_renderResW > 0 && g_renderResH > 0) {
+        snprintf(resCmds, sizeof(resCmds), "seta r_customwidth %d; seta r_customheight %d; ", g_renderResW, g_renderResH);
+        NSLog(@"[Q3-INIT] upscale-override: r_customwidth=%d r_customheight=%d (was native %dx%d)",
+              g_renderResW, g_renderResH, nativeWidth, nativeHeight);
     } else {
         snprintf(resCmds, sizeof(resCmds), "seta r_customwidth %d; seta r_customheight %d; ", nativeWidth, nativeHeight);
     }
@@ -867,12 +938,59 @@ void Quake3_Init(const char *basePath) {
                  ? "seta r_fullscreen 1; "
                  : "seta r_fullscreen 0; ");
     Cbuf_AddText(
-        /* Match the reference capture's HUD state: obituary kill-feed
-         * visible (via default con_notifytime), no bottom HUD numbers
-         * (cg_draw2D 0 kills health/armor/ammo counters). */
-        "seta cg_draw2D 0; "
+        /* HUD + 2D elements ON (2026-06-02). The previous draw2D 0 +
+         * crosshair 0 state was for matching reference AVI captures so
+         * the captured frame would be HUD-free. Normal play wants:
+         *   cg_draw2D 1   — health/armor/ammo counters, powerup icons,
+         *                   weapon icon, scoreboard, lag-o-meter, hit
+         *                   markers, mini-map (where supported). All
+         *                   the 2D bottom-of-screen UI.
+         *   cg_drawCrosshair 4 — Q3 stock default crosshair (numeric
+         *                        values 1-10 are different styles).
+         *                        4 is the canonical "plus sign with
+         *                        small open gap" — most readable.
+         *   cg_drawCrosshairHealth 1 — colour the crosshair by player
+         *                              health (canonical Q3 behaviour;
+         *                              the visual hint that you're low).
+         *   cg_drawStatus 1 — armor/health/ammo numeric panel.
+         *   cg_draw3dIcons 1 — rotating weapon/powerup icons on HUD.
+         *   cg_drawTeamOverlay 1 — team-mate status (CTF / team games).
+         *   cg_drawTimer 1 — match timer (frag count / time remaining).
+         *   cg_drawFPS 1 — display FPS counter top-right (useful for
+         *                  perf verification of async-tex / deformBulge /
+         *                  postprocess passes). Toggle off later if you
+         *                  want a clean look. */
+        "seta cg_draw2D 1; "
         "seta cg_drawGun 1; "
-        "seta cg_drawCrosshair 0; "
+        "seta cg_drawCrosshair 4; "
+        "seta cg_drawCrosshairHealth 1; "
+        "seta cg_drawStatus 1; "
+        /* cg_draw3dIcons OFF (2026-06-02): the 3D-rotating player head /
+         * weapon icon HUD widget uses a render-to-texture sub-scene that
+         * our Metal pipeline doesn't handle correctly — the sarge head
+         * comes out as a garbled mess. 2D fallback icons render via the
+         * normal pic pipeline and look clean. Re-enable once the sub-
+         * scene render path is fixed (3D icon uses cg.refdef.x/y/width/
+         * height on a tiny portion of the framebuffer; needs viewport +
+         * scissor + render-pass handling at the MTKView coordinator). */
+        "seta cg_draw3dIcons 0; "
+        /* cg_drawTeamOverlay OFF — only meaningful in team games
+         * (CTF, Team DM). Single-player demos show a confusing
+         * partial-data widget at bottom-right (the "20 / 0" the user
+         * noticed). */
+        "seta cg_drawTeamOverlay 0; "
+        /* cg_drawTimer OFF — match timer is for live matches; on demo
+         * playback it just shows the recorded demo's elapsed time which
+         * jumps strangely as the demo seeks. Re-enable in live play. */
+        "seta cg_drawTimer 0; "
+        /* cg_drawFPS ON (re-enabled after cg_draw.c patch). The stock
+         * Q3 right-edge anchor (`635 - w`) clipped the "fps" suffix on
+         * 2.16:1 widescreen — we patched CG_DrawFPS in code/cgame/cg_draw.c
+         * to anchor TOP-LEFT (virtual x=5) instead. Now visible on every
+         * aspect ratio and lands in the captured AVI alongside the
+         * MetalFX-upscaled scene, so the four quality-level recordings
+         * (Native/High/Medium/Low) can be A/B'd by FPS visually. */
+        "seta cg_drawFPS 1; "
         /* Force wall marks ON so blood/bullet/shadow decals submit
          * via trap_R_AddPolyToScene → RE_AddPolyToScene. */
         "seta cg_marks 1; "
@@ -896,6 +1014,10 @@ void Quake3_Init(const char *basePath) {
          * value chosen because this fork has no cg_gunFov separator. */
         "seta cg_fov 95; "
         "seta cg_zoomfov 22; "
+        /* Max-quality geometry — mirrors the cmdline +set block above
+         * so the values land in q3config.cfg on writeconfig. */
+        "seta r_subdivisions -1; "
+        "seta r_lodbias -1; "
         "seta r_dynamiclight 1; "
         "seta metal_render_audit 0; "
         "seta metal_cgame_instr 0; "
@@ -995,6 +1117,66 @@ void Quake3_Frame(void) {
     if (!engine_initialized) return;
     IN_Frame();
     Com_Frame(qfalse);
+}
+
+/* Pre-engine-init mod selection. Swift calls Q3_SetBootMod("cpma") before
+ * Quake3_Init() so we can inject `+set fs_game cpma` into the cmdline →
+ * Com_Init's FS_Startup reads that and adds <basepath>/cpma/*.pk3 to the
+ * search path BEFORE pak loading. VM_FindNative (qcommon/vm.c) was patched
+ * to skip the registered native cgame when fs_game points at a mod, so
+ * cgame.qvm / qagame.qvm / ui.qvm from the mod's pk3s load via the
+ * AArch64 JIT path (qagame + ui already use this path on every map).
+ *
+ * Empty / NULL / "baseq3" = vanilla (uses the native cgame).
+ * g_bootMod buffer declared at file scope (top of file). */
+
+void Q3_SetBootMod(const char *modname) {
+    if (modname == NULL || modname[0] == '\0' ||
+        !strcasecmp(modname, "baseq3")) {
+        g_bootMod[0] = '\0';
+        NSLog(@"[Q3-BOOT-MOD] cleared (vanilla baseq3)");
+        return;
+    }
+    /* Allow only [A-Za-z0-9_-] in mod folder names; reject anything that
+     * could escape the fs_game value into the cmdline (semicolons, spaces,
+     * quotes). Mods like cpma / osp / excessiveplus are all safe. */
+    {
+        size_t i;
+        for (i = 0; modname[i] && i < sizeof(g_bootMod) - 1; ++i) {
+            char c = modname[i];
+            if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                  (c >= '0' && c <= '9') || c == '_' || c == '-')) {
+                NSLog(@"[Q3-BOOT-MOD] reject (bad char in '%s')", modname);
+                g_bootMod[0] = '\0';
+                return;
+            }
+            g_bootMod[i] = c;
+        }
+        g_bootMod[i] = '\0';
+    }
+    NSLog(@"[Q3-BOOT-MOD] set to '%s'", g_bootMod);
+}
+
+/* Pre-engine-init render-resolution override (driven by Swift's MetalFX
+ * upscale quality picker). Called BEFORE Quake3_Init. Pass 0/0 to leave
+ * the default native-target sizing intact (Native quality). Otherwise
+ * inject into cmdline as r_customwidth/r_customheight so Q3's projection
+ * + viewport math match the offscreen RT Swift will render into. Sub-
+ * pixel sizes are clamped to [320, 7680] each axis as a sanity guard. */
+void Q3_SetRenderResolution(int w, int h) {
+    if (w <= 0 || h <= 0) {
+        g_renderResW = 0;
+        g_renderResH = 0;
+        NSLog(@"[Q3-UPSCALE] cleared (use default native res)");
+        return;
+    }
+    if (w < 320) w = 320;
+    if (h < 240) h = 240;
+    if (w > 7680) w = 7680;
+    if (h > 4320) h = 4320;
+    g_renderResW = w;
+    g_renderResH = h;
+    NSLog(@"[Q3-UPSCALE] render res = %dx%d", g_renderResW, g_renderResH);
 }
 
 /* Execute an arbitrary Q3 command string from Swift. Used by the

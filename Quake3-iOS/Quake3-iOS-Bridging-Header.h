@@ -14,6 +14,21 @@ void Q3Gamepad_SetButtons(unsigned int buttonMask);
 /* Execute a Q3 console command from Swift (on-screen console overlay). */
 void Q3Exec_Command(const char *cmd);
 
+/* Pre-engine-init mod selection. Must be called BEFORE Quake3_Init() —
+ * the value is injected into the engine cmdline as `+set fs_game <mod>`
+ * so Com_Init's pak loader discovers the mod's pk3 cascade in
+ * <basepath>/<mod>/. Pass NULL or "" or "baseq3" to use vanilla.
+ * Allowed chars: [A-Za-z0-9_-]. See LaunchMenuView mod rows. */
+void Q3_SetBootMod(const char *modname);
+
+/* Pre-engine-init render-resolution override for MetalFX upscaling.
+ * Must be called BEFORE Quake3_Init(). When set (non-zero), the engine
+ * uses these as r_customwidth/r_customheight — Q3 internally renders
+ * at this size into an offscreen RT, and MTLFXSpatialScaler upscales
+ * to the drawable for present. Pass 0/0 to keep the native-target
+ * sizing intact (Native quality, no upscaling). */
+void Q3_SetRenderResolution(int width, int height);
+
 /* Hardware-keyboard / trackpad / mouse input bridges. Called from Swift's
  * Q3InputView (an MTKView subclass) when the user presses a key on the iPad
  * Magic Keyboard, drags on the trackpad, or taps the trackpad. Each call
