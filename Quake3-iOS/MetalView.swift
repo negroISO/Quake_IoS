@@ -2120,6 +2120,7 @@ struct MetalView: UIViewRepresentable {
         fragment float4 q3_entity_fragment(EntityVertexOut in [[stage_in]],
                                            constant EntityUniforms &uniforms [[buffer(1)]],
                                            constant DLightBlock &dlights [[buffer(2)]],
+                                           constant float &pbrNormalScale [[buffer(3)]],
                                            texture2d<float> colorTexture [[texture(0)]],
                                            texture2d<float> normalTexture [[texture(1)]],
                                            sampler textureSampler [[sampler(0)]]) {
@@ -2336,19 +2337,23 @@ struct MetalView: UIViewRepresentable {
                 // Half-Lambert against a fixed key-light direction.
                 // 0.3, 0.5, 0.7 = soft rim from above-back-right.
                 //
-                // Multiplier range tuned to (0.78..1.18) per user
-                // feedback 2026-06-03: rotating world pickups (ammo
-                // boxes, dropped weapons) hit Mikkelsen TBN derivative
-                // instability when the geometry rotates each frame,
-                // producing high-contrast jagged shading at the
-                // previous (0.6..1.2) range. Tighter range keeps the
-                // viewmodel relief visible but prevents the
-                // "shattered glass" look on spinning pickups.
+                // PBR Phase 4 — viewmodel-vs-world entity gating.
+                // The pbrNormalScale uniform is 1.0 for viewmodel
+                // draws (RF_DEPTHHACK) and 0.0 for world entities.
+                // Wide (0.6..1.2) range gives the headline 3D-relief
+                // look on the held viewmodel; tight (0.78..1.18) range
+                // suppresses the Mikkelsen TBN derivative instability
+                // that produces high-contrast jagged shading on
+                // rotating world pickups. Linear-mixed so future
+                // half-strength values (e.g. 0.5 for animated but
+                // non-rotating entities) read sensibly.
                 float3 sunDir = normalize(float3(0.3, 0.5, 0.7));
                 float NdotL = dot(worldN, sunDir) * 0.5 + 0.5;
                 float halfLambert = NdotL * NdotL;
 
-                base.rgb *= (0.78 + halfLambert * 0.40);
+                float lo = mix(0.78, 0.6, pbrNormalScale);
+                float hi = mix(1.18, 1.2, pbrNormalScale);
+                base.rgb *= mix(lo, hi, halfLambert);
             }
             return base;
         }
@@ -4300,6 +4305,15 @@ struct MetalView: UIViewRepresentable {
                         // unbound; q3_entity_fragment uses is_null_texture
                         // to skip the normal-mapped lighting branch.
                         encoder.setFragmentTexture(pbrNormalTexture(for: draw.textureHandle), index: 1)
+                        // PBR Phase 4 — viewmodel-vs-world entity gating.
+                        // Viewmodels (RF_DEPTHHACK) get the wide
+                        // (0.6..1.2) range for prominent surface relief;
+                        // world entities (spinning pickups, dropped
+                        // weapons) get the tight (0.78..1.18) range to
+                        // avoid Mikkelsen TBN derivative instability on
+                        // rotating geometry.
+                        var pbrNormalScaleEntity: Float = wantsDepthHack ? 1.0 : 0.0
+                        encoder.setFragmentBytes(&pbrNormalScaleEntity, length: 4, index: 3)
                         // Per-draw sampler routing.
                         //
                         // Two ways to land on clampToEdge:
@@ -4467,6 +4481,9 @@ struct MetalView: UIViewRepresentable {
                         // unbound; q3_entity_fragment uses is_null_texture
                         // to skip the normal-mapped lighting branch.
                         encoder.setFragmentTexture(pbrNormalTexture(for: draw.textureHandle), index: 1)
+                        // PBR Phase 4 — HUD/scoreboard sub-pass: world-style tight range.
+                        var pbrNormalScaleSub: Float = 0.0
+                        encoder.setFragmentBytes(&pbrNormalScaleSub, length: 4, index: 3)
                         encoder.drawIndexedPrimitives(
                             type: .triangle,
                             indexCount: Int(draw.indexCount),
