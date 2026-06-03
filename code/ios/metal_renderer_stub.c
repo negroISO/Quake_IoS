@@ -207,6 +207,17 @@ static void MetalTelemetryPrintf(const char *type, int printLevel, const char *f
     }
 }
 
+/* Swift-callable bridge so the Swift PBR loader can write to q3_diag.log via
+ * the same channel-tagged pipeline as the C-side hits. Without this, NSLog
+ * messages from MetalView.pbrAlbedoTexture(for:) go to Apple System Log only,
+ * and host-side debugging needs a Mac attached to Console.app. */
+void Q3MetalRenderer_SwiftPBRLog(const char *type, const char *message) {
+    if (type == NULL || type[0] == '\0' || message == NULL || message[0] == '\0') {
+        return;
+    }
+    MetalTelemetryPrintf(type, PRINT_ALL, "%s\n", message);
+}
+
 static glconfig_t s_glConfig;
 static Q3MetalFrameSnapshot s_frameSnapshot;
 static Q3MetalSceneView s_sceneView;

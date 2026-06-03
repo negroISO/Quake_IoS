@@ -2748,6 +2748,16 @@ struct MetalView: UIViewRepresentable {
         /// Returns the PBR albedo texture for a Q3 handle, or nil when
         /// no PBR material was bound or the DDS load fails. First call
         /// per handle does the load; subsequent calls hit the cache.
+        /* Route PBR-Swift logs through the C telemetry pipeline so they
+         * land in Documents/q3_diag.log next to the C-side [Q3-PBR] lines. */
+        private func pbrLog(_ message: String) {
+            "metal_pbr_swift".withCString { typePtr in
+                message.withCString { msgPtr in
+                    Q3MetalRenderer_SwiftPBRLog(typePtr, msgPtr)
+                }
+            }
+        }
+
         private func pbrAlbedoTexture(for handle: UInt32) -> MTLTexture? {
             if let cached = pbrAlbedoCache[handle] { return cached }
             if pbrTriedAndMissed.contains(handle) { return nil }
@@ -2756,12 +2766,15 @@ struct MetalView: UIViewRepresentable {
             }
             let mat = matPtr.pointee
             guard let albedoCStr = mat.albedo else {
+                pbrLog("[Q3-PBR-SWIFT] no-albedo handle=\(handle) (material found but albedo slot is NULL)")
                 pbrTriedAndMissed.insert(handle); return nil
             }
             let path = String(cString: albedoCStr)
             guard let loader = pbrTextureLoader else {
+                pbrLog("[Q3-PBR-SWIFT] no-loader handle=\(handle) path=\(path)")
                 pbrTriedAndMissed.insert(handle); return nil
             }
+            pbrLog("[Q3-PBR-SWIFT] trying handle=\(handle) path=\(path)")
             let url = URL(fileURLWithPath: path)
             let opts: [MTKTextureLoader.Option: Any] = [
                 .SRGB:                NSNumber(value: true),   // albedo is color data
@@ -2773,11 +2786,10 @@ struct MetalView: UIViewRepresentable {
                 let tex = try loader.newTexture(URL: url, options: opts)
                 tex.label = "Q3.pbr.albedo.h\(handle)"
                 pbrAlbedoCache[handle] = tex
-                NSLog("[Q3-PBR-SWIFT] loaded albedo handle=%u path=%@ size=%dx%d", handle, path, tex.width, tex.height)
+                pbrLog("[Q3-PBR-SWIFT] loaded albedo handle=\(handle) size=\(tex.width)x\(tex.height) path=\(path)")
                 return tex
             } catch {
-                NSLog("[Q3-PBR-SWIFT] DDS load FAILED handle=%u path=%@ err=%@",
-                      handle, path, error.localizedDescription)
+                pbrLog("[Q3-PBR-SWIFT] DDS load FAILED handle=\(handle) err=\(error.localizedDescription) path=\(path)")
                 pbrTriedAndMissed.insert(handle)
                 return nil
             }

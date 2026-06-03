@@ -41,6 +41,12 @@ void Q3_SetRenderResolution(int width, int height);
  * lookup keyed on textureHandle. */
 const Q3PBRMaterialPaths *Q3MetalRenderer_GetPBRMaterial(unsigned int textureHandle);
 
+/* Swift→C PBR logging bridge. Wraps the C-side telemetry pipeline so the
+ * Swift renderer's DDS-load events land in Documents/q3_diag.log next to
+ * the C-side `[Q3-PBR]` lines. Pass any short tag for `type` (e.g.
+ * "metal_pbr_swift") — it shows up in the file as `[Q3][type] message`. */
+void Q3MetalRenderer_SwiftPBRLog(const char *type, const char *message);
+
 /* Hardware-keyboard / trackpad / mouse input bridges. Called from Swift's
  * Q3InputView (an MTKView subclass) when the user presses a key on the iPad
  * Magic Keyboard, drags on the trackpad, or taps the trackpad. Each call
