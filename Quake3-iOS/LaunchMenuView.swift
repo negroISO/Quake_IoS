@@ -45,22 +45,28 @@ struct LaunchMenuView: View {
                 .ignoresSafeArea()
                 .opacity(0.55)
 
-            VStack(spacing: 24) {
-                Spacer().frame(height: 40)
+            VStack(spacing: 12) {
+                Spacer().frame(height: 12)
 
-                Text("QUAKE III")
-                    .font(.system(size: 44, weight: .black, design: .serif))
-                    .foregroundColor(.white)
-                    .shadow(color: .red.opacity(0.8), radius: 8, x: 0, y: 0)
-                    .tracking(6)
-
-                Text("ARENA")
-                    .font(.system(size: 28, weight: .heavy, design: .serif))
-                    .foregroundColor(.white.opacity(0.85))
-                    .tracking(8)
-                    .padding(.top, -16)
-
-                Spacer().frame(height: 8)
+                // Title — kept compact so the picker rows + the
+                // scrollable demo/map list all fit on a single phone
+                // screen in landscape. Was 44pt + Spacer(40) above + 24
+                // between rows; the Frame Interpolation row pushed the
+                // ScrollView entirely off-screen so the user lost access
+                // to demos/maps. Tightened the whole header so the
+                // ScrollView fits below without scrolling the picker UI
+                // itself off-screen.
+                HStack(spacing: 12) {
+                    Text("QUAKE III")
+                        .font(.system(size: 28, weight: .black, design: .serif))
+                        .foregroundColor(.white)
+                        .shadow(color: .red.opacity(0.8), radius: 6, x: 0, y: 0)
+                        .tracking(4)
+                    Text("ARENA")
+                        .font(.system(size: 18, weight: .heavy, design: .serif))
+                        .foregroundColor(.white.opacity(0.85))
+                        .tracking(6)
+                }
 
                 // MetalFX upscale quality picker. Persisted via
                 // UserDefaults; Quake3_iOSApp.swift reads it on engine
@@ -88,7 +94,7 @@ struct LaunchMenuView: View {
                                     .foregroundColor(.white.opacity(0.6))
                             }
                             .frame(maxWidth: .infinity)
-                            .padding(.vertical, 8)
+                            .padding(.vertical, 5)
                             .background(
                                 RoundedRectangle(cornerRadius: 6)
                                     .fill(isSelected ? Color(red: 0.7, green: 0.15, blue: 0.1).opacity(0.85)
@@ -107,9 +113,9 @@ struct LaunchMenuView: View {
                 .padding(.horizontal, 24)
 
                 Text("MetalFX Upscale Quality")
-                    .font(.system(size: 11, design: .monospaced))
+                    .font(.system(size: 10, design: .monospaced))
                     .foregroundColor(.white.opacity(0.55))
-                    .padding(.top, -8)
+                    .padding(.top, -10)
 
                 // MetalFX Frame Interpolation toggle. Sits directly under
                 // the upscale-quality picker — same style, two buttons
@@ -134,7 +140,7 @@ struct LaunchMenuView: View {
                                     .foregroundColor(.white.opacity(0.6))
                             }
                             .frame(maxWidth: .infinity)
-                            .padding(.vertical, 8)
+                            .padding(.vertical, 5)
                             .background(
                                 RoundedRectangle(cornerRadius: 6)
                                     .fill(isSelected ? Color(red: 0.7, green: 0.15, blue: 0.1).opacity(0.85)
@@ -152,12 +158,16 @@ struct LaunchMenuView: View {
                 .frame(maxWidth: 560)
                 .padding(.horizontal, 24)
 
-                Text("MetalFX Frame Interpolation (experimental — no motion vectors yet)")
-                    .font(.system(size: 10, design: .monospaced))
+                Text("Frame Interpolation (experimental)")
+                    .font(.system(size: 9, design: .monospaced))
                     .foregroundColor(.white.opacity(0.45))
-                    .padding(.top, -8)
-                    .multilineTextAlignment(.center)
+                    .padding(.top, -10)
 
+                // Scrollable demo + map + mod list. .frame(maxHeight:
+                // .infinity) anchors this to consume all remaining
+                // vertical space, so however many pickers we add above
+                // can never crowd the list off-screen — the list just
+                // shrinks and gets longer scroll content.
                 ScrollView {
                     VStack(spacing: 12) {
                         // Stock demo always available
@@ -241,8 +251,7 @@ struct LaunchMenuView: View {
                     .frame(maxWidth: 560)
                     .frame(maxWidth: .infinity, alignment: .center)
                 }
-
-                Spacer()
+                .frame(maxHeight: .infinity)   // ScrollView takes all remaining vertical space
             }
         }
         .task {
