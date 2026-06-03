@@ -26,6 +26,21 @@
 extern "C" {
 #endif
 
+/* Lightweight Swift-facing view of a PBR material's path slots. The
+ * full q3_pbr_material_t (below) carries internal book-keeping; this
+ * mirror is what the Swift renderer reads via
+ * Q3MetalRenderer_GetPBRMaterial(). Strings remain valid for the
+ * process lifetime. */
+typedef struct {
+    const char *albedo;
+    const char *normal;
+    const char *roughness;
+    const char *metallic;
+    const char *emissive;
+    const char *height;
+    float       emissive_intensity;
+} Q3PBRMaterialPaths;
+
 /* A single PBR material entry. Slot pointers are owned by the table and
  * remain valid for the lifetime of the process. NULL = slot not present
  * in the mod (use a sensible default in the shader). */

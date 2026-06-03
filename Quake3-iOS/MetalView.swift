@@ -2730,6 +2730,58 @@ struct MetalView: UIViewRepresentable {
             fogEncoder.endEncoding()
         }
         private var textureCache: [UInt32: (generation: UInt32, texture: MTLTexture)] = [:]
+
+        /* PBR Phase 1: per-Q3-handle HD albedo cache. When the C-side
+         * texture register hook stamps a metalTexture_t.pbrMaterial,
+         * the Swift entity/world bind paths consult this cache. On
+         * miss, we synchronously load the DDS via MTKTextureLoader
+         * (sync is fine for the small ~50-file curated subset; async
+         * upload is a Phase 2 optimization). DDS textures on Apple
+         * Silicon use the native BC1/BC3/BC5/BC7 hardware decoders. */
+        private var pbrAlbedoCache: [UInt32: MTLTexture] = [:]
+        private var pbrTriedAndMissed: Set<UInt32> = []
+        private lazy var pbrTextureLoader: MTKTextureLoader? = {
+            guard let dev = self.commandQueue?.device else { return nil }
+            return MTKTextureLoader(device: dev)
+        }()
+
+        /// Returns the PBR albedo texture for a Q3 handle, or nil when
+        /// no PBR material was bound or the DDS load fails. First call
+        /// per handle does the load; subsequent calls hit the cache.
+        private func pbrAlbedoTexture(for handle: UInt32) -> MTLTexture? {
+            if let cached = pbrAlbedoCache[handle] { return cached }
+            if pbrTriedAndMissed.contains(handle) { return nil }
+            guard let matPtr = Q3MetalRenderer_GetPBRMaterial(handle) else {
+                pbrTriedAndMissed.insert(handle); return nil
+            }
+            let mat = matPtr.pointee
+            guard let albedoCStr = mat.albedo else {
+                pbrTriedAndMissed.insert(handle); return nil
+            }
+            let path = String(cString: albedoCStr)
+            guard let loader = pbrTextureLoader else {
+                pbrTriedAndMissed.insert(handle); return nil
+            }
+            let url = URL(fileURLWithPath: path)
+            let opts: [MTKTextureLoader.Option: Any] = [
+                .SRGB:                NSNumber(value: true),   // albedo is color data
+                .textureUsage:        NSNumber(value: MTLTextureUsage.shaderRead.rawValue),
+                .textureStorageMode:  NSNumber(value: MTLStorageMode.private.rawValue),
+                .generateMipmaps:     NSNumber(value: false),  // DDS already ships mips
+            ]
+            do {
+                let tex = try loader.newTexture(URL: url, options: opts)
+                tex.label = "Q3.pbr.albedo.h\(handle)"
+                pbrAlbedoCache[handle] = tex
+                NSLog("[Q3-PBR-SWIFT] loaded albedo handle=%u path=%@ size=%dx%d", handle, path, tex.width, tex.height)
+                return tex
+            } catch {
+                NSLog("[Q3-PBR-SWIFT] DDS load FAILED handle=%u path=%@ err=%@",
+                      handle, path, error.localizedDescription)
+                pbrTriedAndMissed.insert(handle)
+                return nil
+            }
+        }
         private var vertexBuffer: MTLBuffer?
         private var vertexBufferCapacity = 0
         private var worldVertexBuffer: MTLBuffer?
@@ -4006,7 +4058,14 @@ struct MetalView: UIViewRepresentable {
                                       : (wantsDepthHack ? depthHackDepthStencilState : depthStencilState)
                             encoder.setDepthStencilState(ensuredDepthStencilState(state, device: view.device))
                         }
-                        encoder.setFragmentTexture(texture, index: 0)
+                        // PBR Phase 1: when q3_pbr_lookup_by_name matched
+                        // a Q3 shader (rocket / shotgun / bfg / etc.), the
+                        // C-side stamped pbrMaterial on the metalTexture
+                        // and we bind the HD DDS albedo here instead of
+                        // the original pak0 JPG-decoded texture. Falls
+                        // back to the original on miss / DDS-load fail.
+                        let pbrTex = pbrAlbedoTexture(for: draw.textureHandle)
+                        encoder.setFragmentTexture(pbrTex ?? texture, index: 0)
                         // Per-draw sampler routing.
                         //
                         // Two ways to land on clampToEdge:
@@ -4164,7 +4223,11 @@ struct MetalView: UIViewRepresentable {
                         let draw = allEntityDraws[drawIdx]
                         guard draw.indexCount > 0 else { continue }
                         guard let texture = texture(for: draw.textureHandle, device: view.device) else { continue }
-                        encoder.setFragmentTexture(texture, index: 0)
+                        // PBR Phase 1 — entity sub-pass (HUD heads,
+                        // ammo rotations, scoreboard portraits). Same
+                        // PBR-or-fallback rule as the main entity pass.
+                        let pbrTex = pbrAlbedoTexture(for: draw.textureHandle)
+                        encoder.setFragmentTexture(pbrTex ?? texture, index: 0)
                         encoder.drawIndexedPrimitives(
                             type: .triangle,
                             indexCount: Int(draw.indexCount),
@@ -4238,7 +4301,9 @@ struct MetalView: UIViewRepresentable {
                             encoder.setRenderPipelineState(pipeline)
                         }
                         if let texture = texture(for: draw.textureHandle, device: view.device) {
-                            encoder.setFragmentTexture(texture, index: 0)
+                            // PBR Phase 1 — final fallback / overlay path
+                            let pbrTex = pbrAlbedoTexture(for: draw.textureHandle)
+                            encoder.setFragmentTexture(pbrTex ?? texture, index: 0)
                             encoder.drawPrimitives(type: .triangle, vertexStart: Int(draw.firstVertex), vertexCount: Int(draw.vertexCount))
                         }
                     }

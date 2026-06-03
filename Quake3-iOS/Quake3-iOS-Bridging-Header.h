@@ -29,6 +29,18 @@ void Q3_SetBootMod(const char *modname);
  * sizing intact (Native quality, no upscaling). */
 void Q3_SetRenderResolution(int width, int height);
 
+/* PBR Phase 1: Q3PBRMaterialPaths defined in code/ios/q3_pbr.h.
+ * Each char* is an absolute filesystem path to a .dds file the Swift
+ * renderer should lazy-load via MTKTextureLoader. NULL slots mean the
+ * material doesn't ship that map (use a default). The struct + pointers
+ * stay valid for the process lifetime. */
+#include "../code/ios/q3_pbr.h"
+
+/* Returns the PBR material paths for a registered Q3 texture, or NULL
+ * if that texture had no PBR match at registration time. Cheap O(1)
+ * lookup keyed on textureHandle. */
+const Q3PBRMaterialPaths *Q3MetalRenderer_GetPBRMaterial(unsigned int textureHandle);
+
 /* Hardware-keyboard / trackpad / mouse input bridges. Called from Swift's
  * Q3InputView (an MTKView subclass) when the user presses a key on the iPad
  * Magic Keyboard, drags on the trackpad, or taps the trackpad. Each call

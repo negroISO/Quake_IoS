@@ -41,6 +41,7 @@ If a visual issue exists, fix the generic mismatch against ioq3/Kenny behavior.
 #include "q3_pbr.h"
 #include <os/log.h>
 #include <stdio.h>
+#include <sys/stat.h>   /* GetRefAPI PBR bundle-path probe */
 
 /* Append a line to ~/Documents/q3_diag.log inside the app sandbox. */
 static void Q3_FileLogf(const char *fmt, ...) {
@@ -9810,13 +9811,36 @@ int Q3_PostprocessEnabled(void) {
     return cv ? cv->integer : 1;
 }
 
+/* Swift bridge for PBR material paths. Backs onto the
+ * metalTexture_t.pbrMaterial pointer the texture register hook
+ * stamped at load time. Returns a static-storage Q3PBRMaterialPaths
+ * mirror per query — Swift treats the pointer as immutable for the
+ * duration of the call site. */
+const Q3PBRMaterialPaths *Q3MetalRenderer_GetPBRMaterial(unsigned int textureHandle) {
+    static Q3PBRMaterialPaths s_paths;  /* not thread-safe; Swift renderer is single-threaded */
+    if (textureHandle == 0) return NULL;
+    const metalTexture_t *tex = FindTextureByHandle((qhandle_t)textureHandle);
+    if (tex == NULL || tex->pbrMaterial == NULL) return NULL;
+    const q3_pbr_material_t *m = (const q3_pbr_material_t *)tex->pbrMaterial;
+    s_paths.albedo    = m->albedo;
+    s_paths.normal    = m->normal;
+    s_paths.roughness = m->roughness;
+    s_paths.metallic  = m->metallic;
+    s_paths.emissive  = m->emissive;
+    s_paths.height    = m->height;
+    s_paths.emissive_intensity = m->emissive_intensity;
+    return &s_paths;
+}
+
 /* PBR materials cvar accessor — referenced by code/ios/q3_pbr.c.
  * Default OFF until the asset pipeline + DDS decoder are wired up;
  * shipping it default-on with no replacement DDS files in the bundle
  * would just degrade to "no-op + extra hashing CPU per texture load". */
 int q3_pbr_cvar_enabled(void) {
     if (ri.Cvar_Get == NULL) return 0;
-    cvar_t *cv = ri.Cvar_Get("r_pbrMaterials", "0", CVAR_ARCHIVE);
+    /* Default ON now that the bundle-path fallback ships the curated
+     * subset under <bundle>/baseq3/pbr/ — no env vars required. */
+    cvar_t *cv = ri.Cvar_Get("r_pbrMaterials", "1", CVAR_ARCHIVE);
     return cv ? cv->integer : 0;
 }
 
@@ -9858,13 +9882,42 @@ refexport_t *GetRefAPI(int apiVersion, refimport_t *rimp) {
     {
         const char *json = getenv("Q3_PBR_JSON");
         const char *root = getenv("Q3_PBR_ASSETS");
+        char bundleJson[1024] = {0};
+        char bundleRoot[1024] = {0};
+
+        /* Env-var path takes precedence (debug / dev). Otherwise fall
+         * back to the bundled subset under
+         * <Bundle.main.resourcePath>/baseq3/pbr/ that
+         * scripts/pbr_stage_named_assets.py staged into source baseq3.
+         * If neither path resolves, q3_pbr_table_load is skipped and
+         * the renderer behaves as if r_pbrMaterials was off. */
+        if (!(json && root && json[0] && root[0])) {
+            extern const char *Sys_DefaultBasePath(void);  /* ios_main.m */
+            const char *base = Sys_DefaultBasePath();
+            if (base && base[0]) {
+                Q_strncpyz(bundleJson, base, sizeof(bundleJson));
+                Q_strcat(bundleJson, sizeof(bundleJson),
+                         "/baseq3/pbr/materials.json");
+                Q_strncpyz(bundleRoot, base, sizeof(bundleRoot));
+                Q_strcat(bundleRoot, sizeof(bundleRoot),
+                         "/baseq3/pbr");
+                /* Probe with stat() — if the bundle copy is present, use it. */
+                struct stat st;
+                if (stat(bundleJson, &st) == 0 && st.st_size > 0) {
+                    json = bundleJson;
+                    root = bundleRoot;
+                }
+            }
+        }
+
         MetalTelemetryPrintf("metal_pbr_boot", PRINT_ALL,
-            "[Q3-PBR] boot env Q3_PBR_JSON=%s Q3_PBR_ASSETS=%s\n",
-            json ? json : "(unset)", root ? root : "(unset)");
+            "[Q3-PBR] boot json=%s root=%s\n",
+            json ? json : "(none)", root ? root : "(none)");
         if (json && root && json[0] && root[0]) {
             int n = q3_pbr_table_load(json, root);
             MetalTelemetryPrintf("metal_pbr_boot", PRINT_ALL,
-                "[Q3-PBR] table_load returned %d materials\n", n);
+                "[Q3-PBR] table_load returned %d materials (named=%d)\n",
+                n, q3_pbr_named_count());
         }
     }
 
