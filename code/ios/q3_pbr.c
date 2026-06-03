@@ -227,8 +227,11 @@ static const struct {
     { "f_rocketl",      "rocket"     },
     { "rocketfn",       "rocket"     },
     { "f_shotgun",      "shotgun"    },
-    { "lightning2",     "lightning"  },
-    { "trail2",         "lightning"  },
+    /* NOTE: the mod's USDA mis-spells this as "lighting" (no n). The
+     * extracted bundle JSON preserves the typo as the entry key, so
+     * we alias both Q3 lightning stems to it verbatim. */
+    { "lightning2",     "lighting"   },
+    { "trail2",         "lighting"   },
     { "f_plasma",       "plasma"     },
     { "plasma_glass",   "plasma"     },
     { "plasma_glo",     "plasma"     },
