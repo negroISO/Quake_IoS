@@ -138,8 +138,15 @@ const q3_pbr_material_t *q3_pbr_lookup(uint64_t hash) {
     return NULL;
 }
 
+/* Forward decl — defined in the Path A section below. */
+static int g_named_count;
+
 int q3_pbr_table_ready(void) {
-    return g_materials_count > 0;
+    /* Path A bundle JSON ships 21 name-keyed materials and 0 hex-keyed
+     * (the hex block is stripped to keep the bundle small). The texture
+     * register hook gates the name-match fallback behind this function,
+     * so we MUST report ready when either pool is populated. */
+    return g_materials_count > 0 || g_named_count > 0;
 }
 
 /* --- Name-indexed lookup (Path A, hash dead-end workaround) ------- */
@@ -193,6 +200,45 @@ static void q3_pbr_normalize_name(const char *in, char *out, size_t outSize) {
     out[i] = '\0';
 }
 
+/* Q3 ships weapon textures with stems that don't match the descriptive
+ * names extracted from the RTX Remix mod USDA. Map them. Left = the
+ * normalized Q3 stem from load_pic_texture_with_mipmap; right = the stem
+ * that appears in materials_by_name (from pbr_extract_hash_table.py).
+ *
+ * Observed Q3 stems from q3_diag.log:
+ *   models/weapons2/machinegun/machinegun    → "machinegun"   ✓ direct
+ *   models/weapons2/plasma/plasma            → "plasma"        ✓ direct
+ *   models/weapons2/rocketl/rocketl          → "rocketl"
+ *   models/weapons2/lightning/lightning2     → "lightning2"
+ *   models/weapons2/shotgun/f_shotgun        → "f_shotgun"
+ *   models/ammo/rocket/rocketfn              → "rocketfn"
+ *   models/weapons2/rocketl/f_rocketl        → "f_rocketl"
+ *   models/weapons2/plasma/f_plasma          → "f_plasma"
+ *   models/ammo/plasma/plasma_a              → "plasma_a"
+ *
+ * The "f_" prefix on weapon flash textures shares the projectile body
+ * appearance — alias to the same PBR set. */
+static const struct {
+    const char *q3_stem;
+    const char *mod_stem;
+} kPbrAliases[] = {
+    { "rocketl",        "rocket"     },
+    { "rocketl2",       "rocket"     },
+    { "f_rocketl",      "rocket"     },
+    { "rocketfn",       "rocket"     },
+    { "f_shotgun",      "shotgun"    },
+    { "lightning2",     "lightning"  },
+    { "trail2",         "lightning"  },
+    { "f_plasma",       "plasma"     },
+    { "plasma_glass",   "plasma"     },
+    { "plasma_glo",     "plasma"     },
+    { "plasma_a",       "plasma"     },
+    { "railgun",        "rail"       },
+    { "grenadelauncher","grenade"    },
+    { "f_bfg",          "bfg"        },
+    { NULL, NULL }
+};
+
 const q3_pbr_material_t *q3_pbr_lookup_by_name(const char *q3_shader_name) {
     if (g_named == NULL || g_named_count == 0 || q3_shader_name == NULL) {
         return NULL;
@@ -200,9 +246,24 @@ const q3_pbr_material_t *q3_pbr_lookup_by_name(const char *q3_shader_name) {
     char key[64];
     q3_pbr_normalize_name(q3_shader_name, key, sizeof(key));
     if (key[0] == '\0') return NULL;
+
+    /* Direct match first. */
     for (int i = 0; i < g_named_count; ++i) {
         if (strcmp(g_named[i].name, key) == 0) {
             return &g_named[i].mat;
+        }
+    }
+
+    /* Alias match — Q3 stem → mod stem. */
+    for (int a = 0; kPbrAliases[a].q3_stem != NULL; ++a) {
+        if (strcmp(key, kPbrAliases[a].q3_stem) == 0) {
+            const char *mod_stem = kPbrAliases[a].mod_stem;
+            for (int i = 0; i < g_named_count; ++i) {
+                if (strcmp(g_named[i].name, mod_stem) == 0) {
+                    return &g_named[i].mat;
+                }
+            }
+            return NULL;  /* alias known but mod doesn't ship this material */
         }
     }
     return NULL;
