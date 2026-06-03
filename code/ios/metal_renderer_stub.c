@@ -1897,10 +1897,27 @@ static qhandle_t RegisterTexture(const char *name) {
             texture->pbrMaterial = m;
             q3_pbr_stats_inc_hashes_matched();
             MetalTelemetryPrintf("metal_pbr_hit", PRINT_ALL,
-                "[Q3-PBR] match name='%s' hash=%016llX albedo=%s normal=%s\n",
+                "[Q3-PBR] hash-match name='%s' hash=%016llX albedo=%s normal=%s\n",
                 name, (unsigned long long)h,
                 m->albedo ? "yes" : "-",
                 m->normal ? "yes" : "-");
+        } else {
+            /* Phase 1 Path A: hash didn't match (RTX Remix hash
+             * algorithm is undetermined — see PBR-PHASE-1-HASH-STATUS.md).
+             * Fall back to descriptive-name match against the small
+             * `materials_by_name` table extracted from mod.usda. Hit
+             * rate ~20 materials covering weapon ammo box pickups +
+             * FX assets. */
+            const q3_pbr_material_t *mn = q3_pbr_lookup_by_name(name);
+            if (mn != NULL) {
+                texture->pbrMaterial = mn;
+                q3_pbr_stats_inc_hashes_matched();
+                MetalTelemetryPrintf("metal_pbr_hit", PRINT_ALL,
+                    "[Q3-PBR] name-match shader='%s' albedo=%s normal=%s\n",
+                    name,
+                    mn->albedo ? "yes" : "-",
+                    mn->normal ? "yes" : "-");
+            }
         }
     }
     /* Propagate blend mode from the shader-map entry that resolved

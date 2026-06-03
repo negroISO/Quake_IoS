@@ -142,6 +142,153 @@ int q3_pbr_table_ready(void) {
     return g_materials_count > 0;
 }
 
+/* --- Name-indexed lookup (Path A, hash dead-end workaround) ------- */
+
+/* Forward declarations of helpers defined further down the file. */
+static const char *find_key(const char *p, const char *end, const char *key);
+static char *json_str_dup(const char *v, const char *end);
+static int json_num(const char *v, const char *end, double *out);
+static const char *resolve_path(const char *root, const char *rel);
+
+/* Parallel array: distinct entries keyed by descriptive stem ("rocket",
+ * "shotgun", …). Backed by the same string arena as g_materials. */
+typedef struct {
+    char name[64];                       /* lowercase, NUL-terminated */
+    q3_pbr_material_t mat;               /* same fields as hash-keyed */
+} q3_pbr_named_t;
+
+static q3_pbr_named_t *g_named = NULL;
+static int g_named_count = 0;
+static int g_named_cap = 0;
+
+int q3_pbr_named_count(void) {
+    return g_named_count;
+}
+
+/* Normalize a Q3 shader path into a lookup key. Examples:
+ *   "models/ammo/rocket/rocket"   →  "rocket"
+ *   "models/weapons2/bfg/bfg.tga" →  "bfg"
+ *   "gfx/effects/blackhole.jpg"   →  "blackhole"
+ *   "ROCKET"                      →  "rocket"
+ * Strategy: take last '/' component, strip extension, lowercase. The
+ * extracted descriptive stems in the JSON are stored lowercase. */
+static void q3_pbr_normalize_name(const char *in, char *out, size_t outSize) {
+    if (out == NULL || outSize == 0) return;
+    out[0] = '\0';
+    if (in == NULL) return;
+
+    /* Last path component */
+    const char *base = in;
+    for (const char *p = in; *p; ++p) {
+        if (*p == '/' || *p == '\\') base = p + 1;
+    }
+    /* Copy until '.' or end */
+    size_t i = 0;
+    while (base[i] && base[i] != '.' && i + 1 < outSize) {
+        char c = base[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        out[i] = c;
+        ++i;
+    }
+    out[i] = '\0';
+}
+
+const q3_pbr_material_t *q3_pbr_lookup_by_name(const char *q3_shader_name) {
+    if (g_named == NULL || g_named_count == 0 || q3_shader_name == NULL) {
+        return NULL;
+    }
+    char key[64];
+    q3_pbr_normalize_name(q3_shader_name, key, sizeof(key));
+    if (key[0] == '\0') return NULL;
+    for (int i = 0; i < g_named_count; ++i) {
+        if (strcmp(g_named[i].name, key) == 0) {
+            return &g_named[i].mat;
+        }
+    }
+    return NULL;
+}
+
+/* JSON loader for the `materials_by_name` block. Called near end of
+ * q3_pbr_table_load after `materials` is parsed. Reads each named
+ * stem and stages it into g_named. Strings are duplicated into the
+ * existing string arena. */
+static void load_named_materials_from_json(const char *json, const char *json_end,
+                                           const char *assetRoot) {
+    /* Find the "materials_by_name" object. */
+    const char *byNamePtr = find_key(json, json_end, "materials_by_name");
+    if (!byNamePtr) return;
+    while (byNamePtr < json_end && *byNamePtr != '{') byNamePtr++;
+    if (byNamePtr >= json_end) return;
+    byNamePtr++;
+
+    /* Walk entries: "<key>": { ... }, repeat. */
+    const char *p = byNamePtr;
+    while (p < json_end) {
+        /* Skip whitespace + commas. */
+        while (p < json_end && (*p == ' ' || *p == '\t' || *p == '\n' ||
+                                *p == '\r' || *p == ',')) p++;
+        if (p >= json_end || *p == '}') break;
+        if (*p != '"') { p++; continue; }
+        p++;  /* skip opening quote */
+        const char *keyEnd = memchr(p, '"', (size_t)(json_end - p));
+        if (!keyEnd) break;
+        size_t keyLen = (size_t)(keyEnd - p);
+        char key[64];
+        if (keyLen >= sizeof(key)) {
+            /* Truncate over-long keys; the descriptive stems are
+             * always short in practice. */
+            keyLen = sizeof(key) - 1;
+        }
+        memcpy(key, p, keyLen);
+        key[keyLen] = '\0';
+
+        /* Locate the object body. */
+        const char *body = keyEnd + 1;
+        while (body < json_end && *body != '{') body++;
+        if (body >= json_end) break;
+        body++;
+        const char *body_end = body;
+        int depth = 1;
+        while (body_end < json_end && depth > 0) {
+            if (*body_end == '{') depth++;
+            else if (*body_end == '}') depth--;
+            body_end++;
+        }
+        if (depth != 0) break;
+
+        /* Grow g_named array as needed. */
+        if (g_named_count >= g_named_cap) {
+            int nc = g_named_cap ? g_named_cap * 2 : 64;
+            q3_pbr_named_t *nn = (q3_pbr_named_t *)realloc(
+                g_named, sizeof(*nn) * (size_t)nc);
+            if (!nn) break;
+            g_named = nn;
+            g_named_cap = nc;
+        }
+        q3_pbr_named_t *e = &g_named[g_named_count];
+        memset(e, 0, sizeof(*e));
+        size_t nl = strlen(key);
+        if (nl >= sizeof(e->name)) nl = sizeof(e->name) - 1;
+        memcpy(e->name, key, nl);
+        e->name[nl] = '\0';
+
+        /* Extract paths + emissive (same as hash-keyed materials). */
+        char *s;
+        if ((s = json_str_dup(find_key(body, body_end, "albedo"),    body_end))) { e->mat.albedo    = resolve_path(assetRoot, s); free(s); }
+        if ((s = json_str_dup(find_key(body, body_end, "normal"),    body_end))) { e->mat.normal    = resolve_path(assetRoot, s); free(s); }
+        if ((s = json_str_dup(find_key(body, body_end, "roughness"), body_end))) { e->mat.roughness = resolve_path(assetRoot, s); free(s); }
+        if ((s = json_str_dup(find_key(body, body_end, "metallic"),  body_end))) { e->mat.metallic  = resolve_path(assetRoot, s); free(s); }
+        if ((s = json_str_dup(find_key(body, body_end, "emissive"),  body_end))) { e->mat.emissive  = resolve_path(assetRoot, s); free(s); }
+        if ((s = json_str_dup(find_key(body, body_end, "height"),    body_end))) { e->mat.height    = resolve_path(assetRoot, s); free(s); }
+        double dv;
+        if (json_num(find_key(body, body_end, "emissive_intensity"), body_end, &dv)) {
+            e->mat.emissive_intensity = (float)dv;
+        }
+        g_named_count++;
+        p = body_end;
+    }
+}
+
 /* --- JSON loader --------------------------------------------------- */
 
 static char *slurp(const char *path, size_t *out_len) {
@@ -258,6 +405,8 @@ int q3_pbr_table_load(const char *jsonPath, const char *assetRoot) {
     free(g_hash_table); g_hash_table = NULL; g_hash_table_mask = 0;
     free(g_str_arena); g_str_arena = NULL;
     g_str_arena_used = 0; g_str_arena_cap = 0;
+    free(g_named); g_named = NULL;
+    g_named_count = 0; g_named_cap = 0;
 
     if (!jsonPath || !assetRoot) return 0;
 
@@ -354,6 +503,10 @@ int q3_pbr_table_load(const char *jsonPath, const char *assetRoot) {
         p = body_end;
     }
 
+    /* Phase 1 Path A: also parse the materials_by_name block for the
+     * descriptive-stem lookup fallback. */
+    load_named_materials_from_json(json, end, assetRoot);
+
     free(json);
 
     /* Build the lookup hash table — power-of-two ≥ 2 * count for low
@@ -378,5 +531,6 @@ int q3_pbr_table_load(const char *jsonPath, const char *assetRoot) {
     plog("[Q3-PBR] loaded %d materials from %s\n",
             g_materials_count, jsonPath);
     plog("[Q3-PBR] assets root: %s\n", assetRoot);
+    plog("[Q3-PBR] name-indexed materials: %d (Path A fallback)\n", g_named_count);
     return g_materials_count;
 }

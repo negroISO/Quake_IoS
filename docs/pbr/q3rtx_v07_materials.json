@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "source": "/Users/targus/Downloads/Quake III Arena RTX v0.7/rtx-remix/mods/q3rtx_v07/mod.usda",
   "material_count": 850,
   "counts": {
@@ -11,6 +11,7 @@
     "height": 643
   },
   "emissive_materials": 208,
+  "name_indexed_count": 21,
   "materials": {
     "D5D774A75BFB47EC": {
       "albedo": "assets/ingested/lighting.a.rtex.dds",
@@ -9335,6 +9336,311 @@
         0.99999,
         0.99999
       ]
+    }
+  },
+  "materials_by_name": {
+    "lighting": {
+      "hash": "D5D774A75BFB47EC",
+      "albedo": "assets/ingested/lighting.a.rtex.dds",
+      "normal": null,
+      "roughness": null,
+      "metallic": null,
+      "emissive": "assets/ingested/lighting.a.rtex.dds",
+      "height": null,
+      "emissive_intensity": 24.0,
+      "emissive_color": [
+        1.0,
+        0.99999,
+        0.99999
+      ]
+    },
+    "rocket": {
+      "hash": "21E72B8334E62360",
+      "albedo": "assets/ingested/rocket.a.rtex.dds",
+      "normal": null,
+      "roughness": null,
+      "metallic": null,
+      "emissive": "assets/ingested/rocket.a.rtex.dds",
+      "height": null,
+      "emissive_intensity": 24.0,
+      "emissive_color": [
+        1.0,
+        0.99999,
+        0.99999
+      ]
+    },
+    "shotgun": {
+      "hash": "61C5085BEC34F11C",
+      "albedo": "assets/ingested/shotgun.n.rtex.dds",
+      "normal": null,
+      "roughness": null,
+      "metallic": null,
+      "emissive": "assets/ingested/shotgun.n.rtex.dds",
+      "height": null,
+      "emissive_intensity": 24.0,
+      "emissive_color": [
+        1.0,
+        0.9999956,
+        0.99999
+      ]
+    },
+    "rail": {
+      "hash": "7E668F62C64A13DF",
+      "albedo": "assets/ingested/rail.a.rtex.dds",
+      "normal": null,
+      "roughness": null,
+      "metallic": null,
+      "emissive": "assets/ingested/rail.a.rtex.dds",
+      "height": null,
+      "emissive_intensity": 24.0,
+      "emissive_color": [
+        0.99999195,
+        1.0,
+        0.99999
+      ]
+    },
+    "grenade": {
+      "hash": "DF738B1BD59E490E",
+      "albedo": "assets/ingested/grenade.a.rtex.dds",
+      "normal": null,
+      "roughness": null,
+      "metallic": null,
+      "emissive": "assets/ingested/grenade.a.rtex.dds",
+      "height": null,
+      "emissive_intensity": 24.0,
+      "emissive_color": [
+        0.9999952,
+        1.0,
+        0.99999
+      ]
+    },
+    "plasma": {
+      "hash": "DF13205F73E62326",
+      "albedo": "assets/ingested/plasma.a.rtex.dds",
+      "normal": null,
+      "roughness": null,
+      "metallic": null,
+      "emissive": "assets/ingested/plasma.a.rtex.dds",
+      "height": null,
+      "emissive_intensity": 24.0,
+      "emissive_color": [
+        0.9999984,
+        0.99999,
+        1.0
+      ]
+    },
+    "machinegun": {
+      "hash": "9F88A1AE2FEC71B4",
+      "albedo": "assets/ingested/machinegun.a.rtex.dds",
+      "normal": null,
+      "roughness": null,
+      "metallic": null,
+      "emissive": "assets/ingested/machinegun.a.rtex.dds",
+      "height": null,
+      "emissive_intensity": 24.0,
+      "emissive_color": [
+        1.0,
+        0.9999988,
+        0.99999
+      ]
+    },
+    "bfg": {
+      "hash": "0468E02FBF195DAC",
+      "albedo": "assets/ingested/bfg.a.rtex.dds",
+      "normal": null,
+      "roughness": null,
+      "metallic": null,
+      "emissive": "assets/ingested/bfg.a.rtex.dds",
+      "height": null,
+      "emissive_intensity": 24.0,
+      "emissive_color": [
+        0.99999,
+        0.9999931,
+        1.0
+      ]
+    },
+    "rtx": {
+      "hash": "43EEFD8BCD4A536F",
+      "albedo": "assets/ingested/rtx.a.rtex.dds",
+      "normal": "assets/ingested/rtx_player_normal_OTH_Normal.n.rtex.dds",
+      "roughness": "assets/ingested/rtx_player_roughness.r.rtex.dds",
+      "metallic": "assets/ingested/rtx_player_metallic.m.rtex.dds",
+      "emissive": "assets/ingested/rtx_player_emissive.e.rtex.dds",
+      "height": null,
+      "emissive_intensity": 100.0,
+      "emissive_color": [
+        1.0,
+        0.99999,
+        0.99999
+      ]
+    },
+    "7b7730f19d9d405": {
+      "hash": "7B7730F19D9D4054",
+      "albedo": "assets/ingested/7B7730F19D9D405_albedo.a.rtex.dds",
+      "normal": "assets/ingested/7B7730F19D9D405_normal_OTH_Normal.n.rtex.dds",
+      "roughness": null,
+      "metallic": null,
+      "emissive": null,
+      "height": "assets/ingested/7B7730F19D9D405_height.h.rtex.dds",
+      "emissive_intensity": null,
+      "emissive_color": null
+    },
+    "lightninggunbeamarcs": {
+      "hash": "77DEB49106CCC47E",
+      "albedo": "assets/ingested/LIghtningGunBeamarcs.a.rtex.dds",
+      "normal": null,
+      "roughness": null,
+      "metallic": null,
+      "emissive": "assets/ingested/LIghtningGunBeamarcs.a.rtex.dds",
+      "height": null,
+      "emissive_intensity": 1.5,
+      "emissive_color": [
+        0.99999,
+        0.9999943,
+        1.0
+      ]
+    },
+    "metal_plate_diff_2k": {
+      "hash": "C1CA8435863C7075",
+      "albedo": "assets/ingested/metal_plate_diff_2k.a.rtex.dds",
+      "normal": "assets/ingested/metal_plate_normal_2k_OTH_Normal.n.rtex.dds",
+      "roughness": null,
+      "metallic": null,
+      "emissive": null,
+      "height": "assets/ingested/metal_plate_disp_2k.h.rtex.dds",
+      "emissive_intensity": null,
+      "emissive_color": null
+    },
+    "nicepng_smoke-texture-png_4373200": {
+      "hash": "8F20B39D2DAA8603",
+      "albedo": "assets/ingested/NicePng_smoke-texture-png_4373200.a.rtex.dds",
+      "normal": null,
+      "roughness": null,
+      "metallic": null,
+      "emissive": null,
+      "height": null,
+      "emissive_intensity": 40.0,
+      "emissive_color": [
+        1.0,
+        0.1,
+        0.1
+      ]
+    },
+    "minigun_impact": {
+      "hash": "AD4D58C1ACB5C516",
+      "albedo": "assets/ingested/Minigun_Impact.a.rtex.dds",
+      "normal": null,
+      "roughness": null,
+      "metallic": null,
+      "emissive": "assets/ingested/Minigun_Impact.a.rtex.dds",
+      "height": null,
+      "emissive_intensity": 0.5,
+      "emissive_color": [
+        1.0,
+        0.9999951,
+        0.99999
+      ]
+    },
+    "blank": {
+      "hash": "80FE300FCD7C59A1",
+      "albedo": "assets/ingested/Blank.a.rtex.dds",
+      "normal": null,
+      "roughness": null,
+      "metallic": null,
+      "emissive": "assets/ingested/Blank.a.rtex.dds",
+      "height": null,
+      "emissive_intensity": 982.55994,
+      "emissive_color": [
+        0.8687259,
+        0.506899,
+        0.0100624785
+      ]
+    },
+    "lightingmuzzle_static": {
+      "hash": "51A694C84E7CA28A",
+      "albedo": "assets/ingested/LightingMuzzle_Static.a.rtex.dds",
+      "normal": null,
+      "roughness": null,
+      "metallic": null,
+      "emissive": "assets/ingested/LightingMuzzle_Static.a.rtex.dds",
+      "height": null,
+      "emissive_intensity": 15.0,
+      "emissive_color": [
+        1.0,
+        0.9999993,
+        0.99999
+      ]
+    },
+    "machinegun_bullethole": {
+      "hash": "09530628FB03A7BB",
+      "albedo": "assets/ingested/machinegun_bullethole.a.rtex.dds",
+      "normal": "assets/ingested/machinegun_bullethole_n_OTH_Normal.n.rtex.dds",
+      "roughness": null,
+      "metallic": null,
+      "emissive": "assets/ingested/machinegun_bullethole_e.e.rtex.dds",
+      "height": "assets/ingested/09530628FB03A7BB_height.h.rtex.dds",
+      "emissive_intensity": 25.0,
+      "emissive_color": [
+        0.41312742,
+        0.0,
+        0.0
+      ]
+    },
+    "lightninggun_burndecal": {
+      "hash": "AE6EEC91DA673133",
+      "albedo": "assets/ingested/LightningGun_BurnDecal.a.rtex.dds",
+      "normal": "assets/ingested/LightningGun_BurnNormal_OTH_Normal.n.rtex.dds",
+      "roughness": null,
+      "metallic": null,
+      "emissive": "assets/ingested/LightningGun_BurnE.e.rtex.dds",
+      "height": null,
+      "emissive_intensity": 327.52,
+      "emissive_color": [
+        0.98841697,
+        0.9884071,
+        0.9884071
+      ]
+    },
+    "thrusterexplosion": {
+      "hash": "0C2995C45B2A9ACF",
+      "albedo": "assets/ingested/ThrusterExplosion.a.rtex.dds",
+      "normal": null,
+      "roughness": null,
+      "metallic": null,
+      "emissive": "assets/ingested/ThrusterExplosion.a.rtex.dds",
+      "height": null,
+      "emissive_intensity": 2.0,
+      "emissive_color": [
+        0.95366794,
+        0.6420025,
+        0.29088715
+      ]
+    },
+    "ppb": {
+      "hash": "AB80822DA561C772",
+      "albedo": "assets/ingested/ppb.a.rtex.dds",
+      "normal": "assets/ingested/ppb_n.a.rtex.dds",
+      "roughness": null,
+      "metallic": null,
+      "emissive": "assets/ingested/ppb_e.a.rtex.dds",
+      "height": null,
+      "emissive_intensity": 1.0,
+      "emissive_color": [
+        1.0,
+        0.99999,
+        0.99999
+      ]
+    },
+    "minigun_muzzleflash": {
+      "hash": "C4FE13A6C7784999",
+      "albedo": "assets/ingested/MiniGun_Muzzleflash.a.rtex.dds",
+      "normal": null,
+      "roughness": null,
+      "metallic": null,
+      "emissive": "assets/ingested/MiniGun_Muzzleflash.a.rtex.dds",
+      "height": null,
+      "emissive_intensity": 0.5,
+      "emissive_color": null
     }
   }
 }

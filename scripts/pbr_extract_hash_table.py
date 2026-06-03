@@ -192,16 +192,65 @@ def main() -> int:
         if d['emissive_intensity'] and d['emissive_intensity'] > 0:
             emissive_materials += 1
 
+    # Phase 1 Path A: extract DESCRIPTIVELY-NAMED materials (not pure hex)
+    # for direct Q3-shader-name binding. The .dds asset paths look like:
+    #   assets/ingested/<stem>_albedo.a.rtex.dds      (descriptive stem)
+    #   assets/ingested/<HEX>_albedo.a.rtex.dds       (RUNO auto-named)
+    # We extract the leading path-component stem and key a by_name map
+    # off it. Q3 shader names like 'models/ammo/rocket/rocket' get
+    # normalized at lookup time (basename, lowercase) and matched.
+    materials_by_name = {}
+    HEX16_RE = re.compile(r'^[0-9A-F]{16}')
+    for h, d in materials.items():
+        # Pick any non-null slot to recover the stem
+        for slot in ('albedo', 'normal', 'roughness', 'metallic', 'emissive', 'height'):
+            p = d[slot]
+            if not p:
+                continue
+            # Path is "assets/ingested/<stem>_<type>.<suffix>.rtex.dds"
+            basename = p.rsplit('/', 1)[-1]
+            # Strip everything after the first known type suffix
+            stem = basename
+            for marker in ('_albedo.', '_normal_OTH_Normal', '_normal.',
+                           '_roughness.', '_metallic.', '_emissive.', '_height',
+                           '.a.rtex', '.n.rtex', '.r.rtex', '.m.rtex',
+                           '.e.rtex', '.h.rtex', '.dds'):
+                idx = stem.find(marker)
+                if idx > 0:
+                    stem = stem[:idx]
+                    break
+            # Skip empty + pure-hex names (those need the content hash)
+            if not stem or HEX16_RE.match(stem):
+                continue
+            key = stem.lower()
+            # First-write-wins (deterministic across re-runs)
+            if key not in materials_by_name:
+                materials_by_name[key] = {
+                    'hash': h,
+                    'albedo':    d['albedo'],
+                    'normal':    d['normal'],
+                    'roughness': d['roughness'],
+                    'metallic':  d['metallic'],
+                    'emissive':  d['emissive'],
+                    'height':    d['height'],
+                    'emissive_intensity': d['emissive_intensity'],
+                    'emissive_color':     d['emissive_color'],
+                }
+            break
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open('w', encoding='utf-8') as f:
         json.dump({
-            'version': 1,
+            'version': 2,
             'source': str(in_path),
             'material_count': len(materials),
             'counts': counts,
             'emissive_materials': emissive_materials,
+            'name_indexed_count': len(materials_by_name),
             'materials': materials,
+            'materials_by_name': materials_by_name,
         }, f, indent=2)
+    print(f'  by_name: {len(materials_by_name)} entries (descriptive stems)', file=sys.stderr)
 
     print(f'[ok] wrote {len(materials)} materials → {out_path}', file=sys.stderr)
     print(f'  albedo:   {counts["albedo"]}', file=sys.stderr)

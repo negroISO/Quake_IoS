@@ -73,6 +73,22 @@ uint64_t q3_pbr_hash_rgba(const unsigned char *rgba, int width, int height);
  * The returned pointer remains valid until the table is reloaded. */
 const q3_pbr_material_t *q3_pbr_lookup(uint64_t hash);
 
+/* Phase 1 Path A: look up a material by descriptive name (e.g.
+ * "rocket", "shotgun") extracted from the .dds asset filename. The
+ * Q3 shader name is normalized at lookup time — basename, lowercased,
+ * extension stripped, common path prefixes (`models/ammo/`,
+ * `models/weapons2/`, `gfx/effects/`) tried.
+ *
+ * Implemented as a linear scan over the small (~20 entry)
+ * `materials_by_name` table from the JSON. Cost is negligible vs the
+ * Lambert lookup the renderer would do otherwise.
+ *
+ * Returns NULL on miss. */
+const q3_pbr_material_t *q3_pbr_lookup_by_name(const char *q3_shader_name);
+
+/* Count of name-indexed materials loaded — used for boot-time stats. */
+int q3_pbr_named_count(void);
+
 /* Logging hook — q3_pbr.c is a leaf .c file with no access to
  * Com_Printf / NSLog. metal_renderer_stub.c wires a callback at boot
  * so our boot messages reach q3_diag.log alongside the rest of the
