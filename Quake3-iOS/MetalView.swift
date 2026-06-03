@@ -1807,6 +1807,7 @@ struct MetalView: UIViewRepresentable {
                                           constant DLightBlock &dlights [[buffer(2)]],
                                           texture2d<float> colorTexture [[texture(0)]],
                                           texture2d<float> lightmapTexture [[texture(1)]],
+                                          texture2d<float> worldNormalMap [[texture(2)]],
                                           sampler textureSampler [[sampler(0)]]) {
             float2 texCoord = in.texCoord;
             int rgbGen = int(drawUniforms.rgbGen + 0.5);
@@ -1999,6 +2000,62 @@ struct MetalView: UIViewRepresentable {
                     dlightN = normalize(cross(dx, dy));
                 }
                 lit = applyDlights(lit, in.worldPos, dlightN, dlights);
+            }
+            /* PBR Phase 3 — uniform world normal-map relief.
+             *
+             * When a normal map is bound at slot 2 (Swift binds one
+             * generic metal-plate normal for ALL world surfaces when
+             * r_pbrWorldNormal is enabled), apply tangent-space
+             * normal-mapped lighting modulation on top of the existing
+             * lightmap+vertex-color result.
+             *
+             * Goal is NOT to swap world textures (Q3's authored color
+             * variety stays intact) — only to add visible surface
+             * relief: bolt heads sink, panel seams catch rim light,
+             * brick texture shows depth. Same Mikkelsen screen-space
+             * TBN trick used by the entity shader, but the lighting
+             * multiplier is subtle (0.85..1.15) so the existing BSP
+             * lightmap remains dominant — fake sun is a small accent.
+             *
+             * Tile UV by 0.5 so the 1024² metal-plate normal at a 4x
+             * scale across the wall gives plausible texel size that
+             * roughly matches Q3's diffuse texel density. Without the
+             * tile-down the relief reads as too-coarse on tight
+             * geometry. */
+            if (!is_null_texture(worldNormalMap)) {
+                float2 nmUV = in.texCoord * 0.5;
+                float3 nMap = worldNormalMap.sample(textureSampler, nmUV).xyz * 2.0 - 1.0;
+
+                float3 N = in.worldNormal;
+                if (length(N) < 1e-4) {
+                    float3 dxN = dfdx(in.worldPos);
+                    float3 dyN = dfdy(in.worldPos);
+                    N = normalize(cross(dxN, dyN));
+                } else {
+                    N = normalize(N);
+                }
+
+                float3 dp1 = dfdx(in.worldPos);
+                float3 dp2 = dfdy(in.worldPos);
+                float2 duv1 = dfdx(in.texCoord);
+                float2 duv2 = dfdy(in.texCoord);
+                float3 dp2perp = cross(dp2, N);
+                float3 dp1perp = cross(N, dp1);
+                float3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+                float3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+                float invmax = rsqrt(max(dot(T, T), dot(B, B)) + 1e-4);
+                T *= invmax;
+                B *= invmax;
+
+                float3 worldN = normalize(T * nMap.x + B * nMap.y + N * nMap.z);
+
+                // Subtle fake sun — softer than entity shader since the
+                // BSP lightmap already provides the primary lighting.
+                float3 sunDir = normalize(float3(0.4, 0.5, 0.6));
+                float NdotL = dot(worldN, sunDir) * 0.5 + 0.5;
+                float halfLambert = NdotL * NdotL;
+
+                lit *= (0.85 + halfLambert * 0.30);
             }
             return float4(lit, texel.a * va);
         }
@@ -2803,6 +2860,13 @@ struct MetalView: UIViewRepresentable {
         private var pbrNormalCache: [UInt32: MTLTexture] = [:]
         private var pbrTriedAndMissed: Set<UInt32> = []
         private var pbrNormalTried: Set<UInt32> = []
+        /// Phase 3 — single global normal map applied to ALL world surfaces
+        /// when r_pbrMaterials is on. Loads once on first world-fragment
+        /// call; nil while still loading or if the DDS is missing. The
+        /// q3_world_fragment MSL guards with is_null_texture(), so a nil
+        /// binding produces vanilla rendering.
+        private var pbrWorldNormalTexture: MTLTexture?
+        private var pbrWorldNormalAttempted = false
         private lazy var pbrTextureLoader: MTKTextureLoader? = {
             guard let dev = self.commandQueue?.device else { return nil }
             return MTKTextureLoader(device: dev)
@@ -2889,6 +2953,40 @@ struct MetalView: UIViewRepresentable {
                 return tex
             } catch {
                 pbrLog("[Q3-PBR-SWIFT] normal DDS load FAILED handle=\(handle) err=\(error.localizedDescription) path=\(path)")
+                return nil
+            }
+        }
+
+        /// Phase 3 — lazy-load the metal-plate normal map for uniform
+        /// world-surface relief. One bundled DDS, shared across every
+        /// world draw. Sticks to nil until first call; subsequent calls
+        /// hit the cached texture.
+        private func ensurePBRWorldNormal() -> MTLTexture? {
+            if pbrWorldNormalTexture != nil { return pbrWorldNormalTexture }
+            if pbrWorldNormalAttempted { return nil }
+            pbrWorldNormalAttempted = true
+            // Only attach when the r_pbrMaterials cvar is on, so the world
+            // shader falls back to vanilla when PBR is disabled.
+            if q3_pbr_enabled() == 0 { return nil }
+            guard let loader = pbrTextureLoader else { return nil }
+            guard let bundleRoot = Bundle.main.resourcePath else { return nil }
+            let path = bundleRoot + "/baseq3/pbr/assets/ingested/metal_plate_normal_2k_OTH_Normal.n.rtex.dds"
+            pbrLog("[Q3-PBR-SWIFT] world-normal trying path=\(path)")
+            let url = URL(fileURLWithPath: path)
+            let opts: [MTKTextureLoader.Option: Any] = [
+                .SRGB:                NSNumber(value: false),   // vector data
+                .textureUsage:        NSNumber(value: MTLTextureUsage.shaderRead.rawValue),
+                .textureStorageMode:  NSNumber(value: MTLStorageMode.private.rawValue),
+                .generateMipmaps:     NSNumber(value: false),
+            ]
+            do {
+                let tex = try loader.newTexture(URL: url, options: opts)
+                tex.label = "Q3.pbr.world.normal.metal_plate"
+                pbrWorldNormalTexture = tex
+                pbrLog("[Q3-PBR-SWIFT] loaded world-normal size=\(tex.width)x\(tex.height)")
+                return tex
+            } catch {
+                pbrLog("[Q3-PBR-SWIFT] world-normal DDS load FAILED err=\(error.localizedDescription)")
                 return nil
             }
         }
@@ -3405,6 +3503,11 @@ struct MetalView: UIViewRepresentable {
                         )
                         encoder.setFragmentTexture(baseTexture, index: 0)
                         encoder.setFragmentTexture(lightmapTexture, index: 1)
+                        // PBR Phase 3 — bind generic world normal map at
+                        // slot 2 for tangent-space relief. nil bind leaves
+                        // slot unbound; q3_world_fragment guards with
+                        // is_null_texture() so the vanilla path is preserved.
+                        encoder.setFragmentTexture(ensurePBRWorldNormal(), index: 2)
                         encoder.setFragmentBytes(&drawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 0)
                         encoder.setVertexBytes(&drawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 2)
                         encoder.drawIndexedPrimitives(
@@ -3757,6 +3860,8 @@ struct MetalView: UIViewRepresentable {
                             }
                             encoder.setFragmentTexture(lightmapTexture, index: 0)
                             encoder.setFragmentTexture(lightmapTexture, index: 1)
+                            // PBR Phase 3 — see main world bind site for rationale.
+                            encoder.setFragmentTexture(ensurePBRWorldNormal(), index: 2)
                             encoder.setFragmentBytes(&fogUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 0)
                             encoder.setVertexBytes(&fogUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 2)
                             encoder.drawIndexedPrimitives(
