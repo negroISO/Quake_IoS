@@ -1,6 +1,7 @@
 # PBR Architecture — Quake3-iOS
 
-**Status:** Phase 4b shipped as of commit `d26a768` on `metal-renderer-fresh`.
+**Status:** Phase 6 IBL shipped as of commit `170c175` on `metal-renderer-fresh`.
+Phase 5 A/B gate shipped as of commit `12061eb`.
 
 This document explains how PBR materials are wired through the Q3-iOS port —
 from C-side texture registration, through Swift's MTKTextureLoader cache,
@@ -16,6 +17,9 @@ to the Metal entity/world fragment shaders. It exists so a future contributor
 | 3 | **Universal world normal mapping**. Single bundled `metal_plate_normal_2k_OTH_Normal.n.rtex.dds` applied to every world surface. Q3 color variety preserved (no albedo swap); just adds rim-light modulation via the same Mikkelsen TBN. | `MetalView.swift` `q3_world_fragment` | `bc284f0` |
 | 4 | **Cook-Torrance**-style specular. Initially attempted real GGX (commits `fdf5f56`, `ec4b9e3`, `4e0d07e`) but on Q3 viewmodel geometry the GGX peak was too narrow to read (`pow(NdotH, 43)` ≈ 5e-5 at typical viewing angles). After magenta/green diagnostic proved the branch fires, settled on **Fresnel-rim mix-blend** as the production formulation. | `MetalView.swift` `q3_entity_fragment` | `b2b6f0c` |
 | 4b | Generic **shotgun.n.rtex.dds** normal-map fallback when material has albedo but no normal. Lets railgun/grenade/BFG enter the Phase 4 lighting block too. | `MetalView.swift` `pbrNormalTexture(for:)` | `d26a768` |
+| 5 | Full **Cook-Torrance GGX + Burley diffuse** ported from SomaZ/OpenJK rend2 `lightall.glsl`. D_GGX normal distribution + V_SmithJointApprox geometry + F_Schlick Fresnel + Diff_Burley with kD = (1-F)(1-metallic) energy split. Gated by `hasFullPBR = !is_null(rough) && !is_null(metal)` so only rocket fires this block. Direct sun light contribution radiance = (kD * burley + spec) * sunColor * NdotL with sunColor (2.4, 2.2, 1.9). | `MetalView.swift` `q3_entity_fragment` | `c53a768` |
+| 6 | **Image-Based Lighting** — procedural sky-gradient cubemap (64²×6 RGBA8Unorm, mipmapped via blit `generateMipmaps`). Sky-blue top → warm horizon → dark ground via per-texel direction sampling. Replaces flat `ambient = base.rgb * 0.35` inside hasFullPBR block. Diffuse IBL: cube sampled at world normal at the smallest most-blurred mip (irradiance approximation). Specular IBL: cube sampled at `reflect(-V, N)` at `roughness * maxMip` (Epic split-sum pre-filter approx). Karis NdotV Fresnel simplification (no half vector for env sampling) with `max(1-roughness, F0)` floor. kD energy split for diffuse-vs-metal. Direct sun radiance peaks over IBL fill. Dedicated `.clampToEdge` env sampler at sampler slot 1 prevents cube-face seams. | `MetalView.swift` `ensurePBREnvCube()` + `q3_entity_fragment` IBL block | `170c175` |
+| 5/6 A/B | Two CVAR_ARCHIVE gates (defaults "1"): `r_pbr_ibl` gates the IBL block; `r_pbr_phase5` gates the entire Cook-Torrance block via nil-binding of roughness + metallic textures (forces `hasFullPBR=false`). Sim A/B captures verified both axes contribute visibly to the held rocket launcher viewmodel. | `metal_renderer_stub.c` + `MetalView.swift` binding loop | `170c175` + `12061eb` |
 
 ## Per-weapon coverage matrix
 
@@ -103,8 +107,76 @@ shaders to the mod's metal plate albedo.
 
 ## Known limitations
 
-- **No path tracing** — Apple doesn't expose the RTX Remix path-tracing API. Phase 4 is a *stylized rim accent* that mimics PBR's wet-metal cue, not real IBL-driven PBR.
-- **Single fake sun direction** `(0.3, 0.5, 0.7)` — hardcoded in MSL. A real PBR rig would derive from BSP lightgrid.
-- **No environment cubemap reflections** — chrome surfaces don't reflect the room. Would need a render-to-cube pass.
+- **No path tracing** — Apple doesn't expose the RTX Remix path-tracing API. Phase 4–6 stack mimics PBR with raster shading + image-based environment fill, not real path-traced PBR.
+- **Single fake sun direction** `(0.3, 0.5, 0.7)` — hardcoded in MSL. Phase 7 plan: replace with per-entity sample from BSP lightgrid via `R_LightForPoint(ent.origin)`. **Blocked:** our `R_LightForPoint` is a stub returning 0; needs full `R_SetupEntityLightingGrid` + `tr.world->lightGridData` byte parse port. Multi-hundred-LOC effort deferred to its own session.
+- **~~No environment cubemap reflections~~** — **DELIVERED in Phase 6 (170c175)** via the procedural sky-gradient cube. v2 candidate: per-map scene cube rendered once on `Stub_BeginRegistration` so reflections match the actual map skybox + walls.
 - **No emissive bloom** — lightning gun coils etc. don't tint surrounding world. Would need HDR + 2-pass blur.
 - **830 hex-keyed mod materials unreachable** — RTX Remix uses XXH3 hash of D3D9 buffer bytes; algorithm not reverse-engineered. Only the ~21 descriptive-stem materials in `materials_by_name` are used.
+- **No BRDF integration LUT** — Phase 6 uses the Karis NdotV Fresnel simplification instead of the full Epic split-sum (LUT-driven `scale*F + bias` term). This saves a 256² rg16Float LUT + one-time precompute kernel; the simplification gives ~80% of the rough-surface specular IBL fidelity per DeepSeek's recommendation. Can be added later if rough specular reads as too dim.
+- **Per-weapon-tunable Cook-Torrance** — Phase 5 uses fixed `sunColor (2.4, 2.2, 1.9)` and ambient floor multiplier. Future iteration could route these through per-material settings in `materials_by_name`.
+
+## Phase 6 IBL technical notes
+
+### Procedural cube generation pattern
+
+`ensurePBREnvCube()` in `MetalView.swift` builds the cube once on first entity
+draw that requests IBL (lazy-init pattern matching the rest of the PBR cache).
+Sky model:
+- Top (`Y=+1`): sky blue `(0.55, 0.72, 0.92)` — clear daytime sky
+- Horizon (`Y=0`): warm dusk `(0.85, 0.78, 0.65)` — atmospheric scattering tint
+- Bottom (`Y=-1`): dark ground `(0.15, 0.13, 0.10)` — brown earth
+
+Per-texel direction computed via standard Metal cube face convention:
+slice 0=+X (right), 1=-X (left), 2=+Y (top), 3=-Y (bottom), 4=+Z (front),
+5=-Z (back). The `Y` component of the resulting unit vector drives the
+gradient interpolation directly.
+
+Mips via blit `generateMipmaps(for:)` — box filter, not GGX importance-sampled.
+At 64² with 7 mips the difference is imperceptible at viewmodel scale, and the
+implementation cost is one blit dispatch vs a custom compute kernel.
+
+### MSL IBL composition
+
+```msl
+float maxMipF = float(envCube.get_num_mip_levels() - 1);
+float3 diffuseIBL = envCube.sample(envSampler, worldN, level(maxMipF)).rgb;
+float3 R = reflect(-V, worldN);
+float specMip = roughness * maxMipF;
+float3 specularIBL = envCube.sample(envSampler, R, level(specMip)).rgb;
+// Karis NdotV Fresnel with roughness floor (no half vector for env sampling)
+float3 F_v = F0 + (max(float3(1.0 - roughness), F0) - F0) * pow(1.0 - NdotV, 5.0);
+float3 kD_v = (float3(1.0) - F_v) * (1.0 - metallic);
+float3 iblTerm = kD_v * diffuseIBL * base.rgb + F_v * specularIBL;
+base.rgb = iblTerm + radiance;  // direct sun PEAKS over IBL fill
+```
+
+The diffuse sample uses `level(maxMipF)` (smallest, most-blurred mip — the
+irradiance approximation). The specular sample uses `level(roughness *
+maxMipF)` — sharp mip 0 for mirror surfaces (`roughness=0`), heavily blurred
+mip 6 for fully matte surfaces (`roughness=1`).
+
+### Sampler convention
+
+Dedicated `pbrEnvSampler` at fragment sampler slot 1, separate from the
+per-draw 2D sampler at slot 0. All three address modes set to `.clampToEdge`
+to prevent cube-face seam artefacts — same class of fix as Q2's sky-seam
+`.repeat → .clampToEdge` switch from commit ffeb197 in the Q2 sibling repo.
+
+### Free fragment slot inventory
+
+Entity fragment texture slots after Phase 6:
+- 0 = diffuse (color)
+- 1 = normal map
+- 2 = (free)
+- 3 = roughness
+- 4 = metallic
+- 5 = environment cubemap (Phase 6)
+- 6, 7 = (free)
+
+Entity fragment sampler slots after Phase 6:
+- 0 = per-draw routing (.repeat or .clampToEdge based on shader flags)
+- 1 = environment sampler (.clampToEdge all axes)
+- 2-7 = (free)
+
+Buffer slots: 1 = EntityUniforms, 2 = DLightBlock, 3 = pbrNormalScale,
+4 = pbrRimParams (Phase F runtime tunables). Slots 0, 5, 6, 7 free.
