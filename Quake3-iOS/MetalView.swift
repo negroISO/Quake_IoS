@@ -3095,6 +3095,21 @@ struct MetalView: UIViewRepresentable {
         /// them populated in materials_by_name.
         private var pbrRoughnessCache: [UInt32: MTLTexture] = [:]
         private var pbrMetallicCache: [UInt32: MTLTexture] = [:]
+        /// Phase 6+ extension — 1×1 R8Unorm constant fallback textures.
+        /// When a material has albedo or normal but no explicit roughness
+        /// or metallic DDS, these shim into the texture(3)/(4) bindings so
+        /// the MSL `hasFullPBR` check evaluates true and the weapon enters
+        /// the Cook-Torrance + IBL block with default values (0.55 rough,
+        /// 0.50 metal). Brings shotgun / lightning / railgun / grenade /
+        /// BFG up to the same shading path as the rocket without needing
+        /// per-weapon DDS authoring. Built once on first request; shared
+        /// pointer across all handles falling back. Values match the
+        /// in-MSL default constants used pre-Phase 6 (see q3_entity_fragment
+        /// `roughness = 0.55; metallic = 0.50;`).
+        private var pbrRoughnessDefaultTex: MTLTexture?
+        private var pbrRoughnessDefaultAttempted = false
+        private var pbrMetallicDefaultTex: MTLTexture?
+        private var pbrMetallicDefaultAttempted = false
         /// Phase 6 — IBL environment cubemap. Procedural sky-gradient cube
         /// (bright blue top → warm horizon → dark ground), 64²×6, mipmapped.
         /// Built once on first call to `ensurePBREnvCube()` and reused for
@@ -3388,36 +3403,118 @@ struct MetalView: UIViewRepresentable {
             return pbrEnvSampler
         }
 
+        /// Phase 6+ extension — 1×1 R8Unorm constant-value texture builder.
+        /// Shared helper for roughness + metallic fallback textures. Stores
+        /// `value` clamped to [0, 1] as a single byte; MSL samples `.r` and
+        /// gets the same scalar regardless of which texel it picks.
+        private func makeConstantR8Texture(value: Float, label: String) -> MTLTexture? {
+            guard let device = self.commandQueue?.device else { return nil }
+            let desc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .r8Unorm,
+                width: 1, height: 1, mipmapped: false
+            )
+            desc.usage = [.shaderRead]
+            desc.storageMode = .shared
+            guard let tex = device.makeTexture(descriptor: desc) else { return nil }
+            tex.label = label
+            var byte: UInt8 = UInt8(max(0, min(255, Int((value.isFinite ? value : 0.0) * 255.0))))
+            let region = MTLRegionMake2D(0, 0, 1, 1)
+            withUnsafePointer(to: &byte) { ptr in
+                tex.replace(region: region, mipmapLevel: 0,
+                            withBytes: UnsafeRawPointer(ptr),
+                            bytesPerRow: 1)
+            }
+            return tex
+        }
+
+        /// Phase 6+ — default roughness constant (0.55). Lazy-built on first
+        /// request; shared across every weapon falling back from no-explicit-
+        /// roughness-DDS. Matches the pre-Phase 6 in-MSL default literal so
+        /// the GGX peak width stays unchanged for weapons that DID NOT have
+        /// explicit textures before this extension.
+        private func pbrRoughnessDefault() -> MTLTexture? {
+            if let t = pbrRoughnessDefaultTex { return t }
+            if pbrRoughnessDefaultAttempted { return nil }
+            pbrRoughnessDefaultAttempted = true
+            let tex = makeConstantR8Texture(value: 0.55, label: "Q3.pbr.roughness.default_0p55")
+            pbrRoughnessDefaultTex = tex
+            if tex != nil {
+                pbrLog("[Q3-PBR-SWIFT] roughness default 1x1=0.55 ready")
+            } else {
+                pbrLog("[Q3-PBR-SWIFT] roughness default alloc FAILED")
+            }
+            return tex
+        }
+
+        /// Phase 6+ — default metallic constant (0.50). Partial-metal value
+        /// reads as "weathered steel": F0 lerps halfway between dielectric
+        /// 0.04 and base.rgb, giving the rocket-style tinted highlight + half
+        /// diffuse contribution. Same value as the previous in-MSL default.
+        private func pbrMetallicDefault() -> MTLTexture? {
+            if let t = pbrMetallicDefaultTex { return t }
+            if pbrMetallicDefaultAttempted { return nil }
+            pbrMetallicDefaultAttempted = true
+            let tex = makeConstantR8Texture(value: 0.50, label: "Q3.pbr.metallic.default_0p50")
+            pbrMetallicDefaultTex = tex
+            if tex != nil {
+                pbrLog("[Q3-PBR-SWIFT] metallic default 1x1=0.50 ready")
+            } else {
+                pbrLog("[Q3-PBR-SWIFT] metallic default alloc FAILED")
+            }
+            return tex
+        }
+
         /// Phase 4 — lazy-load roughness map. Single-channel (R) data:
         /// 0=mirror polish, 1=fully matte. Like normals, must NOT be
         /// sRGB (linear scalar data, not gamma-encoded color).
+        ///
+        /// Phase 6+ extension: when the material has albedo or normal but
+        /// no explicit roughness DDS, return the 1×1 R8 constant fallback
+        /// (`pbrRoughnessDefault`, value 0.55) so the MSL `hasFullPBR`
+        /// check evaluates true and the weapon enters the Cook-Torrance +
+        /// IBL block. Brings shotgun/lightning/railgun/grenade/BFG up to
+        /// the same shading path as the rocket.
         private func pbrRoughnessTexture(for handle: UInt32) -> MTLTexture? {
             if let cached = pbrRoughnessCache[handle] { return cached }
             if pbrRoughnessTried.contains(handle) { return nil }
             pbrRoughnessTried.insert(handle)
             guard let matPtr = Q3MetalRenderer_GetPBRMaterial(handle) else { return nil }
             let mat = matPtr.pointee
-            guard let rCStr = mat.roughness else { return nil }
-            let path = String(cString: rCStr)
-            guard let loader = pbrTextureLoader else { return nil }
-            pbrLog("[Q3-PBR-SWIFT] trying-roughness handle=\(handle) path=\(path)")
-            let url = URL(fileURLWithPath: path)
-            let opts: [MTKTextureLoader.Option: Any] = [
-                .SRGB:                NSNumber(value: false),
-                .textureUsage:        NSNumber(value: MTLTextureUsage.shaderRead.rawValue),
-                .textureStorageMode:  NSNumber(value: MTLStorageMode.private.rawValue),
-                .generateMipmaps:     NSNumber(value: false),
-            ]
-            do {
-                let tex = try loader.newTexture(URL: url, options: opts)
-                tex.label = "Q3.pbr.roughness.h\(handle)"
-                pbrRoughnessCache[handle] = tex
-                pbrLog("[Q3-PBR-SWIFT] loaded roughness handle=\(handle) size=\(tex.width)x\(tex.height) path=\(path)")
-                return tex
-            } catch {
-                pbrLog("[Q3-PBR-SWIFT] roughness DDS load FAILED handle=\(handle) err=\(error.localizedDescription)")
-                return nil
+            if let rCStr = mat.roughness {
+                let path = String(cString: rCStr)
+                if let loader = pbrTextureLoader {
+                    pbrLog("[Q3-PBR-SWIFT] trying-roughness handle=\(handle) path=\(path)")
+                    let url = URL(fileURLWithPath: path)
+                    let opts: [MTKTextureLoader.Option: Any] = [
+                        .SRGB:                NSNumber(value: false),
+                        .textureUsage:        NSNumber(value: MTLTextureUsage.shaderRead.rawValue),
+                        .textureStorageMode:  NSNumber(value: MTLStorageMode.private.rawValue),
+                        .generateMipmaps:     NSNumber(value: false),
+                    ]
+                    do {
+                        let tex = try loader.newTexture(URL: url, options: opts)
+                        tex.label = "Q3.pbr.roughness.h\(handle)"
+                        pbrRoughnessCache[handle] = tex
+                        pbrLog("[Q3-PBR-SWIFT] loaded roughness handle=\(handle) size=\(tex.width)x\(tex.height) path=\(path)")
+                        return tex
+                    } catch {
+                        pbrLog("[Q3-PBR-SWIFT] roughness DDS load FAILED handle=\(handle) err=\(error.localizedDescription) — will try default fallback")
+                        // fall through to default fallback below
+                    }
+                }
             }
+            // No explicit roughness map (or load failed) — fall back to the
+            // 1×1 R8 default constant when the material has any other PBR
+            // slot. This is the Phase 6+ coverage extension for the lower-
+            // tier weapons.
+            if mat.albedo != nil || mat.normal != nil {
+                if let fallback = pbrRoughnessDefault() {
+                    pbrRoughnessCache[handle] = fallback
+                    pbrLog("[Q3-PBR-SWIFT] roughness DEFAULT fallback handle=\(handle) value=0.55")
+                    return fallback
+                }
+            }
+            return nil
         }
 
         /// Phase 4 — lazy-load metallic map. Single-channel (R): 0=plastic
@@ -3425,33 +3522,47 @@ struct MetalView: UIViewRepresentable {
         /// 1=metal reflects ~100% TINTED by the base color (gold reflects
         /// gold, copper reflects copper). Required for Schlick Fresnel
         /// F0 lerp in the Cook-Torrance BRDF.
+        ///
+        /// Phase 6+ extension: see pbrRoughnessTexture(for:) comment — same
+        /// fallback policy with `pbrMetallicDefault` (value 0.50).
         private func pbrMetallicTexture(for handle: UInt32) -> MTLTexture? {
             if let cached = pbrMetallicCache[handle] { return cached }
             if pbrMetallicTried.contains(handle) { return nil }
             pbrMetallicTried.insert(handle)
             guard let matPtr = Q3MetalRenderer_GetPBRMaterial(handle) else { return nil }
             let mat = matPtr.pointee
-            guard let mCStr = mat.metallic else { return nil }
-            let path = String(cString: mCStr)
-            guard let loader = pbrTextureLoader else { return nil }
-            pbrLog("[Q3-PBR-SWIFT] trying-metallic handle=\(handle) path=\(path)")
-            let url = URL(fileURLWithPath: path)
-            let opts: [MTKTextureLoader.Option: Any] = [
-                .SRGB:                NSNumber(value: false),
-                .textureUsage:        NSNumber(value: MTLTextureUsage.shaderRead.rawValue),
-                .textureStorageMode:  NSNumber(value: MTLStorageMode.private.rawValue),
-                .generateMipmaps:     NSNumber(value: false),
-            ]
-            do {
-                let tex = try loader.newTexture(URL: url, options: opts)
-                tex.label = "Q3.pbr.metallic.h\(handle)"
-                pbrMetallicCache[handle] = tex
-                pbrLog("[Q3-PBR-SWIFT] loaded metallic handle=\(handle) size=\(tex.width)x\(tex.height) path=\(path)")
-                return tex
-            } catch {
-                pbrLog("[Q3-PBR-SWIFT] metallic DDS load FAILED handle=\(handle) err=\(error.localizedDescription)")
-                return nil
+            if let mCStr = mat.metallic {
+                let path = String(cString: mCStr)
+                if let loader = pbrTextureLoader {
+                    pbrLog("[Q3-PBR-SWIFT] trying-metallic handle=\(handle) path=\(path)")
+                    let url = URL(fileURLWithPath: path)
+                    let opts: [MTKTextureLoader.Option: Any] = [
+                        .SRGB:                NSNumber(value: false),
+                        .textureUsage:        NSNumber(value: MTLTextureUsage.shaderRead.rawValue),
+                        .textureStorageMode:  NSNumber(value: MTLStorageMode.private.rawValue),
+                        .generateMipmaps:     NSNumber(value: false),
+                    ]
+                    do {
+                        let tex = try loader.newTexture(URL: url, options: opts)
+                        tex.label = "Q3.pbr.metallic.h\(handle)"
+                        pbrMetallicCache[handle] = tex
+                        pbrLog("[Q3-PBR-SWIFT] loaded metallic handle=\(handle) size=\(tex.width)x\(tex.height) path=\(path)")
+                        return tex
+                    } catch {
+                        pbrLog("[Q3-PBR-SWIFT] metallic DDS load FAILED handle=\(handle) err=\(error.localizedDescription) — will try default fallback")
+                        // fall through to default fallback below
+                    }
+                }
             }
+            // Phase 6+ default fallback (see pbrRoughnessTexture comment).
+            if mat.albedo != nil || mat.normal != nil {
+                if let fallback = pbrMetallicDefault() {
+                    pbrMetallicCache[handle] = fallback
+                    pbrLog("[Q3-PBR-SWIFT] metallic DEFAULT fallback handle=\(handle) value=0.50")
+                    return fallback
+                }
+            }
+            return nil
         }
 
         /// Phase 3 — lazy-load the metal-plate normal map for uniform
