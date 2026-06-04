@@ -353,6 +353,10 @@ struct MetalView: UIViewRepresentable {
         struct RTPrimitiveMaterial {
             var albedoSlot: UInt32
             var lightmapSlot: UInt32
+            var tcModType: UInt32
+            var tcModCount: UInt32
+            var alphaTcModControl: SIMD4<Float> // x=alphaTestThreshold, y=count, z=type0
+            var tcModParams0: SIMD4<Float>
         }
 
         struct WorldDrawUniforms {
@@ -2995,6 +2999,7 @@ struct MetalView: UIViewRepresentable {
         private var rtBlendPipelineState: MTLComputePipelineState?
         private var rtTexture: MTLTexture?
         private var rtCompositeTexture: MTLTexture?
+        private var rtWhiteTexture: MTLTexture?
         private var rtTextureSize = MTLSize(width: 0, height: 0, depth: 1)
         private var worldASBuilt = false
         private var worldASGeneration: UInt32 = 0
@@ -3120,9 +3125,54 @@ struct MetalView: UIViewRepresentable {
             struct RTPrimitiveMaterial {
                 uint albedoSlot;
                 uint lightmapSlot;
+                uint tcModType;
+                uint tcModCount;
+                float4 alphaTcModControl;
+                float4 tcModParams0;
             };
 
+            float2 rtApplyTcMod(float2 uv, float3 worldPos, int type, float4 params, float timeSeconds) {
+                if (type == 1) {
+                    float2 adj = params.xy * timeSeconds;
+                    adj -= floor(adj);
+                    return uv + adj;
+                } else if (type == 2) {
+                    float s = sin(timeSeconds * params.w) * params.y;
+                    return uv + float2(s, s);
+                } else if (type == 3) {
+                    float degrees = fmod(params.x * timeSeconds, 360.0);
+                    float a = degrees * (3.14159265 / 180.0);
+                    float c = cos(a);
+                    float sn = sin(a);
+                    float2 p = uv - 0.5;
+                    return float2(p.x * c - p.y * sn, p.x * sn + p.y * c) + 0.5;
+                } else if (type == 4) {
+                    return uv * params.xy;
+                } else if (type == 5) {
+                    float amp = params.x;
+                    float freq = params.y;
+                    float phase = params.z;
+                    float now = fract(phase + timeSeconds * freq);
+                    float kX = (worldPos.x + worldPos.z) * (1.0 / 1024.0) + now;
+                    float kY = worldPos.y * (1.0 / 1024.0) + now;
+                    float twoPi = 2.0 * 3.14159265;
+                    return uv + float2(sin(kX * twoPi) * amp, sin(kY * twoPi) * amp);
+                } else if (type == 6) {
+                    float angle = 2.0 * 3.14159265 * (params.z + timeSeconds * params.w);
+                    float eval = params.x + sin(angle) * params.y;
+                    if (abs(eval) < 0.0001) eval = 1.0;
+                    return (uv - 0.5) * (1.0 / eval) + 0.5;
+                } else if (type == 7) {
+                    return float2(uv.x * params.x + uv.y * params.y,
+                                  uv.x * params.z + uv.y * params.w);
+                } else if (type == 8) {
+                    return uv + params.xy;
+                }
+                return uv;
+            }
+
             kernel void rtKernel(texture2d<float, access::write> output [[texture(0)]],
+                                 texturecube<float> envCube [[texture(1)]],
                                  array<texture2d<float>, 110> albedoTextures [[texture(2)]],
                                  array<texture2d<float>, 16> lightmapTextures [[texture(112)]],
                                  constant RayTracingUniforms &uniforms [[buffer(0)]],
@@ -3172,19 +3222,40 @@ struct MetalView: UIViewRepresentable {
                         float2 lm0 = vertices[i0].lightmapTexCoord;
                         float2 lm1 = vertices[i1].lightmapTexCoord;
                         float2 lm2 = vertices[i2].lightmapTexCoord;
+                        float3 hitPos = uniforms.cameraPos.xyz + rayDir * hit.distance;
                         float2 uv = uv0 * w + uv1 * bary.x + uv2 * bary.y;
                         float2 lmuv = lm0 * w + lm1 * bary.x + lm2 * bary.y;
+                        if (mat.tcModCount > 0) {
+                            uv = rtApplyTcMod(uv, hitPos, int(mat.tcModType), mat.tcModParams0, uniforms.fovParams.z);
+                        }
                         constexpr sampler repeatSampler(filter::linear, address::repeat);
                         constexpr sampler clampSampler(filter::linear, address::clamp_to_edge);
-                        float3 albedo = albedoTextures[mat.albedoSlot].sample(repeatSampler, uv).rgb;
-                        float3 lightmap = lightmapTextures[mat.lightmapSlot].sample(clampSampler, lmuv).rgb;
-                        color = albedo * max(lightmap * 2.0, float3(0.18));
-                        color = mix(color, normalColor, 0.18);
+                        constexpr sampler envSampler(filter::linear, address::clamp_to_edge);
+                        float4 albedoSample = albedoTextures[mat.albedoSlot].sample(repeatSampler, uv);
+                        float alphaThreshold = mat.alphaTcModControl.x;
+                        bool alphaReject = (alphaThreshold > 0.0 && albedoSample.a < alphaThreshold) ||
+                                           (alphaThreshold < 0.0 && albedoSample.a >= -alphaThreshold);
+                        if (alphaReject) {
+                            if (!is_null_texture(envCube)) {
+                                color = envCube.sample(envSampler, rayDir).rgb;
+                            } else {
+                                color = float3(0.04, 0.07, 0.13) + float3(0.01, 0.03, 0.06) * (1.0 - ndc.y);
+                            }
+                        } else {
+                            float3 lightmap = lightmapTextures[mat.lightmapSlot].sample(clampSampler, lmuv).rgb;
+                            color = albedoSample.rgb * max(lightmap * 2.0, float3(0.18));
+                            color = mix(color, normalColor, 0.18);
+                        }
                     } else {
                         color = normalColor;
                     }
                 } else {
-                    color = float3(0.04, 0.07, 0.13) + float3(0.01, 0.03, 0.06) * (1.0 - ndc.y);
+                    constexpr sampler envSampler(filter::linear, address::clamp_to_edge);
+                    if (!is_null_texture(envCube)) {
+                        color = envCube.sample(envSampler, rayDir).rgb;
+                    } else {
+                        color = float3(0.04, 0.07, 0.13) + float3(0.01, 0.03, 0.06) * (1.0 - ndc.y);
+                    }
                 }
                 if (any(isnan(color)) || any(isinf(color))) { color = float3(0.0); }
                 output.write(float4(saturate(color), 1.0), tid);
@@ -3241,7 +3312,14 @@ struct MetalView: UIViewRepresentable {
         @MainActor
         private func buildRTPrimitiveMaterials(device: MTLDevice, primitiveCount: Int) {
             let invalid = UInt32.max
-            var materials = [RTPrimitiveMaterial](repeating: RTPrimitiveMaterial(albedoSlot: invalid, lightmapSlot: invalid), count: primitiveCount)
+            let invalidMaterial = RTPrimitiveMaterial(
+                albedoSlot: invalid,
+                lightmapSlot: invalid,
+                tcModType: 0,
+                tcModCount: 0,
+                alphaTcModControl: SIMD4<Float>(0, 0, 0, 0),
+                tcModParams0: SIMD4<Float>(0, 0, 0, 0))
+            var materials = [RTPrimitiveMaterial](repeating: invalidMaterial, count: primitiveCount)
             rtAlbedoHandles = [UInt32](repeating: 0, count: rtMaxAlbedoSlots)
             rtLightmapHandles = [UInt32](repeating: 0, count: rtMaxLightmapSlots)
 
@@ -3312,7 +3390,16 @@ struct MetalView: UIViewRepresentable {
                 let end = min(firstTri + triCount, materials.count)
                 for tri in firstTri..<end {
                     if materials[tri].albedoSlot == invalid {
-                        materials[tri] = RTPrimitiveMaterial(albedoSlot: aSlot, lightmapSlot: lSlot)
+                        let chain = Self.fillTcMods(stage)
+                        let tcType = chain.count > 0 ? UInt32(max(0, Int(stage.tcMods.0.type))) : 0
+                        let alphaThreshold = Self.alphaTestThreshold(for: stage.alphaFunc)
+                        materials[tri] = RTPrimitiveMaterial(
+                            albedoSlot: aSlot,
+                            lightmapSlot: lSlot,
+                            tcModType: tcType,
+                            tcModCount: UInt32(min(chain.count, 1)),
+                            alphaTcModControl: SIMD4<Float>(alphaThreshold, Float(min(chain.count, 1)), Float(tcType), 0),
+                            tcModParams0: chain.p0)
                         assigned += 1
                     } else {
                         skippedOverwrite += 1
@@ -3400,6 +3487,26 @@ struct MetalView: UIViewRepresentable {
             return rtTexture != nil && rtCompositeTexture != nil
         }
 
+
+        @MainActor
+        private func ensureRTWhiteTexture(device: MTLDevice) -> MTLTexture? {
+            if let rtWhiteTexture { return rtWhiteTexture }
+            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: 1, height: 1, mipmapped: false)
+            desc.usage = [.shaderRead]
+            desc.storageMode = .shared
+            guard let tex = device.makeTexture(descriptor: desc) else { return nil }
+            var pixel: UInt32 = 0xffffffff
+            withUnsafeBytes(of: &pixel) { bytes in
+                tex.replace(region: MTLRegionMake2D(0, 0, 1, 1),
+                            mipmapLevel: 0,
+                            withBytes: bytes.baseAddress!,
+                            bytesPerRow: 4)
+            }
+            tex.label = "Q3.RT.whiteFallback"
+            rtWhiteTexture = tex
+            return tex
+        }
+
         @MainActor
         private func encodeRTOverlay(commandBuffer: MTLCommandBuffer,
                                      rasterTexture: MTLTexture,
@@ -3432,7 +3539,7 @@ struct MetalView: UIViewRepresentable {
                                               cameraRight: SIMD4<Float>(right.x, right.y, right.z, 0),
                                               cameraUp: SIMD4<Float>(up.x, up.y, up.z, 0),
                                               jitterNearFar: SIMD4<Float>(0, 0, 4.0, 8192.0),
-                                              fovParams: SIMD4<Float>(tan(sceneView.fovX * .pi / 360.0), tan(sceneView.fovY * .pi / 360.0), 0, 0))
+                                              fovParams: SIMD4<Float>(tan(sceneView.fovX * .pi / 360.0), tan(sceneView.fovY * .pi / 360.0), Float(CACurrentMediaTime() - frameTimeOrigin), 0))
             if !rtOverlayLogPrintedOnce {
                 print("[RT] overlay active mix=\(mixValue) size=\(renderW)x\(renderH) camera=\(cameraPos)")
                 rtOverlayLogPrintedOnce = true
@@ -3443,11 +3550,13 @@ struct MetalView: UIViewRepresentable {
                 enc.label = "Q3.RT.trace"
                 enc.setComputePipelineState(rtPSO)
                 enc.setTexture(rtTex, index: 0)
+                enc.setTexture(ensurePBREnvCube(), index: 1)
+                let fallbackTex = ensureRTWhiteTexture(device: device)
                 for i in 0..<rtMaxAlbedoSlots {
-                    enc.setTexture(texture(for: rtAlbedoHandles[i], device: device), index: 2 + i)
+                    enc.setTexture(texture(for: rtAlbedoHandles[i], device: device) ?? fallbackTex, index: 2 + i)
                 }
                 for i in 0..<rtMaxLightmapSlots {
-                    enc.setTexture(texture(for: rtLightmapHandles[i], device: device), index: 112 + i)
+                    enc.setTexture(texture(for: rtLightmapHandles[i], device: device) ?? fallbackTex, index: 112 + i)
                 }
                 enc.setBytes(&uniforms, length: MemoryLayout<RayTracingUniforms>.stride, index: 0)
                 enc.setAccelerationStructure(worldAS, bufferIndex: 1)
