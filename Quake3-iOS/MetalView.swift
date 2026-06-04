@@ -292,6 +292,22 @@ struct MetalView: UIViewRepresentable {
             var fogParams: SIMD4<Float>
         }
 
+        struct RayTracingUniforms {
+            var viewProjection: simd_float4x4
+            var invViewProjection: simd_float4x4
+            var cameraPos: SIMD3<Float>
+            var _pad0: Float = 0
+            var cameraForward: SIMD3<Float>
+            var _pad1: Float = 0
+            var cameraRight: SIMD3<Float>
+            var _pad2: Float = 0
+            var cameraUp: SIMD3<Float>
+            var _pad3: Float = 0
+            var jitter: SIMD2<Float>
+            var nearPlane: Float
+            var farPlane: Float
+        }
+
         struct WorldDrawUniforms {
             var tcGen: Float
             var tcModCount: Int32
@@ -2927,6 +2943,18 @@ struct MetalView: UIViewRepresentable {
         private var postprocessEncodeCount: Int = 0
         private var postprocessLogPrintedOnce: Bool = false
 
+        private var worldAccelerationStructure: MTLAccelerationStructure?
+        private var rtPipelineState: MTLComputePipelineState?
+        private var rtBlendPipelineState: MTLComputePipelineState?
+        private var rtTexture: MTLTexture?
+        private var rtCompositeTexture: MTLTexture?
+        private var rtTextureSize = MTLSize(width: 0, height: 0, depth: 1)
+        private var worldASBuilt = false
+        private var worldASGeneration: UInt32 = 0
+        private var rtASVertexBuffer: MTLBuffer?
+        private var rtASIndexBuffer: MTLBuffer?
+        private var rtLogPrintedOnce = false
+
         private struct PostprocessUniforms {
             var intensity: Float
             var gamma: Float
@@ -3002,6 +3030,224 @@ struct MetalView: UIViewRepresentable {
             if postprocessEncodeCount == 1 || postprocessEncodeCount % 120 == 0 {
                 print("[MTL_POSTPROC] encode #\(postprocessEncodeCount) intensity=\(u.intensity) gamma=\(u.gamma) size=\(w)x\(h)")
             }
+        }
+
+
+        @MainActor
+        private func makeRTLibrary(device: MTLDevice) -> MTLLibrary? {
+            let src = """
+            #include <metal_stdlib>
+            #include <metal_raytracing>
+            using namespace metal;
+            using namespace raytracing;
+
+            struct RayTracingUniforms {
+                float4x4 viewProjection;
+                float4x4 invViewProjection;
+                packed_float3 cameraPos; float _pad0;
+                packed_float3 cameraForward; float _pad1;
+                packed_float3 cameraRight; float _pad2;
+                packed_float3 cameraUp; float _pad3;
+                float2 jitter;
+                float nearPlane;
+                float farPlane;
+            };
+
+            kernel void rtKernel(texture2d<float, access::write> output [[texture(0)]],
+                                 constant RayTracingUniforms &uniforms [[buffer(0)]],
+                                 acceleration_structure<> worldAS [[buffer(1)]],
+                                 uint2 tid [[thread_position_in_grid]]) {
+                if (tid.x >= output.get_width() || tid.y >= output.get_height()) return;
+                float2 uv = (float2(tid) + 0.5) / float2(output.get_width(), output.get_height());
+                uv += uniforms.jitter;
+                float2 ndc = uv * 2.0 - 1.0;
+                float4 rayClip = float4(ndc.x, -ndc.y, 1.0, 1.0);
+                float4 rayWorld = uniforms.invViewProjection * rayClip;
+                rayWorld.xyz /= max(rayWorld.w, 1.0e-6);
+                float3 rayDir = normalize(rayWorld.xyz - float3(uniforms.cameraPos));
+
+                ray r;
+                r.origin = float3(uniforms.cameraPos);
+                r.direction = rayDir;
+                r.min_distance = uniforms.nearPlane;
+                r.max_distance = uniforms.farPlane;
+                intersector<> i;
+                auto hit = i.intersect(r, worldAS);
+
+                float3 color;
+                if (hit.type == intersection_type::triangle) {
+                    float t = saturate(hit.distance / uniforms.farPlane);
+                    color = float3(1.0 - t);
+                } else {
+                    color = float3(0.2, 0.3, 0.5);
+                }
+                output.write(float4(color, 1.0), tid);
+            }
+
+            kernel void blendRT(texture2d<float, access::read> rt [[texture(0)]],
+                                texture2d<float, access::read> raster [[texture(1)]],
+                                texture2d<float, access::write> output [[texture(2)]],
+                                constant float &mixAmount [[buffer(0)]],
+                                uint2 tid [[thread_position_in_grid]]) {
+                if (tid.x >= output.get_width() || tid.y >= output.get_height()) return;
+                float3 rtColor = rt.read(tid).rgb;
+                float3 rasterColor = raster.read(tid).rgb;
+                float3 blended = mix(rasterColor, rtColor, saturate(mixAmount));
+                output.write(float4(blended, 1.0), tid);
+            }
+            """
+            let opts = MTLCompileOptions()
+            opts.languageVersion = .version2_4
+            do { return try device.makeLibrary(source: src, options: opts) }
+            catch { print("[RT] library compile failed: \(error)"); return nil }
+        }
+
+        @MainActor
+        private func ensureRTPipeline(device: MTLDevice) -> MTLComputePipelineState? {
+            if let rtPipelineState { return rtPipelineState }
+            guard device.supportsRaytracing else {
+                if !rtLogPrintedOnce { print("[RT] skipped: device/simulator does not support Metal ray tracing"); rtLogPrintedOnce = true }
+                return nil
+            }
+            guard let lib = makeRTLibrary(device: device), let fn = lib.makeFunction(name: "rtKernel") else {
+                print("[RT] failed to create rtKernel"); return nil
+            }
+            do { let pso = try device.makeComputePipelineState(function: fn); rtPipelineState = pso; print("[RT] rtKernel pipeline ready"); return pso }
+            catch { print("[RT] pipeline state error: \(error)"); return nil }
+        }
+
+        @MainActor
+        private func ensureRTBlendPipeline(device: MTLDevice) -> MTLComputePipelineState? {
+            if let rtBlendPipelineState { return rtBlendPipelineState }
+            guard let lib = makeRTLibrary(device: device), let fn = lib.makeFunction(name: "blendRT") else {
+                print("[RT] failed to create blendRT"); return nil
+            }
+            do { let pso = try device.makeComputePipelineState(function: fn); rtBlendPipelineState = pso; print("[RT] blendRT pipeline ready"); return pso }
+            catch { print("[RT] blend pipeline state error: \(error)"); return nil }
+        }
+
+        @MainActor
+        private func buildWorldAccelerationStructure(device: MTLDevice) -> MTLAccelerationStructure? {
+            guard device.supportsRaytracing, Q3MetalRenderer_IsWorldLoaded() != 0 else { return nil }
+            guard let vb = worldVertexBuffer, let ib = worldIndexBuffer else { return nil }
+            let vertexCount = Int(Q3MetalRenderer_GetWorldVertexCount())
+            let indexCount = Int(Q3MetalRenderer_GetWorldIndexCount())
+            guard vertexCount > 0, indexCount >= 3 else { return nil }
+
+            let geomDesc = MTLAccelerationStructureTriangleGeometryDescriptor()
+            geomDesc.vertexBuffer = vb
+            geomDesc.vertexBufferOffset = 0
+            geomDesc.vertexStride = MemoryLayout<GPUWorldVertex>.stride
+            geomDesc.vertexFormat = .float3
+            geomDesc.indexBuffer = ib
+            geomDesc.indexBufferOffset = 0
+            geomDesc.indexType = .uint32
+            geomDesc.triangleCount = indexCount / 3
+            geomDesc.opaque = true
+
+            let asDesc = MTLPrimitiveAccelerationStructureDescriptor()
+            asDesc.geometryDescriptors = [geomDesc]
+            let sizes = device.accelerationStructureSizes(descriptor: asDesc)
+            guard let scratch = device.makeBuffer(length: sizes.buildScratchBufferSize, options: .storageModePrivate),
+                  let accel = device.makeAccelerationStructure(size: sizes.accelerationStructureSize),
+                  let queue = commandQueue,
+                  let cb = queue.makeCommandBuffer(),
+                  let enc = cb.makeAccelerationStructureCommandEncoder() else {
+                print("[RT] AS build allocation failed"); return nil
+            }
+            accel.label = "Q3.RT.worldAS"
+            scratch.label = "Q3.RT.worldAS.scratch"
+            enc.label = "Q3.RT.buildWorldAS"
+            enc.build(accelerationStructure: accel, descriptor: asDesc, scratchBuffer: scratch, scratchBufferOffset: 0)
+            enc.endEncoding()
+            cb.commit(); cb.waitUntilCompleted()
+            if let err = cb.error { print("[RT] AS build failed: \(err)"); return nil }
+            rtASVertexBuffer = vb; rtASIndexBuffer = ib
+            print("[RT] built world AS: vertices=\(vertexCount) indices=\(indexCount) tris=\(indexCount / 3) size=\(sizes.accelerationStructureSize)")
+            return accel
+        }
+
+        @MainActor
+        private func ensureRTTextures(device: MTLDevice, width: Int, height: Int, pixelFormat: MTLPixelFormat) -> Bool {
+            let w = max(width, 1), h = max(height, 1)
+            if rtTexture != nil && rtCompositeTexture != nil && rtTextureSize.width == w && rtTextureSize.height == h { return true }
+            let rtDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: w, height: h, mipmapped: false)
+            rtDesc.usage = [.shaderRead, .shaderWrite]; rtDesc.storageMode = .private
+            let compDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: pixelFormat, width: w, height: h, mipmapped: false)
+            compDesc.usage = [.shaderRead, .shaderWrite]; compDesc.storageMode = .private
+            rtTexture = device.makeTexture(descriptor: rtDesc)
+            rtCompositeTexture = device.makeTexture(descriptor: compDesc)
+            rtTexture?.label = "Q3.RT.output"; rtCompositeTexture?.label = "Q3.RT.composite"
+            rtTextureSize = MTLSize(width: w, height: h, depth: 1)
+            return rtTexture != nil && rtCompositeTexture != nil
+        }
+
+        @MainActor
+        private func encodeRTOverlay(commandBuffer: MTLCommandBuffer,
+                                     rasterTexture: MTLTexture,
+                                     outputDrawableTexture: MTLTexture,
+                                     device: MTLDevice,
+                                     sceneView: Q3MetalSceneView,
+                                     renderW: Int,
+                                     renderH: Int) -> MTLTexture? {
+            let mixValue = Q3_RTMix()
+            guard mixValue > 0 else { return nil }
+            guard device.supportsRaytracing else {
+                if !rtLogPrintedOnce { print("[RT] disabled: current device/simulator does not support acceleration structures"); rtLogPrintedOnce = true }
+                return nil
+            }
+            guard worldASBuilt, let worldAS = worldAccelerationStructure else { return nil }
+            guard let rtPSO = ensureRTPipeline(device: device), let blendPSO = ensureRTBlendPipeline(device: device) else { return nil }
+            guard ensureRTTextures(device: device, width: renderW, height: renderH, pixelFormat: rasterTexture.pixelFormat),
+                  let rtTex = rtTexture, let compositeTex = rtCompositeTexture else { return nil }
+
+            let viewProj = makeWorldViewProjection(sceneView)
+            let cameraPos = SIMD3<Float>(sceneView.viewOrigin.0, sceneView.viewOrigin.1, sceneView.viewOrigin.2)
+            let forward = SIMD3<Float>(sceneView.viewAxis.0, sceneView.viewAxis.1, sceneView.viewAxis.2)
+            let right = SIMD3<Float>(-sceneView.viewAxis.3, -sceneView.viewAxis.4, -sceneView.viewAxis.5)
+            let up = SIMD3<Float>(sceneView.viewAxis.6, sceneView.viewAxis.7, sceneView.viewAxis.8)
+            var uniforms = RayTracingUniforms(viewProjection: viewProj,
+                                              invViewProjection: simd_inverse(viewProj),
+                                              cameraPos: cameraPos,
+                                              cameraForward: forward,
+                                              cameraRight: right,
+                                              cameraUp: up,
+                                              jitter: SIMD2<Float>(0, 0),
+                                              nearPlane: 4.0,
+                                              farPlane: 8192.0)
+            let tg = MTLSize(width: 16, height: 16, depth: 1)
+            let groups = MTLSize(width: (renderW + 15) / 16, height: (renderH + 15) / 16, depth: 1)
+            if let enc = commandBuffer.makeComputeCommandEncoder() {
+                enc.label = "Q3.RT.trace"
+                enc.setComputePipelineState(rtPSO)
+                enc.setTexture(rtTex, index: 0)
+                enc.setBytes(&uniforms, length: MemoryLayout<RayTracingUniforms>.stride, index: 0)
+                enc.setAccelerationStructure(worldAS, bufferIndex: 1)
+                enc.dispatchThreadgroups(groups, threadsPerThreadgroup: tg)
+                enc.endEncoding()
+            }
+            var m = mixValue
+            if let enc = commandBuffer.makeComputeCommandEncoder() {
+                enc.label = "Q3.RT.blend"
+                enc.setComputePipelineState(blendPSO)
+                enc.setTexture(rtTex, index: 0)
+                enc.setTexture(rasterTexture, index: 1)
+                enc.setTexture(compositeTex, index: 2)
+                enc.setBytes(&m, length: MemoryLayout<Float>.stride, index: 0)
+                enc.dispatchThreadgroups(groups, threadsPerThreadgroup: tg)
+                enc.endEncoding()
+            }
+            if rasterTexture === outputDrawableTexture, let blit = commandBuffer.makeBlitCommandEncoder() {
+                blit.label = "Q3.RT.copyCompositeToDrawable"
+                blit.copy(from: compositeTex, sourceSlice: 0, sourceLevel: 0,
+                          sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                          sourceSize: MTLSize(width: renderW, height: renderH, depth: 1),
+                          to: outputDrawableTexture, destinationSlice: 0, destinationLevel: 0,
+                          destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+                blit.endEncoding()
+                return nil
+            }
+            return compositeTex
         }
 
         private func ensuredDepthStencilState(_ preferred: MTLDepthStencilState?, device: MTLDevice?) -> MTLDepthStencilState? {
@@ -5594,13 +5840,33 @@ struct MetalView: UIViewRepresentable {
 
             encoder.endEncoding()
 
+            var rtCompositeForUpscale: MTLTexture? = nil
+            if let device = view.device,
+               Q3MetalRenderer_IsWorldLoaded() != 0,
+               let sceneView = Q3MetalRenderer_GetSceneView()?.pointee {
+                if (!worldASBuilt || worldASGeneration != snapshot.worldGeneration),
+                   worldVertexBuffer != nil, worldIndexBuffer != nil {
+                    worldAccelerationStructure = buildWorldAccelerationStructure(device: device)
+                    worldASBuilt = (worldAccelerationStructure != nil)
+                    worldASGeneration = worldASBuilt ? snapshot.worldGeneration : 0
+                }
+                let rasterForRT = (upscaleActive ? upscaleColorTarget : drawable.texture) ?? drawable.texture
+                rtCompositeForUpscale = encodeRTOverlay(commandBuffer: commandBuffer,
+                                                        rasterTexture: rasterForRT,
+                                                        outputDrawableTexture: drawable.texture,
+                                                        device: device,
+                                                        sceneView: sceneView,
+                                                        renderW: renderW,
+                                                        renderH: renderH)
+            }
+
             #if canImport(MetalFX)
             /* MetalFX spatial upscale: when active, all main render encoders
              * above wrote to upscaleColorTarget (renderW × renderH). Encode
              * the scaler now to fill the drawable with the upscaled image.
-             * MTLFXSpatialScaler is a one-shot pass — it sets up its own
-             * compute pipeline and writes outputTexture directly. */
-            if upscaleActive, let scaler = spatialScaler, let colorRT = upscaleColorTarget {
+             * If RT overlay produced a composite texture, MetalFX reads that
+             * instead of the raw raster color target. */
+            if upscaleActive, let scaler = spatialScaler, let colorRT = (rtCompositeForUpscale ?? upscaleColorTarget) {
                 scaler.colorTexture = colorRT
                 scaler.outputTexture = drawable.texture
                 scaler.encode(commandBuffer: commandBuffer)
@@ -6217,6 +6483,11 @@ struct MetalView: UIViewRepresentable {
             )
             worldIndexBuffer?.label = "Q3.ib.world"
             cachedWorldGeneration = generation
+            worldAccelerationStructure = nil
+            worldASBuilt = false
+            worldASGeneration = 0
+            rtASVertexBuffer = nil
+            rtASIndexBuffer = nil
             return worldVertexBuffer
         }
 

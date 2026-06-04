@@ -9767,6 +9767,18 @@ const uint32_t *Q3MetalRenderer_GetWorldIndices(void) {
     return s_world.indices;
 }
 
+uint32_t Q3MetalRenderer_GetWorldVertexCount(void) {
+    return s_world.vertexCount;
+}
+
+uint32_t Q3MetalRenderer_GetWorldIndexCount(void) {
+    return s_world.indexCount;
+}
+
+int Q3MetalRenderer_IsWorldLoaded(void) {
+    return s_world.loaded ? 1 : 0;
+}
+
 const Q3MetalWorldDrawCmd *Q3MetalRenderer_GetWorldDrawCommands(void) {
     if (s_world.visibleDrawsValid && s_world.visibleDraws != NULL) {
         return s_world.visibleDraws;
@@ -10018,6 +10030,15 @@ int Q3_PBRWorldClassMatchEnabled(void) {
     if (ri.Cvar_Get == NULL) return 1;
     cvar_t *cv = ri.Cvar_Get("r_pbr_world_class_match", "1", CVAR_ARCHIVE);
     return cv ? cv->integer : 1;
+}
+
+float Q3_RTMix(void) {
+    if (ri.Cvar_Get == NULL) return 0.0f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_mix", "0", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.0f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    return v;
 }
 
 /* PBR Phase 6 v2 — map-specific skybox IBL source.
