@@ -3261,12 +3261,14 @@ struct MetalView: UIViewRepresentable {
              * tiny early detail draws consumed slots. */
             var albedoWeights: [UInt32: Int] = [:]
             var lightmapWeights: [UInt32: Int] = [:]
+            let fogOnlyBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY)
             for draw in draws where draw.indexCount >= 3 {
+                if (draw.flags & fogOnlyBit) != 0 { continue }
                 let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
                 guard stageCount > 0 else { continue }
                 let triCount = max(1, Int(draw.indexCount / 3))
                 let stage = Self.worldStage(draw, 0)
-                if stage.textureHandle != 0 {
+                if stage.useLightmap == 0 && stage.textureHandle != 0 {
                     albedoWeights[stage.textureHandle, default: 0] += triCount
                 }
                 if draw.lightmapTextureHandle != 0 {
@@ -3295,26 +3297,33 @@ struct MetalView: UIViewRepresentable {
             let lightmapSlots = Dictionary(uniqueKeysWithValues: topLightmaps.enumerated().map { (UInt32($0.offset), $0.element) }.map { ($0.1, $0.0) })
 
             var assigned = 0
+            var skippedOverwrite = 0
             for draw in draws where draw.indexCount >= 3 {
+                if (draw.flags & fogOnlyBit) != 0 { continue }
                 let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
                 guard stageCount > 0 else { continue }
                 let stage = Self.worldStage(draw, 0)
-                guard let aSlot = albedoSlots[stage.textureHandle],
+                guard stage.useLightmap == 0,
+                      let aSlot = albedoSlots[stage.textureHandle],
                       let lSlot = lightmapSlots[draw.lightmapTextureHandle] else { continue }
                 let firstTri = Int(draw.firstIndex / 3)
                 let triCount = Int(draw.indexCount / 3)
                 guard firstTri < materials.count else { continue }
                 let end = min(firstTri + triCount, materials.count)
                 for tri in firstTri..<end {
-                    materials[tri] = RTPrimitiveMaterial(albedoSlot: aSlot, lightmapSlot: lSlot)
+                    if materials[tri].albedoSlot == invalid {
+                        materials[tri] = RTPrimitiveMaterial(albedoSlot: aSlot, lightmapSlot: lSlot)
+                        assigned += 1
+                    } else {
+                        skippedOverwrite += 1
+                    }
                 }
-                assigned += max(0, end - firstTri)
             }
             rtPrimitiveMaterialBuffer = device.makeBuffer(bytes: materials,
                                                           length: materials.count * MemoryLayout<RTPrimitiveMaterial>.stride,
                                                           options: .storageModeShared)
             rtPrimitiveMaterialBuffer?.label = "Q3.RT.primitiveMaterials"
-            print("[RT] material table: albedo=\(topAlbedos.count)/\(albedoWeights.count) lightmap=\(topLightmaps.count)/\(lightmapWeights.count) assigned=\(assigned)/\(primitiveCount)")
+            print("[RT] material table: albedo=\(topAlbedos.count)/\(albedoWeights.count) lightmap=\(topLightmaps.count)/\(lightmapWeights.count) assigned=\(assigned)/\(primitiveCount) skippedOverwrite=\(skippedOverwrite)")
         }
 
         @MainActor
