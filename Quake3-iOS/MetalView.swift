@@ -3116,10 +3116,18 @@ struct MetalView: UIViewRepresentable {
 
                 float3 color;
                 if (hit.type == intersection_type::triangle) {
-                    float t = saturate(hit.distance / max(uniforms.jitterNearFar.w, 1.0));
-                    color = float3(1.0 - t);
+                    // Debug depth ramp: q3dm1 geometry is close relative to farPlane,
+                    // so compress the useful range to make pure RT legible.
+                    float t = saturate(hit.distance / 768.0);
+                    float depth = smoothstep(0.0, 1.0, t);
+                    float3 depthColor = mix(float3(1.0, 0.82, 0.12),
+                                            float3(0.05, 0.20, 0.95),
+                                            depth);
+                    float h = fract(sin(float(hit.primitive_id) * 12.9898) * 43758.5453);
+                    float band = 0.72 + 0.28 * h;
+                    color = depthColor * band;
                 } else {
-                    color = float3(0.08, 0.14, 0.22) + float3(0.02, 0.04, 0.08) * (1.0 - ndc.y);
+                    color = float3(0.04, 0.07, 0.13) + float3(0.01, 0.03, 0.06) * (1.0 - ndc.y);
                 }
                 if (any(isnan(color)) || any(isinf(color))) { color = float3(0.0); }
                 output.write(float4(saturate(color), 1.0), tid);
