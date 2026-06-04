@@ -347,7 +347,8 @@ struct MetalView: UIViewRepresentable {
             var cameraRight: SIMD4<Float>
             var cameraUp: SIMD4<Float>
             var jitterNearFar: SIMD4<Float> // xy=jitter, z=near, w=far
-            var fovParams: SIMD4<Float>     // x=tanHalfFovX, y=tanHalfFovY
+            var fovParams: SIMD4<Float>     // x=tanHalfFovX, y=tanHalfFovY, z=time
+            var rtToneParams: SIMD4<Float>  // x=exposure, y=gamma exponent, z=ambient floor, w=normal mix
         }
 
         struct RTPrimitiveMaterial {
@@ -3113,6 +3114,7 @@ struct MetalView: UIViewRepresentable {
                 float4 cameraUp;
                 float4 jitterNearFar;
                 float4 fovParams;
+                float4 rtToneParams;
             };
 
             struct RTWorldVertex {
@@ -3259,8 +3261,9 @@ struct MetalView: UIViewRepresentable {
                             }
                         } else {
                             float3 lightmap = lightmapTextures[mat.lightmapSlot].sample(clampSampler, lmuv).rgb;
-                            color = albedoSample.rgb * max(lightmap * 2.0, float3(0.18));
-                            color = mix(color, normalColor, 0.18);
+                            float ambientFloor = uniforms.rtToneParams.z;
+                            color = albedoSample.rgb * max(lightmap * 1.25, float3(ambientFloor));
+                            color = mix(color, normalColor, uniforms.rtToneParams.w);
                         }
                     } else {
                         color = normalColor;
@@ -3274,6 +3277,8 @@ struct MetalView: UIViewRepresentable {
                     }
                 }
                 if (any(isnan(color)) || any(isinf(color))) { color = float3(0.0); }
+                color = saturate(color * uniforms.rtToneParams.x);
+                color = pow(color, float3(max(uniforms.rtToneParams.y, 0.001)));
                 output.write(float4(saturate(color), 1.0), tid);
             }
 
@@ -3568,7 +3573,8 @@ struct MetalView: UIViewRepresentable {
                                               cameraRight: SIMD4<Float>(right.x, right.y, right.z, 0),
                                               cameraUp: SIMD4<Float>(up.x, up.y, up.z, 0),
                                               jitterNearFar: SIMD4<Float>(0, 0, 4.0, 8192.0),
-                                              fovParams: SIMD4<Float>(tan(sceneView.fovX * .pi / 360.0), tan(sceneView.fovY * .pi / 360.0), Float(CACurrentMediaTime() - frameTimeOrigin), 0))
+                                              fovParams: SIMD4<Float>(tan(sceneView.fovX * .pi / 360.0), tan(sceneView.fovY * .pi / 360.0), Float(CACurrentMediaTime() - frameTimeOrigin), 0),
+                                              rtToneParams: SIMD4<Float>(Q3_RTExposure(), Q3_RTGamma(), Q3_RTAmbient(), Q3_RTNormalMix()))
             if !rtOverlayLogPrintedOnce {
                 print("[RT] overlay active mix=\(mixValue) size=\(renderW)x\(renderH) camera=\(cameraPos)")
                 rtOverlayLogPrintedOnce = true

@@ -10068,6 +10068,42 @@ float Q3_SetRTMix(float mix) {
     return Q3_RTMix();
 }
 
+float Q3_RTExposure(void) {
+    if (ri.Cvar_Get == NULL) return 0.65f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_exposure", "0.65", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.65f;
+    if (v < 0.05f) v = 0.05f;
+    if (v > 4.0f) v = 4.0f;
+    return v;
+}
+
+float Q3_RTGamma(void) {
+    if (ri.Cvar_Get == NULL) return 1.15f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_gamma", "1.15", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 1.15f;
+    if (v < 0.25f) v = 0.25f;
+    if (v > 3.0f) v = 3.0f;
+    return v;
+}
+
+float Q3_RTAmbient(void) {
+    if (ri.Cvar_Get == NULL) return 0.08f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_ambient", "0.08", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.08f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    return v;
+}
+
+float Q3_RTNormalMix(void) {
+    if (ri.Cvar_Get == NULL) return 0.06f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_normal_mix", "0.06", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.06f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    return v;
+}
+
 /* PBR Phase 6 v2 — map-specific skybox IBL source.
  *
  * r_pbr_ibl_skybox: stem (no _ft/_bk/etc suffix, no .tga extension) of the
