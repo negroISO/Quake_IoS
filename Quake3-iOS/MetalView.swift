@@ -2403,49 +2403,49 @@ struct MetalView: UIViewRepresentable {
                 // gracefully in testing (the Mikkelsen TBN instability
                 // affects the underlying worldN, but the specular
                 // contribution is too smooth to amplify that artifact).
-                if (!is_null_texture(roughnessTexture) &&
-                    !is_null_texture(metallicTexture)) {
-                    // PBR Phase 4 production (v5-derived). Green-mix
-                    // diagnostic proved the branch fires and mix-blend
-                    // produces visible color delta — earlier attempts
-                    // (Cook-Torrance, additive Blinn-Phong) produced
-                    // values too small to read on a dark-red base.
-                    //
-                    // Production formulation: Fresnel-only rim blended
-                    // (not added) toward a smoothness-modulated highlight
-                    // color. Fresnel depends only on view direction —
-                    // always produces visible silhouette brightening
-                    // regardless of how worldN aligns with the fake sun.
-                    //
-                    // Roughness modulates rim intensity: smoother
-                    // surfaces (low roughness) get a stronger highlight.
-                    // Metallic modulates the rim color: dielectric gets
-                    // a neutral white-ish rim, metal pulls the rim
-                    // toward the base color (gold reflects gold, etc).
-                    float roughness = roughnessTexture.sample(textureSampler, in.texCoord).r;
-                    float metallic  = metallicTexture.sample(textureSampler, in.texCoord).r;
+                // PBR Phase 4 production (v6). Always-on Fresnel rim:
+                // fires for any weapon that has a normal map (which is
+                // the gate for entering this enclosing block already).
+                // When roughness + metallic textures are also bound
+                // (rocket only at the moment), we sample them for
+                // variable response. Otherwise we use sane defaults so
+                // shotgun and lightning gun also get visible shine.
+                //
+                // Intensity tuned DOWN from v5 (rimStrength range
+                // 0.20..0.55 instead of 0.45..1.00) — earlier setting
+                // read as "marble" on the rocket. New range gives a
+                // clearly visible bright edge without overwhelming the
+                // base color in the interior.
+                {
+                    float roughness = 0.55;  // default — semi-rough
+                    float metallic  = 0.50;  // default — partial metal
+                    if (!is_null_texture(roughnessTexture)) {
+                        roughness = roughnessTexture.sample(textureSampler, in.texCoord).r;
+                    }
+                    if (!is_null_texture(metallicTexture)) {
+                        metallic = metallicTexture.sample(textureSampler, in.texCoord).r;
+                    }
 
                     float3 V = normalize(uniforms.cameraPos - in.worldPos);
                     float NdotV = max(dot(worldN, V), 0.0);
 
-                    // Fresnel: pow(1-NdotV, 2) — quadratic falloff,
-                    // peaks at silhouette (NdotV=0), zero face-on.
-                    float fresnel = pow(1.0 - NdotV, 2.0);
+                    // Fresnel: pow(1-NdotV, 2.5) — sharper falloff than
+                    // the v5 quadratic to keep rim band narrower.
+                    float fresnel = pow(1.0 - NdotV, 2.5);
 
-                    // Rim color: dielectric → bright white-grey;
-                    // metallic → brightened base color.
+                    // Rim color: dielectric → light grey; metallic →
+                    // mildly brightened base. Less aggressive than v5's
+                    // base*1.6+0.25 to avoid the marble look.
                     float3 rimColor = mix(
-                        float3(0.85, 0.85, 0.85),
-                        base.rgb * 1.6 + 0.25,
+                        float3(0.75, 0.75, 0.78),
+                        base.rgb * 1.25 + 0.15,
                         metallic
                     );
 
-                    // Rim strength: smoothness scales intensity 0.3..1.0,
-                    // weighted by Fresnel. Mix-blend toward rim color
-                    // instead of additive — preserves base color in the
-                    // interior, blends to highlight at edges, can't be
-                    // washed out by dark base values.
-                    float rimStrength = fresnel * mix(0.45, 1.0, 1.0 - roughness);
+                    // Strength range tightened: floor 0.20 + smoothness
+                    // adds up to 0.55. Mix-blend toward rim color so
+                    // dark base never washes out the highlight.
+                    float rimStrength = fresnel * mix(0.20, 0.55, 1.0 - roughness);
                     base.rgb = mix(base.rgb, rimColor, saturate(rimStrength));
                 }
             }
