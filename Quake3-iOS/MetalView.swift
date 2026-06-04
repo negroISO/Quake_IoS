@@ -357,6 +357,8 @@ struct MetalView: UIViewRepresentable {
             var tcModCount: UInt32
             var _pad0: UInt32 = 0
             var alphaTcModControl: SIMD4<Float> // x=alphaTestThreshold
+            var materialFlags: SIMD4<UInt32>    // x=isSky, y=isEmissive
+            var materialParams: SIMD4<Float>    // x=emissiveIntensity
             var tcModTypes: SIMD4<UInt32>       // up to 4 tcMod types, 0=none
             var tcModParams0: SIMD4<Float>
             var tcModParams1: SIMD4<Float>
@@ -3018,6 +3020,7 @@ struct MetalView: UIViewRepresentable {
         private var rtLightmapHandles = [UInt32](repeating: 0, count: 16)
         private var rtLogPrintedOnce = false
         private var rtOverlayLogPrintedOnce = false
+        private var rtLastMaterialRefreshTime: Float = 0
 
         private struct PostprocessUniforms {
             var intensity: Float
@@ -3134,6 +3137,8 @@ struct MetalView: UIViewRepresentable {
                 uint tcModCount;
                 uint _pad0;
                 float4 alphaTcModControl;
+                uint4 materialFlags;
+                float4 materialParams;
                 uint4 tcModTypes;
                 float4 tcModParams0;
                 float4 tcModParams1;
@@ -3225,7 +3230,14 @@ struct MetalView: UIViewRepresentable {
                     float3 normalColor = N * 0.5 + 0.5;
 
                     RTPrimitiveMaterial mat = primitiveMaterials[tri];
-                    if (mat.albedoSlot < 110 && mat.lightmapSlot < 16) {
+                    constexpr sampler envSampler(filter::linear, address::clamp_to_edge);
+                    if (mat.materialFlags.x != 0) {
+                        if (!is_null_texture(envCube)) {
+                            color = envCube.sample(envSampler, rayDir).rgb;
+                        } else {
+                            color = float3(0.04, 0.07, 0.13) + float3(0.01, 0.03, 0.06) * (1.0 - ndc.y);
+                        }
+                    } else if (mat.albedoSlot < 110 && mat.lightmapSlot < 16) {
                         float2 uv0 = vertices[i0].texCoord;
                         float2 uv1 = vertices[i1].texCoord;
                         float2 uv2 = vertices[i2].texCoord;
@@ -3248,7 +3260,6 @@ struct MetalView: UIViewRepresentable {
                         }
                         constexpr sampler repeatSampler(filter::linear, address::repeat);
                         constexpr sampler clampSampler(filter::linear, address::clamp_to_edge);
-                        constexpr sampler envSampler(filter::linear, address::clamp_to_edge);
                         float4 albedoSample = albedoTextures[mat.albedoSlot].sample(repeatSampler, uv);
                         float alphaThreshold = mat.alphaTcModControl.x;
                         bool alphaReject = (alphaThreshold > 0.0 && albedoSample.a < alphaThreshold) ||
@@ -3263,6 +3274,10 @@ struct MetalView: UIViewRepresentable {
                             float3 lightmap = lightmapTextures[mat.lightmapSlot].sample(clampSampler, lmuv).rgb;
                             float ambientFloor = uniforms.rtToneParams.z;
                             color = albedoSample.rgb * max(lightmap * 1.25, float3(ambientFloor));
+                            if (mat.materialFlags.y != 0) {
+                                color += albedoSample.rgb * mat.materialParams.x;
+                                color = min(color, float3(2.0));
+                            }
                             color = mix(color, normalColor, uniforms.rtToneParams.w);
                         }
                     } else {
@@ -3331,7 +3346,7 @@ struct MetalView: UIViewRepresentable {
 
 
         @MainActor
-        private func buildRTPrimitiveMaterials(device: MTLDevice, primitiveCount: Int) {
+        private func buildRTPrimitiveMaterials(device: MTLDevice, primitiveCount: Int, log: Bool = true) {
             let invalid = UInt32.max
             let invalidMaterial = RTPrimitiveMaterial(
                 albedoSlot: invalid,
@@ -3339,6 +3354,8 @@ struct MetalView: UIViewRepresentable {
                 tcModCount: 0,
                 _pad0: 0,
                 alphaTcModControl: SIMD4<Float>(0, 0, 0, 0),
+                materialFlags: SIMD4<UInt32>(0, 0, 0, 0),
+                materialParams: SIMD4<Float>(0, 0, 0, 0),
                 tcModTypes: SIMD4<UInt32>(0, 0, 0, 0),
                 tcModParams0: SIMD4<Float>(0, 0, 0, 0),
                 tcModParams1: SIMD4<Float>(0, 0, 0, 0),
@@ -3406,9 +3423,16 @@ struct MetalView: UIViewRepresentable {
                 let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
                 guard stageCount > 0 else { continue }
                 let stage = Self.worldStage(draw, 0)
-                guard stage.useLightmap == 0,
-                      let aSlot = albedoSlots[stage.textureHandle],
-                      let lSlot = lightmapSlots[draw.lightmapTextureHandle] else { continue }
+                let skyFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
+                let isSkyDraw = (draw.flags & skyFlagBit) != 0
+                let aSlotOptional = albedoSlots[stage.textureHandle]
+                let lSlotOptional = lightmapSlots[draw.lightmapTextureHandle]
+                guard stage.useLightmap == 0 else { continue }
+                if !isSkyDraw && (aSlotOptional == nil || lSlotOptional == nil) { continue }
+                let aSlot = aSlotOptional ?? 0
+                let lSlot = lSlotOptional ?? 0
+                let blendMode = Self.worldBlendClass(for: stage)
+                let isEmissive = (blendMode == 1 || blendMode == 5)
                 let firstTri = Int(draw.firstIndex / 3)
                 let triCount = Int(draw.indexCount / 3)
                 guard firstTri < materials.count else { continue }
@@ -3429,6 +3453,8 @@ struct MetalView: UIViewRepresentable {
                             tcModCount: tcCount,
                             _pad0: 0,
                             alphaTcModControl: SIMD4<Float>(alphaThreshold, Float(tcCount), 0, 0),
+                            materialFlags: SIMD4<UInt32>(isSkyDraw ? 1 : 0, isEmissive ? 1 : 0, 0, 0),
+                            materialParams: SIMD4<Float>(isEmissive ? 0.8 : 0.0, 0, 0, 0),
                             tcModTypes: tcTypes,
                             tcModParams0: chain.p0,
                             tcModParams1: chain.p1,
@@ -3444,7 +3470,9 @@ struct MetalView: UIViewRepresentable {
                                                           length: materials.count * MemoryLayout<RTPrimitiveMaterial>.stride,
                                                           options: .storageModeShared)
             rtPrimitiveMaterialBuffer?.label = "Q3.RT.primitiveMaterials"
-            print("[RT] material table: albedo=\(topAlbedos.count)/\(albedoWeights.count) lightmap=\(topLightmaps.count)/\(lightmapWeights.count) assigned=\(assigned)/\(primitiveCount) skippedOverwrite=\(skippedOverwrite)")
+            if log {
+                print("[RT] material table: albedo=\(topAlbedos.count)/\(albedoWeights.count) lightmap=\(topLightmaps.count)/\(lightmapWeights.count) assigned=\(assigned)/\(primitiveCount) skippedOverwrite=\(skippedOverwrite)")
+            }
         }
 
         @MainActor
@@ -3556,6 +3584,14 @@ struct MetalView: UIViewRepresentable {
                 return nil
             }
             guard worldASBuilt, let worldAS = worldAccelerationStructure else { return nil }
+            let rtNow = Float(CACurrentMediaTime() - frameTimeOrigin)
+            if rtNow - rtLastMaterialRefreshTime >= (1.0 / 30.0) {
+                let primitiveCount = Int(Q3MetalRenderer_GetWorldIndexCount()) / 3
+                if primitiveCount > 0 {
+                    buildRTPrimitiveMaterials(device: device, primitiveCount: primitiveCount, log: false)
+                    rtLastMaterialRefreshTime = rtNow
+                }
+            }
             guard let primitiveMaterialBuffer = rtPrimitiveMaterialBuffer else { return nil }
             guard let rtPSO = ensureRTPipeline(device: device), let blendPSO = ensureRTBlendPipeline(device: device) else { return nil }
             guard ensureRTTextures(device: device, width: renderW, height: renderH, pixelFormat: rasterTexture.pixelFormat),
