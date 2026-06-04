@@ -3002,9 +3002,9 @@ struct MetalView: UIViewRepresentable {
         private var rtASPositionBuffer: MTLBuffer?
         private var rtASIndexBuffer: MTLBuffer?
         private var rtPrimitiveMaterialBuffer: MTLBuffer?
-        private let rtMaxAlbedoSlots = 64
+        private let rtMaxAlbedoSlots = 110
         private let rtMaxLightmapSlots = 16
-        private var rtAlbedoHandles = [UInt32](repeating: 0, count: 64)
+        private var rtAlbedoHandles = [UInt32](repeating: 0, count: 110)
         private var rtLightmapHandles = [UInt32](repeating: 0, count: 16)
         private var rtLogPrintedOnce = false
         private var rtOverlayLogPrintedOnce = false
@@ -3123,8 +3123,8 @@ struct MetalView: UIViewRepresentable {
             };
 
             kernel void rtKernel(texture2d<float, access::write> output [[texture(0)]],
-                                 array<texture2d<float>, 64> albedoTextures [[texture(2)]],
-                                 array<texture2d<float>, 16> lightmapTextures [[texture(66)]],
+                                 array<texture2d<float>, 110> albedoTextures [[texture(2)]],
+                                 array<texture2d<float>, 16> lightmapTextures [[texture(112)]],
                                  constant RayTracingUniforms &uniforms [[buffer(0)]],
                                  acceleration_structure<> worldAS [[buffer(1)]],
                                  const device uint *indices [[buffer(2)]],
@@ -3165,7 +3165,7 @@ struct MetalView: UIViewRepresentable {
                     float3 normalColor = N * 0.5 + 0.5;
 
                     RTPrimitiveMaterial mat = primitiveMaterials[tri];
-                    if (mat.albedoSlot < 64 && mat.lightmapSlot < 16) {
+                    if (mat.albedoSlot < 110 && mat.lightmapSlot < 16) {
                         float2 uv0 = vertices[i0].texCoord;
                         float2 uv1 = vertices[i1].texCoord;
                         float2 uv2 = vertices[i2].texCoord;
@@ -3438,7 +3438,7 @@ struct MetalView: UIViewRepresentable {
                     enc.setTexture(texture(for: rtAlbedoHandles[i], device: device), index: 2 + i)
                 }
                 for i in 0..<rtMaxLightmapSlots {
-                    enc.setTexture(texture(for: rtLightmapHandles[i], device: device), index: 66 + i)
+                    enc.setTexture(texture(for: rtLightmapHandles[i], device: device), index: 112 + i)
                 }
                 enc.setBytes(&uniforms, length: MemoryLayout<RayTracingUniforms>.stride, index: 0)
                 enc.setAccelerationStructure(worldAS, bufferIndex: 1)
