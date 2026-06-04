@@ -2405,42 +2405,48 @@ struct MetalView: UIViewRepresentable {
                 // contribution is too smooth to amplify that artifact).
                 if (!is_null_texture(roughnessTexture) &&
                     !is_null_texture(metallicTexture)) {
-                    // Production Phase 4 v3: Blinn-Phong with WIDE
-                    // highlight + Fresnel rim. The earlier gloss=43
-                    // exponent restricted the highlight to a narrow
-                    // mirror-angle band that Q3 viewmodel geometry
-                    // rarely hits relative to a fixed sun. Dropping
-                    // gloss to 6 spreads the highlight across most of
-                    // the model surface.
+                    // PBR Phase 4 production (v5-derived). Green-mix
+                    // diagnostic proved the branch fires and mix-blend
+                    // produces visible color delta — earlier attempts
+                    // (Cook-Torrance, additive Blinn-Phong) produced
+                    // values too small to read on a dark-red base.
                     //
-                    // The Fresnel rim contribution depends only on
-                    // view direction (not sun) — guarantees a visible
-                    // accent on the silhouette/edges regardless of
-                    // worldN/sun alignment. Reads as "wet chrome" or
-                    // "polished metal".
-                    float metallic  = 0.85;
-                    float roughness = 0.40;
+                    // Production formulation: Fresnel-only rim blended
+                    // (not added) toward a smoothness-modulated highlight
+                    // color. Fresnel depends only on view direction —
+                    // always produces visible silhouette brightening
+                    // regardless of how worldN aligns with the fake sun.
+                    //
+                    // Roughness modulates rim intensity: smoother
+                    // surfaces (low roughness) get a stronger highlight.
+                    // Metallic modulates the rim color: dielectric gets
+                    // a neutral white-ish rim, metal pulls the rim
+                    // toward the base color (gold reflects gold, etc).
+                    float roughness = roughnessTexture.sample(textureSampler, in.texCoord).r;
+                    float metallic  = metallicTexture.sample(textureSampler, in.texCoord).r;
 
                     float3 V = normalize(uniforms.cameraPos - in.worldPos);
-                    float3 H = normalize(V + sunDir);
-                    float NdotH = max(dot(worldN, H), 0.0);
                     float NdotV = max(dot(worldN, V), 0.0);
 
-                    // WIDE Blinn-Phong: gloss 6 (instead of 43) so the
-                    // highlight reads across more pixels.
-                    float spec = pow(NdotH, 6.0);
+                    // Fresnel: pow(1-NdotV, 2) — quadratic falloff,
+                    // peaks at silhouette (NdotV=0), zero face-on.
+                    float fresnel = pow(1.0 - NdotV, 2.0);
 
-                    // Fresnel rim — brightens silhouette edges.
-                    // pow(1-NdotV, 3) peaks where surface normal is
-                    // perpendicular to view, falls off toward face-on.
-                    float rim = pow(1.0 - NdotV, 3.0);
+                    // Rim color: dielectric → bright white-grey;
+                    // metallic → brightened base color.
+                    float3 rimColor = mix(
+                        float3(0.85, 0.85, 0.85),
+                        base.rgb * 1.6 + 0.25,
+                        metallic
+                    );
 
-                    // Metallic tints the highlight by base color.
-                    float3 specTint = mix(float3(1.0), base.rgb + 0.3, metallic * 0.6);
-
-                    // Combined: phong highlight + rim accent, both
-                    // tinted, weighted heavily so it's visibly bright.
-                    base.rgb += (spec * 1.2 + rim * 0.5) * specTint;
+                    // Rim strength: smoothness scales intensity 0.3..1.0,
+                    // weighted by Fresnel. Mix-blend toward rim color
+                    // instead of additive — preserves base color in the
+                    // interior, blends to highlight at edges, can't be
+                    // washed out by dark base values.
+                    float rimStrength = fresnel * mix(0.45, 1.0, 1.0 - roughness);
+                    base.rgb = mix(base.rgb, rimColor, saturate(rimStrength));
                 }
             }
             return base;

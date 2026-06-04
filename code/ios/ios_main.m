@@ -1040,7 +1040,7 @@ void Quake3_Init(const char *basePath) {
         /* Disable sound so the AVI muxer skips the audio stream (our
          * sim build doesn't wire up CoreAudio — dma.speed stays 0,
          * which ffprobe rejects as Invalid sample rate). */
-        "seta s_initsound 0; "
+        "seta s_initsound 1; "
         /* Notify area off: obituary kill-feed and engine diagnostic
          * spam both route through Com_Printf, so we can't show one
          * without the other. Losing obituary-text parity with the
