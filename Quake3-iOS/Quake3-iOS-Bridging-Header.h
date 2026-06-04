@@ -94,4 +94,16 @@ float Q3_PostprocessGamma(void);
 void Q3IOS_AudioSetSampleRate(int rate);
 int  Q3IOS_AudioPullStereo16(short *dest, int frames);
 
+/* PBR Phase 4 runtime tunables (added as part of overnight Phase F).
+ * Read by MetalView.swift each frame and pushed to the entity fragment
+ * shader as a constant uniform replacing the hardcoded magic numbers.
+ *
+ *   r_pbr_rim_intensity (0..1.5, default 0.55) — peak rim brightness.
+ *     Maps to mix(0.20, this, 1.0 - roughness) in the shader.
+ *   r_pbr_rim_falloff   (1..5,   default 2.5)  — Fresnel exponent.
+ *     Higher = narrower rim band; lower = broader.
+ */
+float Q3_PBRRimIntensity(void);
+float Q3_PBRRimFalloff(void);
+
 #endif

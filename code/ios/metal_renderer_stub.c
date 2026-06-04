@@ -9873,6 +9873,27 @@ float Q3_PostprocessGamma(void) {
     return v;
 }
 
+/* PBR Phase 4 runtime tunables. Defaults match the hardcoded values from
+ * b2b6f0c v6. Range-clamped so a misconfigured value can't blow out the
+ * highlight or make it invisible. */
+float Q3_PBRRimIntensity(void) {
+    if (ri.Cvar_Get == NULL) return 0.55f;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_rim_intensity", "0.55", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.55f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.5f) v = 1.5f;
+    return v;
+}
+
+float Q3_PBRRimFalloff(void) {
+    if (ri.Cvar_Get == NULL) return 2.5f;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_rim_falloff", "2.5", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 2.5f;
+    if (v < 1.0f) v = 1.0f;
+    if (v > 5.0f) v = 5.0f;
+    return v;
+}
+
 refexport_t *GetRefAPI(int apiVersion, refimport_t *rimp) {
     static refexport_t re;
 

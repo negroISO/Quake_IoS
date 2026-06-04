@@ -2121,6 +2121,7 @@ struct MetalView: UIViewRepresentable {
                                            constant EntityUniforms &uniforms [[buffer(1)]],
                                            constant DLightBlock &dlights [[buffer(2)]],
                                            constant float &pbrNormalScale [[buffer(3)]],
+                                           constant float2 &pbrRimParams [[buffer(4)]],
                                            texture2d<float> colorTexture [[texture(0)]],
                                            texture2d<float> normalTexture [[texture(1)]],
                                            texture2d<float> roughnessTexture [[texture(3)]],
@@ -2431,7 +2432,9 @@ struct MetalView: UIViewRepresentable {
 
                     // Fresnel: pow(1-NdotV, 2.5) — sharper falloff than
                     // the v5 quadratic to keep rim band narrower.
-                    float fresnel = pow(1.0 - NdotV, 2.5);
+                    // Phase F — pbrRimParams.x = peak intensity (default 0.55),
+                    // pbrRimParams.y = Fresnel exponent (default 2.5).
+                    float fresnel = pow(1.0 - NdotV, pbrRimParams.y);
 
                     // Rim color: dielectric → light grey; metallic →
                     // mildly brightened base. Less aggressive than v5's
@@ -2445,7 +2448,7 @@ struct MetalView: UIViewRepresentable {
                     // Strength range tightened: floor 0.20 + smoothness
                     // adds up to 0.55. Mix-blend toward rim color so
                     // dark base never washes out the highlight.
-                    float rimStrength = fresnel * mix(0.20, 0.55, 1.0 - roughness);
+                    float rimStrength = fresnel * mix(0.20, pbrRimParams.x, 1.0 - roughness);
                     base.rgb = mix(base.rgb, rimColor, saturate(rimStrength));
                 }
             }
@@ -4532,6 +4535,10 @@ struct MetalView: UIViewRepresentable {
                         // rotating geometry.
                         var pbrNormalScaleEntity: Float = wantsDepthHack ? 1.0 : 0.0
                         encoder.setFragmentBytes(&pbrNormalScaleEntity, length: 4, index: 3)
+                        // PBR Phase F — runtime tunable rim params at buffer(4).
+                        var pbrRimParamsEntity = SIMD2<Float>(
+                            Q3_PBRRimIntensity(), Q3_PBRRimFalloff())
+                        encoder.setFragmentBytes(&pbrRimParamsEntity, length: 8, index: 4)
                         // PBR Phase 4 — Cook-Torrance specular textures.
                         // Roughness at slot 3, metallic at slot 4. The
                         // MSL fragment guards both with is_null_texture
@@ -4711,6 +4718,11 @@ struct MetalView: UIViewRepresentable {
                         // PBR Phase 4 — HUD/scoreboard sub-pass: world-style tight range.
                         var pbrNormalScaleSub: Float = 0.0
                         encoder.setFragmentBytes(&pbrNormalScaleSub, length: 4, index: 3)
+                        // PBR Phase F — rim params at buffer(4) — same defaults as main entity pass
+                        // so HUD entities (rotating weapon icons) read sensibly.
+                        var pbrRimParamsSub = SIMD2<Float>(
+                            Q3_PBRRimIntensity(), Q3_PBRRimFalloff())
+                        encoder.setFragmentBytes(&pbrRimParamsSub, length: 8, index: 4)
                         encoder.drawIndexedPrimitives(
                             type: .triangle,
                             indexCount: Int(draw.indexCount),
