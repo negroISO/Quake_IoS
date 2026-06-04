@@ -3096,9 +3096,22 @@ struct MetalView: UIViewRepresentable {
                 float4 fovParams;
             };
 
+            struct RTWorldVertex {
+                packed_float3 position;
+                float2 texCoord;
+                float2 lightmapTexCoord;
+                packed_float3 normal;
+                float4 color;
+                float4 autospriteCenter;
+                float4 autospriteLongAxis;
+                packed_float3 lightingDiffuse;
+            };
+
             kernel void rtKernel(texture2d<float, access::write> output [[texture(0)]],
                                  constant RayTracingUniforms &uniforms [[buffer(0)]],
                                  acceleration_structure<> worldAS [[buffer(1)]],
+                                 const device uint *indices [[buffer(2)]],
+                                 const device RTWorldVertex *vertices [[buffer(3)]],
                                  uint2 tid [[thread_position_in_grid]]) {
                 if (tid.x >= output.get_width() || tid.y >= output.get_height()) return;
                 float2 uv = (float2(tid) + 0.5) / float2(output.get_width(), output.get_height());
@@ -3111,21 +3124,29 @@ struct MetalView: UIViewRepresentable {
                                         + right * (ndc.x * uniforms.fovParams.x)
                                         + up * (-ndc.y * uniforms.fovParams.y));
                 ray r(uniforms.cameraPos.xyz, rayDir, uniforms.jitterNearFar.z, uniforms.jitterNearFar.w);
-                intersector<> i;
+                intersector<triangle_data> i;
                 auto hit = i.intersect(r, worldAS);
 
                 float3 color;
                 if (hit.type == intersection_type::triangle) {
-                    // Debug depth ramp: q3dm1 geometry is close relative to farPlane,
-                    // so compress the useful range to make pure RT legible.
-                    float t = saturate(hit.distance / 768.0);
-                    float depth = smoothstep(0.0, 1.0, t);
-                    float3 depthColor = mix(float3(1.0, 0.82, 0.12),
-                                            float3(0.05, 0.20, 0.95),
-                                            depth);
-                    float h = fract(sin(float(hit.primitive_id) * 12.9898) * 43758.5453);
-                    float band = 0.72 + 0.28 * h;
-                    color = depthColor * band;
+                    uint tri = hit.primitive_id;
+                    uint i0 = indices[tri * 3 + 0];
+                    uint i1 = indices[tri * 3 + 1];
+                    uint i2 = indices[tri * 3 + 2];
+                    float3 n0 = float3(vertices[i0].normal);
+                    float3 n1 = float3(vertices[i1].normal);
+                    float3 n2 = float3(vertices[i2].normal);
+                    float2 bary = hit.triangle_barycentric_coord;
+                    float w = 1.0 - bary.x - bary.y;
+                    float3 N = n0 * w + n1 * bary.x + n2 * bary.y;
+                    if (dot(N, N) < 1.0e-6) {
+                        float3 p0 = float3(vertices[i0].position);
+                        float3 p1 = float3(vertices[i1].position);
+                        float3 p2 = float3(vertices[i2].position);
+                        N = cross(p1 - p0, p2 - p0);
+                    }
+                    N = normalize(N);
+                    color = N * 0.5 + 0.5;
                 } else {
                     color = float3(0.04, 0.07, 0.13) + float3(0.01, 0.03, 0.06) * (1.0 - ndc.y);
                 }
@@ -3296,6 +3317,8 @@ struct MetalView: UIViewRepresentable {
                 enc.setTexture(rtTex, index: 0)
                 enc.setBytes(&uniforms, length: MemoryLayout<RayTracingUniforms>.stride, index: 0)
                 enc.setAccelerationStructure(worldAS, bufferIndex: 1)
+                enc.setBuffer(rtASIndexBuffer, offset: 0, index: 2)
+                enc.setBuffer(rtASVertexBuffer, offset: 0, index: 3)
                 enc.dispatchThreadgroups(groups, threadsPerThreadgroup: tg)
                 enc.endEncoding()
             }
