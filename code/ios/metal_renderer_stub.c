@@ -9913,6 +9913,64 @@ int Q3_PBRPhase5Enabled(void) {
     return cv ? cv->integer : 1;
 }
 
+/* PBR Phase 6 v2 — map-specific skybox IBL source.
+ *
+ * r_pbr_ibl_skybox: stem (no _ft/_bk/etc suffix, no .tga extension) of the
+ * 6-face Q3 skybox TGAs Swift should load from the pak filesystem to build
+ * the IBL environment cubemap. e.g. "env/space1" → loads env/space1_ft.tga,
+ * env/space1_bk.tga, env/space1_lf.tga, env/space1_rt.tga, env/space1_up.tga,
+ * env/space1_dn.tga. When the cvar is empty OR any of the 6 files cannot
+ * be read, Swift falls back to the procedural sky-gradient cube.
+ *
+ * Default "env/space1" — Q3 stock skybox used in nv15demo's q3dm17 + many
+ * DM maps; widest visual coverage for first-run experience.
+ *
+ * Q3_PBRIBLSkyboxName(out, max_len): writes the current cvar value to `out`
+ * (null-terminated). Returns 1 if non-empty, 0 if empty/missing/no ri yet. */
+int Q3_PBRIBLSkyboxName(char *out, int max_len) {
+    if (out == NULL || max_len <= 0) return 0;
+    out[0] = '\0';
+    if (ri.Cvar_Get == NULL) {
+        Q_strncpyz(out, "env/space1", max_len);
+        return 1;
+    }
+    cvar_t *cv = ri.Cvar_Get("r_pbr_ibl_skybox", "env/space1", CVAR_ARCHIVE);
+    if (cv == NULL || cv->string == NULL || cv->string[0] == '\0') return 0;
+    Q_strncpyz(out, cv->string, max_len);
+    return out[0] != '\0' ? 1 : 0;
+}
+
+/* PBR Phase 6 v2 — engine FS bridge for Swift TGA reads.
+ *
+ * Swift can't read pk3-packed files directly via Bundle paths; this routes
+ * through the Q3 engine FS so pak0.pk3 / pak1.pk3 / etc are searched. Mirrors
+ * the ri.FS_ReadFile / ri.FS_FreeFile pattern used elsewhere in this TU.
+ * Caller MUST call Q3MetalRenderer_FSFreeFile on the returned pointer.
+ *
+ * Returns: 1 on success with *out_buf set + *out_size populated; 0 on failure
+ *   (nothing to free). Thread safety: Q3 engine FS is single-threaded; call
+ *   from Swift main thread only (same context where Q3 renderer runs). */
+int Q3MetalRenderer_FSReadFile(const char *path, const unsigned char **out_buf, int *out_size) {
+    if (out_buf == NULL || out_size == NULL) return 0;
+    *out_buf = NULL;
+    *out_size = 0;
+    if (path == NULL || path[0] == '\0' || ri.FS_ReadFile == NULL) return 0;
+    void *fileBuffer = NULL;
+    int sz = ri.FS_ReadFile((char *)path, &fileBuffer);
+    if (sz <= 0 || fileBuffer == NULL) {
+        if (fileBuffer != NULL && ri.FS_FreeFile != NULL) ri.FS_FreeFile(fileBuffer);
+        return 0;
+    }
+    *out_buf = (const unsigned char *)fileBuffer;
+    *out_size = sz;
+    return 1;
+}
+
+void Q3MetalRenderer_FSFreeFile(const unsigned char *buf) {
+    if (buf == NULL || ri.FS_FreeFile == NULL) return;
+    ri.FS_FreeFile((void *)buf);
+}
+
 refexport_t *GetRefAPI(int apiVersion, refimport_t *rimp) {
     static refexport_t re;
 

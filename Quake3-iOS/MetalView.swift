@@ -3269,6 +3269,224 @@ struct MetalView: UIViewRepresentable {
             }
         }
 
+        /// Phase 6 v2 — minimal TGA decoder for skybox face files.
+        ///
+        /// Q3 ships skybox faces as 256×256 uncompressed Type 2 truecolor TGAs
+        /// (RGB, 24-bit). A handful are RGBA 32-bit. RLE-compressed (Type 10)
+        /// support skipped — none of Q3's stock skyboxes use it.
+        ///
+        /// Returns RGBA8 bytes (width*height*4) in CPU memory plus dimensions,
+        /// or nil on parse failure / unsupported variant. TGA byte order is
+        /// stored BGR(A), origin is bottom-left by default; we swap to RGBA
+        /// and flip vertically so the caller gets standard top-down RGBA
+        /// ready for `MTLTexture.replace(region:slice:withBytes:)`.
+        ///
+        /// Reference: TGA spec v2.0 §3.1-3.4. Header layout (18 bytes):
+        ///   0:  ID length             u8
+        ///   1:  color map type        u8 (must be 0 — palette unsupported)
+        ///   2:  image type            u8 (must be 2 — uncompressed truecolor)
+        ///   3:  color map spec        u16+u16+u8 (5 bytes, all 0 expected)
+        ///   8:  X origin              u16 le
+        ///   10: Y origin              u16 le
+        ///   12: width                 u16 le
+        ///   14: height                u16 le
+        ///   16: bits per pixel        u8 (24 or 32)
+        ///   17: image descriptor      u8 (bit 5 = top-down origin flag,
+        ///                                bits 0-3 = alpha bits)
+        private func decodeTGAToRGBA(_ data: UnsafeBufferPointer<UInt8>) -> (rgba: [UInt8], width: Int, height: Int)? {
+            guard data.count >= 18 else { return nil }
+            let idLen     = Int(data[0])
+            let mapType   = Int(data[1])
+            let imageType = Int(data[2])
+            // Tolerate only uncompressed truecolor with no color map.
+            guard mapType == 0 else { return nil }
+            guard imageType == 2 else { return nil }
+            let width  = Int(data[12]) | (Int(data[13]) << 8)
+            let height = Int(data[14]) | (Int(data[15]) << 8)
+            let bpp    = Int(data[16])
+            let descriptor = Int(data[17])
+            guard width > 0, height > 0 else { return nil }
+            guard bpp == 24 || bpp == 32 else { return nil }
+            let bytesPerPixel = bpp / 8
+            let pixelDataOffset = 18 + idLen
+            let expectedPixelBytes = width * height * bytesPerPixel
+            guard data.count >= pixelDataOffset + expectedPixelBytes else { return nil }
+            // bit 5 of descriptor → top-down origin if set, bottom-up if clear
+            let topDown = (descriptor & 0x20) != 0
+            var rgba = [UInt8](repeating: 0, count: width * height * 4)
+            for row in 0..<height {
+                let srcRow = topDown ? row : (height - 1 - row)
+                let srcOffset = pixelDataOffset + srcRow * width * bytesPerPixel
+                let dstOffset = row * width * 4
+                for col in 0..<width {
+                    let s = srcOffset + col * bytesPerPixel
+                    let d = dstOffset + col * 4
+                    // TGA stores BGR(A); swap to RGBA
+                    rgba[d + 0] = data[s + 2]
+                    rgba[d + 1] = data[s + 1]
+                    rgba[d + 2] = data[s + 0]
+                    rgba[d + 3] = bpp == 32 ? data[s + 3] : 255
+                }
+            }
+            return (rgba, width, height)
+        }
+
+        /// Phase 6 v2 — CoreGraphics-based fallback decoder for image data
+        /// CGImageSource recognises (JPG / PNG / HEIC / TIFF). Q3's stock
+        /// skybox face TGAs were re-encoded as JPG in pak0.pk3 to save space,
+        /// so the JPG path is the actual default; TGA support is for any
+        /// modder authoring custom skyboxes in TGA. Renders the decoded
+        /// image into a CPU RGBA buffer via a CGBitmapContext.
+        private func decodeImageDataToRGBA(_ data: Data) -> (rgba: [UInt8], width: Int, height: Int)? {
+            guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+                  let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+            let w = cgImage.width
+            let h = cgImage.height
+            guard w > 0, h > 0 else { return nil }
+            var rgba = [UInt8](repeating: 0, count: w * h * 4)
+            let colorSpace = CGColorSpaceCreateDeviceRGB()
+            let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
+            let ok = rgba.withUnsafeMutableBytes { bytes -> Bool in
+                guard let ctx = CGContext(data: bytes.baseAddress,
+                                           width: w, height: h,
+                                           bitsPerComponent: 8,
+                                           bytesPerRow: w * 4,
+                                           space: colorSpace,
+                                           bitmapInfo: bitmapInfo) else { return false }
+                ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))
+                return true
+            }
+            guard ok else { return nil }
+            return (rgba, w, h)
+        }
+
+        /// Phase 6 v2 — load a single Q3 skybox face by stem (no extension).
+        /// Tries `.tga` first via the minimal TGA decoder (for modders shipping
+        /// custom skies as TGA), then `.jpg` via CoreGraphics (Q3 stock skies).
+        /// Returns RGBA bytes + dimensions on success, nil if neither variant
+        /// resolves. Routes through engine FS so pak0.pk3 content is found.
+        private func loadSkyboxFace(stem: String) -> (rgba: [UInt8], width: Int, height: Int)? {
+            // Try .tga first
+            let tgaPath = "\(stem).tga"
+            var bufPtr: UnsafePointer<UInt8>? = nil
+            var size: Int32 = 0
+            var ok = tgaPath.withCString { cstr -> Int32 in
+                return Q3MetalRenderer_FSReadFile(cstr, &bufPtr, &size)
+            }
+            if ok != 0, let raw = bufPtr, size > 0 {
+                let buf = UnsafeBufferPointer(start: raw, count: Int(size))
+                let decoded = decodeTGAToRGBA(buf)
+                Q3MetalRenderer_FSFreeFile(raw)
+                if let r = decoded { return r }
+                // TGA file exists but decode failed — could be RLE or palette.
+                // Fall through to JPG attempt.
+            }
+            // Try .jpg via CoreGraphics
+            let jpgPath = "\(stem).jpg"
+            bufPtr = nil
+            size = 0
+            ok = jpgPath.withCString { cstr -> Int32 in
+                return Q3MetalRenderer_FSReadFile(cstr, &bufPtr, &size)
+            }
+            guard ok != 0, let raw = bufPtr, size > 0 else { return nil }
+            defer { Q3MetalRenderer_FSFreeFile(raw) }
+            let buf = UnsafeBufferPointer(start: raw, count: Int(size))
+            let data = Data(bytes: buf.baseAddress!, count: buf.count)
+            return decodeImageDataToRGBA(data)
+        }
+
+        /// Phase 6 v2 — attempt to build the IBL cube from the active map's
+        /// skybox faces. Reads the `r_pbr_ibl_skybox` cvar via the C bridge,
+        /// then loads 6 TGAs (`<stem>_ft.tga`, `_bk`, `_lf`, `_rt`, `_up`,
+        /// `_dn`). Returns the cubemap on full success, or nil if any face
+        /// fails — caller falls back to the procedural sky-gradient cube.
+        ///
+        /// Face mapping (Q3 sky face → Metal cube slice):
+        ///   slice 0 (+X right) = _rt
+        ///   slice 1 (-X left)  = _lf
+        ///   slice 2 (+Y top)   = _up
+        ///   slice 3 (-Y bottom)= _dn
+        ///   slice 4 (+Z front) = _ft
+        ///   slice 5 (-Z back)  = _bk
+        ///
+        /// Q3 face orientation correction: some TGAs need horizontal/vertical
+        /// flips because Q3's world axes don't match Metal's cubemap face
+        /// orientation. v1 ships the simple mapping; if the resulting
+        /// reflection looks rotated 90° on a face, swap the suffix mapping
+        /// in this method.
+        private func tryBuildMapSkyboxCube() -> MTLTexture? {
+            // Read active skybox stem
+            var nameBuf = [CChar](repeating: 0, count: 128)
+            let gotName = nameBuf.withUnsafeMutableBufferPointer { p -> Int32 in
+                Q3_PBRIBLSkyboxName(p.baseAddress, Int32(p.count))
+            }
+            guard gotName != 0 else { return nil }
+            let stem = String(cString: nameBuf)
+            guard !stem.isEmpty else { return nil }
+
+            let suffixes = ["_rt", "_lf", "_up", "_dn", "_ft", "_bk"]
+            var faceData: [(rgba: [UInt8], width: Int, height: Int)] = []
+            for suffix in suffixes {
+                let faceStem = "\(stem)\(suffix)"
+                guard let face = loadSkyboxFace(stem: faceStem) else {
+                    pbrLog("[Q3-PBR-IBL] map skybox FS read MISS stem=\(faceStem) (.tga and .jpg both unavailable) — falling back to procedural")
+                    return nil
+                }
+                faceData.append(face)
+            }
+            // All 6 faces must share dimensions (square)
+            let baseSize = faceData[0].width
+            guard baseSize > 0, baseSize == faceData[0].height else { return nil }
+            for f in faceData {
+                if f.width != baseSize || f.height != baseSize {
+                    pbrLog("[Q3-PBR-IBL] map skybox face size mismatch — falling back")
+                    return nil
+                }
+            }
+
+            // Build cube
+            guard let device = self.commandQueue?.device else { return nil }
+            let desc = MTLTextureDescriptor.textureCubeDescriptor(
+                pixelFormat: .rgba8Unorm,
+                size: baseSize,
+                mipmapped: true
+            )
+            desc.usage = [.shaderRead]
+            desc.storageMode = .shared
+            guard let cube = device.makeTexture(descriptor: desc) else {
+                pbrLog("[Q3-PBR-IBL] map skybox cube alloc FAILED size=\(baseSize)")
+                return nil
+            }
+            cube.label = "Q3.pbr.envcube.map.\(stem)"
+
+            let bytesPerRow = baseSize * 4
+            let bytesPerImage = bytesPerRow * baseSize
+            let region = MTLRegionMake2D(0, 0, baseSize, baseSize)
+            for face in 0..<6 {
+                faceData[face].rgba.withUnsafeBytes { rawBuf in
+                    cube.replace(region: region,
+                                 mipmapLevel: 0,
+                                 slice: face,
+                                 withBytes: rawBuf.baseAddress!,
+                                 bytesPerRow: bytesPerRow,
+                                 bytesPerImage: bytesPerImage)
+                }
+            }
+            // Generate mip chain for roughness-based specular sampling
+            if let queue = device.makeCommandQueue(),
+               let cb = queue.makeCommandBuffer(),
+               let blit = cb.makeBlitCommandEncoder() {
+                blit.generateMipmaps(for: cube)
+                blit.endEncoding()
+                cb.commit()
+                cb.waitUntilCompleted()
+            }
+            NSLog("[Q3-PBR-IBL] map skybox envCube ready stem=%@ %dx%dx6 mips=%d",
+                  stem, baseSize, baseSize, cube.mipmapLevelCount)
+            pbrLog("[Q3-PBR-IBL] map skybox envCube ready stem=\(stem) \(baseSize)x\(baseSize)x6 mips=\(cube.mipmapLevelCount)")
+            return cube
+        }
+
         /// Phase 6 — procedural sky-gradient environment cubemap.
         ///
         /// Built once at first call; reused across all entity draws via
@@ -3291,6 +3509,17 @@ struct MetalView: UIViewRepresentable {
             if let cube = pbrEnvCube { return cube }
             if pbrEnvCubeAttempted { return nil }
             pbrEnvCubeAttempted = true
+
+            // Phase 6 v2 — try map-specific skybox cube first. Returns nil on
+            // any miss (engine FS not ready, skybox name empty, any of the 6
+            // TGAs fail to read, decode fails, sizes mismatch). On success
+            // we cache and return immediately; the procedural fallback below
+            // never fires for this session.
+            if let mapCube = tryBuildMapSkyboxCube() {
+                pbrEnvCube = mapCube
+                return mapCube
+            }
+
             guard let device = self.commandQueue?.device else { return nil }
 
             let size = 64

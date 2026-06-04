@@ -115,4 +115,16 @@ float Q3_PBRRimFalloff(void);
 int Q3_PBRIBLEnabled(void);
 int Q3_PBRPhase5Enabled(void);
 
+/* PBR Phase 6 v2 — map-specific skybox IBL.
+ *
+ * Q3_PBRIBLSkyboxName: writes the active r_pbr_ibl_skybox cvar value to
+ *   `out` (null-terminated). Returns 1 on non-empty, 0 on empty/missing.
+ * Q3MetalRenderer_FSReadFile/FSFreeFile: Swift→engine FS bridge so Swift
+ *   can read pk3-packed env/<name>_*.tga skybox face textures, decode them
+ *   with the minimal Type 2 truecolor reader in MetalView.swift, and build
+ *   a real per-map IBL cube. Callers MUST FSFreeFile what FSReadFile gives. */
+int Q3_PBRIBLSkyboxName(char *out, int max_len);
+int Q3MetalRenderer_FSReadFile(const char *path, const unsigned char **out_buf, int *out_size);
+void Q3MetalRenderer_FSFreeFile(const unsigned char *buf);
+
 #endif
