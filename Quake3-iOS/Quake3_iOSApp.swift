@@ -198,9 +198,8 @@ struct Quake3_iOSApp: App {
                             NSLog("[Q3-BOOT] back on main; engine ready")
                             DebugTelemetry.shared.log(source: Self.telemetrySource, type: "engine_ready")
                             print("[Swift] Engine initialized")
-                            let rtLine = rtMix.consoleCommand + "\n"
-                            NSLog("[Q3-BOOT] queuing RT cvar: %@", rtMix.consoleCommand)
-                            rtLine.withCString { Q3Exec_Command($0) }
+                            let appliedRTMix = Q3_SetRTMix(rtMix.value)
+                            NSLog("[Q3-BOOT] applied RT cvar: %@ (actual %.3f)", rtMix.consoleCommand, appliedRTMix)
                             if let cmd = launchCommand {
                                 let line = cmd + "\n"
                                 NSLog("[Q3-BOOT] queuing command: %@", cmd)

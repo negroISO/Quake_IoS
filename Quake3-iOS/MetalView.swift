@@ -172,6 +172,7 @@ enum Q3RTMix: String, CaseIterable {
         }
     }
 
+    var value: Float { Float(rawValue) ?? 0 }
     var consoleCommand: String { "r_rt_mix \(rawValue)" }
 }
 
@@ -341,17 +342,12 @@ struct MetalView: UIViewRepresentable {
         struct RayTracingUniforms {
             var viewProjection: simd_float4x4
             var invViewProjection: simd_float4x4
-            var cameraPos: SIMD3<Float>
-            var _pad0: Float = 0
-            var cameraForward: SIMD3<Float>
-            var _pad1: Float = 0
-            var cameraRight: SIMD3<Float>
-            var _pad2: Float = 0
-            var cameraUp: SIMD3<Float>
-            var _pad3: Float = 0
-            var jitter: SIMD2<Float>
-            var nearPlane: Float
-            var farPlane: Float
+            var cameraPos: SIMD4<Float>
+            var cameraForward: SIMD4<Float>
+            var cameraRight: SIMD4<Float>
+            var cameraUp: SIMD4<Float>
+            var jitterNearFar: SIMD4<Float> // xy=jitter, z=near, w=far
+            var fovParams: SIMD4<Float>     // x=tanHalfFovX, y=tanHalfFovY
         }
 
         struct WorldDrawUniforms {
@@ -2998,8 +2994,10 @@ struct MetalView: UIViewRepresentable {
         private var worldASBuilt = false
         private var worldASGeneration: UInt32 = 0
         private var rtASVertexBuffer: MTLBuffer?
+        private var rtASPositionBuffer: MTLBuffer?
         private var rtASIndexBuffer: MTLBuffer?
         private var rtLogPrintedOnce = false
+        private var rtOverlayLogPrintedOnce = false
 
         private struct PostprocessUniforms {
             var intensity: Float
@@ -3090,13 +3088,12 @@ struct MetalView: UIViewRepresentable {
             struct RayTracingUniforms {
                 float4x4 viewProjection;
                 float4x4 invViewProjection;
-                packed_float3 cameraPos; float _pad0;
-                packed_float3 cameraForward; float _pad1;
-                packed_float3 cameraRight; float _pad2;
-                packed_float3 cameraUp; float _pad3;
-                float2 jitter;
-                float nearPlane;
-                float farPlane;
+                float4 cameraPos;
+                float4 cameraForward;
+                float4 cameraRight;
+                float4 cameraUp;
+                float4 jitterNearFar;
+                float4 fovParams;
             };
 
             kernel void rtKernel(texture2d<float, access::write> output [[texture(0)]],
@@ -3105,29 +3102,27 @@ struct MetalView: UIViewRepresentable {
                                  uint2 tid [[thread_position_in_grid]]) {
                 if (tid.x >= output.get_width() || tid.y >= output.get_height()) return;
                 float2 uv = (float2(tid) + 0.5) / float2(output.get_width(), output.get_height());
-                uv += uniforms.jitter;
+                uv += uniforms.jitterNearFar.xy;
                 float2 ndc = uv * 2.0 - 1.0;
-                float4 rayClip = float4(ndc.x, -ndc.y, 1.0, 1.0);
-                float4 rayWorld = uniforms.invViewProjection * rayClip;
-                rayWorld.xyz /= max(rayWorld.w, 1.0e-6);
-                float3 rayDir = normalize(rayWorld.xyz - float3(uniforms.cameraPos));
-
-                ray r;
-                r.origin = float3(uniforms.cameraPos);
-                r.direction = rayDir;
-                r.min_distance = uniforms.nearPlane;
-                r.max_distance = uniforms.farPlane;
+                float3 fwd = normalize(uniforms.cameraForward.xyz);
+                float3 right = normalize(uniforms.cameraRight.xyz);
+                float3 up = normalize(uniforms.cameraUp.xyz);
+                float3 rayDir = normalize((-fwd)
+                                        + right * (ndc.x * uniforms.fovParams.x)
+                                        + up * (-ndc.y * uniforms.fovParams.y));
+                ray r(uniforms.cameraPos.xyz, rayDir, uniforms.jitterNearFar.z, uniforms.jitterNearFar.w);
                 intersector<> i;
                 auto hit = i.intersect(r, worldAS);
 
                 float3 color;
                 if (hit.type == intersection_type::triangle) {
-                    float t = saturate(hit.distance / uniforms.farPlane);
+                    float t = saturate(hit.distance / max(uniforms.jitterNearFar.w, 1.0));
                     color = float3(1.0 - t);
                 } else {
-                    color = float3(0.2, 0.3, 0.5);
+                    color = float3(0.08, 0.14, 0.22) + float3(0.02, 0.04, 0.08) * (1.0 - ndc.y);
                 }
-                output.write(float4(color, 1.0), tid);
+                if (any(isnan(color)) || any(isinf(color))) { color = float3(0.0); }
+                output.write(float4(saturate(color), 1.0), tid);
             }
 
             kernel void blendRT(texture2d<float, access::read> rt [[texture(0)]],
@@ -3136,9 +3131,14 @@ struct MetalView: UIViewRepresentable {
                                 constant float &mixAmount [[buffer(0)]],
                                 uint2 tid [[thread_position_in_grid]]) {
                 if (tid.x >= output.get_width() || tid.y >= output.get_height()) return;
-                float3 rtColor = rt.read(tid).rgb;
-                float3 rasterColor = raster.read(tid).rgb;
-                float3 blended = mix(rasterColor, rtColor, saturate(mixAmount));
+                float m = saturate(mixAmount);
+                float3 rtColor = saturate(rt.read(tid).rgb);
+                if (m >= 0.999) {
+                    output.write(float4(rtColor, 1.0), tid);
+                    return;
+                }
+                float3 rasterColor = saturate(raster.read(tid).rgb);
+                float3 blended = mix(rasterColor, rtColor, m);
                 output.write(float4(blended, 1.0), tid);
             }
             """
@@ -3175,22 +3175,38 @@ struct MetalView: UIViewRepresentable {
         @MainActor
         private func buildWorldAccelerationStructure(device: MTLDevice) -> MTLAccelerationStructure? {
             guard device.supportsRaytracing, Q3MetalRenderer_IsWorldLoaded() != 0 else { return nil }
-            guard let vb = worldVertexBuffer, let ib = worldIndexBuffer else { return nil }
+            guard let ib = worldIndexBuffer else { return nil }
             let vertexCount = Int(Q3MetalRenderer_GetWorldVertexCount())
             let indexCount = Int(Q3MetalRenderer_GetWorldIndexCount())
-            guard vertexCount > 0, indexCount >= 3 else { return nil }
+            guard vertexCount > 0, indexCount >= 3, let src = Q3MetalRenderer_GetWorldVertices() else { return nil }
+
+            let verts = UnsafeBufferPointer(start: src, count: vertexCount)
+            var compactPositions = [Float]()
+            compactPositions.reserveCapacity(vertexCount * 3)
+            for v in verts {
+                compactPositions.append(v.position.0)
+                compactPositions.append(v.position.1)
+                compactPositions.append(v.position.2)
+            }
+            guard let positionBuffer = device.makeBuffer(bytes: compactPositions,
+                                                         length: compactPositions.count * MemoryLayout<Float>.stride,
+                                                         options: .storageModeShared) else {
+                print("[RT] AS compact position buffer allocation failed")
+                return nil
+            }
+            positionBuffer.label = "Q3.RT.positions.compact"
+            rtASPositionBuffer = positionBuffer
 
             let geomDesc = MTLAccelerationStructureTriangleGeometryDescriptor()
-            geomDesc.vertexBuffer = vb
+            geomDesc.vertexBuffer = positionBuffer
             geomDesc.vertexBufferOffset = 0
-            geomDesc.vertexStride = MemoryLayout<GPUWorldVertex>.stride
+            geomDesc.vertexStride = 3 * MemoryLayout<Float>.stride
             geomDesc.vertexFormat = .float3
             geomDesc.indexBuffer = ib
             geomDesc.indexBufferOffset = 0
             geomDesc.indexType = .uint32
             geomDesc.triangleCount = indexCount / 3
             geomDesc.opaque = true
-
             let asDesc = MTLPrimitiveAccelerationStructureDescriptor()
             asDesc.geometryDescriptors = [geomDesc]
             let sizes = device.accelerationStructureSizes(descriptor: asDesc)
@@ -3208,7 +3224,7 @@ struct MetalView: UIViewRepresentable {
             enc.endEncoding()
             cb.commit(); cb.waitUntilCompleted()
             if let err = cb.error { print("[RT] AS build failed: \(err)"); return nil }
-            rtASVertexBuffer = vb; rtASIndexBuffer = ib
+            rtASVertexBuffer = worldVertexBuffer; rtASIndexBuffer = ib
             print("[RT] built world AS: vertices=\(vertexCount) indices=\(indexCount) tris=\(indexCount / 3) size=\(sizes.accelerationStructureSize)")
             return accel
         }
@@ -3254,13 +3270,16 @@ struct MetalView: UIViewRepresentable {
             let up = SIMD3<Float>(sceneView.viewAxis.6, sceneView.viewAxis.7, sceneView.viewAxis.8)
             var uniforms = RayTracingUniforms(viewProjection: viewProj,
                                               invViewProjection: simd_inverse(viewProj),
-                                              cameraPos: cameraPos,
-                                              cameraForward: forward,
-                                              cameraRight: right,
-                                              cameraUp: up,
-                                              jitter: SIMD2<Float>(0, 0),
-                                              nearPlane: 4.0,
-                                              farPlane: 8192.0)
+                                              cameraPos: SIMD4<Float>(cameraPos.x, cameraPos.y, cameraPos.z, 0),
+                                              cameraForward: SIMD4<Float>(forward.x, forward.y, forward.z, 0),
+                                              cameraRight: SIMD4<Float>(right.x, right.y, right.z, 0),
+                                              cameraUp: SIMD4<Float>(up.x, up.y, up.z, 0),
+                                              jitterNearFar: SIMD4<Float>(0, 0, 4.0, 8192.0),
+                                              fovParams: SIMD4<Float>(tan(sceneView.fovX * .pi / 360.0), tan(sceneView.fovY * .pi / 360.0), 0, 0))
+            if !rtOverlayLogPrintedOnce {
+                print("[RT] overlay active mix=\(mixValue) size=\(renderW)x\(renderH) camera=\(cameraPos)")
+                rtOverlayLogPrintedOnce = true
+            }
             let tg = MTLSize(width: 16, height: 16, depth: 1)
             let groups = MTLSize(width: (renderW + 15) / 16, height: (renderH + 15) / 16, depth: 1)
             if let enc = commandBuffer.makeComputeCommandEncoder() {

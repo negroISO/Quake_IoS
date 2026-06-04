@@ -10041,6 +10041,21 @@ float Q3_RTMix(void) {
     return v;
 }
 
+float Q3_SetRTMix(float mix) {
+    if (mix < 0.0f) mix = 0.0f;
+    if (mix > 1.0f) mix = 1.0f;
+    if (ri.Cvar_Get == NULL) return mix;
+    ri.Cvar_Get("r_rt_mix", "0", CVAR_ARCHIVE);
+    if (ri.Cvar_SetValue != NULL) {
+        ri.Cvar_SetValue("r_rt_mix", mix);
+    } else if (ri.Cvar_Set != NULL) {
+        char buf[32];
+        Com_sprintf(buf, sizeof(buf), "%g", mix);
+        ri.Cvar_Set("r_rt_mix", buf);
+    }
+    return Q3_RTMix();
+}
+
 /* PBR Phase 6 v2 — map-specific skybox IBL source.
  *
  * r_pbr_ibl_skybox: stem (no _ft/_bk/etc suffix, no .tga extension) of the
