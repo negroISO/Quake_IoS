@@ -23,3 +23,6 @@ brain.db
 
 # Local GPU captures / traces
 debug_captures/
+
+# Q3 diagnostic log archives — script-managed, not source-controlled
+docs/q3-logs/q3_diag-*.log
