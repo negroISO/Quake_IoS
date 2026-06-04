@@ -9786,6 +9786,10 @@ const Q3MetalWorldDrawCmd *Q3MetalRenderer_GetWorldDrawCommands(void) {
     return s_world.draws;
 }
 
+uint32_t Q3MetalRenderer_GetWorldDrawCommandCount(void) {
+    return MetalWorldCurrentDrawCount();
+}
+
 int Q3MetalRenderer_GetWorldFogCount(void) {
     return s_worldFogCount;
 }

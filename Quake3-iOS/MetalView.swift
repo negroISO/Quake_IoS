@@ -350,6 +350,11 @@ struct MetalView: UIViewRepresentable {
             var fovParams: SIMD4<Float>     // x=tanHalfFovX, y=tanHalfFovY
         }
 
+        struct RTPrimitiveMaterial {
+            var albedoSlot: UInt32
+            var lightmapSlot: UInt32
+        }
+
         struct WorldDrawUniforms {
             var tcGen: Float
             var tcModCount: Int32
@@ -2996,6 +3001,9 @@ struct MetalView: UIViewRepresentable {
         private var rtASVertexBuffer: MTLBuffer?
         private var rtASPositionBuffer: MTLBuffer?
         private var rtASIndexBuffer: MTLBuffer?
+        private var rtPrimitiveMaterialBuffer: MTLBuffer?
+        private var rtAlbedoHandles = [UInt32](repeating: 0, count: 16)
+        private var rtLightmapHandles = [UInt32](repeating: 0, count: 16)
         private var rtLogPrintedOnce = false
         private var rtOverlayLogPrintedOnce = false
 
@@ -3107,22 +3115,28 @@ struct MetalView: UIViewRepresentable {
                 packed_float3 lightingDiffuse;
             };
 
+            struct RTPrimitiveMaterial {
+                uint albedoSlot;
+                uint lightmapSlot;
+            };
+
             kernel void rtKernel(texture2d<float, access::write> output [[texture(0)]],
+                                 array<texture2d<float>, 16> albedoTextures [[texture(2)]],
+                                 array<texture2d<float>, 16> lightmapTextures [[texture(18)]],
                                  constant RayTracingUniforms &uniforms [[buffer(0)]],
                                  acceleration_structure<> worldAS [[buffer(1)]],
                                  const device uint *indices [[buffer(2)]],
                                  const device RTWorldVertex *vertices [[buffer(3)]],
+                                 const device RTPrimitiveMaterial *primitiveMaterials [[buffer(4)]],
                                  uint2 tid [[thread_position_in_grid]]) {
                 if (tid.x >= output.get_width() || tid.y >= output.get_height()) return;
                 float2 uv = (float2(tid) + 0.5) / float2(output.get_width(), output.get_height());
                 uv += uniforms.jitterNearFar.xy;
                 float2 ndc = uv * 2.0 - 1.0;
-                float3 fwd = normalize(uniforms.cameraForward.xyz);
-                float3 right = normalize(uniforms.cameraRight.xyz);
-                float3 up = normalize(uniforms.cameraUp.xyz);
-                float3 rayDir = normalize((-fwd)
-                                        + right * (ndc.x * uniforms.fovParams.x)
-                                        + up * (-ndc.y * uniforms.fovParams.y));
+                float4 farClip = float4(ndc.x, -ndc.y, 1.0, 1.0);
+                float4 farWorld = uniforms.invViewProjection * farClip;
+                farWorld.xyz /= max(abs(farWorld.w), 1.0e-6);
+                float3 rayDir = normalize(farWorld.xyz - uniforms.cameraPos.xyz);
                 ray r(uniforms.cameraPos.xyz, rayDir, uniforms.jitterNearFar.z, uniforms.jitterNearFar.w);
                 intersector<triangle_data> i;
                 auto hit = i.intersect(r, worldAS);
@@ -3146,7 +3160,27 @@ struct MetalView: UIViewRepresentable {
                         N = cross(p1 - p0, p2 - p0);
                     }
                     N = normalize(N);
-                    color = N * 0.5 + 0.5;
+                    float3 normalColor = N * 0.5 + 0.5;
+
+                    RTPrimitiveMaterial mat = primitiveMaterials[tri];
+                    if (mat.albedoSlot < 16 && mat.lightmapSlot < 16) {
+                        float2 uv0 = vertices[i0].texCoord;
+                        float2 uv1 = vertices[i1].texCoord;
+                        float2 uv2 = vertices[i2].texCoord;
+                        float2 lm0 = vertices[i0].lightmapTexCoord;
+                        float2 lm1 = vertices[i1].lightmapTexCoord;
+                        float2 lm2 = vertices[i2].lightmapTexCoord;
+                        float2 uv = uv0 * w + uv1 * bary.x + uv2 * bary.y;
+                        float2 lmuv = lm0 * w + lm1 * bary.x + lm2 * bary.y;
+                        constexpr sampler repeatSampler(filter::linear, address::repeat);
+                        constexpr sampler clampSampler(filter::linear, address::clamp_to_edge);
+                        float3 albedo = albedoTextures[mat.albedoSlot].sample(repeatSampler, uv).rgb;
+                        float3 lightmap = lightmapTextures[mat.lightmapSlot].sample(clampSampler, lmuv).rgb;
+                        color = albedo * max(lightmap * 2.0, float3(0.18));
+                        color = mix(color, normalColor, 0.18);
+                    } else {
+                        color = normalColor;
+                    }
                 } else {
                     color = float3(0.04, 0.07, 0.13) + float3(0.01, 0.03, 0.06) * (1.0 - ndc.y);
                 }
@@ -3201,6 +3235,86 @@ struct MetalView: UIViewRepresentable {
             catch { print("[RT] blend pipeline state error: \(error)"); return nil }
         }
 
+
+        @MainActor
+        private func buildRTPrimitiveMaterials(device: MTLDevice, primitiveCount: Int) {
+            let invalid = UInt32.max
+            var materials = [RTPrimitiveMaterial](repeating: RTPrimitiveMaterial(albedoSlot: invalid, lightmapSlot: invalid), count: primitiveCount)
+            rtAlbedoHandles = [UInt32](repeating: 0, count: 16)
+            rtLightmapHandles = [UInt32](repeating: 0, count: 16)
+
+            guard let drawsPtr = Q3MetalRenderer_GetWorldDrawCommands() else {
+                rtPrimitiveMaterialBuffer = device.makeBuffer(bytes: materials,
+                                                              length: materials.count * MemoryLayout<RTPrimitiveMaterial>.stride,
+                                                              options: .storageModeShared)
+                return
+            }
+
+            let drawCount = Int(Q3MetalRenderer_GetWorldDrawCommandCount())
+            let draws = UnsafeBufferPointer(start: drawsPtr, count: drawCount)
+
+            /* Pick the 16 most important handles by covered triangle count,
+             * not the first 16 encountered. The first-come table made large
+             * late BSP surfaces fall back to normal debug magenta/cyan while
+             * tiny early detail draws consumed slots. */
+            var albedoWeights: [UInt32: Int] = [:]
+            var lightmapWeights: [UInt32: Int] = [:]
+            for draw in draws where draw.indexCount >= 3 {
+                let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+                guard stageCount > 0 else { continue }
+                let triCount = max(1, Int(draw.indexCount / 3))
+                let stage = Self.worldStage(draw, 0)
+                if stage.textureHandle != 0 {
+                    albedoWeights[stage.textureHandle, default: 0] += triCount
+                }
+                if draw.lightmapTextureHandle != 0 {
+                    lightmapWeights[draw.lightmapTextureHandle, default: 0] += triCount
+                }
+            }
+
+            func topHandles(_ weights: [UInt32: Int]) -> [UInt32] {
+                Array(weights.sorted { lhs, rhs in
+                    if lhs.value != rhs.value { return lhs.value > rhs.value }
+                    return lhs.key < rhs.key
+                }.prefix(16).map { $0.key })
+            }
+
+            let topAlbedos = topHandles(albedoWeights)
+            let topLightmaps = topHandles(lightmapWeights)
+            for (i, h) in topAlbedos.enumerated() {
+                rtAlbedoHandles[i] = h
+                _ = texture(for: h, device: device)
+            }
+            for (i, h) in topLightmaps.enumerated() {
+                rtLightmapHandles[i] = h
+                _ = texture(for: h, device: device)
+            }
+            let albedoSlots = Dictionary(uniqueKeysWithValues: topAlbedos.enumerated().map { (UInt32($0.offset), $0.element) }.map { ($0.1, $0.0) })
+            let lightmapSlots = Dictionary(uniqueKeysWithValues: topLightmaps.enumerated().map { (UInt32($0.offset), $0.element) }.map { ($0.1, $0.0) })
+
+            var assigned = 0
+            for draw in draws where draw.indexCount >= 3 {
+                let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+                guard stageCount > 0 else { continue }
+                let stage = Self.worldStage(draw, 0)
+                guard let aSlot = albedoSlots[stage.textureHandle],
+                      let lSlot = lightmapSlots[draw.lightmapTextureHandle] else { continue }
+                let firstTri = Int(draw.firstIndex / 3)
+                let triCount = Int(draw.indexCount / 3)
+                guard firstTri < materials.count else { continue }
+                let end = min(firstTri + triCount, materials.count)
+                for tri in firstTri..<end {
+                    materials[tri] = RTPrimitiveMaterial(albedoSlot: aSlot, lightmapSlot: lSlot)
+                }
+                assigned += max(0, end - firstTri)
+            }
+            rtPrimitiveMaterialBuffer = device.makeBuffer(bytes: materials,
+                                                          length: materials.count * MemoryLayout<RTPrimitiveMaterial>.stride,
+                                                          options: .storageModeShared)
+            rtPrimitiveMaterialBuffer?.label = "Q3.RT.primitiveMaterials"
+            print("[RT] material table: albedo=\(topAlbedos.count)/\(albedoWeights.count) lightmap=\(topLightmaps.count)/\(lightmapWeights.count) assigned=\(assigned)/\(primitiveCount)")
+        }
+
         @MainActor
         private func buildWorldAccelerationStructure(device: MTLDevice) -> MTLAccelerationStructure? {
             guard device.supportsRaytracing, Q3MetalRenderer_IsWorldLoaded() != 0 else { return nil }
@@ -3225,6 +3339,8 @@ struct MetalView: UIViewRepresentable {
             }
             positionBuffer.label = "Q3.RT.positions.compact"
             rtASPositionBuffer = positionBuffer
+
+            buildRTPrimitiveMaterials(device: device, primitiveCount: indexCount / 3)
 
             let geomDesc = MTLAccelerationStructureTriangleGeometryDescriptor()
             geomDesc.vertexBuffer = positionBuffer
@@ -3288,6 +3404,7 @@ struct MetalView: UIViewRepresentable {
                 return nil
             }
             guard worldASBuilt, let worldAS = worldAccelerationStructure else { return nil }
+            guard let primitiveMaterialBuffer = rtPrimitiveMaterialBuffer else { return nil }
             guard let rtPSO = ensureRTPipeline(device: device), let blendPSO = ensureRTBlendPipeline(device: device) else { return nil }
             guard ensureRTTextures(device: device, width: renderW, height: renderH, pixelFormat: rasterTexture.pixelFormat),
                   let rtTex = rtTexture, let compositeTex = rtCompositeTexture else { return nil }
@@ -3315,10 +3432,15 @@ struct MetalView: UIViewRepresentable {
                 enc.label = "Q3.RT.trace"
                 enc.setComputePipelineState(rtPSO)
                 enc.setTexture(rtTex, index: 0)
+                for i in 0..<16 {
+                    enc.setTexture(texture(for: rtAlbedoHandles[i], device: device), index: 2 + i)
+                    enc.setTexture(texture(for: rtLightmapHandles[i], device: device), index: 18 + i)
+                }
                 enc.setBytes(&uniforms, length: MemoryLayout<RayTracingUniforms>.stride, index: 0)
                 enc.setAccelerationStructure(worldAS, bufferIndex: 1)
                 enc.setBuffer(rtASIndexBuffer, offset: 0, index: 2)
                 enc.setBuffer(rtASVertexBuffer, offset: 0, index: 3)
+                enc.setBuffer(primitiveMaterialBuffer, offset: 0, index: 4)
                 enc.dispatchThreadgroups(groups, threadsPerThreadgroup: tg)
                 enc.endEncoding()
             }
@@ -4499,6 +4621,7 @@ struct MetalView: UIViewRepresentable {
                 return
             }
             encoder.label = "Q3.render"
+            var rtCompositeForUpscale: MTLTexture? = nil
 
             // Viewport matches the actual render-target size (RT when
             // upscaling, drawable when native).
@@ -5436,6 +5559,49 @@ struct MetalView: UIViewRepresentable {
                 }
             }
 
+            /* RT world composite must happen before raster entities/HUD.
+             * The trace replaces/blends only the already-rendered world color;
+             * subsequent entity, flare, sub-scene, and UI passes draw over it.
+             * This keeps r_rt_mix=1 usable as "RT world + raster weapon/HUD"
+             * instead of the old after-everything overlay that hid the weapon
+             * and HUD. */
+            if let device = view.device,
+               Q3MetalRenderer_IsWorldLoaded() != 0,
+               let sceneView = Q3MetalRenderer_GetSceneView()?.pointee {
+                if (!worldASBuilt || worldASGeneration != snapshot.worldGeneration),
+                   worldVertexBuffer != nil, worldIndexBuffer != nil {
+                    worldAccelerationStructure = buildWorldAccelerationStructure(device: device)
+                    worldASBuilt = (worldAccelerationStructure != nil)
+                    worldASGeneration = worldASBuilt ? snapshot.worldGeneration : 0
+                }
+                let rtTargetTexture = (upscaleActive ? upscaleColorTarget : drawable.texture) ?? drawable.texture
+                if Q3_RTMix() > 0 {
+                    encoder.endEncoding()
+                    _ = encodeRTOverlay(commandBuffer: commandBuffer,
+                                        rasterTexture: rtTargetTexture,
+                                        outputDrawableTexture: rtTargetTexture,
+                                        device: device,
+                                        sceneView: sceneView,
+                                        renderW: renderW,
+                                        renderH: renderH)
+                    let postRTPass = makeLoadedRenderPassDescriptor(colorTexture: rtTargetTexture,
+                                                                    depthTexture: descriptor.depthAttachment.texture)
+                    guard let postRTEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: postRTPass) else {
+                        return
+                    }
+                    encoder = postRTEncoder
+                    encoder.label = "Q3.render.postRT"
+                    encoder.setViewport(MTLViewport(originX: 0, originY: 0,
+                                                    width: Double(renderW),
+                                                    height: Double(renderH),
+                                                    znear: 0.0,
+                                                    zfar: 1.0))
+                    encoder.setScissorRect(MTLScissorRect(x: 0, y: 0,
+                                                           width: renderW,
+                                                           height: renderH))
+                }
+            }
+
             if snapshot.entityCommandCount > 0,
                let entityPipelineState,
                let sceneView = Q3MetalRenderer_GetSceneView()?.pointee,
@@ -5935,26 +6101,6 @@ struct MetalView: UIViewRepresentable {
             }
 
             encoder.endEncoding()
-
-            var rtCompositeForUpscale: MTLTexture? = nil
-            if let device = view.device,
-               Q3MetalRenderer_IsWorldLoaded() != 0,
-               let sceneView = Q3MetalRenderer_GetSceneView()?.pointee {
-                if (!worldASBuilt || worldASGeneration != snapshot.worldGeneration),
-                   worldVertexBuffer != nil, worldIndexBuffer != nil {
-                    worldAccelerationStructure = buildWorldAccelerationStructure(device: device)
-                    worldASBuilt = (worldAccelerationStructure != nil)
-                    worldASGeneration = worldASBuilt ? snapshot.worldGeneration : 0
-                }
-                let rasterForRT = (upscaleActive ? upscaleColorTarget : drawable.texture) ?? drawable.texture
-                rtCompositeForUpscale = encodeRTOverlay(commandBuffer: commandBuffer,
-                                                        rasterTexture: rasterForRT,
-                                                        outputDrawableTexture: drawable.texture,
-                                                        device: device,
-                                                        sceneView: sceneView,
-                                                        renderW: renderW,
-                                                        renderH: renderH)
-            }
 
             #if canImport(MetalFX)
             /* MetalFX spatial upscale: when active, all main render encoders

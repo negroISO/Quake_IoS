@@ -481,6 +481,7 @@ uint32_t Q3MetalRenderer_GetWorldVertexCount(void);
 uint32_t Q3MetalRenderer_GetWorldIndexCount(void);
 int Q3MetalRenderer_IsWorldLoaded(void);
 const Q3MetalWorldDrawCmd *Q3MetalRenderer_GetWorldDrawCommands(void);
+uint32_t Q3MetalRenderer_GetWorldDrawCommandCount(void);
 uint32_t Q3MetalRenderer_BuildWorldBatches(uint32_t passMask);
 const Q3MetalWorldBatchCmd *Q3MetalRenderer_GetWorldBatches(void);
 uint32_t Q3MetalRenderer_GetWorldBatchCount(void);
