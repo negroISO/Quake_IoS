@@ -207,6 +207,16 @@ static void MetalTelemetryPrintf(const char *type, int printLevel, const char *f
     }
 }
 
+static void Q3PBRLogf(const char *format, ...) {
+    char message[2048];
+    va_list args;
+    if (format == NULL) return;
+    va_start(args, format);
+    Q_vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+    MetalTelemetryPrintf("metal_pbr_ibl", PRINT_ALL, "%s", message);
+}
+
 /* Swift-callable bridge so the Swift PBR loader can write to q3_diag.log via
  * the same channel-tagged pipeline as the C-side hits. Without this, NSLog
  * messages from MetalView.pbrAlbedoTexture(for:) go to Apple System Log only,
@@ -538,6 +548,8 @@ typedef struct {
      * 1 = clamp to edge (`clampmap`). Propagated to Q3MetalWorldStage
      * so the Swift draw loop binds the matching MTLSamplerState. */
     int wrapClampMode;
+    float pbrRoughness;
+    float pbrMetallic;
 } Q3MetalStage;
 
 enum {
@@ -583,6 +595,9 @@ typedef struct {
     qboolean isSky;
     Q3MetalStage stages[Q3_MAX_STAGES];
     int stageCount;
+    q3_pbr_world_mat_t pbrMatClass;
+    float pbrRoughness;
+    float pbrMetallic;
 } metalShaderMap_t;
 
 static metalTexture_t *FindTextureByHandle(qhandle_t handle);
@@ -1231,6 +1246,8 @@ static void AddWorldDrawStage(Q3MetalWorldDrawCmd *draw,
      * MetalView.swift lines 3267/3504/4330 that killed the quad-damage
      * breathing shell on viewmodels. */
     stage->wrapClampMode = (uint32_t)src->wrapClampMode;
+    stage->pbrRoughness = (src->pbrRoughness > 0.0f) ? src->pbrRoughness : 0.55f;
+    stage->pbrMetallic = (src->pbrRoughness > 0.0f) ? src->pbrMetallic : 0.30f;
 }
 
 /* Fallback for draws with no parsed .shader entry — construct a minimal
@@ -1250,6 +1267,8 @@ static void AddWorldDrawStageSimple(Q3MetalWorldDrawCmd *draw,
     tmp.rgbConstColor[1] = 1.0f;
     tmp.rgbConstColor[2] = 1.0f;
     tmp.alphaConst = 1.0f;
+    tmp.pbrRoughness = 0.55f;
+    tmp.pbrMetallic = 0.30f;
     tmp.alphaFunc = alphaFunc;
     tmp.cullMode = METAL_SHADER_CULL_BACK;
     AddWorldDrawStage(draw, textureHandle, &tmp);
@@ -4688,6 +4707,9 @@ static void MetalWorldEmitSurfaceStages(const char *shaderName,
     _emitted = 0;
     _combinedLightmapBaseStage = MetalShaderCombinedLightmapBaseStage(_e, hasLightmap, lightmapHandle);
     _combinedLightmap = (_combinedLightmapBaseStage >= 0) ? qtrue : qfalse;
+    if (_e != NULL) {
+        q3_pbr_log_classification(shaderName, _e->pbrMatClass);
+    }
     EmitMetalStageAudit(shaderName, _e);
 
     if (_e != NULL && _e->hasFog) {
@@ -6192,6 +6214,10 @@ static void ShaderMap_Register(const char *name, const char *path, qboolean tcGe
     s_shaderMap[s_shaderMapCount].animFps = 0.0f;
     s_shaderMap[s_shaderMapCount].cullMode = METAL_SHADER_CULL_BACK;
     s_shaderMap[s_shaderMapCount].stageCount = 0;
+    s_shaderMap[s_shaderMapCount].pbrMatClass = q3_pbr_classify_shader(name);
+    q3_pbr_class_params(s_shaderMap[s_shaderMapCount].pbrMatClass,
+                        &s_shaderMap[s_shaderMapCount].pbrRoughness,
+                        &s_shaderMap[s_shaderMapCount].pbrMetallic);
     s_shaderMapCount += 1;
 }
 
@@ -6217,6 +6243,10 @@ static void ShaderMap_RegisterAnimated(const char *name,
     s_shaderMap[s_shaderMapCount].animFps = (fps > 0.0f) ? fps : 8.0f;
     s_shaderMap[s_shaderMapCount].cullMode = METAL_SHADER_CULL_BACK;
     s_shaderMap[s_shaderMapCount].stageCount = 0;
+    s_shaderMap[s_shaderMapCount].pbrMatClass = q3_pbr_classify_shader(name);
+    q3_pbr_class_params(s_shaderMap[s_shaderMapCount].pbrMatClass,
+                        &s_shaderMap[s_shaderMapCount].pbrRoughness,
+                        &s_shaderMap[s_shaderMapCount].pbrMetallic);
     for (i = 0; i < maxFrames; ++i) {
         Q_strncpyz(s_shaderMap[s_shaderMapCount].animFrames[i], frames[i],
                    sizeof(s_shaderMap[0].animFrames[i]));
@@ -7091,6 +7121,8 @@ static void ParseShaderText(const char *text) {
                     last->stages[s].deformBulgeHeight = deformBulgeHeight;
                     last->stages[s].deformBulgeSpeed  = deformBulgeSpeed;
                     last->stages[s].autospriteMode  = topAutospriteMode;
+                    last->stages[s].pbrRoughness = last->pbrRoughness;
+                    last->stages[s].pbrMetallic = last->pbrMetallic;
                 }
                 last->isPortal = gotPortal;
                 last->hasFog = gotFog;
@@ -9967,20 +9999,25 @@ int   Q3_PBRWorldEnabled(void) {
     return cv ? cv->integer : 1;
 }
 float Q3_PBRWorldAmbientBoost(void) {
-    if (ri.Cvar_Get == NULL) return 0.20f;
-    cvar_t *cv = ri.Cvar_Get("r_pbr_world_ambient_boost", "0.20", CVAR_ARCHIVE);
-    float v = cv ? cv->value : 0.20f;
+    if (ri.Cvar_Get == NULL) return 0.30f;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_world_ambient_boost", "0.30", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.30f;
     if (v < 0.0f) v = 0.0f;
-    if (v > 1.0f) v = 1.0f;
+    if (v > 1.5f) v = 1.5f;
     return v;
 }
 float Q3_PBRWorldSpecBoost(void) {
-    if (ri.Cvar_Get == NULL) return 0.40f;
-    cvar_t *cv = ri.Cvar_Get("r_pbr_world_spec_boost", "0.40", CVAR_ARCHIVE);
-    float v = cv ? cv->value : 0.40f;
+    if (ri.Cvar_Get == NULL) return 0.60f;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_world_spec_boost", "0.60", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.60f;
     if (v < 0.0f) v = 0.0f;
-    if (v > 1.0f) v = 1.0f;
+    if (v > 2.0f) v = 2.0f;
     return v;
+}
+int Q3_PBRWorldClassMatchEnabled(void) {
+    if (ri.Cvar_Get == NULL) return 1;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_world_class_match", "1", CVAR_ARCHIVE);
+    return cv ? cv->integer : 1;
 }
 
 /* PBR Phase 6 v2 — map-specific skybox IBL source.
@@ -10057,7 +10094,7 @@ refexport_t *GetRefAPI(int apiVersion, refimport_t *rimp) {
      * per process). JSON via Q3_PBR_JSON; assets-root via Q3_PBR_ASSETS.
      * Failure is silent — q3_pbr_lookup returns NULL, render path
      * falls through to existing Lambert. */
-    q3_pbr_set_log(Com_Printf);
+    q3_pbr_set_log(Q3PBRLogf);
     {
         const char *json = getenv("Q3_PBR_JSON");
         const char *root = getenv("Q3_PBR_ASSETS");

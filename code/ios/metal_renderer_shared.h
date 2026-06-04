@@ -178,6 +178,12 @@ typedef struct {
      * which killed the quad-damage breathing shell on viewmodels (tcGen
      * environment + map texture needs repeat to wrap seamlessly). */
     uint32_t wrapClampMode;
+    /* PBR Phase 9: synthetic per-shader material-class constants.
+     * Copied from q3_pbr_classify_shader(shaderName) at shader parse
+     * time and consumed by q3_world_fragment when
+     * r_pbr_world_class_match is enabled. */
+    float pbrRoughness;
+    float pbrMetallic;
 } Q3MetalWorldStage;
 
 #define Q3_METAL_MAX_STAGES 8

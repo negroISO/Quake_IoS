@@ -137,5 +137,6 @@ void Q3MetalRenderer_FSFreeFile(const unsigned char *buf);
 int   Q3_PBRWorldEnabled(void);
 float Q3_PBRWorldAmbientBoost(void);
 float Q3_PBRWorldSpecBoost(void);
+int   Q3_PBRWorldClassMatchEnabled(void);
 
 #endif

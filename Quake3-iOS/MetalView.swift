@@ -364,6 +364,8 @@ struct MetalView: UIViewRepresentable {
             var fogOnly: Float = 0
             var stageUsesLightmap: Float = 0
             var drawHasLightmapStage: Float = 0
+            var pbrRoughness: Float = 0.55
+            var pbrMetallic: Float = 0.30
             var _pad0: Float = 0
         }
 
@@ -545,6 +547,8 @@ struct MetalView: UIViewRepresentable {
             hashCombine(&h, floatBits(stage.alphaWaveAmp))
             hashCombine(&h, floatBits(stage.alphaWavePhase))
             hashCombine(&h, floatBits(stage.alphaWaveFreq))
+            hashCombine(&h, floatBits(stage.pbrRoughness))
+            hashCombine(&h, floatBits(stage.pbrMetallic))
             let mods = [stage.tcMods.0, stage.tcMods.1, stage.tcMods.2, stage.tcMods.3]
             for m in mods {
                 hashCombine(&h, UInt64(m.type))
@@ -596,6 +600,8 @@ struct MetalView: UIViewRepresentable {
                   a.alphaWaveFreq == b.alphaWaveFreq,
                   float3Equal(a.rgbConstColor, b.rgbConstColor),
                   a.alphaConst == b.alphaConst,
+                  a.pbrRoughness == b.pbrRoughness,
+                  a.pbrMetallic == b.pbrMetallic,
                   float4Equal(a.tcGenVec0, b.tcGenVec0),
                   float4Equal(a.tcGenVec1, b.tcGenVec1) else {
                 return false
@@ -1286,6 +1292,8 @@ struct MetalView: UIViewRepresentable {
             float fogOnly;
             float stageUsesLightmap;
             float drawHasLightmapStage;
+            float pbrRoughness;
+            float pbrMetallic;
             float _pad0;
         };
 
@@ -2089,12 +2097,19 @@ struct MetalView: UIViewRepresentable {
                  *                    of diffuse IBL adds onto lit color
                  * pbrWorldParams.z = specBoost scalar [0..1] — metallic
                  *                    highlight intensity
-                 * pbrWorldParams.w = reserved */
+                 * pbrWorldParams.w = class-match gate; 0 falls back to
+                 *                    Phase 8 uniform rough/metal. */
                 if (pbrWorldParams.x > 0.5 && !is_null_texture(envCube)) {
                     float3 V = normalize(uniforms.cameraPos - in.worldPos);
                     float NdotV = max(dot(worldN, V), 0.0);
-                    float roughness = 0.55;
-                    float metallic = 0.50;
+                    // Middle-ground defaults. Metallic 0.30 — still mostly
+                    // dielectric (stone surfaces look like stone) but high
+                    // enough that the Fresnel rim picks up a visible
+                    // tint on edges. Roughness 0.45 gives a moderately
+                    // sharp highlight without painting chrome streaks
+                    // across flat bricks.
+                    float roughness = (pbrWorldParams.w > 0.5) ? drawUniforms.pbrRoughness : 0.45;
+                    float metallic = (pbrWorldParams.w > 0.5) ? drawUniforms.pbrMetallic : 0.30;
 
                     float maxMipF = float(envCube.get_num_mip_levels() - 1);
                     float3 diffuseIBL = envCube.sample(envSampler, worldN, level(maxMipF)).rgb;
@@ -2109,16 +2124,33 @@ struct MetalView: UIViewRepresentable {
 
                     float ambBoost  = pbrWorldParams.y;
                     float specBoost = pbrWorldParams.z;
-                    // Additive diffuse IBL scaled by inverse-luma — adds
-                    // shadow-side fill without washing the lightmap's
-                    // warm/cool color tone. The (1 - litLuma) factor pumps
-                    // dark crevices but leaves already-bright pixels alone,
-                    // so lava-red walls don't desaturate to grey.
+                    // Twin gates on the spec contribution:
+                    //   shadowMask = 1 - luma — kill spec on already-bright
+                    //                pixels (no double-brighten on lit
+                    //                corridors or emissive plaques).
+                    //   fresnelGate = pow(1-NdotV, 2) — keep spec on
+                    //                EDGE / GRAZING-angle pixels where
+                    //                chrome physically lives. Center of
+                    //                a flat brick face → NdotV ≈ 1 →
+                    //                fresnelGate ≈ 0 → no flat mirror
+                    //                streak. Door trim or curved alias
+                    //                edge → low NdotV → fresnelGate high
+                    //                → visible rim chrome cue.
+                    //
+                    // The diffuse fill stays gated by shadowMask alone
+                    // so shadow side gets brightened uniformly (matches
+                    // how PT bounce GI fills shadows in the reference
+                    // video).
                     float litLuma = dot(lit, float3(0.2126, 0.7152, 0.0722));
-                    float fillScale = ambBoost * (1.0 - saturate(litLuma));
+                    float shadowMask  = 1.0 - saturate(litLuma);
+                    float fresnelGate = pow(1.0 - NdotV, 2.0);
+                    float fillScale = ambBoost * shadowMask;
+                    float specMask  = specBoost
+                                    * (0.5 * shadowMask + 0.5)   // half shadow-driven
+                                    * (0.3 + 0.7 * fresnelGate); // mostly edge-driven
                     lit = lit
                         + kD_v * diffuseIBL * fillScale
-                        + F_v  * specularIBL * specBoost;
+                        + F_v  * specularIBL * specMask;
                 }
             }
             return float4(lit, texel.a * va);
@@ -4438,6 +4470,8 @@ struct MetalView: UIViewRepresentable {
                             fogOnly: 0,
                             stageUsesLightmap: stage.useLightmap != 0 ? 1.0 : 0.0,
                             drawHasLightmapStage: drawHasLightmapStage ? 1.0 : 0.0,
+                            pbrRoughness: stage.pbrRoughness,
+                            pbrMetallic: stage.pbrMetallic,
                             _pad0: (draw.flags & combinedLightmapBit) != 0 ? 1.0 : 0.0
                         )
                         encoder.setFragmentTexture(baseTexture, index: 0)
@@ -4460,7 +4494,7 @@ struct MetalView: UIViewRepresentable {
                             Q3_PBRWorldEnabled() != 0 ? 1.0 : 0.0,
                             Q3_PBRWorldAmbientBoost(),
                             Q3_PBRWorldSpecBoost(),
-                            0.0)
+                            Q3_PBRWorldClassMatchEnabled() != 0 ? 1.0 : 0.0)
                         encoder.setFragmentBytes(&pbrWorldParams, length: 16, index: 3)
                         encoder.setFragmentBytes(&drawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 0)
                         encoder.setVertexBytes(&drawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 2)
@@ -4963,6 +4997,8 @@ struct MetalView: UIViewRepresentable {
                                 fogOnly: 0,
                                 stageUsesLightmap: stage.useLightmap != 0 ? 1.0 : 0.0,
                                 drawHasLightmapStage: drawHasLightmapStage ? 1.0 : 0.0,
+                                pbrRoughness: stage.pbrRoughness,
+                                pbrMetallic: stage.pbrMetallic,
                                 _pad0: (draw.flags & combinedLightmapBit) != 0 ? 1.0 : 0.0
                             )
                             setWorldFragmentTextureCached(baseTexture, index: 0)

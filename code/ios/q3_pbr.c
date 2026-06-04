@@ -91,6 +91,97 @@ void q3_pbr_stats_inc_hashes_matched(void)  { g_stats.hashes_matched++; }
 void q3_pbr_stats_inc_dds_load_requested(void) { g_stats.dds_load_requested++; }
 void q3_pbr_stats_inc_dds_load_failed(void)    { g_stats.dds_load_failed++; }
 
+/* --- PBR Phase 9 world material classifier ----------------------- */
+
+static int q3_pbr_prefix_match(const char *name, const char *prefix) {
+    size_t i;
+    if (name == NULL || prefix == NULL) return 0;
+    for (i = 0; prefix[i] != '\0'; ++i) {
+        char a = name[i];
+        char b = prefix[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
+static const struct {
+    const char *prefix;
+    q3_pbr_world_mat_t mat;
+} kQ3PBRClassRules[] = {
+    { "textures/gothic_floor/metalbridge",        Q3_PBR_MAT_METAL_BRIDGE },
+    { "textures/gothic_floor/blocks",             Q3_PBR_MAT_STONE_ROUGH },
+    { "textures/gothic_floor/largerblock",        Q3_PBR_MAT_STONE_ROUGH },
+    { "textures/gothic_floor/xstair",             Q3_PBR_MAT_STONE_ROUGH },
+    { "textures/gothic_floor/xstepborder",        Q3_PBR_MAT_STONE_ROUGH },
+    { "textures/gothic_floor/center2trn",         Q3_PBR_MAT_STONE_ROUGH },
+    { "textures/gothic_ceiling/woodceiling",      Q3_PBR_MAT_WOOD },
+    { "textures/gothic_door/skullarch",           Q3_PBR_MAT_METAL_PLAQUE },
+    { "textures/gothic_door/skull_door",          Q3_PBR_MAT_METAL_PLAQUE },
+    { "textures/gothic_door/skull",               Q3_PBR_MAT_METAL_PLAQUE },
+    { "textures/gothic_door/km_arena1arch",       Q3_PBR_MAT_METAL_TRIM },
+    { "textures/gothic_door/km_arena1column",     Q3_PBR_MAT_METAL_PLAQUE },
+    { "textures/gothic_door/xian_tourneyarch",    Q3_PBR_MAT_METAL_TRIM },
+    { "textures/gothic_trim/baseboard",           Q3_PBR_MAT_METAL_TRIM },
+    { "textures/gothic_trim/km_arena1tower",      Q3_PBR_MAT_METAL_TRIM },
+    { "textures/gothic_block/killblock",          Q3_PBR_MAT_METAL_PLAQUE },
+    { "textures/gothic_block/demon_block",        Q3_PBR_MAT_STONE_ROUGH },
+    { "textures/gothic_block/blocks",             Q3_PBR_MAT_STONE_ROUGH },
+    { "textures/gothic_light/pentagram_light",    Q3_PBR_MAT_LIGHT_FIXTURE },
+    { NULL, Q3_PBR_MAT_DEFAULT }
+};
+
+static const struct {
+    float roughness;
+    float metallic;
+} kQ3PBRClassParams[Q3_PBR_MAT_MAX] = {
+    { 0.55f, 0.30f },
+    { 0.85f, 0.02f },
+    { 0.75f, 0.00f },
+    { 0.30f, 0.85f },
+    { 0.25f, 0.90f },
+    { 0.40f, 0.70f },
+    { 0.50f, 0.30f }
+};
+
+q3_pbr_world_mat_t q3_pbr_classify_shader(const char *name) {
+    int i;
+    if (name == NULL || name[0] == '\0') return Q3_PBR_MAT_DEFAULT;
+    for (i = 0; kQ3PBRClassRules[i].prefix != NULL; ++i) {
+        if (q3_pbr_prefix_match(name, kQ3PBRClassRules[i].prefix)) {
+            return kQ3PBRClassRules[i].mat;
+        }
+    }
+    return Q3_PBR_MAT_DEFAULT;
+}
+
+void q3_pbr_class_params(q3_pbr_world_mat_t mat, float *out_rough, float *out_metal) {
+    if (mat < Q3_PBR_MAT_DEFAULT || mat >= Q3_PBR_MAT_MAX) {
+        mat = Q3_PBR_MAT_DEFAULT;
+    }
+    if (out_rough) *out_rough = kQ3PBRClassParams[mat].roughness;
+    if (out_metal) *out_metal = kQ3PBRClassParams[mat].metallic;
+}
+
+void q3_pbr_log_classification(const char *name, q3_pbr_world_mat_t mat) {
+    static char seen[64][128];
+    static int seen_count = 0;
+    float rough = 0.55f, metal = 0.30f;
+    int i;
+    if (name == NULL || name[0] == '\0' || mat == Q3_PBR_MAT_DEFAULT) return;
+    for (i = 0; i < seen_count; ++i) {
+        if (strcmp(seen[i], name) == 0) return;
+    }
+    if (seen_count < (int)(sizeof(seen) / sizeof(seen[0]))) {
+        snprintf(seen[seen_count], sizeof(seen[seen_count]), "%s", name);
+        seen_count++;
+    }
+    q3_pbr_class_params(mat, &rough, &metal);
+    plog("[Q3-PBR-CLASS] '%s' -> class=%d rough=%.2f metal=%.2f\n",
+         name, (int)mat, rough, metal);
+}
+
 /* --- xxhash bridge ------------------------------------------------- */
 
 uint64_t q3_pbr_hash_rgba(const unsigned char *rgba, int width, int height) {

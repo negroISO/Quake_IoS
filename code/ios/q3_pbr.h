@@ -111,6 +111,25 @@ int q3_pbr_named_count(void);
 typedef void (*q3_pbr_log_fn)(const char *fmt, ...);
 void q3_pbr_set_log(q3_pbr_log_fn fn);
 
+
+/* PBR Phase 9 — world shader-name material classifier.
+ * Values are synthetic roughness/metallic constants keyed by Q3 shader
+ * path prefixes. World-only; entity/material JSON path is unchanged. */
+typedef enum {
+    Q3_PBR_MAT_DEFAULT = 0,
+    Q3_PBR_MAT_STONE_ROUGH,
+    Q3_PBR_MAT_WOOD,
+    Q3_PBR_MAT_METAL_TRIM,
+    Q3_PBR_MAT_METAL_PLAQUE,
+    Q3_PBR_MAT_METAL_BRIDGE,
+    Q3_PBR_MAT_LIGHT_FIXTURE,
+    Q3_PBR_MAT_MAX
+} q3_pbr_world_mat_t;
+
+q3_pbr_world_mat_t q3_pbr_classify_shader(const char *name);
+void q3_pbr_class_params(q3_pbr_world_mat_t mat, float *out_rough, float *out_metal);
+void q3_pbr_log_classification(const char *name, q3_pbr_world_mat_t mat);
+
 /* Cvar accessor — non-zero when r_pbrMaterials is on. The renderer
  * gates the PBR shader path on this; q3_pbr_table_load runs
  * regardless so we can audit hash matches independent of the
