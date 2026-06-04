@@ -106,4 +106,13 @@ int  Q3IOS_AudioPullStereo16(short *dest, int frames);
 float Q3_PBRRimIntensity(void);
 float Q3_PBRRimFalloff(void);
 
+/* PBR Phase 6 IBL gate — drives Swift's procedural environment cubemap
+ * binding to fragment slot 5 and the MSL IBL block inside `hasFullPBR`.
+ * Default "1"; set "0" to A/B against Phase 5's flat 0.35 ambient floor.
+ *
+ * PBR Phase 5 gate — direct-sun Cook-Torrance + Burley GGX block. Default
+ * "1"; set "0" to A/B against Phase 4 v6 (Fresnel rim only). */
+int Q3_PBRIBLEnabled(void);
+int Q3_PBRPhase5Enabled(void);
+
 #endif

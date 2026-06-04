@@ -9894,6 +9894,25 @@ float Q3_PBRRimFalloff(void) {
     return v;
 }
 
+/* PBR Phase 6 IBL gate. Default "1" — the procedural sky-gradient cubemap
+ * is built once at first entity draw and shared across all weapon viewmodel
+ * draws. Set "0" to A/B against Phase 5 (flat 0.35 ambient floor). */
+int Q3_PBRIBLEnabled(void) {
+    if (ri.Cvar_Get == NULL) return 1;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_ibl", "1", CVAR_ARCHIVE);
+    return cv ? cv->integer : 1;
+}
+
+/* PBR Phase 5 gate. Default "1" — enables the Cook-Torrance + Burley
+ * direct-sun lighting block inside the hasFullPBR branch. Set "0" to A/B
+ * against Phase 4 v6 (Fresnel rim only, no GGX peak). Used for the user's
+ * "decide if Phase 5 should remain default" comparison. */
+int Q3_PBRPhase5Enabled(void) {
+    if (ri.Cvar_Get == NULL) return 1;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_phase5", "1", CVAR_ARCHIVE);
+    return cv ? cv->integer : 1;
+}
+
 refexport_t *GetRefAPI(int apiVersion, refimport_t *rimp) {
     static refexport_t re;
 
