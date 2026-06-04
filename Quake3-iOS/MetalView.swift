@@ -129,6 +129,52 @@ enum Q3FrameInterpolation: String, CaseIterable {
     }
 }
 
+
+/// Runtime ray-tracing overlay mix. This is a launch-menu convenience
+/// around the existing `r_rt_mix` cvar: 0 = raster only, 0.5 = blended
+/// A/B view, 1 = pure RT output. Persisted so Q3_RT can boot directly
+/// into the user's last selected RT mode.
+enum Q3RTMix: String, CaseIterable {
+    case off = "0"
+    case blend = "0.5"
+    case pure = "1"
+
+    static let userDefaultsKey = "q3_rt_mix"
+
+    static var current: Q3RTMix {
+        if let envRaw = ProcessInfo.processInfo.environment["Q3_RT_MIX"],
+           let envQ = Q3RTMix(rawValue: envRaw) {
+            NSLog("[Q3-RT] using env var Q3_RT_MIX=%@", envRaw)
+            return envQ
+        }
+        let raw = UserDefaults.standard.string(forKey: userDefaultsKey) ?? "0"
+        return Q3RTMix(rawValue: raw) ?? .off
+    }
+
+    static func save(_ q: Q3RTMix) {
+        UserDefaults.standard.set(q.rawValue, forKey: userDefaultsKey)
+        UserDefaults.standard.synchronize()
+    }
+
+    var label: String {
+        switch self {
+        case .off: return "Raster"
+        case .blend: return "RT Blend"
+        case .pure: return "Pure RT"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .off: return "r_rt_mix 0"
+        case .blend: return "r_rt_mix 0.5"
+        case .pure: return "r_rt_mix 1"
+        }
+    }
+
+    var consoleCommand: String { "r_rt_mix \(rawValue)" }
+}
+
 struct MetalView: UIViewRepresentable {
     func makeUIView(context: Context) -> Q3InputView {
         let view = Q3InputView(frame: .zero, device: MTLCreateSystemDefaultDevice())

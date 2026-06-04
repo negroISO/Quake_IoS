@@ -21,6 +21,7 @@ struct LaunchMenuView: View {
     @Binding var launchCommand: String?
 
     @State private var demoFiles: [DemoEntry] = []
+    @State private var selectedRTMix: Q3RTMix = Q3RTMix.current
     @State private var selectedQuality: Q3UpscaleQuality = Q3UpscaleQuality.current
     @State private var selectedFrameInterp: Q3FrameInterpolation = Q3FrameInterpolation.current
 
@@ -67,6 +68,51 @@ struct LaunchMenuView: View {
                         .foregroundColor(.white.opacity(0.85))
                         .tracking(6)
                 }
+
+                // Ray-tracing overlay mix picker. Persisted via
+                // UserDefaults; Quake3_iOSApp queues `r_rt_mix` after
+                // engine init so this controls raster-only, blended A/B,
+                // or pure RT output at launch. Placed above MetalFX so RT
+                // mode is chosen before output scaling options.
+                HStack(spacing: 8) {
+                    ForEach(Q3RTMix.allCases, id: \.self) { rt in
+                        let isSelected = (selectedRTMix == rt)
+                        Button(action: {
+                            selectedRTMix = rt
+                            Q3RTMix.save(rt)
+                            NSLog("[Q3-MENU] RT mix = %@", rt.rawValue)
+                        }) {
+                            VStack(spacing: 2) {
+                                Text(rt.label)
+                                    .font(.system(size: 13, weight: .heavy, design: .monospaced))
+                                    .foregroundColor(.white)
+                                Text(rt.subtitle)
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundColor(.white.opacity(0.6))
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 5)
+                            .background(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .fill(isSelected ? Color(red: 0.7, green: 0.15, blue: 0.1).opacity(0.85)
+                                                     : Color.black.opacity(0.55))
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .stroke(Color(red: 0.7, green: 0.15, blue: 0.1).opacity(isSelected ? 1.0 : 0.5),
+                                            lineWidth: isSelected ? 2 : 1)
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .frame(maxWidth: 560)
+                .padding(.horizontal, 24)
+
+                Text("Ray Tracing Overlay")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.55))
+                    .padding(.top, -10)
 
                 // MetalFX upscale quality picker. Persisted via
                 // UserDefaults; Quake3_iOSApp.swift reads it on engine
