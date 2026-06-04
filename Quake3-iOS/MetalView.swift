@@ -3055,6 +3055,23 @@ struct MetalView: UIViewRepresentable {
             pbrNormalTried.insert(handle)
             guard let matPtr = Q3MetalRenderer_GetPBRMaterial(handle) else { return nil }
             let mat = matPtr.pointee
+            // Phase 4b — generic normal fallback. If material has albedo
+            // but no normal (railgun / grenade / bfg currently), return
+            // the cached shotgun.n.rtex.dds as a generic surface relief
+            // map. This puts the Phase 4 Fresnel rim on more weapons
+            // without requiring per-weapon authored normals.
+            // Skips when albedo is also null (shotgun's case — but shotgun
+            // DOES have its own normal so this branch never fires for it).
+            if mat.normal == nil {
+                if mat.albedo != nil {
+                    if let generic = pbrGenericFallbackNormal() {
+                        pbrNormalCache[handle] = generic
+                        pbrLog("[Q3-PBR-SWIFT] generic-normal fallback handle=\(handle)")
+                        return generic
+                    }
+                }
+                return nil
+            }
             guard let normalCStr = mat.normal else { return nil }
             let path = String(cString: normalCStr)
             guard let loader = pbrTextureLoader else { return nil }
@@ -3074,6 +3091,38 @@ struct MetalView: UIViewRepresentable {
                 return tex
             } catch {
                 pbrLog("[Q3-PBR-SWIFT] normal DDS load FAILED handle=\(handle) err=\(error.localizedDescription) path=\(path)")
+                return nil
+            }
+        }
+
+        /// Phase 4b — generic fallback normal. Single bundled shotgun.n
+        /// DDS (256² ≈ 87 KB, smaller than rocket_body which is 1.4 MB
+        /// at 1024²). Loaded once, shared across all handles whose
+        /// material has albedo but no normal of its own.
+        private var pbrGenericNormalTex: MTLTexture?
+        private var pbrGenericNormalAttempted = false
+        private func pbrGenericFallbackNormal() -> MTLTexture? {
+            if pbrGenericNormalTex != nil { return pbrGenericNormalTex }
+            if pbrGenericNormalAttempted { return nil }
+            pbrGenericNormalAttempted = true
+            guard let loader = pbrTextureLoader else { return nil }
+            guard let bundleRoot = Bundle.main.resourcePath else { return nil }
+            let path = bundleRoot + "/baseq3/pbr/assets/ingested/shotgun.n.rtex.dds"
+            let url = URL(fileURLWithPath: path)
+            let opts: [MTKTextureLoader.Option: Any] = [
+                .SRGB:                NSNumber(value: false),
+                .textureUsage:        NSNumber(value: MTLTextureUsage.shaderRead.rawValue),
+                .textureStorageMode:  NSNumber(value: MTLStorageMode.private.rawValue),
+                .generateMipmaps:     NSNumber(value: false),
+            ]
+            do {
+                let tex = try loader.newTexture(URL: url, options: opts)
+                tex.label = "Q3.pbr.normal.generic.shotgun_n"
+                pbrGenericNormalTex = tex
+                pbrLog("[Q3-PBR-SWIFT] loaded generic-normal size=\(tex.width)x\(tex.height)")
+                return tex
+            } catch {
+                pbrLog("[Q3-PBR-SWIFT] generic-normal load FAILED err=\(error.localizedDescription)")
                 return nil
             }
         }
