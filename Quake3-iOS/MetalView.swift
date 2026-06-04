@@ -3002,7 +3002,9 @@ struct MetalView: UIViewRepresentable {
         private var rtASPositionBuffer: MTLBuffer?
         private var rtASIndexBuffer: MTLBuffer?
         private var rtPrimitiveMaterialBuffer: MTLBuffer?
-        private var rtAlbedoHandles = [UInt32](repeating: 0, count: 16)
+        private let rtMaxAlbedoSlots = 64
+        private let rtMaxLightmapSlots = 16
+        private var rtAlbedoHandles = [UInt32](repeating: 0, count: 64)
         private var rtLightmapHandles = [UInt32](repeating: 0, count: 16)
         private var rtLogPrintedOnce = false
         private var rtOverlayLogPrintedOnce = false
@@ -3121,8 +3123,8 @@ struct MetalView: UIViewRepresentable {
             };
 
             kernel void rtKernel(texture2d<float, access::write> output [[texture(0)]],
-                                 array<texture2d<float>, 16> albedoTextures [[texture(2)]],
-                                 array<texture2d<float>, 16> lightmapTextures [[texture(18)]],
+                                 array<texture2d<float>, 64> albedoTextures [[texture(2)]],
+                                 array<texture2d<float>, 16> lightmapTextures [[texture(66)]],
                                  constant RayTracingUniforms &uniforms [[buffer(0)]],
                                  acceleration_structure<> worldAS [[buffer(1)]],
                                  const device uint *indices [[buffer(2)]],
@@ -3163,7 +3165,7 @@ struct MetalView: UIViewRepresentable {
                     float3 normalColor = N * 0.5 + 0.5;
 
                     RTPrimitiveMaterial mat = primitiveMaterials[tri];
-                    if (mat.albedoSlot < 16 && mat.lightmapSlot < 16) {
+                    if (mat.albedoSlot < 64 && mat.lightmapSlot < 16) {
                         float2 uv0 = vertices[i0].texCoord;
                         float2 uv1 = vertices[i1].texCoord;
                         float2 uv2 = vertices[i2].texCoord;
@@ -3240,17 +3242,17 @@ struct MetalView: UIViewRepresentable {
         private func buildRTPrimitiveMaterials(device: MTLDevice, primitiveCount: Int) {
             let invalid = UInt32.max
             var materials = [RTPrimitiveMaterial](repeating: RTPrimitiveMaterial(albedoSlot: invalid, lightmapSlot: invalid), count: primitiveCount)
-            rtAlbedoHandles = [UInt32](repeating: 0, count: 16)
-            rtLightmapHandles = [UInt32](repeating: 0, count: 16)
+            rtAlbedoHandles = [UInt32](repeating: 0, count: rtMaxAlbedoSlots)
+            rtLightmapHandles = [UInt32](repeating: 0, count: rtMaxLightmapSlots)
 
-            guard let drawsPtr = Q3MetalRenderer_GetWorldDrawCommands() else {
+            guard let drawsPtr = Q3MetalRenderer_GetWorldAllDrawCommands() else {
                 rtPrimitiveMaterialBuffer = device.makeBuffer(bytes: materials,
                                                               length: materials.count * MemoryLayout<RTPrimitiveMaterial>.stride,
                                                               options: .storageModeShared)
                 return
             }
 
-            let drawCount = Int(Q3MetalRenderer_GetWorldDrawCommandCount())
+            let drawCount = Int(Q3MetalRenderer_GetWorldAllDrawCommandCount())
             let draws = UnsafeBufferPointer(start: drawsPtr, count: drawCount)
 
             /* Pick the 16 most important handles by covered triangle count,
@@ -3272,15 +3274,15 @@ struct MetalView: UIViewRepresentable {
                 }
             }
 
-            func topHandles(_ weights: [UInt32: Int]) -> [UInt32] {
+            func topHandles(_ weights: [UInt32: Int], limit: Int) -> [UInt32] {
                 Array(weights.sorted { lhs, rhs in
                     if lhs.value != rhs.value { return lhs.value > rhs.value }
                     return lhs.key < rhs.key
-                }.prefix(16).map { $0.key })
+                }.prefix(limit).map { $0.key })
             }
 
-            let topAlbedos = topHandles(albedoWeights)
-            let topLightmaps = topHandles(lightmapWeights)
+            let topAlbedos = topHandles(albedoWeights, limit: rtMaxAlbedoSlots)
+            let topLightmaps = topHandles(lightmapWeights, limit: rtMaxLightmapSlots)
             for (i, h) in topAlbedos.enumerated() {
                 rtAlbedoHandles[i] = h
                 _ = texture(for: h, device: device)
@@ -3432,9 +3434,11 @@ struct MetalView: UIViewRepresentable {
                 enc.label = "Q3.RT.trace"
                 enc.setComputePipelineState(rtPSO)
                 enc.setTexture(rtTex, index: 0)
-                for i in 0..<16 {
+                for i in 0..<rtMaxAlbedoSlots {
                     enc.setTexture(texture(for: rtAlbedoHandles[i], device: device), index: 2 + i)
-                    enc.setTexture(texture(for: rtLightmapHandles[i], device: device), index: 18 + i)
+                }
+                for i in 0..<rtMaxLightmapSlots {
+                    enc.setTexture(texture(for: rtLightmapHandles[i], device: device), index: 66 + i)
                 }
                 enc.setBytes(&uniforms, length: MemoryLayout<RayTracingUniforms>.stride, index: 0)
                 enc.setAccelerationStructure(worldAS, bufferIndex: 1)
