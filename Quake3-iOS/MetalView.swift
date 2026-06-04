@@ -4804,8 +4804,21 @@ struct MetalView: UIViewRepresentable {
                         // skip the specular block entirely. Currently
                         // only the rocket launcher has both maps wired
                         // in materials.json.
-                        encoder.setFragmentTexture(pbrRoughnessTexture(for: draw.textureHandle), index: 3)
-                        encoder.setFragmentTexture(pbrMetallicTexture(for: draw.textureHandle), index: 4)
+                        // PBR Phase 5 A/B gate — when r_pbr_phase5=0, bind nil
+                        // for roughness + metallic so the MSL `hasFullPBR`
+                        // check falls through and the Cook-Torrance + Burley
+                        // direct-sun block is skipped. Pure v6 Fresnel rim
+                        // remains active. Note: this also disables Phase 6 IBL
+                        // (gated inside hasFullPBR) so a clean Phase 5 A/B
+                        // requires IBL stays on — but IBL is only PRESENT
+                        // inside hasFullPBR, so without Phase 5 there's no
+                        // hasFullPBR block to host IBL either. Two-axis A/B
+                        // (phase5 × ibl) needs both cvars: r_pbr_phase5=0
+                        // → no GGX peak, no IBL; r_pbr_ibl=0 → IBL replaced
+                        // by 0.35 ambient floor (Phase 5 GGX still fires).
+                        let phase5Enabled = Q3_PBRPhase5Enabled() != 0
+                        encoder.setFragmentTexture(phase5Enabled ? pbrRoughnessTexture(for: draw.textureHandle) : nil, index: 3)
+                        encoder.setFragmentTexture(phase5Enabled ? pbrMetallicTexture(for: draw.textureHandle) : nil, index: 4)
                         // Phase 6 IBL — procedural env cubemap + dedicated
                         // clampToEdge sampler. Bound nil-safe; MSL guards via
                         // is_null_texture so a fail-to-alloc falls back to
