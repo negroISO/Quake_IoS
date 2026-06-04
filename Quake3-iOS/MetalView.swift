@@ -3119,6 +3119,16 @@ struct MetalView: UIViewRepresentable {
         private var pbrEnvCube: MTLTexture?
         private var pbrEnvCubeAttempted = false
         private var pbrEnvSampler: MTLSamplerState?
+        /// Phase 6 v3 — the stem (e.g., "env/space1") the current pbrEnvCube
+        /// was built from. Compared against the live r_pbr_ibl_skybox cvar at
+        /// the top of each ensurePBREnvCube() call; mismatch invalidates the
+        /// cached cube + flags the lazy builder to try again. Lets the
+        /// in-engine sky-shader auto-publisher (C-side GetSkyFaceTextureForSurface)
+        /// drive per-map IBL swaps seamlessly without restart. Sentinel
+        /// "<procedural>" marks the procedural-fallback path so subsequent
+        /// frames don't re-attempt the FS loader once it has been determined
+        /// to miss for the current stem.
+        private var pbrEnvCubeStem: String?
         private var pbrTriedAndMissed: Set<UInt32> = []
         private var pbrNormalTried: Set<UInt32> = []
         private var pbrRoughnessTried: Set<UInt32> = []
@@ -3505,7 +3515,35 @@ struct MetalView: UIViewRepresentable {
         /// rendering needs a 6-face render-pass at first valid frame after
         /// world load, which is invasive plumbing. Procedural v1 ships the
         /// headline "rocket reflects sky" win in one self-contained method.
+        /// Phase 6 v3 — read the active skybox stem from the C bridge. Returns
+        /// the cvar value (which the engine auto-publishes on map load via
+        /// GetSkyFaceTextureForSurface) or nil if unavailable / empty.
+        private func currentPBRSkyboxStem() -> String? {
+            var nameBuf = [CChar](repeating: 0, count: 128)
+            let ok = nameBuf.withUnsafeMutableBufferPointer { p -> Int32 in
+                Q3_PBRIBLSkyboxName(p.baseAddress, Int32(p.count))
+            }
+            guard ok != 0 else { return nil }
+            let stem = String(cString: nameBuf)
+            return stem.isEmpty ? nil : stem
+        }
+
         private func ensurePBREnvCube() -> MTLTexture? {
+            // Phase 6 v3 — live cvar-change detection. Read the active stem
+            // and compare against the stem the cached cube was built from.
+            // If the engine auto-publish (or user console set) has moved the
+            // cvar since we last built, invalidate so the lazy builder
+            // re-runs. The "<procedural>" sentinel records sessions where
+            // the map skybox path missed and we shipped the procedural
+            // fallback — those don't invalidate when the cvar changes UNLESS
+            // the cvar now names something different from when the procedural
+            // was selected (sentinel always != real stem).
+            let currentStem = currentPBRSkyboxStem()
+            if pbrEnvCube != nil, pbrEnvCubeStem != currentStem {
+                pbrLog("[Q3-PBR-IBL] skybox stem changed (\(pbrEnvCubeStem ?? "<nil>") → \(currentStem ?? "<nil>")) — invalidating cache")
+                pbrEnvCube = nil
+                pbrEnvCubeAttempted = false
+            }
             if let cube = pbrEnvCube { return cube }
             if pbrEnvCubeAttempted { return nil }
             pbrEnvCubeAttempted = true
@@ -3517,6 +3555,7 @@ struct MetalView: UIViewRepresentable {
             // never fires for this session.
             if let mapCube = tryBuildMapSkyboxCube() {
                 pbrEnvCube = mapCube
+                pbrEnvCubeStem = currentStem
                 return mapCube
             }
 
@@ -3606,6 +3645,10 @@ struct MetalView: UIViewRepresentable {
                 cb.waitUntilCompleted()
             }
             pbrEnvCube = cube
+            // Phase 6 v3 — stamp the procedural sentinel so if the cvar
+            // later changes to a real loadable stem, ensurePBREnvCube
+            // invalidates and re-tries the map-cube path next call.
+            pbrEnvCubeStem = "<procedural>"
             NSLog("[Q3-PBR-IBL] procedural envCube ready %dx%dx6 mips=%d",
                   size, size, cube.mipmapLevelCount)
             pbrLog("[Q3-PBR-IBL] procedural envCube ready \(size)x\(size)x6 mips=\(cube.mipmapLevelCount)")

@@ -5745,7 +5745,39 @@ static qhandle_t GetSkyFaceTextureForSurface(const char *shaderName,
             break;
         }
     }
-    if (entry == NULL) return 0;
+    if (entry == NULL) {
+        static int s_skyMissReported = 0;
+        if (!s_skyMissReported) {
+            s_skyMissReported = 1;
+            MetalTelemetryPrintf("metal_pbr_ibl", PRINT_ALL,
+                "[Q3-PBR-IBL] sky-face lookup MISS shader='%s' (no entry or empty skyBoxBase)\n",
+                shaderName);
+        }
+        return 0;
+    }
+
+    /* PBR Phase 6 v3 — auto-publish active map's sky stem to r_pbr_ibl_skybox.
+     *
+     * Every visible sky surface hits this fn each frame with its parent shader
+     * name; the matched entry's skyBoxBase IS the map's authored sky stem
+     * (parsed at .shader load time, line ~6336). Copying to the cvar lets the
+     * Swift IBL builder source from the right env path on every map load
+     * with zero engine plumbing — and Swift's per-frame cvar-string compare picks
+     * the change up within one frame and invalidates the cached cubemap.
+     *
+     * Compare-then-set so we don't spam Cvar_Set every frame; only fires the
+     * write when the active sky genuinely changes (i.e. once per map load
+     * unless the user manually overrides the cvar). */
+    if (entry->skyBoxBase[0] != '\0' &&
+        ri.Cvar_Set != NULL && ri.Cvar_VariableString != NULL) {
+        const char *cur = ri.Cvar_VariableString("r_pbr_ibl_skybox");
+        if (cur == NULL || Q_stricmp(cur, entry->skyBoxBase) != 0) {
+            MetalTelemetryPrintf("metal_pbr_ibl", PRINT_ALL,
+                "[Q3-PBR-IBL] auto-detect: shader='%s' sky stem='%s' (was '%s')\n",
+                shaderName, entry->skyBoxBase, cur ? cur : "<null>");
+            ri.Cvar_Set("r_pbr_ibl_skybox", entry->skyBoxBase);
+        }
+    }
 
     ax = fabsf(nx); ay = fabsf(ny); az = fabsf(nz);
     if (az >= ax && az >= ay) {
