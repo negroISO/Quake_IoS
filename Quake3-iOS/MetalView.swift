@@ -2420,6 +2420,8 @@ struct MetalView: UIViewRepresentable {
                 {
                     float roughness = 0.55;  // default — semi-rough
                     float metallic  = 0.50;  // default — partial metal
+                    bool hasFullPBR = !is_null_texture(roughnessTexture) &&
+                                      !is_null_texture(metallicTexture);
                     if (!is_null_texture(roughnessTexture)) {
                         roughness = roughnessTexture.sample(textureSampler, in.texCoord).r;
                     }
@@ -2430,25 +2432,99 @@ struct MetalView: UIViewRepresentable {
                     float3 V = normalize(uniforms.cameraPos - in.worldPos);
                     float NdotV = max(dot(worldN, V), 0.0);
 
-                    // Fresnel: pow(1-NdotV, 2.5) — sharper falloff than
-                    // the v5 quadratic to keep rim band narrower.
+                    if (hasFullPBR) {
+                        /* PBR Phase 5 — Cook-Torrance GGX with Burley diffuse.
+                         *
+                         * Ported from SomaZ/OpenJK rend2 lightall.glsl —
+                         * the gold-standard Q3-engine PBR reference. Adapted
+                         * to MSL and our single fake-sun lighting model
+                         * (vs their multi-light + IBL setup).
+                         *
+                         * The earlier Phase 4 v2 GGX attempt (fdf5f56) failed
+                         * because:
+                         *   1. NdotL term multiplication zeroed spec on
+                         *      surfaces not facing the hardcoded sun
+                         *   2. Single fake sun was so narrow that few pixels
+                         *      hit the peak
+                         *
+                         * Phase 5 fix: use a brighter sun + AMBIENT diffuse
+                         * floor so even unlit-by-sun pixels get baseline
+                         * shading. Plus we keep the Fresnel rim as additive
+                         * accent on top — no longer a replacement, now a
+                         * supplement.
+                         */
+                        float3 L = sunDir;  // already normalized above
+                        float3 H = normalize(V + L);
+                        float NdotL = max(dot(worldN, L), 0.0);
+                        float NdotH = max(dot(worldN, H), 0.0);
+                        float VdotH = max(dot(V, H), 0.0);
+                        float LdotH = max(dot(L, H), 0.0);
+
+                        // D — GGX normal distribution (OpenJK D_GGX)
+                        float alpha  = max(roughness * roughness, 0.0625);
+                        float alpha2 = alpha * alpha;
+                        float d = (NdotH * alpha2 - NdotH) * NdotH + 1.0;
+                        float D = alpha2 / (M_PI_F * d * d + 1e-6);
+
+                        // G — Smith joint approx (OpenJK V_SmithJointApprox)
+                        float Vis_SmithV = NdotL * (max(NdotV, 0.001) * (1.0 - alpha) + alpha);
+                        float Vis_SmithL = NdotV * (NdotL * (1.0 - alpha) + alpha);
+                        float G = 0.5 / max(Vis_SmithV + Vis_SmithL, 1e-6);
+
+                        // F — Schlick Fresnel (OpenJK F_Schlick variant)
+                        float3 F0 = mix(float3(0.04), base.rgb, metallic);
+                        float3 F  = F0 + (float3(1.0) - F0) * pow(1.0 - VdotH, 5.0);
+
+                        // Specular (D * F * G), pre-multiplied by NdotL
+                        float3 spec = D * F * G;
+
+                        // Burley diffuse (OpenJK Diff_Burley)
+                        float f90 = 0.5 + 2.0 * roughness * LdotH * LdotH;
+                        float diffScatterL = 1.0 + (f90 - 1.0) * pow(1.0 - NdotL, 5.0);
+                        float diffScatterV = 1.0 + (f90 - 1.0) * pow(1.0 - NdotV, 5.0);
+                        float3 burley = base.rgb * diffScatterL * diffScatterV * (1.0 / M_PI_F);
+
+                        // Diffuse energy: dielectric contributes all
+                        // unreflected light, metal contributes none
+                        float3 kD = (float3(1.0) - F) * (1.0 - metallic);
+
+                        // Sun intensity scaled UP to compensate for our
+                        // single-light no-IBL setup. Real PBR rigs have
+                        // many lights + sky contribution; we approximate
+                        // by boosting the one light we have.
+                        float3 sunColor = float3(2.4, 2.2, 1.9);  // warmish white sun
+
+                        // Per-light radiance
+                        float3 radiance = (kD * burley + spec) * sunColor * NdotL;
+
+                        // Ambient floor — without IBL we'd render
+                        // shadow-side pixels as pure black. Use base color
+                        // dimmed as crude ambient approximation.
+                        float3 ambient = base.rgb * 0.35;
+
+                        // Replace base with Cook-Torrance result and add
+                        // the Fresnel rim on top (still useful as outline
+                        // accent on metal silhouette).
+                        base.rgb = ambient + radiance;
+                    }
+
+                    // Fresnel rim — fires for ALL entities (including the
+                    // GGX-path rocket). For rough/matte surfaces it adds
+                    // the silhouette accent that proper PBR alone produces
+                    // via shadowed-edge contrast.
                     // Phase F — pbrRimParams.x = peak intensity (default 0.55),
                     // pbrRimParams.y = Fresnel exponent (default 2.5).
                     float fresnel = pow(1.0 - NdotV, pbrRimParams.y);
-
-                    // Rim color: dielectric → light grey; metallic →
-                    // mildly brightened base. Less aggressive than v5's
-                    // base*1.6+0.25 to avoid the marble look.
                     float3 rimColor = mix(
                         float3(0.75, 0.75, 0.78),
                         base.rgb * 1.25 + 0.15,
                         metallic
                     );
-
-                    // Strength range tightened: floor 0.20 + smoothness
-                    // adds up to 0.55. Mix-blend toward rim color so
-                    // dark base never washes out the highlight.
                     float rimStrength = fresnel * mix(0.20, pbrRimParams.x, 1.0 - roughness);
+                    // GGX-path entities (full PBR) get a much subtler rim
+                    // accent than rim-only entities — they already have
+                    // proper specular from the BRDF.
+                    rimStrength *= hasFullPBR ? 0.35 : 1.0;
                     base.rgb = mix(base.rgb, rimColor, saturate(rimStrength));
                 }
             }
