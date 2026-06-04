@@ -175,6 +175,11 @@ struct Quake3_iOSApp: App {
                             let telemetrySource = Self.telemetrySource
                             await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
                                 DispatchQueue.global(qos: .userInitiated).async {
+                                    // PBR Phase C — start audio backend BEFORE
+                                    // Quake3_Init so the sample rate negotiated
+                                    // with AVAudioSession is set when the engine's
+                                    // S_Init eventually calls SNDDMA_Init.
+                                    Q3AudioManager.shared.start()
                                     NSLog("[Q3-BOOT] (bg) calling Quake3_Init")
                                     DebugTelemetry.shared.log(source: telemetrySource, type: "engine_init_begin")
                                     Quake3_Init(basePath)

@@ -87,4 +87,11 @@ int Q3_PostprocessEnabled(void);
 float Q3_PostprocessIntensity(void);
 float Q3_PostprocessGamma(void);
 
+/* Audio backend (ios_main.m SNDDMA + ring buffer). Set the rate BEFORE
+ * Quake3_Init so SNDDMA_Init allocates correctly. Pull is called from
+ * the AVAudioSourceNode render block on the audio thread — no allocs,
+ * no Swift traffic, no logging. */
+void Q3IOS_AudioSetSampleRate(int rate);
+int  Q3IOS_AudioPullStereo16(short *dest, int frames);
+
 #endif

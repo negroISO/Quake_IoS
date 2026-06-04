@@ -89,6 +89,7 @@
 		5EFA7655160872E3CF768C93 /* huffman.c in Sources */ = {isa = PBXBuildFile; fileRef = 9A016534BC02287B5673659D /* huffman.c */; };
 		5FC21AA3F6919270E277DC4E /* sv_filter.c in Sources */ = {isa = PBXBuildFile; fileRef = B5D25120565B04C5A523521C /* sv_filter.c */; };
 		5FC4133FCC928C5EA7D6E8F8 /* Q3MetalStateMap.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16A2E95B180E4A27CB1D25B3 /* Q3MetalStateMap.swift */; };
+		5FC66B9DE019B28957ABA620 /* AudioManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 722A4FC384A627CBE3971E3F /* AudioManager.swift */; };
 		604502D6B26311220B48C22B /* be_ai_gen.c in Sources */ = {isa = PBXBuildFile; fileRef = 0C0E9584F687BF79EA00B217 /* be_ai_gen.c */; };
 		60DDD73890C5531CFBD6BA2F /* jcdctmgr.c in Sources */ = {isa = PBXBuildFile; fileRef = 2C87540B2341A77172F0D916 /* jcdctmgr.c */; };
 		65B72BC9CD0820A63AA24B09 /* q3_stage.c in Sources */ = {isa = PBXBuildFile; fileRef = 535182FB70512EBC40B08335 /* q3_stage.c */; };
@@ -244,6 +245,7 @@
 		14D7DE132B65EDBBFE1DA920 /* cg_draw.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = cg_draw.c; sourceTree = "<group>"; };
 		163E47040C329A658DE94003 /* jaricom.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = jaricom.c; sourceTree = "<group>"; };
 		16A2E95B180E4A27CB1D25B3 /* Q3MetalStateMap.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Q3MetalStateMap.swift; sourceTree = "<group>"; };
+		722A4FC384A627CBE3971E3F /* AudioManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioManager.swift; sourceTree = "<group>"; };
 		16FDF29543E8821F4A9A0AC3 /* jdcoefct.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = jdcoefct.c; sourceTree = "<group>"; };
 		171EF12724EED24A9334AC45 /* sv_snapshot.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = sv_snapshot.c; sourceTree = "<group>"; };
 		175FF2F5F2FD80428A506E80 /* q_shared.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = q_shared.h; sourceTree = "<group>"; };
@@ -1092,6 +1094,7 @@
 				2C8B120A0EBCD9CEE983C412 /* LaunchMenuView.swift */,
 				88E516AF1355E11FE7A7FD28 /* MetalView.swift */,
 				16A2E95B180E4A27CB1D25B3 /* Q3MetalStateMap.swift */,
+				722A4FC384A627CBE3971E3F /* AudioManager.swift */,
 				12703A83024DC702F9413C41 /* Quake3_iOSApp.swift */,
 				6AF21139679F9E7FC929A172 /* Quake3-iOS-Bridging-Header.h */,
 			);
@@ -1197,6 +1200,7 @@
 				13E1EBA63D1082D3878C8049 /* LaunchMenuView.swift in Sources */,
 				4665DA1B2C281DE4C038DB06 /* MetalView.swift in Sources */,
 				5FC4133FCC928C5EA7D6E8F8 /* Q3MetalStateMap.swift in Sources */,
+				5FC66B9DE019B28957ABA620 /* AudioManager.swift in Sources */,
 				FAE1E11980EB55CB99AC1EFC /* Quake3_iOSApp.swift in Sources */,
 				D38C90BB2B1D4064FE9E7C4C /* analysis.c in Sources */,
 				36E64738B68D9C670599B04A /* be_aas_bspq3.c in Sources */,

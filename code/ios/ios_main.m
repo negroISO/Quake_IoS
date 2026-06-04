@@ -652,26 +652,156 @@ void Sys_ConfigureFPU(void) {}
 // Network functions provided by net_ip.c
 
 // =============================================================
-// Sound DMA stubs (replacing SDL audio driver)
+// Sound DMA — iOS AVAudioEngine backend (ported from Q2_too_ios)
 // =============================================================
 
+#include <stdatomic.h>
+#include <limits.h>
 #include "../client/snd_local.h"
 
+extern int s_paintedtime;
+extern dma_t dma;
+
+#define Q3IOS_SOUND_MIN_BUFFER_FRAMES 48000
+#define Q3IOS_SOUND_CHANNELS          2
+#define Q3IOS_SOUND_BITS              16
+
+static _Atomic int g_q3ios_audio_sample_rate = 44100;
+static _Atomic int g_q3ios_audio_read = 0;
+static _Atomic int g_q3ios_audio_underflow_blocks = 0;
+static _Atomic int g_q3ios_audio_underflow_frames = 0;
+
+static byte *g_q3ios_dma_storage = NULL;
+static int   g_q3ios_dma_total_samples = 0;
+
+static int q3ios_next_power_of_two(int value) {
+    int result = 1;
+    while (result < value && result <= (INT_MAX >> 1)) {
+        result <<= 1;
+    }
+    return result;
+}
+
+void Q3IOS_AudioSetSampleRate(int rate) {
+    if (rate >= 8000 && rate <= 96000) {
+        atomic_store_explicit(&g_q3ios_audio_sample_rate, rate,
+                              memory_order_release);
+    }
+}
+
 qboolean SNDDMA_Init(void) {
-    return qfalse;
+    int sample_rate = atomic_load_explicit(&g_q3ios_audio_sample_rate,
+                                           memory_order_acquire);
+    if (sample_rate < 8000 || sample_rate > 96000) sample_rate = 44100;
+
+    int min_frames = sample_rate > Q3IOS_SOUND_MIN_BUFFER_FRAMES
+        ? sample_rate : Q3IOS_SOUND_MIN_BUFFER_FRAMES;
+    int frames = q3ios_next_power_of_two(min_frames);
+    int mono_samples = frames * Q3IOS_SOUND_CHANNELS;
+    size_t bytes = (size_t)mono_samples * (Q3IOS_SOUND_BITS / 8);
+
+    if (g_q3ios_dma_storage) {
+        free(g_q3ios_dma_storage);
+        g_q3ios_dma_storage = NULL;
+    }
+    g_q3ios_dma_storage = (byte *)calloc(1, bytes);
+    if (!g_q3ios_dma_storage) {
+        Com_Printf("SNDDMA_Init: out of memory allocating %zu bytes\n", bytes);
+        return qfalse;
+    }
+    g_q3ios_dma_total_samples = mono_samples;
+
+    dma.channels         = Q3IOS_SOUND_CHANNELS;
+    dma.samples          = mono_samples;
+    dma.fullsamples      = mono_samples / Q3IOS_SOUND_CHANNELS;
+    dma.submission_chunk = 1;
+    dma.samplebits       = Q3IOS_SOUND_BITS;
+    dma.isfloat          = 0;
+    dma.speed            = sample_rate;
+    dma.buffer           = g_q3ios_dma_storage;
+    dma.driver           = "AVAudioEngine";
+
+    atomic_store_explicit(&g_q3ios_audio_read, 0, memory_order_release);
+
+    Com_Printf("SNDDMA_Init: %d Hz, %d ch, %d-bit, %d frame ring (AVAudioEngine)\n",
+               sample_rate, dma.channels, dma.samplebits, frames);
+    return qtrue;
 }
 
 int SNDDMA_GetDMAPos(void) {
-    return 0;
+    int pos = atomic_load_explicit(&g_q3ios_audio_read, memory_order_acquire);
+    static int last_report_pos = 0;
+    int report_interval_mono = dma.speed * dma.channels;
+    if (pos - last_report_pos >= report_interval_mono) {
+        int blocks = atomic_exchange_explicit(&g_q3ios_audio_underflow_blocks,
+                                              0, memory_order_relaxed);
+        int frames = atomic_exchange_explicit(&g_q3ios_audio_underflow_frames,
+                                              0, memory_order_relaxed);
+        if (blocks > 0) {
+            NSLog(@"[Q3-AUDIO] underflow blocks=%d frames=%d (~%dms missing)",
+                  blocks, frames,
+                  dma.speed > 0 ? (frames * 1000 / dma.speed) : 0);
+        }
+        last_report_pos = pos;
+    }
+    return pos;
 }
 
 void SNDDMA_Shutdown(void) {
+    if (g_q3ios_dma_storage) {
+        free(g_q3ios_dma_storage);
+        g_q3ios_dma_storage = NULL;
+    }
+    g_q3ios_dma_total_samples = 0;
+    dma.buffer  = NULL;
+    dma.samples = 0;
 }
 
-void SNDDMA_BeginPainting(void) {
-}
+void SNDDMA_BeginPainting(void) { }
+void SNDDMA_Submit(void)        { }
 
-void SNDDMA_Submit(void) {
+int Q3IOS_AudioPullStereo16(short *dest, int frames) {
+    if (!dest || frames <= 0) return 0;
+    if (!g_q3ios_dma_storage || g_q3ios_dma_total_samples <= 0) {
+        memset(dest, 0, (size_t)frames * 2 * sizeof(short));
+        return 0;
+    }
+
+    int total_samples = g_q3ios_dma_total_samples;
+    int read_mono = atomic_load_explicit(&g_q3ios_audio_read,
+                                         memory_order_acquire);
+    short *ring = (short *)(void *)g_q3ios_dma_storage;
+
+    int painted_pairs = __atomic_load_n(&s_paintedtime, __ATOMIC_ACQUIRE);
+    int painted_mono  = painted_pairs * Q3IOS_SOUND_CHANNELS;
+    int available_mono = painted_mono - read_mono;
+    if (available_mono < 0) available_mono = 0;
+
+    int requested_mono = frames * Q3IOS_SOUND_CHANNELS;
+    int playable_mono = (available_mono < requested_mono) ? available_mono
+                                                          : requested_mono;
+    int playable_frames = playable_mono / Q3IOS_SOUND_CHANNELS;
+
+    for (int i = 0; i < playable_frames; ++i) {
+        int offset_mono = (read_mono + i * Q3IOS_SOUND_CHANNELS) % total_samples;
+        dest[2 * i + 0] = ring[offset_mono + 0];
+        dest[2 * i + 1] = ring[offset_mono + 1];
+    }
+    if (playable_frames < frames) {
+        memset(dest + (size_t)playable_frames * 2, 0,
+               (size_t)(frames - playable_frames) * 2 * sizeof(short));
+        if (painted_pairs > 0) {
+            atomic_fetch_add_explicit(&g_q3ios_audio_underflow_blocks, 1,
+                                      memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_q3ios_audio_underflow_frames,
+                                      frames - playable_frames,
+                                      memory_order_relaxed);
+        }
+    }
+
+    int new_read = read_mono + requested_mono;
+    atomic_store_explicit(&g_q3ios_audio_read, new_read, memory_order_release);
+    return playable_frames;
 }
 
 // =============================================================
