@@ -9945,6 +9945,44 @@ int Q3_PBRPhase5Enabled(void) {
     return cv ? cv->integer : 1;
 }
 
+/* PBR Phase 8 — world-surface PBR shading.
+ *
+ * Augments the existing Phase 3 Mikkelsen normal-map block in
+ * q3_world_fragment with a Cook-Torrance + IBL composition. Synthetic
+ * defaults (0.55 roughness / 0.50 metallic) for all world surfaces —
+ * Q3 stock textures don't ship authored rough/metal, and the RTX Remix
+ * mod's 2,804 hex-hashed DDS pool is unreachable until the hash algo
+ * is cracked. Visible effect: walls show IBL chrome cue, soft sky-cube
+ * reflection on metal-leaning surfaces, brighter shadow side (no GI
+ * compensation).
+ *
+ *   r_pbr_world_textures      gate, default "1"
+ *   r_pbr_world_ambient_boost [0..1] additive diffuse-IBL fraction,
+ *                             default "0.20" — light shadow-side fill
+ *   r_pbr_world_spec_boost    [0..1] specular IBL highlight intensity,
+ *                             default "0.40" — chrome cue strength */
+int   Q3_PBRWorldEnabled(void) {
+    if (ri.Cvar_Get == NULL) return 1;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_world_textures", "1", CVAR_ARCHIVE);
+    return cv ? cv->integer : 1;
+}
+float Q3_PBRWorldAmbientBoost(void) {
+    if (ri.Cvar_Get == NULL) return 0.20f;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_world_ambient_boost", "0.20", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.20f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    return v;
+}
+float Q3_PBRWorldSpecBoost(void) {
+    if (ri.Cvar_Get == NULL) return 0.40f;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_world_spec_boost", "0.40", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.40f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    return v;
+}
+
 /* PBR Phase 6 v2 — map-specific skybox IBL source.
  *
  * r_pbr_ibl_skybox: stem (no _ft/_bk/etc suffix, no .tga extension) of the

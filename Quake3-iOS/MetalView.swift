@@ -1805,10 +1805,13 @@ struct MetalView: UIViewRepresentable {
                                           constant WorldDrawUniforms &drawUniforms [[buffer(0)]],
                                           constant WorldUniforms &uniforms [[buffer(1)]],
                                           constant DLightBlock &dlights [[buffer(2)]],
+                                          constant float4 &pbrWorldParams [[buffer(3)]],
                                           texture2d<float> colorTexture [[texture(0)]],
                                           texture2d<float> lightmapTexture [[texture(1)]],
                                           texture2d<float> worldNormalMap [[texture(2)]],
-                                          sampler textureSampler [[sampler(0)]]) {
+                                          texturecube<float> envCube [[texture(3)]],
+                                          sampler textureSampler [[sampler(0)]],
+                                          sampler envSampler [[sampler(1)]]) {
             float2 texCoord = in.texCoord;
             int rgbGen = int(drawUniforms.rgbGen + 0.5);
             int alphaGen = int(drawUniforms.alphaGen + 0.5);
@@ -2061,6 +2064,62 @@ struct MetalView: UIViewRepresentable {
                 float halfLambert = NdotL * NdotL;
 
                 lit *= (0.65 + halfLambert * 0.70);
+
+                /* PBR Phase 8 — Cook-Torrance + IBL on world surfaces.
+                 *
+                 * Gated by pbrWorldParams.x (r_pbr_world_textures cvar).
+                 * Augments the Phase 3 Mikkelsen normal-map shading with:
+                 *   - kD * diffuseIBL * lit * ambientBoost  (env-fill on
+                 *     shadow side, compensates for no GI)
+                 *   - F * specularIBL * specBoost           (metallic
+                 *     highlight reflecting active map skybox cube via
+                 *     Phase 6 v3 auto-detect)
+                 *
+                 * Uses synthetic defaults — Q3 stock textures don't ship
+                 * authored roughness/metallic, so all world surfaces get
+                 * the same 0.55 roughness / 0.50 metallic. Result is a
+                 * "PBR shading layer on top of vanilla textures" — visible
+                 * IBL chrome cue on walls, brighter shadow side, soft
+                 * reflections — but no per-surface authored variety (that
+                 * would require unlocking the mod's 2,804 hex-hashed DDS
+                 * pool which our hash algorithm doesn't match yet).
+                 *
+                 * pbrWorldParams.x = enable gate (0 or 1)
+                 * pbrWorldParams.y = ambientBoost scalar [0..1] — how much
+                 *                    of diffuse IBL adds onto lit color
+                 * pbrWorldParams.z = specBoost scalar [0..1] — metallic
+                 *                    highlight intensity
+                 * pbrWorldParams.w = reserved */
+                if (pbrWorldParams.x > 0.5 && !is_null_texture(envCube)) {
+                    float3 V = normalize(uniforms.cameraPos - in.worldPos);
+                    float NdotV = max(dot(worldN, V), 0.0);
+                    float roughness = 0.55;
+                    float metallic = 0.50;
+
+                    float maxMipF = float(envCube.get_num_mip_levels() - 1);
+                    float3 diffuseIBL = envCube.sample(envSampler, worldN, level(maxMipF)).rgb;
+                    float3 R = reflect(-V, worldN);
+                    float specMip = roughness * maxMipF;
+                    float3 specularIBL = envCube.sample(envSampler, R, level(specMip)).rgb;
+
+                    float3 F0 = mix(float3(0.04), lit, metallic);
+                    float3 F_v = F0 + (max(float3(1.0 - roughness), F0) - F0)
+                                       * pow(1.0 - NdotV, 5.0);
+                    float3 kD_v = (float3(1.0) - F_v) * (1.0 - metallic);
+
+                    float ambBoost  = pbrWorldParams.y;
+                    float specBoost = pbrWorldParams.z;
+                    // Additive diffuse IBL scaled by inverse-luma — adds
+                    // shadow-side fill without washing the lightmap's
+                    // warm/cool color tone. The (1 - litLuma) factor pumps
+                    // dark crevices but leaves already-bright pixels alone,
+                    // so lava-red walls don't desaturate to grey.
+                    float litLuma = dot(lit, float3(0.2126, 0.7152, 0.0722));
+                    float fillScale = ambBoost * (1.0 - saturate(litLuma));
+                    lit = lit
+                        + kD_v * diffuseIBL * fillScale
+                        + F_v  * specularIBL * specBoost;
+                }
             }
             return float4(lit, texel.a * va);
         }
@@ -4388,6 +4447,21 @@ struct MetalView: UIViewRepresentable {
                         // slot unbound; q3_world_fragment guards with
                         // is_null_texture() so the vanilla path is preserved.
                         encoder.setFragmentTexture(ensurePBRWorldNormal(), index: 2)
+                        // PBR Phase 8 — bind IBL env cube + sampler for the
+                        // Cook-Torrance + IBL block on world surfaces. Same
+                        // cube as entity binding (Phase 6 v3 auto-detected).
+                        if Q3_PBRIBLEnabled() != 0 && Q3_PBRWorldEnabled() != 0 {
+                            encoder.setFragmentTexture(ensurePBREnvCube(), index: 3)
+                            encoder.setFragmentSamplerState(ensurePBREnvSampler(), index: 1)
+                        } else {
+                            encoder.setFragmentTexture(nil, index: 3)
+                        }
+                        var pbrWorldParams = SIMD4<Float>(
+                            Q3_PBRWorldEnabled() != 0 ? 1.0 : 0.0,
+                            Q3_PBRWorldAmbientBoost(),
+                            Q3_PBRWorldSpecBoost(),
+                            0.0)
+                        encoder.setFragmentBytes(&pbrWorldParams, length: 16, index: 3)
                         encoder.setFragmentBytes(&drawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 0)
                         encoder.setVertexBytes(&drawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 2)
                         encoder.drawIndexedPrimitives(
@@ -4742,6 +4816,19 @@ struct MetalView: UIViewRepresentable {
                             encoder.setFragmentTexture(lightmapTexture, index: 1)
                             // PBR Phase 3 — see main world bind site for rationale.
                             encoder.setFragmentTexture(ensurePBRWorldNormal(), index: 2)
+                            // PBR Phase 8 — IBL env cube binding (fog pass).
+                            if Q3_PBRIBLEnabled() != 0 && Q3_PBRWorldEnabled() != 0 {
+                                encoder.setFragmentTexture(ensurePBREnvCube(), index: 3)
+                                encoder.setFragmentSamplerState(ensurePBREnvSampler(), index: 1)
+                            } else {
+                                encoder.setFragmentTexture(nil, index: 3)
+                            }
+                            var pbrWorldFogParams = SIMD4<Float>(
+                                Q3_PBRWorldEnabled() != 0 ? 1.0 : 0.0,
+                                Q3_PBRWorldAmbientBoost(),
+                                Q3_PBRWorldSpecBoost(),
+                                0.0)
+                            encoder.setFragmentBytes(&pbrWorldFogParams, length: 16, index: 3)
                             encoder.setFragmentBytes(&fogUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 0)
                             encoder.setVertexBytes(&fogUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 2)
                             encoder.drawIndexedPrimitives(

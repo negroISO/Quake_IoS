@@ -127,4 +127,15 @@ int Q3_PBRIBLSkyboxName(char *out, int max_len);
 int Q3MetalRenderer_FSReadFile(const char *path, const unsigned char **out_buf, int *out_size);
 void Q3MetalRenderer_FSFreeFile(const unsigned char *buf);
 
+/* PBR Phase 8 — world-surface PBR shading toggles.
+ * r_pbr_world_textures (1) gates the Cook-Torrance+IBL block on top of
+ * Phase 3 normal-map shading inside q3_world_fragment.
+ * r_pbr_world_ambient_boost (0.20) scales the diffuse-IBL fill that
+ * brightens shadow side (compensates for no GI in raster).
+ * r_pbr_world_spec_boost (0.40) scales the specular IBL highlight that
+ * reflects active map skybox cube on metallic-leaning surfaces. */
+int   Q3_PBRWorldEnabled(void);
+float Q3_PBRWorldAmbientBoost(void);
+float Q3_PBRWorldSpecBoost(void);
+
 #endif
