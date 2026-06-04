@@ -353,10 +353,14 @@ struct MetalView: UIViewRepresentable {
         struct RTPrimitiveMaterial {
             var albedoSlot: UInt32
             var lightmapSlot: UInt32
-            var tcModType: UInt32
             var tcModCount: UInt32
-            var alphaTcModControl: SIMD4<Float> // x=alphaTestThreshold, y=count, z=type0
+            var _pad0: UInt32 = 0
+            var alphaTcModControl: SIMD4<Float> // x=alphaTestThreshold
+            var tcModTypes: SIMD4<UInt32>       // up to 4 tcMod types, 0=none
             var tcModParams0: SIMD4<Float>
+            var tcModParams1: SIMD4<Float>
+            var tcModParams2: SIMD4<Float>
+            var tcModParams3: SIMD4<Float>
         }
 
         struct WorldDrawUniforms {
@@ -3125,10 +3129,14 @@ struct MetalView: UIViewRepresentable {
             struct RTPrimitiveMaterial {
                 uint albedoSlot;
                 uint lightmapSlot;
-                uint tcModType;
                 uint tcModCount;
+                uint _pad0;
                 float4 alphaTcModControl;
+                uint4 tcModTypes;
                 float4 tcModParams0;
+                float4 tcModParams1;
+                float4 tcModParams2;
+                float4 tcModParams3;
             };
 
             float2 rtApplyTcMod(float2 uv, float3 worldPos, int type, float4 params, float timeSeconds) {
@@ -3225,8 +3233,16 @@ struct MetalView: UIViewRepresentable {
                         float3 hitPos = uniforms.cameraPos.xyz + rayDir * hit.distance;
                         float2 uv = uv0 * w + uv1 * bary.x + uv2 * bary.y;
                         float2 lmuv = lm0 * w + lm1 * bary.x + lm2 * bary.y;
-                        if (mat.tcModCount > 0) {
-                            uv = rtApplyTcMod(uv, hitPos, int(mat.tcModType), mat.tcModParams0, uniforms.fovParams.z);
+                        uint tcCount = min(mat.tcModCount, 4u);
+                        for (uint mi = 0; mi < tcCount; ++mi) {
+                            uint type = mat.tcModTypes[mi];
+                            if (type == 0) { continue; }
+                            float4 params = mat.tcModParams0;
+                            if (mi == 1) { params = mat.tcModParams1; }
+                            else if (mi == 2) { params = mat.tcModParams2; }
+                            else if (mi == 3) { params = mat.tcModParams3; }
+                            uv = rtApplyTcMod(uv, hitPos, int(type), params, uniforms.fovParams.z);
+                            lmuv = rtApplyTcMod(lmuv, hitPos, int(type), params, uniforms.fovParams.z);
                         }
                         constexpr sampler repeatSampler(filter::linear, address::repeat);
                         constexpr sampler clampSampler(filter::linear, address::clamp_to_edge);
@@ -3315,10 +3331,14 @@ struct MetalView: UIViewRepresentable {
             let invalidMaterial = RTPrimitiveMaterial(
                 albedoSlot: invalid,
                 lightmapSlot: invalid,
-                tcModType: 0,
                 tcModCount: 0,
+                _pad0: 0,
                 alphaTcModControl: SIMD4<Float>(0, 0, 0, 0),
-                tcModParams0: SIMD4<Float>(0, 0, 0, 0))
+                tcModTypes: SIMD4<UInt32>(0, 0, 0, 0),
+                tcModParams0: SIMD4<Float>(0, 0, 0, 0),
+                tcModParams1: SIMD4<Float>(0, 0, 0, 0),
+                tcModParams2: SIMD4<Float>(0, 0, 0, 0),
+                tcModParams3: SIMD4<Float>(0, 0, 0, 0))
             var materials = [RTPrimitiveMaterial](repeating: invalidMaterial, count: primitiveCount)
             rtAlbedoHandles = [UInt32](repeating: 0, count: rtMaxAlbedoSlots)
             rtLightmapHandles = [UInt32](repeating: 0, count: rtMaxLightmapSlots)
@@ -3391,15 +3411,24 @@ struct MetalView: UIViewRepresentable {
                 for tri in firstTri..<end {
                     if materials[tri].albedoSlot == invalid {
                         let chain = Self.fillTcMods(stage)
-                        let tcType = chain.count > 0 ? UInt32(max(0, Int(stage.tcMods.0.type))) : 0
+                        let tcCount = UInt32(max(0, min(Int(chain.count), 4)))
+                        let tcTypes = SIMD4<UInt32>(
+                            tcCount > 0 ? UInt32(max(0, Int(stage.tcMods.0.type))) : 0,
+                            tcCount > 1 ? UInt32(max(0, Int(stage.tcMods.1.type))) : 0,
+                            tcCount > 2 ? UInt32(max(0, Int(stage.tcMods.2.type))) : 0,
+                            tcCount > 3 ? UInt32(max(0, Int(stage.tcMods.3.type))) : 0)
                         let alphaThreshold = Self.alphaTestThreshold(for: stage.alphaFunc)
                         materials[tri] = RTPrimitiveMaterial(
                             albedoSlot: aSlot,
                             lightmapSlot: lSlot,
-                            tcModType: tcType,
-                            tcModCount: UInt32(min(chain.count, 1)),
-                            alphaTcModControl: SIMD4<Float>(alphaThreshold, Float(min(chain.count, 1)), Float(tcType), 0),
-                            tcModParams0: chain.p0)
+                            tcModCount: tcCount,
+                            _pad0: 0,
+                            alphaTcModControl: SIMD4<Float>(alphaThreshold, Float(tcCount), 0, 0),
+                            tcModTypes: tcTypes,
+                            tcModParams0: chain.p0,
+                            tcModParams1: chain.p1,
+                            tcModParams2: chain.p2,
+                            tcModParams3: chain.p3)
                         assigned += 1
                     } else {
                         skippedOverwrite += 1
