@@ -349,6 +349,7 @@ struct MetalView: UIViewRepresentable {
             var jitterNearFar: SIMD4<Float> // xy=jitter, z=near, w=far
             var fovParams: SIMD4<Float>     // x=tanHalfFovX, y=tanHalfFovY, z=time
             var rtToneParams: SIMD4<Float>  // x=exposure, y=gamma exponent, z=ambient floor, w=normal mix
+            var rtControlParams: SIMD4<Float> // x=resolutionScale, y=bounces, z=taaAlpha, w=taaEnabled
         }
 
         struct RTPrimitiveMaterial {
@@ -3031,6 +3032,8 @@ struct MetalView: UIViewRepresentable {
         private var rtLastEnvCubeLabel: String?
         private var rtHistoryValid = false
         private var rtJitterFrame: UInt32 = 0
+        private var rtMetricsFrame: UInt64 = 0
+        private var rtLastMetricsLogTime: CFTimeInterval = 0
 
         private struct PostprocessUniforms {
             var intensity: Float
@@ -3128,6 +3131,7 @@ struct MetalView: UIViewRepresentable {
                 float4 jitterNearFar;
                 float4 fovParams;
                 float4 rtToneParams;
+                float4 rtControlParams;
             };
 
             struct RTWorldVertex {
@@ -3330,35 +3334,36 @@ struct MetalView: UIViewRepresentable {
                                 color += albedoSample.rgb * mat.materialParams.x;
                                 color = min(color, float3(2.0));
                             }
-                            // First-pass one-bounce indirect: shoot one short cosine-weighted
-                            // ray from the primary hit and add a small sky/emissive/ambient term.
-                            float rnd0 = rtHash12(float2(tid) + uniforms.fovParams.zz * float2(17.0, 31.0));
-                            float rnd1 = rtHash12(float2(tid.yx) + uniforms.fovParams.zz * float2(47.0, 11.0));
-                            float3 bounceDir = rtCosineHemisphere(N, float2(rnd0, rnd1));
-                            ray bounceRay(hitPos + N * 0.75, bounceDir, 0.1, 2048.0);
-                            auto bounceHit = i.intersect(bounceRay, worldAS);
-                            float3 indirect = float3(0.0);
-                            if (bounceHit.type == intersection_type::triangle) {
-                                uint btri = bounceHit.primitive_id;
-                                RTPrimitiveMaterial bounceMat = primitiveMaterials[btri];
-                                if (bounceMat.materialFlags.y != 0 && bounceMat.albedoSlot < 110) {
-                                    uint bi0 = indices[btri * 3 + 0];
-                                    uint bi1 = indices[btri * 3 + 1];
-                                    uint bi2 = indices[btri * 3 + 2];
-                                    float2 bb = bounceHit.triangle_barycentric_coord;
-                                    float bw = 1.0 - bb.x - bb.y;
-                                    float2 buv = vertices[bi0].texCoord * bw + vertices[bi1].texCoord * bb.x + vertices[bi2].texCoord * bb.y;
-                                    float3 emitAlbedo = albedoTextures[bounceMat.albedoSlot].sample(repeatSampler, buv).rgb;
-                                    indirect = emitAlbedo * max(bounceMat.materialParams.x, 0.8) * 0.22;
+                            // First-pass one-bounce indirect: gated by r_rt_bounces.
+                            if (uniforms.rtControlParams.y > 0.5) {
+                                float rnd0 = rtHash12(float2(tid) + uniforms.fovParams.zz * float2(17.0, 31.0));
+                                float rnd1 = rtHash12(float2(tid.yx) + uniforms.fovParams.zz * float2(47.0, 11.0));
+                                float3 bounceDir = rtCosineHemisphere(N, float2(rnd0, rnd1));
+                                ray bounceRay(hitPos + N * 0.75, bounceDir, 0.1, 2048.0);
+                                auto bounceHit = i.intersect(bounceRay, worldAS);
+                                float3 indirect = float3(0.0);
+                                if (bounceHit.type == intersection_type::triangle) {
+                                    uint btri = bounceHit.primitive_id;
+                                    RTPrimitiveMaterial bounceMat = primitiveMaterials[btri];
+                                    if (bounceMat.materialFlags.y != 0 && bounceMat.albedoSlot < 110) {
+                                        uint bi0 = indices[btri * 3 + 0];
+                                        uint bi1 = indices[btri * 3 + 1];
+                                        uint bi2 = indices[btri * 3 + 2];
+                                        float2 bb = bounceHit.triangle_barycentric_coord;
+                                        float bw = 1.0 - bb.x - bb.y;
+                                        float2 buv = vertices[bi0].texCoord * bw + vertices[bi1].texCoord * bb.x + vertices[bi2].texCoord * bb.y;
+                                        float3 emitAlbedo = albedoTextures[bounceMat.albedoSlot].sample(repeatSampler, buv).rgb;
+                                        indirect = emitAlbedo * max(bounceMat.materialParams.x, 0.8) * 0.22;
+                                    } else {
+                                        indirect = float3(0.035);
+                                    }
+                                } else if (!is_null_texture(envCube)) {
+                                    indirect = envCube.sample(envSampler, bounceDir).rgb * 0.06;
                                 } else {
-                                    indirect = float3(0.035);
+                                    indirect = float3(0.01, 0.015, 0.025);
                                 }
-                            } else if (!is_null_texture(envCube)) {
-                                indirect = envCube.sample(envSampler, bounceDir).rgb * 0.06;
-                            } else {
-                                indirect = float3(0.01, 0.015, 0.025);
+                                color += albedoSample.rgb * indirect;
                             }
-                            color += albedoSample.rgb * indirect;
                             color = mix(color, normalColor, uniforms.rtToneParams.w);
                         }
                     } else {
@@ -3792,8 +3797,12 @@ struct MetalView: UIViewRepresentable {
             guard let rtPSO = ensureRTPipeline(device: device),
                   let accumPSO = ensureRTAccumPipeline(device: device),
                   let blendPSO = ensureRTBlendPipeline(device: device) else { return nil }
-            let traceW = max(1, renderW / 2)
-            let traceH = max(1, renderH / 2)
+            let rtResolutionScale = Q3_RTResolutionScale()
+            let rtBounceCount = Q3_RTBounces()
+            let rtTAAEnabled = Q3_RTTAA() > 0.5
+            let rtTAAAlpha = Q3_RTTAAAlpha()
+            let traceW = max(1, Int((Float(renderW) * rtResolutionScale).rounded(.toNearestOrAwayFromZero)))
+            let traceH = max(1, Int((Float(renderH) * rtResolutionScale).rounded(.toNearestOrAwayFromZero)))
             guard ensureRTTextures(device: device,
                                    traceWidth: traceW,
                                    traceHeight: traceH,
@@ -3833,9 +3842,10 @@ struct MetalView: UIViewRepresentable {
                                               cameraUp: SIMD4<Float>(up.x, up.y, up.z, 0),
                                               jitterNearFar: SIMD4<Float>(jitter.x, jitter.y, 4.0, 8192.0),
                                               fovParams: SIMD4<Float>(tan(sceneView.fovX * .pi / 360.0), tan(sceneView.fovY * .pi / 360.0), Float(CACurrentMediaTime() - frameTimeOrigin), entityAccelerationStructure == nil ? 0 : 1),
-                                              rtToneParams: SIMD4<Float>(Q3_RTExposure(), Q3_RTGamma(), Q3_RTAmbient(), Q3_RTNormalMix()))
+                                              rtToneParams: SIMD4<Float>(Q3_RTExposure(), Q3_RTGamma(), Q3_RTAmbient(), Q3_RTNormalMix()),
+                                              rtControlParams: SIMD4<Float>(rtResolutionScale, rtBounceCount, rtTAAAlpha, rtTAAEnabled ? 1.0 : 0.0))
             if !rtOverlayLogPrintedOnce {
-                print("[RT] overlay active mix=\(mixValue) trace=\(traceW)x\(traceH) composite=\(renderW)x\(renderH) camera=\(cameraPos)")
+                print("[RT] overlay active mix=\(mixValue) trace=\(traceW)x\(traceH) scale=\(rtResolutionScale) bounces=\(rtBounceCount) taa=\(rtTAAEnabled ? 1 : 0) composite=\(renderW)x\(renderH) camera=\(cameraPos)")
                 rtOverlayLogPrintedOnce = true
             }
             let tg = MTLSize(width: 16, height: 16, depth: 1)
@@ -3869,7 +3879,7 @@ struct MetalView: UIViewRepresentable {
                 enc.dispatchThreadgroups(traceGroups, threadsPerThreadgroup: tg)
                 enc.endEncoding()
             }
-            var accumAlpha: Float = rtHistoryValid ? 0.10 : 1.0
+            var accumAlpha: Float = (!rtTAAEnabled || !rtHistoryValid) ? 1.0 : rtTAAAlpha
             if let enc = commandBuffer.makeComputeCommandEncoder() {
                 enc.label = "Q3.RT.accumulate"
                 enc.setComputePipelineState(accumPSO)
@@ -3900,6 +3910,22 @@ struct MetalView: UIViewRepresentable {
                 enc.setBytes(&m, length: MemoryLayout<Float>.stride, index: 0)
                 enc.dispatchThreadgroups(compositeGroups, threadsPerThreadgroup: tg)
                 enc.endEncoding()
+            }
+            rtMetricsFrame &+= 1
+            let metricsNow = CACurrentMediaTime()
+            if metricsNow - rtLastMetricsLogTime >= 2.0 {
+                rtLastMetricsLogTime = metricsNow
+                let frameId = rtMetricsFrame
+                let scaleText = String(format: "%.2f", rtResolutionScale)
+                let taaText = rtTAAEnabled ? "1" : "0"
+                let alphaText = String(format: "%.2f", rtTAAAlpha)
+                print("[RT] metrics frame=\(frameId) trace=\(traceW)x\(traceH) composite=\(renderW)x\(renderH) scale=\(scaleText) bounces=\(Int(rtBounceCount)) taa=\(taaText) taaAlpha=\(alphaText) groups=\(traceGroups.width)x\(traceGroups.height)")
+                commandBuffer.addCompletedHandler { cb in
+                    let gpuMs = (cb.gpuEndTime > cb.gpuStartTime) ? (cb.gpuEndTime - cb.gpuStartTime) * 1000.0 : 0.0
+                    if gpuMs > 0.0 {
+                        print(String(format: "[RT] metrics frame=%llu gpuCommandMs=%.3f", frameId, gpuMs))
+                    }
+                }
             }
             if rasterTexture === outputDrawableTexture, let blit = commandBuffer.makeBlitCommandEncoder() {
                 blit.label = "Q3.RT.copyCompositeToDrawable"

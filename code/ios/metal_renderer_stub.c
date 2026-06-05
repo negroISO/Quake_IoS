@@ -10104,6 +10104,39 @@ float Q3_RTNormalMix(void) {
     return v;
 }
 
+float Q3_RTResolutionScale(void) {
+    if (ri.Cvar_Get == NULL) return 0.5f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_resolution_scale", "0.5", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.5f;
+    if (v < 0.25f) v = 0.25f;
+    if (v > 1.0f) v = 1.0f;
+    return v;
+}
+
+float Q3_RTBounces(void) {
+    if (ri.Cvar_Get == NULL) return 1.0f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_bounces", "1", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 1.0f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 2.0f) v = 2.0f;
+    return v;
+}
+
+float Q3_RTTAA(void) {
+    if (ri.Cvar_Get == NULL) return 1.0f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_taa", "1", CVAR_ARCHIVE);
+    return (cv && cv->integer == 0) ? 0.0f : 1.0f;
+}
+
+float Q3_RTTAAAlpha(void) {
+    if (ri.Cvar_Get == NULL) return 0.10f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_taa_alpha", "0.10", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.10f;
+    if (v < 0.02f) v = 0.02f;
+    if (v > 1.0f) v = 1.0f;
+    return v;
+}
+
 /* PBR Phase 6 v2 — map-specific skybox IBL source.
  *
  * r_pbr_ibl_skybox: stem (no _ft/_bk/etc suffix, no .tga extension) of the

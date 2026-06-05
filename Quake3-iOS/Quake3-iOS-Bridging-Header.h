@@ -144,5 +144,9 @@ float Q3_RTExposure(void);
 float Q3_RTGamma(void);
 float Q3_RTAmbient(void);
 float Q3_RTNormalMix(void);
+float Q3_RTResolutionScale(void);
+float Q3_RTBounces(void);
+float Q3_RTTAA(void);
+float Q3_RTTAAAlpha(void);
 
 #endif
