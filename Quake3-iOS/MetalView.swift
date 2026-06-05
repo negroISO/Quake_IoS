@@ -3238,7 +3238,7 @@ struct MetalView: UIViewRepresentable {
                         } else {
                             color = float3(0.04, 0.07, 0.13) + float3(0.01, 0.03, 0.06) * (1.0 - ndc.y);
                         }
-                    } else if (mat.albedoSlot < 110 && mat.lightmapSlot < 16) {
+                    } else if (mat.albedoSlot < 110) {
                         float2 uv0 = vertices[i0].texCoord;
                         float2 uv1 = vertices[i1].texCoord;
                         float2 uv2 = vertices[i2].texCoord;
@@ -3277,7 +3277,10 @@ struct MetalView: UIViewRepresentable {
                             color = float3(0.0);
                             outputAlpha = 0.0;
                         } else {
-                            float3 lightmap = lightmapTextures[mat.lightmapSlot].sample(clampSampler, lmuv).rgb;
+                            float3 lightmap = float3(1.0);
+                            if (mat.lightmapSlot < 16) {
+                                lightmap = lightmapTextures[mat.lightmapSlot].sample(clampSampler, lmuv).rgb;
+                            }
                             float ambientFloor = uniforms.rtToneParams.z;
                             color = albedoSample.rgb * max(lightmap * 1.25, float3(ambientFloor));
                             if (mat.materialFlags.y != 0) {
@@ -3437,9 +3440,14 @@ struct MetalView: UIViewRepresentable {
                 let aSlotOptional = albedoSlots[stage.textureHandle]
                 let lSlotOptional = lightmapSlots[draw.lightmapTextureHandle]
                 guard stage.useLightmap == 0 else { continue }
-                if !isSkyDraw && (aSlotOptional == nil || lSlotOptional == nil) { continue }
+                // Task 1 RT fallback: an opaque world primitive only needs its
+                // original/base Q3 texture slot. If its lightmap did not make the
+                // small 16-slot RT lightmap table, keep the material valid and let
+                // the kernel shade it with the ambient floor instead of dropping to
+                // transparent/debug fallback.
+                if !isSkyDraw && aSlotOptional == nil { continue }
                 let aSlot = aSlotOptional ?? 0
-                let lSlot = lSlotOptional ?? 0
+                let lSlot = lSlotOptional ?? invalid
                 let blendMode = Self.worldBlendClass(for: stage)
                 let isEmissive = (blendMode == 1 || blendMode == 5)
                 let firstTri = Int(draw.firstIndex / 3)
@@ -3486,7 +3494,8 @@ struct MetalView: UIViewRepresentable {
                                                           options: .storageModeShared)
             rtPrimitiveMaterialBuffer?.label = "Q3.RT.primitiveMaterials"
             if log {
-                print("[RT] material table: albedo=\(topAlbedos.count)/\(albedoWeights.count) lightmap=\(topLightmaps.count)/\(lightmapWeights.count) assigned=\(assigned)/\(primitiveCount) skippedOverwrite=\(skippedOverwrite)")
+                let lightmapFallbacks = materials.reduce(0) { $0 + (($1.albedoSlot != invalid && $1.lightmapSlot == invalid && $1.materialFlags.x == 0) ? 1 : 0) }
+                print("[RT] material table: albedo=\(topAlbedos.count)/\(albedoWeights.count) lightmap=\(topLightmaps.count)/\(lightmapWeights.count) assigned=\(assigned)/\(primitiveCount) originalNoLightmap=\(lightmapFallbacks) skippedOverwrite=\(skippedOverwrite)")
             }
         }
 
