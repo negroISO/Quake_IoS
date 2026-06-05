@@ -3034,6 +3034,8 @@ struct MetalView: UIViewRepresentable {
         private var rtJitterFrame: UInt32 = 0
         private var rtMetricsFrame: UInt64 = 0
         private var rtLastMetricsLogTime: CFTimeInterval = 0
+        private var rtLastCameraPos: SIMD3<Float>?
+        private var rtLastCameraForward: SIMD3<Float>?
 
         private struct PostprocessUniforms {
             var intensity: Float
@@ -3825,15 +3827,26 @@ struct MetalView: UIViewRepresentable {
                 }
                 return r
             }
-            rtJitterFrame &+= 1
-            let jitter = SIMD2<Float>((halton(rtJitterFrame, 2) - 0.5) / Float(max(traceW, 1)),
-                                      (halton(rtJitterFrame, 3) - 0.5) / Float(max(traceH, 1)))
-
             let viewProj = makeWorldViewProjection(sceneView)
             let cameraPos = SIMD3<Float>(sceneView.viewOrigin.0, sceneView.viewOrigin.1, sceneView.viewOrigin.2)
             let forward = SIMD3<Float>(sceneView.viewAxis.0, sceneView.viewAxis.1, sceneView.viewAxis.2)
             let right = SIMD3<Float>(-sceneView.viewAxis.3, -sceneView.viewAxis.4, -sceneView.viewAxis.5)
             let up = SIMD3<Float>(sceneView.viewAxis.6, sceneView.viewAxis.7, sceneView.viewAxis.8)
+            let forwardLen = max(simd_length(forward), 0.0001)
+            let forwardNorm = forward / forwardLen
+            if let lastPos = rtLastCameraPos, let lastForward = rtLastCameraForward {
+                let moved = simd_length_squared(cameraPos - lastPos) > 0.25
+                let turned = simd_dot(forwardNorm, lastForward) < 0.9995
+                if moved || turned { rtHistoryValid = false }
+            }
+            rtLastCameraPos = cameraPos
+            rtLastCameraForward = forwardNorm
+
+            rtJitterFrame &+= 1
+            let jitter = rtTAAEnabled
+                ? SIMD2<Float>((halton(rtJitterFrame, 2) - 0.5) / Float(max(traceW, 1)),
+                               (halton(rtJitterFrame, 3) - 0.5) / Float(max(traceH, 1)))
+                : SIMD2<Float>(0, 0)
             var uniforms = RayTracingUniforms(viewProjection: viewProj,
                                               invViewProjection: simd_inverse(viewProj),
                                               cameraPos: SIMD4<Float>(cameraPos.x, cameraPos.y, cameraPos.z, 0),
@@ -4073,10 +4086,12 @@ struct MetalView: UIViewRepresentable {
                  * already covered by the per-surface fog/cap passes above;
                  * keep an explicit override only for GPU-capture A/B. */
                 if ProcessInfo.processInfo.environment["Q3_METAL_FOG_RAYBOX_ALLOW_OUTSIDE"] != "1" {
-                    if fog.hasSurface != 0 {
-                        let eyeT = simd_dot(cameraPos, SIMD3<Float>(surface.x, surface.y, surface.z)) - surface.w
-                        if eyeT < 0 { continue }
-                    }
+                    /* Use brush bounds, not fog-surface plane sign, to decide
+                     * whether the eye is in the volume. q3dm4's fog cap is
+                     * visible even when the surface equation sign is opposite
+                     * our test, which left the line/cap but skipped the actual
+                     * under-fog ray-box. Bounds still prevent the old adjacent-
+                     * room slab artifact. */
                     let boundsMargin: Float = 0.5
                     guard cameraPos.x >= bmin.x - boundsMargin,
                           cameraPos.x <= bmax.x + boundsMargin,
