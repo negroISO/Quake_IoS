@@ -3028,6 +3028,7 @@ struct MetalView: UIViewRepresentable {
         private var rtLogPrintedOnce = false
         private var rtOverlayLogPrintedOnce = false
         private var rtLastMaterialRefreshTime: Float = 0
+        private var rtLastEnvCubeLabel: String?
         private var rtHistoryValid = false
         private var rtJitterFrame: UInt32 = 0
 
@@ -3832,7 +3833,14 @@ struct MetalView: UIViewRepresentable {
                 enc.label = "Q3.RT.trace"
                 enc.setComputePipelineState(rtPSO)
                 enc.setTexture(rtTex, index: 0)
-                enc.setTexture(ensurePBREnvCube(), index: 1)
+                let envCube = ensurePBREnvCube()
+                let envLabel = envCube?.label ?? "<nil>"
+                if rtLastEnvCubeLabel != envLabel {
+                    print("[RT] skybox env source=\(envLabel) stem=\(currentPBRSkyboxStem() ?? "<procedural>")")
+                    rtLastEnvCubeLabel = envLabel
+                    rtHistoryValid = false
+                }
+                enc.setTexture(envCube, index: 1)
                 let fallbackTex = ensureRTWhiteTexture(device: device)
                 for i in 0..<rtMaxAlbedoSlots {
                     enc.setTexture(texture(for: rtAlbedoHandles[i], device: device) ?? fallbackTex, index: 2 + i)
