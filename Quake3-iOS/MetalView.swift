@@ -4157,6 +4157,24 @@ struct MetalView: UIViewRepresentable {
         }
         private var textureCache: [UInt32: (generation: UInt32, texture: MTLTexture)] = [:]
         private var loggedAlphaEffectTextures: Set<UInt32> = []
+        private lazy var alphaTextureLogURL: URL? = {
+            FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
+                .appendingPathComponent("q3_alpha_tex.log")
+        }()
+
+        private func logAlphaTextureDiagnostic(_ message: String) {
+            NSLog("%@", message)
+            guard let url = alphaTextureLogURL else { return }
+            let data = Data((message + "\n").utf8)
+            if FileManager.default.fileExists(atPath: url.path),
+               let handle = try? FileHandle(forWritingTo: url) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                try? handle.close()
+            } else {
+                try? data.write(to: url, options: .atomic)
+            }
+        }
 
         /* PBR Phase 1: per-Q3-handle HD albedo cache. When the C-side
          * texture register hook stamps a metalTexture_t.pbrMaterial,
@@ -6332,7 +6350,7 @@ struct MetalView: UIViewRepresentable {
                             let q3Name = Q3MetalRenderer_GetTextureName(draw.textureHandle).map { String(cString: $0) } ?? "unknown"
                             let pbrLabel = pbrTex?.label ?? "nil"
                             let srcLabel = texture.label ?? "nil"
-                            print("[ALPHA-TEX] handle=\(draw.textureHandle) name='\(q3Name)' pass=\(drawPass) flags=0x\(String(draw.flags, radix: 16)) alphaFunc=\(info.alphaFunc) rgbGen=\(info.rgbGen) alphaGen=\(info.alphaGen) pbr='\(pbrLabel)' src='\(srcLabel)' size=\(info.width)x\(info.height)")
+                            logAlphaTextureDiagnostic("[ALPHA-TEX] handle=\(draw.textureHandle) name='\(q3Name)' pass=\(drawPass) flags=0x\(String(draw.flags, radix: 16)) alphaFunc=\(info.alphaFunc) rgbGen=\(info.rgbGen) alphaGen=\(info.alphaGen) pbr='\(pbrLabel)' src='\(srcLabel)' size=\(info.width)x\(info.height)")
                         }
                         encoder.setFragmentTexture(pbrTex ?? texture, index: 0)
                         // PBR Phase 2 — bind normal map to slot 1 if the
