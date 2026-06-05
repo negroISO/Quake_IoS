@@ -545,18 +545,18 @@ static int parse_hex64(const char *s, uint64_t *out) {
  * s == NULL, returns NULL. Grows the arena geometrically. */
 static const char *str_arena_dup(const char *s) {
     if (!s) return NULL;
+    /* The original "arena" used realloc() and returned direct pointers
+     * into the backing buffer. Every growth could move the buffer and
+     * silently invalidate all previously returned material paths. That
+     * showed up on-device as empty/garbage DDS paths and partial PBR
+     * binding. Use individually stable allocations instead; the table is
+     * process-lifetime data and only ~800 named materials in the iOS
+     * bundle, so this tiny leak-on-reload is preferable to dangling
+     * pointers. */
     size_t len = strlen(s) + 1;
-    if (g_str_arena_used + len > g_str_arena_cap) {
-        size_t newcap = g_str_arena_cap ? g_str_arena_cap * 2 : 16384;
-        while (newcap < g_str_arena_used + len) newcap *= 2;
-        char *nb = (char *)realloc(g_str_arena, newcap);
-        if (!nb) return NULL;
-        g_str_arena = nb;
-        g_str_arena_cap = newcap;
-    }
-    char *dst = g_str_arena + g_str_arena_used;
+    char *dst = (char *)malloc(len);
+    if (!dst) return NULL;
     memcpy(dst, s, len);
-    g_str_arena_used += len;
     return dst;
 }
 
@@ -574,7 +574,20 @@ static const char *find_key(const char *p, const char *end, const char *key) {
         q++;
         if (q + klen + 1 < end && memcmp(q, key, klen) == 0 && q[klen] == '"') {
             const char *r = q + klen + 1;
-            while (r < end && (*r == ' ' || *r == '\t' || *r == ':' || *r == '\n' || *r == '\r')) r++;
+            /* This is a JSON object-key finder, not a generic string
+             * search. Require the closing quote to be followed by optional
+             * whitespace and then ':' before accepting it. Without this,
+             * values like `"source": "albedo"` were misidentified as the
+             * `albedo` key, causing named world materials whose source tag
+             * was "albedo" to lose their actual albedo map while still
+             * keeping later fields such as normal. */
+            while (r < end && (*r == ' ' || *r == '\t' || *r == '\n' || *r == '\r')) r++;
+            if (r >= end || *r != ':') {
+                p = q;
+                continue;
+            }
+            r++;
+            while (r < end && (*r == ' ' || *r == '\t' || *r == '\n' || *r == '\r')) r++;
             return r;
         }
         p = q;
