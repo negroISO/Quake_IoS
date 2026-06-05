@@ -1023,6 +1023,9 @@ struct MetalView: UIViewRepresentable {
              * lights to the source texture itself double-brightens muzzle
              * flashes and projectile cores. */
             var suppressDlights: UInt32 = 0
+            /* 1 for sprites/effects whose source/PBR texture may be RGB-only
+             * even though shader blending expects alpha from luminance. */
+            var forceLuminanceAlpha: UInt32 = 0
             /* deformVertexes wave (shader-level, stage 0). When
              * deformWaveFunc != 0, q3_entity_vertex offsets the vertex
              * along its normal by:
@@ -1670,6 +1673,7 @@ struct MetalView: UIViewRepresentable {
             float4 fogParams;
             float4 fogSurface;
             uint suppressDlights;
+            uint forceLuminanceAlpha;
             /* deformVertexes wave (shader-level). Applied in
              * q3_entity_vertex when deformWaveFunc != 0. Matches the
              * world pipeline's deform formula exactly. */
@@ -2346,7 +2350,8 @@ struct MetalView: UIViewRepresentable {
              * everywhere) while the Q3 shader expects a luminance mask. Recover
              * a soft mask in-shader for additive draws and alpha-tested entity
              * stages so smoke/flares/explosions do not become solid quads. */
-            bool entityAlphaSensitive = (uniforms.suppressDlights != 0u ||
+            bool entityAlphaSensitive = (uniforms.forceLuminanceAlpha != 0u ||
+                                         uniforms.suppressDlights != 0u ||
                                          uniforms.alphaTestThreshold != 0.0 ||
                                          uniforms.alphaGenMode == 5u ||
                                          uniforms.alphaGenMode == 6u);
@@ -4174,6 +4179,26 @@ struct MetalView: UIViewRepresentable {
             } else {
                 try? data.write(to: url, options: .atomic)
             }
+        }
+
+        private static func textureNameNeedsLuminanceAlpha(_ name: String) -> Bool {
+            let n = name.lowercased()
+            if n.hasPrefix("sprites/") || n.hasPrefix("gfx/misc/") ||
+               n.hasPrefix("gfx/damage/") || n.hasPrefix("models/weaphits/") ||
+               n.hasPrefix("models/ammo/rocket/rockfl") {
+                return true
+            }
+            if n == "smokepuff" || n == "shotgunsmokepuff" ||
+               n == "plasmaexplosion" || n == "teleporteffect" ||
+               n == "viewbloodblend" || n == "gfx/misc/tracer" {
+                return true
+            }
+            if n.contains("/f_") || n.contains("f_machinegun") ||
+               n.contains("f_rocketl") || n.contains("f_shotgun") ||
+               n.contains("f_plasma") {
+                return true
+            }
+            return false
         }
 
         /* PBR Phase 1: per-Q3-handle HD albedo cache. When the C-side
@@ -6343,14 +6368,17 @@ struct MetalView: UIViewRepresentable {
                         // the original pak0 JPG-decoded texture. Falls
                         // back to the original on miss / DDS-load fail.
                         let pbrTex = pbrAlbedoTexture(for: draw.textureHandle)
+                        let q3Name = Q3MetalRenderer_GetTextureName(draw.textureHandle).map { String(cString: $0) } ?? "unknown"
+                        entityUniforms.forceLuminanceAlpha = Self.textureNameNeedsLuminanceAlpha(q3Name) ? 1 : 0
+                        encoder.setVertexBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
+                        encoder.setFragmentBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
                         if (isEntityAdditive || isEntityAdditiveFull || isEntityAlpha || isScenePoly || (draw.flags & aTestGT0Bit) != 0),
                            loggedAlphaEffectTextures.insert(draw.textureHandle).inserted {
                             var info = Q3MetalTextureInfo()
                             _ = Q3MetalRenderer_GetTextureInfo(draw.textureHandle, &info)
-                            let q3Name = Q3MetalRenderer_GetTextureName(draw.textureHandle).map { String(cString: $0) } ?? "unknown"
                             let pbrLabel = pbrTex?.label ?? "nil"
                             let srcLabel = texture.label ?? "nil"
-                            logAlphaTextureDiagnostic("[ALPHA-TEX] handle=\(draw.textureHandle) name='\(q3Name)' pass=\(drawPass) flags=0x\(String(draw.flags, radix: 16)) alphaFunc=\(info.alphaFunc) rgbGen=\(info.rgbGen) alphaGen=\(info.alphaGen) pbr='\(pbrLabel)' src='\(srcLabel)' size=\(info.width)x\(info.height)")
+                            logAlphaTextureDiagnostic("[ALPHA-TEX] handle=\(draw.textureHandle) name='\(q3Name)' pass=\(drawPass) flags=0x\(String(draw.flags, radix: 16)) alphaFunc=\(info.alphaFunc) rgbGen=\(info.rgbGen) alphaGen=\(info.alphaGen) forceLum=\(entityUniforms.forceLuminanceAlpha) pbr='\(pbrLabel)' src='\(srcLabel)' size=\(info.width)x\(info.height)")
                         }
                         encoder.setFragmentTexture(pbrTex ?? texture, index: 0)
                         // PBR Phase 2 — bind normal map to slot 1 if the
