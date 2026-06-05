@@ -3919,7 +3919,8 @@ struct MetalView: UIViewRepresentable {
                 enc.setTexture(envCube, index: 1)
                 let fallbackTex = ensureRTWhiteTexture(device: device)
                 for i in 0..<rtMaxAlbedoSlots {
-                    enc.setTexture(texture(for: rtAlbedoHandles[i], device: device) ?? fallbackTex, index: 2 + i)
+                    let h = rtAlbedoHandles[i]
+                    enc.setTexture(pbrAlbedoTexture(for: h) ?? texture(for: h, device: device) ?? fallbackTex, index: 2 + i)
                 }
                 for i in 0..<rtMaxLightmapSlots {
                     enc.setTexture(texture(for: rtLightmapHandles[i], device: device) ?? fallbackTex, index: 112 + i)
@@ -5513,7 +5514,8 @@ struct MetalView: UIViewRepresentable {
                             pbrMetallic: stage.pbrMetallic,
                             _pad0: (draw.flags & combinedLightmapBit) != 0 ? 1.0 : 0.0
                         )
-                        encoder.setFragmentTexture(baseTexture, index: 0)
+                        let worldBaseTexture = pbrAlbedoTexture(for: stage.textureHandle) ?? baseTexture
+                        encoder.setFragmentTexture(worldBaseTexture, index: 0)
                         encoder.setFragmentTexture(lightmapTexture, index: 1)
                         // PBR Phase 3 — bind generic world normal map at
                         // slot 2 for tangent-space relief. nil bind leaves
