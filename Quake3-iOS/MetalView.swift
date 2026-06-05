@@ -3195,6 +3195,22 @@ struct MetalView: UIViewRepresentable {
                 return uv;
             }
 
+            float rtHash12(float2 p) {
+                float3 p3 = fract(float3(p.xyx) * 0.1031);
+                p3 += dot(p3, p3.yzx + 33.33);
+                return fract((p3.x + p3.y) * p3.z);
+            }
+
+            float3 rtCosineHemisphere(float3 n, float2 randv) {
+                float phi = 6.2831853 * randv.x;
+                float cosTheta = sqrt(max(0.0, 1.0 - randv.y));
+                float sinTheta = sqrt(max(0.0, randv.y));
+                float3 up = (abs(n.z) < 0.999) ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
+                float3 tangent = normalize(cross(up, n));
+                float3 bitangent = cross(n, tangent);
+                return normalize(tangent * cos(phi) * sinTheta + bitangent * sin(phi) * sinTheta + n * cosTheta);
+            }
+
             kernel void rtKernel(texture2d<float, access::write> output [[texture(0)]],
                                  texturecube<float> envCube [[texture(1)]],
                                  array<texture2d<float>, 110> albedoTextures [[texture(2)]],
@@ -3304,6 +3320,23 @@ struct MetalView: UIViewRepresentable {
                                 color += albedoSample.rgb * mat.materialParams.x;
                                 color = min(color, float3(2.0));
                             }
+                            // First-pass one-bounce indirect: shoot one short cosine-weighted
+                            // ray from the primary hit and add a small sky/emissive/ambient term.
+                            float rnd0 = rtHash12(float2(tid) + uniforms.fovParams.zz * float2(17.0, 31.0));
+                            float rnd1 = rtHash12(float2(tid.yx) + uniforms.fovParams.zz * float2(47.0, 11.0));
+                            float3 bounceDir = rtCosineHemisphere(N, float2(rnd0, rnd1));
+                            ray bounceRay(hitPos + N * 0.75, bounceDir, 0.1, 2048.0);
+                            auto bounceHit = i.intersect(bounceRay, worldAS);
+                            float3 indirect = float3(0.0);
+                            if (bounceHit.type == intersection_type::triangle) {
+                                RTPrimitiveMaterial bounceMat = primitiveMaterials[bounceHit.primitive_id];
+                                indirect = (bounceMat.materialFlags.y != 0) ? float3(0.18) : float3(0.035);
+                            } else if (!is_null_texture(envCube)) {
+                                indirect = envCube.sample(envSampler, bounceDir).rgb * 0.06;
+                            } else {
+                                indirect = float3(0.01, 0.015, 0.025);
+                            }
+                            color += albedoSample.rgb * indirect;
                             color = mix(color, normalColor, uniforms.rtToneParams.w);
                         }
                     } else {
