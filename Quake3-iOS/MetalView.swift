@@ -3014,6 +3014,9 @@ struct MetalView: UIViewRepresentable {
         private var rtASVertexBuffer: MTLBuffer?
         private var rtASPositionBuffer: MTLBuffer?
         private var rtASIndexBuffer: MTLBuffer?
+        private var entityAccelerationStructure: MTLAccelerationStructure?
+        private var entityASSize = 0
+        private var entityASLogCounter: UInt64 = 0
         private var rtPrimitiveMaterialBuffer: MTLBuffer?
         private let rtMaxAlbedoSlots = 110
         private let rtMaxLightmapSlots = 16
@@ -3196,6 +3199,7 @@ struct MetalView: UIViewRepresentable {
                                  const device uint *indices [[buffer(2)]],
                                  const device RTWorldVertex *vertices [[buffer(3)]],
                                  const device RTPrimitiveMaterial *primitiveMaterials [[buffer(4)]],
+                                 acceleration_structure<> entityAS [[buffer(5)]],
                                  uint2 tid [[thread_position_in_grid]]) {
                 if (tid.x >= output.get_width() || tid.y >= output.get_height()) return;
                 float2 uv = (float2(tid) + 0.5) / float2(output.get_width(), output.get_height());
@@ -3208,10 +3212,17 @@ struct MetalView: UIViewRepresentable {
                 ray r(uniforms.cameraPos.xyz, rayDir, uniforms.jitterNearFar.z, uniforms.jitterNearFar.w);
                 intersector<triangle_data> i;
                 auto hit = i.intersect(r, worldAS);
+                auto entityHit = i.intersect(r, entityAS);
+                bool useEntityHit = uniforms.fovParams.w > 0.5 &&
+                                    entityHit.type == intersection_type::triangle &&
+                                    (hit.type != intersection_type::triangle || entityHit.distance < hit.distance);
 
                 float3 color;
                 float outputAlpha = 1.0;
-                if (hit.type == intersection_type::triangle) {
+                if (useEntityHit) {
+                    float shade = 1.0 - saturate(entityHit.distance / uniforms.jitterNearFar.w);
+                    color = mix(float3(0.35, 0.35, 0.38), float3(0.9, 0.9, 0.95), shade);
+                } else if (hit.type == intersection_type::triangle) {
                     uint tri = hit.primitive_id;
                     uint i0 = indices[tri * 3 + 0];
                     uint i1 = indices[tri * 3 + 1];
@@ -3503,6 +3514,63 @@ struct MetalView: UIViewRepresentable {
         }
 
         @MainActor
+        private func encodeEntityAccelerationStructureBuild(device: MTLDevice,
+                                                            commandBuffer: MTLCommandBuffer) -> MTLAccelerationStructure? {
+            guard device.supportsRaytracing,
+                  let snapshot = Q3MetalRenderer_GetFrameSnapshot()?.pointee,
+                  let vb = entityVertexBuffer,
+                  let ib = entityIndexBuffer else {
+                entityAccelerationStructure = nil
+                entityASSize = 0
+                return nil
+            }
+            let vertexCount = Int(snapshot.entityVertexCount)
+            let indexCount = Int(snapshot.entityIndexCount)
+            guard vertexCount > 0, indexCount >= 3 else {
+                entityAccelerationStructure = nil
+                entityASSize = 0
+                return nil
+            }
+
+            let geomDesc = MTLAccelerationStructureTriangleGeometryDescriptor()
+            geomDesc.vertexBuffer = vb
+            geomDesc.vertexBufferOffset = 0
+            geomDesc.vertexStride = MemoryLayout<GPUEntityVertex>.stride
+            geomDesc.vertexFormat = .float3
+            geomDesc.indexBuffer = ib
+            geomDesc.indexBufferOffset = 0
+            geomDesc.indexType = .uint32
+            geomDesc.triangleCount = indexCount / 3
+            geomDesc.opaque = true
+
+            let asDesc = MTLPrimitiveAccelerationStructureDescriptor()
+            asDesc.geometryDescriptors = [geomDesc]
+            let sizes = device.accelerationStructureSizes(descriptor: asDesc)
+            if entityAccelerationStructure == nil || entityASSize < sizes.accelerationStructureSize {
+                entityAccelerationStructure = device.makeAccelerationStructure(size: sizes.accelerationStructureSize)
+                entityAccelerationStructure?.label = "Q3.RT.entityAS"
+                entityASSize = sizes.accelerationStructureSize
+            }
+            guard let accel = entityAccelerationStructure,
+                  let scratch = device.makeBuffer(length: sizes.buildScratchBufferSize, options: .storageModePrivate),
+                  let enc = commandBuffer.makeAccelerationStructureCommandEncoder() else {
+                return nil
+            }
+            scratch.label = "Q3.RT.entityAS.scratch"
+            enc.label = "Q3.RT.buildEntityAS"
+            enc.build(accelerationStructure: accel,
+                      descriptor: asDesc,
+                      scratchBuffer: scratch,
+                      scratchBufferOffset: 0)
+            enc.endEncoding()
+            entityASLogCounter &+= 1
+            if entityASLogCounter == 1 || entityASLogCounter % 120 == 0 {
+                print("[RT] built entity AS: vertices=\(vertexCount) indices=\(indexCount) tris=\(indexCount / 3) size=\(sizes.accelerationStructureSize)")
+            }
+            return accel
+        }
+
+        @MainActor
         private func buildWorldAccelerationStructure(device: MTLDevice) -> MTLAccelerationStructure? {
             guard device.supportsRaytracing, Q3MetalRenderer_IsWorldLoaded() != 0 else { return nil }
             guard let ib = worldIndexBuffer else { return nil }
@@ -3655,7 +3723,7 @@ struct MetalView: UIViewRepresentable {
                                               cameraRight: SIMD4<Float>(right.x, right.y, right.z, 0),
                                               cameraUp: SIMD4<Float>(up.x, up.y, up.z, 0),
                                               jitterNearFar: SIMD4<Float>(0, 0, 4.0, 8192.0),
-                                              fovParams: SIMD4<Float>(tan(sceneView.fovX * .pi / 360.0), tan(sceneView.fovY * .pi / 360.0), Float(CACurrentMediaTime() - frameTimeOrigin), 0),
+                                              fovParams: SIMD4<Float>(tan(sceneView.fovX * .pi / 360.0), tan(sceneView.fovY * .pi / 360.0), Float(CACurrentMediaTime() - frameTimeOrigin), entityAccelerationStructure == nil ? 0 : 1),
                                               rtToneParams: SIMD4<Float>(Q3_RTExposure(), Q3_RTGamma(), Q3_RTAmbient(), Q3_RTNormalMix()))
             if !rtOverlayLogPrintedOnce {
                 print("[RT] overlay active mix=\(mixValue) trace=\(traceW)x\(traceH) composite=\(renderW)x\(renderH) camera=\(cameraPos)")
@@ -3681,6 +3749,7 @@ struct MetalView: UIViewRepresentable {
                 enc.setBuffer(rtASIndexBuffer, offset: 0, index: 2)
                 enc.setBuffer(rtASVertexBuffer, offset: 0, index: 3)
                 enc.setBuffer(primitiveMaterialBuffer, offset: 0, index: 4)
+                enc.setAccelerationStructure(entityAccelerationStructure ?? worldAS, bufferIndex: 5)
                 enc.dispatchThreadgroups(traceGroups, threadsPerThreadgroup: tg)
                 enc.endEncoding()
             }
@@ -5823,7 +5892,9 @@ struct MetalView: UIViewRepresentable {
                 }
                 let rtTargetTexture = (upscaleActive ? upscaleColorTarget : drawable.texture) ?? drawable.texture
                 if Q3_RTMix() > 0 {
+                    _ = uploadEntityBuffers(device: device)
                     encoder.endEncoding()
+                    _ = encodeEntityAccelerationStructureBuild(device: device, commandBuffer: commandBuffer)
                     _ = encodeRTOverlay(commandBuffer: commandBuffer,
                                         rasterTexture: rtTargetTexture,
                                         outputDrawableTexture: rtTargetTexture,
