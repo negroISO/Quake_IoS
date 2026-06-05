@@ -4156,6 +4156,7 @@ struct MetalView: UIViewRepresentable {
             fogEncoder.endEncoding()
         }
         private var textureCache: [UInt32: (generation: UInt32, texture: MTLTexture)] = [:]
+        private var loggedAlphaEffectTextures: Set<UInt32> = []
 
         /* PBR Phase 1: per-Q3-handle HD albedo cache. When the C-side
          * texture register hook stamps a metalTexture_t.pbrMaterial,
@@ -6324,6 +6325,15 @@ struct MetalView: UIViewRepresentable {
                         // the original pak0 JPG-decoded texture. Falls
                         // back to the original on miss / DDS-load fail.
                         let pbrTex = pbrAlbedoTexture(for: draw.textureHandle)
+                        if (isEntityAdditive || isEntityAdditiveFull || isEntityAlpha || isScenePoly || (draw.flags & aTestGT0Bit) != 0),
+                           loggedAlphaEffectTextures.insert(draw.textureHandle).inserted {
+                            var info = Q3MetalTextureInfo()
+                            _ = Q3MetalRenderer_GetTextureInfo(draw.textureHandle, &info)
+                            let q3Name = Q3MetalRenderer_GetTextureName(draw.textureHandle).map { String(cString: $0) } ?? "unknown"
+                            let pbrLabel = pbrTex?.label ?? "nil"
+                            let srcLabel = texture.label ?? "nil"
+                            print("[ALPHA-TEX] handle=\(draw.textureHandle) name='\(q3Name)' pass=\(drawPass) flags=0x\(String(draw.flags, radix: 16)) alphaFunc=\(info.alphaFunc) rgbGen=\(info.rgbGen) alphaGen=\(info.alphaGen) pbr='\(pbrLabel)' src='\(srcLabel)' size=\(info.width)x\(info.height)")
+                        }
                         encoder.setFragmentTexture(pbrTex ?? texture, index: 0)
                         // PBR Phase 2 — bind normal map to slot 1 if the
                         // material ships one. Nil bind leaves the slot
