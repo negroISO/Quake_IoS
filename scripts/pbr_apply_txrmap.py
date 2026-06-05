@@ -153,6 +153,16 @@ def main(argv: list[str]) -> int:
     mapping_path = Path(argv[2])
     out_path = Path(argv[3])
 
+    if not materials_path.is_file():
+        raise SystemExit(f"[err] materials.json not found: {materials_path}")
+    if not mapping_path.is_file():
+        raise SystemExit(
+            f"[err] txrmap file not found: {mapping_path}\n"
+            "Generate/provide it first, e.g.:\n"
+            "  python /path/to/xxhash-txrmap.py <original_textures_folder> txrmap.txt\n"
+            "Then rerun pbr_apply_txrmap.py with that txrmap path."
+        )
+
     full = json.loads(materials_path.read_text(encoding="utf-8"))
     mapping = parse_mapping(mapping_path)
     materials = full.get("materials", {})

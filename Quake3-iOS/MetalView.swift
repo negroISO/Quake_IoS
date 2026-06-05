@@ -3209,6 +3209,7 @@ struct MetalView: UIViewRepresentable {
                 auto hit = i.intersect(r, worldAS);
 
                 float3 color;
+                float outputAlpha = 1.0;
                 if (hit.type == intersection_type::triangle) {
                     uint tri = hit.primitive_id;
                     uint i0 = indices[tri * 3 + 0];
@@ -3265,11 +3266,16 @@ struct MetalView: UIViewRepresentable {
                         bool alphaReject = (alphaThreshold > 0.0 && albedoSample.a < alphaThreshold) ||
                                            (alphaThreshold < 0.0 && albedoSample.a >= -alphaThreshold);
                         if (alphaReject) {
-                            if (!is_null_texture(envCube)) {
-                                color = envCube.sample(envSampler, rayDir).rgb;
-                            } else {
-                                color = float3(0.04, 0.07, 0.13) + float3(0.01, 0.03, 0.06) * (1.0 - ndc.y);
-                            }
+                            // Let the already-rasterized world show through. A primitive AS
+                            // cannot alpha-discard and continue traversal without custom
+                            // intersection/multi-hit logic, so alpha holes preserve raster.
+                            color = float3(0.0);
+                            outputAlpha = 0.0;
+                        } else if (mat.materialFlags.w != 0) {
+                            // Preserve raster for blended/translucent world surfaces in pure
+                            // RT mode until a proper sorted/multi-hit transparent RT path exists.
+                            color = float3(0.0);
+                            outputAlpha = 0.0;
                         } else {
                             float3 lightmap = lightmapTextures[mat.lightmapSlot].sample(clampSampler, lmuv).rgb;
                             float ambientFloor = uniforms.rtToneParams.z;
@@ -3281,7 +3287,10 @@ struct MetalView: UIViewRepresentable {
                             color = mix(color, normalColor, uniforms.rtToneParams.w);
                         }
                     } else {
+                        // Missing RT material slot: keep raster instead of painting debug
+                        // normals over unmapped maps/surfaces.
                         color = normalColor;
+                        outputAlpha = 0.0;
                     }
                 } else {
                     constexpr sampler envSampler(filter::linear, address::clamp_to_edge);
@@ -3294,7 +3303,7 @@ struct MetalView: UIViewRepresentable {
                 if (any(isnan(color)) || any(isinf(color))) { color = float3(0.0); }
                 color = saturate(color * uniforms.rtToneParams.x);
                 color = pow(color, float3(max(uniforms.rtToneParams.y, 0.001)));
-                output.write(float4(saturate(color), 1.0), tid);
+                output.write(float4(saturate(color), saturate(outputAlpha)), tid);
             }
 
             kernel void blendRT(texture2d<float, access::read> rt [[texture(0)]],
@@ -3304,13 +3313,13 @@ struct MetalView: UIViewRepresentable {
                                 uint2 tid [[thread_position_in_grid]]) {
                 if (tid.x >= output.get_width() || tid.y >= output.get_height()) return;
                 float m = saturate(mixAmount);
-                float3 rtColor = saturate(rt.read(tid).rgb);
-                if (m >= 0.999) {
-                    output.write(float4(rtColor, 1.0), tid);
-                    return;
-                }
+                float4 rtSample = rt.read(tid);
+                float3 rtColor = saturate(rtSample.rgb);
                 float3 rasterColor = saturate(raster.read(tid).rgb);
-                float3 blended = mix(rasterColor, rtColor, m);
+                // RT alpha is a per-pixel preserve-raster mask used for alpha-test
+                // holes, blended world surfaces, and unmapped RT materials.
+                float effectiveMix = m * saturate(rtSample.a);
+                float3 blended = mix(rasterColor, rtColor, effectiveMix);
                 output.write(float4(blended, 1.0), tid);
             }
             """
@@ -3453,7 +3462,13 @@ struct MetalView: UIViewRepresentable {
                             tcModCount: tcCount,
                             _pad0: 0,
                             alphaTcModControl: SIMD4<Float>(alphaThreshold, Float(tcCount), 0, 0),
-                            materialFlags: SIMD4<UInt32>(isSkyDraw ? 1 : 0, isEmissive ? 1 : 0, 0, 0),
+                            // flags: x=sky, y=emissive, z=alpha-test, w=blended/translucent.
+                            // RT keeps blended/translucent world surfaces as raster fallback
+                            // so grates/flames/portals do not become opaque black blockers.
+                            materialFlags: SIMD4<UInt32>(isSkyDraw ? 1 : 0,
+                                                         isEmissive ? 1 : 0,
+                                                         alphaThreshold != 0 ? 1 : 0,
+                                                         blendMode != 0 ? 1 : 0),
                             materialParams: SIMD4<Float>(isEmissive ? 0.8 : 0.0, 0, 0, 0),
                             tcModTypes: tcTypes,
                             tcModParams0: chain.p0,
@@ -4703,11 +4718,18 @@ struct MetalView: UIViewRepresentable {
              * to MetalFX. Native quality keeps the existing direct path. */
             let outputW = Int(view.drawableSize.width)
             let outputH = Int(view.drawableSize.height)
+            let rtMixForResolution = Q3_RTMix()
+            // Device-native + RT currently trips Q3's later entity/HUD submission on
+            // very large phone drawables. Use the proven 0.75 internal path while
+            // still presenting at native panel resolution whenever RT is active.
+            let effectiveUpscaleQuality: Q3UpscaleQuality = (upscaleQuality == .native && rtMixForResolution > 0)
+                ? .high
+                : upscaleQuality
             let upscaleActive: Bool
             let renderW: Int
             let renderH: Int
-            if upscaleQuality != .native, let device = view.device, outputW > 0, outputH > 0 {
-                let rs = upscaleQuality.renderSize(forOutput: view.drawableSize)
+            if effectiveUpscaleQuality != .native, let device = view.device, outputW > 0, outputH > 0 {
+                let rs = effectiveUpscaleQuality.renderSize(forOutput: view.drawableSize)
                 let rW = max(1, Int(rs.width))
                 let rH = max(1, Int(rs.height))
                 if ensureSpatialUpscaleTargets(device: device, inputW: rW, inputH: rH, outputW: outputW, outputH: outputH) {
