@@ -2341,6 +2341,24 @@ struct MetalView: UIViewRepresentable {
             if (entityModCount > 2) texCoord = applyTcMod(texCoord, in.worldPos, int(uniforms.tcModType.z + 0.5), uniforms.tcModParams2, uniforms.timeSeconds);
             if (entityModCount > 3) texCoord = applyTcMod(texCoord, in.worldPos, int(uniforms.tcModType.w + 0.5), uniforms.tcModParams3, uniforms.timeSeconds);
             float4 texel = colorTexture.sample(textureSampler, texCoord);
+            /* Entity/effect alpha synthesis: PBR/RTX replacement DDS files for
+             * sprites and additive effects can arrive as RGB-only (alpha=1
+             * everywhere) while the Q3 shader expects a luminance mask. Recover
+             * a soft mask in-shader for additive draws and alpha-tested entity
+             * stages so smoke/flares/explosions do not become solid quads. */
+            bool entityAlphaSensitive = (uniforms.suppressDlights != 0u ||
+                                         uniforms.alphaTestThreshold != 0.0 ||
+                                         uniforms.alphaGenMode == 5u ||
+                                         uniforms.alphaGenMode == 6u);
+            if (entityAlphaSensitive && texel.a >= 0.995) {
+                float lumAlpha = max(max(texel.r, texel.g), texel.b);
+                float2 centered = texCoord - 0.5;
+                float radial = saturate(1.0 - dot(centered, centered) * 2.0);
+                radial = radial * radial * (3.0 - 2.0 * radial);
+                float synthA = saturate(lumAlpha * radial);
+                texel.rgb *= synthA;
+                texel.a = synthA;
+            }
             /* Entity alphaFunc discard — mirrors upstream GLS_ATEST_GT_0 /
              * GE_80 / LT_80 as fragment kills so grate-style meshes and
              * any entity using `alphaFunc GT0` (sparks, explosion puffs on
