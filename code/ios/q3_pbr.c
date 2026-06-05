@@ -291,6 +291,36 @@ static void q3_pbr_normalize_name(const char *in, char *out, size_t outSize) {
     out[i] = '\0';
 }
 
+
+/* Normalize a Q3 shader path into a full lookup key: lowercase, strip
+ * image extension, preserve directories. Example:
+ *   "textures/base_wall/foo.tga" -> "textures/base_wall/foo". */
+static void q3_pbr_normalize_full_name(const char *in, char *out, size_t outSize) {
+    if (out == NULL || outSize == 0) return;
+    out[0] = '\0';
+    if (in == NULL) return;
+
+    size_t i = 0;
+    for (; in[i] && i + 1 < outSize; ++i) {
+        char c = in[i];
+        if (c == '\\') c = '/';
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        out[i] = c;
+    }
+    out[i] = '\0';
+
+    /* Strip common image extension from the full path. */
+    char *slash = strrchr(out, '/');
+    char *dot = strrchr(out, '.');
+    if (dot && (!slash || dot > slash)) {
+        if (!strcmp(dot, ".tga") || !strcmp(dot, ".jpg") ||
+            !strcmp(dot, ".jpeg") || !strcmp(dot, ".png") ||
+            !strcmp(dot, ".dds")) {
+            *dot = '\0';
+        }
+    }
+}
+
 /* Q3 ships weapon textures with stems that don't match the descriptive
  * names extracted from the RTX Remix mod USDA. Map them. Left = the
  * normalized Q3 stem from load_pic_texture_with_mipmap; right = the stem
@@ -352,12 +382,28 @@ const q3_pbr_material_t *q3_pbr_lookup_by_name(const char *q3_shader_name) {
         return NULL;
     }
     char key[64];
+    char fullKey[128];
     q3_pbr_normalize_name(q3_shader_name, key, sizeof(key));
-    if (key[0] == '\0') return NULL;
+    q3_pbr_normalize_full_name(q3_shader_name, fullKey, sizeof(fullKey));
+    if (key[0] == '\0' && fullKey[0] == '\0') return NULL;
 
-    /* Direct match first. */
+    /* Full shader-path match first. The current whole-game PBR bundle is
+     * keyed by full Q3 shader names (textures/base_wall/foo), not just
+     * basename stems. The older 21-entry weapon bundle used basename stems,
+     * so keep that fallback below. */
     for (int i = 0; i < g_named_count; ++i) {
-        if (strcmp(g_named[i].name, key) == 0) {
+        char namedFull[128];
+        q3_pbr_normalize_full_name(g_named[i].name, namedFull, sizeof(namedFull));
+        if (fullKey[0] != '\0' && strcmp(namedFull, fullKey) == 0) {
+            return &g_named[i].mat;
+        }
+    }
+
+    /* Basename/stem match for legacy small bundles and model aliases. */
+    for (int i = 0; i < g_named_count; ++i) {
+        char namedStem[64];
+        q3_pbr_normalize_name(g_named[i].name, namedStem, sizeof(namedStem));
+        if (key[0] != '\0' && strcmp(namedStem, key) == 0) {
             return &g_named[i].mat;
         }
     }
