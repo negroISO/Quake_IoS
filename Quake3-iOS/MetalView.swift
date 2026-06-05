@@ -3008,6 +3008,7 @@ struct MetalView: UIViewRepresentable {
         private var rtCompositeTexture: MTLTexture?
         private var rtWhiteTexture: MTLTexture?
         private var rtTextureSize = MTLSize(width: 0, height: 0, depth: 1)
+        private var rtCompositeTextureSize = MTLSize(width: 0, height: 0, depth: 1)
         private var worldASBuilt = false
         private var worldASGeneration: UInt32 = 0
         private var rtASVertexBuffer: MTLBuffer?
@@ -3309,14 +3310,16 @@ struct MetalView: UIViewRepresentable {
                 output.write(float4(saturate(color), saturate(outputAlpha)), tid);
             }
 
-            kernel void blendRT(texture2d<float, access::read> rt [[texture(0)]],
+            kernel void blendRT(texture2d<float, access::sample> rt [[texture(0)]],
                                 texture2d<float, access::read> raster [[texture(1)]],
                                 texture2d<float, access::write> output [[texture(2)]],
                                 constant float &mixAmount [[buffer(0)]],
                                 uint2 tid [[thread_position_in_grid]]) {
                 if (tid.x >= output.get_width() || tid.y >= output.get_height()) return;
                 float m = saturate(mixAmount);
-                float4 rtSample = rt.read(tid);
+                float2 uv = (float2(tid) + 0.5) / float2(output.get_width(), output.get_height());
+                constexpr sampler rtUpscaleSampler(filter::linear, address::clamp_to_edge);
+                float4 rtSample = rt.sample(rtUpscaleSampler, uv);
                 float3 rtColor = saturate(rtSample.rgb);
                 float3 rasterColor = saturate(raster.read(tid).rgb);
                 // RT alpha is a per-pixel preserve-raster mask used for alpha-test
@@ -3559,17 +3562,29 @@ struct MetalView: UIViewRepresentable {
         }
 
         @MainActor
-        private func ensureRTTextures(device: MTLDevice, width: Int, height: Int, pixelFormat: MTLPixelFormat) -> Bool {
-            let w = max(width, 1), h = max(height, 1)
-            if rtTexture != nil && rtCompositeTexture != nil && rtTextureSize.width == w && rtTextureSize.height == h { return true }
-            let rtDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: w, height: h, mipmapped: false)
+        private func ensureRTTextures(device: MTLDevice,
+                                      traceWidth: Int,
+                                      traceHeight: Int,
+                                      compositeWidth: Int,
+                                      compositeHeight: Int,
+                                      pixelFormat: MTLPixelFormat) -> Bool {
+            let tw = max(traceWidth, 1), th = max(traceHeight, 1)
+            let cw = max(compositeWidth, 1), ch = max(compositeHeight, 1)
+            if rtTexture != nil && rtCompositeTexture != nil &&
+                rtTextureSize.width == tw && rtTextureSize.height == th &&
+                rtCompositeTextureSize.width == cw && rtCompositeTextureSize.height == ch {
+                return true
+            }
+            let rtDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: tw, height: th, mipmapped: false)
             rtDesc.usage = [.shaderRead, .shaderWrite]; rtDesc.storageMode = .private
-            let compDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: pixelFormat, width: w, height: h, mipmapped: false)
+            let compDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: pixelFormat, width: cw, height: ch, mipmapped: false)
             compDesc.usage = [.shaderRead, .shaderWrite]; compDesc.storageMode = .private
             rtTexture = device.makeTexture(descriptor: rtDesc)
             rtCompositeTexture = device.makeTexture(descriptor: compDesc)
-            rtTexture?.label = "Q3.RT.output"; rtCompositeTexture?.label = "Q3.RT.composite"
-            rtTextureSize = MTLSize(width: w, height: h, depth: 1)
+            rtTexture?.label = "Q3.RT.output.halfres"; rtCompositeTexture?.label = "Q3.RT.composite"
+            rtTextureSize = MTLSize(width: tw, height: th, depth: 1)
+            rtCompositeTextureSize = MTLSize(width: cw, height: ch, depth: 1)
+            print("[RT] textures trace=\(tw)x\(th) composite=\(cw)x\(ch)")
             return rtTexture != nil && rtCompositeTexture != nil
         }
 
@@ -3618,7 +3633,14 @@ struct MetalView: UIViewRepresentable {
             }
             guard let primitiveMaterialBuffer = rtPrimitiveMaterialBuffer else { return nil }
             guard let rtPSO = ensureRTPipeline(device: device), let blendPSO = ensureRTBlendPipeline(device: device) else { return nil }
-            guard ensureRTTextures(device: device, width: renderW, height: renderH, pixelFormat: rasterTexture.pixelFormat),
+            let traceW = max(1, renderW / 2)
+            let traceH = max(1, renderH / 2)
+            guard ensureRTTextures(device: device,
+                                   traceWidth: traceW,
+                                   traceHeight: traceH,
+                                   compositeWidth: renderW,
+                                   compositeHeight: renderH,
+                                   pixelFormat: rasterTexture.pixelFormat),
                   let rtTex = rtTexture, let compositeTex = rtCompositeTexture else { return nil }
 
             let viewProj = makeWorldViewProjection(sceneView)
@@ -3636,11 +3658,12 @@ struct MetalView: UIViewRepresentable {
                                               fovParams: SIMD4<Float>(tan(sceneView.fovX * .pi / 360.0), tan(sceneView.fovY * .pi / 360.0), Float(CACurrentMediaTime() - frameTimeOrigin), 0),
                                               rtToneParams: SIMD4<Float>(Q3_RTExposure(), Q3_RTGamma(), Q3_RTAmbient(), Q3_RTNormalMix()))
             if !rtOverlayLogPrintedOnce {
-                print("[RT] overlay active mix=\(mixValue) size=\(renderW)x\(renderH) camera=\(cameraPos)")
+                print("[RT] overlay active mix=\(mixValue) trace=\(traceW)x\(traceH) composite=\(renderW)x\(renderH) camera=\(cameraPos)")
                 rtOverlayLogPrintedOnce = true
             }
             let tg = MTLSize(width: 16, height: 16, depth: 1)
-            let groups = MTLSize(width: (renderW + 15) / 16, height: (renderH + 15) / 16, depth: 1)
+            let traceGroups = MTLSize(width: (traceW + 15) / 16, height: (traceH + 15) / 16, depth: 1)
+            let compositeGroups = MTLSize(width: (renderW + 15) / 16, height: (renderH + 15) / 16, depth: 1)
             if let enc = commandBuffer.makeComputeCommandEncoder() {
                 enc.label = "Q3.RT.trace"
                 enc.setComputePipelineState(rtPSO)
@@ -3658,7 +3681,7 @@ struct MetalView: UIViewRepresentable {
                 enc.setBuffer(rtASIndexBuffer, offset: 0, index: 2)
                 enc.setBuffer(rtASVertexBuffer, offset: 0, index: 3)
                 enc.setBuffer(primitiveMaterialBuffer, offset: 0, index: 4)
-                enc.dispatchThreadgroups(groups, threadsPerThreadgroup: tg)
+                enc.dispatchThreadgroups(traceGroups, threadsPerThreadgroup: tg)
                 enc.endEncoding()
             }
             var m = mixValue
@@ -3669,7 +3692,7 @@ struct MetalView: UIViewRepresentable {
                 enc.setTexture(rasterTexture, index: 1)
                 enc.setTexture(compositeTex, index: 2)
                 enc.setBytes(&m, length: MemoryLayout<Float>.stride, index: 0)
-                enc.dispatchThreadgroups(groups, threadsPerThreadgroup: tg)
+                enc.dispatchThreadgroups(compositeGroups, threadsPerThreadgroup: tg)
                 enc.endEncoding()
             }
             if rasterTexture === outputDrawableTexture, let blit = commandBuffer.makeBlitCommandEncoder() {
