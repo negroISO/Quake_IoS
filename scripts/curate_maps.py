@@ -4,8 +4,13 @@
 Usage:
   scripts/curate_maps.py <pak.pk3> <full_materials.json> <rtx_assets_root> <output_root> <map> [<map> ...]
 
+If `full_materials.json` was generated directly from mod.usda, first apply a
+BlueAmulet xxhash texture map so it has real Q3 shader names:
+
+  scripts/pbr_apply_txrmap.py docs/pbr/q3rtx_v07_materials.json txrmap.txt /tmp/q3rtx_v07_named.json
+
 Example:
-  scripts/curate_maps.py baseq3/pak0.pk3 docs/pbr/q3rtx_v07_materials.json \
+  scripts/curate_maps.py baseq3/pak0.pk3 /tmp/q3rtx_v07_named.json \
     "/Users/targus/Downloads/Quake III Arena RTX v0.7/rtx-remix/mods/q3rtx_v07/assets" \
     /tmp/q3_pbr_maps q3dm1 q3dm4 q3dm6 q3dm17 nv15
 """

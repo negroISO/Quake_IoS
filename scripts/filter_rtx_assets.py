@@ -36,8 +36,20 @@ def material_shader_name(mat: dict) -> str:
 
 def copy_texture(src_root: Path, out_ingested: Path, rel: str) -> tuple[str | None, bool]:
     rel_path = Path(rel.replace("\\", "/"))
-    candidates = [src_root / rel_path, src_root / rel_path.name]
+    # Accept either the mod root (.../q3rtx_v07) or the assets root
+    # (.../q3rtx_v07/assets) as src_root. The full table stores paths like
+    # assets/ingested/foo.dds, but users naturally point this tool at either.
+    candidates = [
+        src_root / rel_path,
+        src_root / rel_path.name,
+        src_root / "ingested" / rel_path.name,
+        src_root / "assets" / "ingested" / rel_path.name,
+    ]
+    seen: set[Path] = set()
     for src in candidates:
+        if src in seen:
+            continue
+        seen.add(src)
         if src.exists():
             dst = out_ingested / src.name
             shutil.copy2(src, dst)
