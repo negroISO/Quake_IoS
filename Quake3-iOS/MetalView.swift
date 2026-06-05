@@ -3302,15 +3302,33 @@ struct MetalView: UIViewRepresentable {
                         constexpr sampler repeatSampler(filter::linear, address::repeat);
                         constexpr sampler clampSampler(filter::linear, address::clamp_to_edge);
                         float4 albedoSample = albedoTextures[mat.albedoSlot].sample(repeatSampler, uv);
+                        float blendMode = mat.materialParams.y;
+                        bool additiveBlend = (abs(blendMode - 1.0) < 0.5 || abs(blendMode - 5.0) < 0.5);
+                        bool alphaSensitive = (mat.materialFlags.z != 0 || mat.materialFlags.w != 0 || additiveBlend);
+                        float sampledAlpha = albedoSample.a;
+                        // Several RTX/effect DDS captures are effectively RGB-only even though
+                        // the original Q3 shader expects luminance alpha. Synthesize alpha in
+                        // shader for effect/blended/alpha-test materials so smoke, flares and
+                        // sprites do not become opaque white quads.
+                        float luminanceAlpha = max(max(albedoSample.r, albedoSample.g), albedoSample.b);
+                        float effectiveAlpha = (alphaSensitive && sampledAlpha >= 0.995) ? luminanceAlpha : sampledAlpha;
                         float alphaThreshold = mat.alphaTcModControl.x;
-                        bool alphaReject = (alphaThreshold > 0.0 && albedoSample.a < alphaThreshold) ||
-                                           (alphaThreshold < 0.0 && albedoSample.a >= -alphaThreshold);
+                        bool alphaReject = (alphaThreshold > 0.0 && effectiveAlpha < alphaThreshold) ||
+                                           (alphaThreshold < 0.0 && effectiveAlpha >= -alphaThreshold);
                         if (alphaReject) {
                             // Let the already-rasterized world show through. A primitive AS
                             // cannot alpha-discard and continue traversal without custom
                             // intersection/multi-hit logic, so alpha holes preserve raster.
                             color = float3(0.0);
                             outputAlpha = 0.0;
+                        } else if (additiveBlend) {
+                            // Additive Q3 stages (flares, smoke/energy sprites, portals) are
+                            // self-lit effect passes, not lightmapped world. Preserve raster via
+                            // alpha instead of turning RGB-only DDS effects into solid squares.
+                            float intensity = max(mat.materialParams.x, 1.0);
+                            float alphaForAdd = (abs(blendMode - 5.0) < 0.5) ? max(effectiveAlpha, 0.65) : effectiveAlpha;
+                            color = albedoSample.rgb * intensity * alphaForAdd;
+                            outputAlpha = clamp(alphaForAdd, 0.0, 0.85);
                         } else if (mat.materialFlags.w != 0) {
                             // First-pass translucency: shade blended surfaces but emit partial
                             // alpha so the composite pass preserves raster behind/through them.
@@ -3321,10 +3339,10 @@ struct MetalView: UIViewRepresentable {
                             float ambientFloor = uniforms.rtToneParams.z;
                             color = albedoSample.rgb * max(lightmap * 1.25, float3(ambientFloor));
                             if (mat.materialFlags.y != 0) {
-                                color += albedoSample.rgb * mat.materialParams.x;
+                                color += albedoSample.rgb * mat.materialParams.x * effectiveAlpha;
                                 color = min(color, float3(2.0));
                             }
-                            outputAlpha = clamp(max(albedoSample.a, 0.35), 0.20, 0.70);
+                            outputAlpha = clamp(effectiveAlpha, 0.0, 0.70);
                         } else {
                             float3 lightmap = float3(1.0);
                             if (mat.lightmapSlot < 16) {
@@ -3581,7 +3599,7 @@ struct MetalView: UIViewRepresentable {
                                                          isEmissive ? 1 : 0,
                                                          alphaThreshold != 0 ? 1 : 0,
                                                          blendMode != 0 ? 1 : 0),
-                            materialParams: SIMD4<Float>(isEmissive ? 0.8 : 0.0, 0, 0, 0),
+                            materialParams: SIMD4<Float>(isEmissive ? 0.8 : 0.0, Float(blendMode), 0, 0),
                             tcModTypes: tcTypes,
                             tcModParams0: chain.p0,
                             tcModParams1: chain.p1,
