@@ -3339,8 +3339,20 @@ struct MetalView: UIViewRepresentable {
                             auto bounceHit = i.intersect(bounceRay, worldAS);
                             float3 indirect = float3(0.0);
                             if (bounceHit.type == intersection_type::triangle) {
-                                RTPrimitiveMaterial bounceMat = primitiveMaterials[bounceHit.primitive_id];
-                                indirect = (bounceMat.materialFlags.y != 0) ? float3(0.18) : float3(0.035);
+                                uint btri = bounceHit.primitive_id;
+                                RTPrimitiveMaterial bounceMat = primitiveMaterials[btri];
+                                if (bounceMat.materialFlags.y != 0 && bounceMat.albedoSlot < 110) {
+                                    uint bi0 = indices[btri * 3 + 0];
+                                    uint bi1 = indices[btri * 3 + 1];
+                                    uint bi2 = indices[btri * 3 + 2];
+                                    float2 bb = bounceHit.triangle_barycentric_coord;
+                                    float bw = 1.0 - bb.x - bb.y;
+                                    float2 buv = vertices[bi0].texCoord * bw + vertices[bi1].texCoord * bb.x + vertices[bi2].texCoord * bb.y;
+                                    float3 emitAlbedo = albedoTextures[bounceMat.albedoSlot].sample(repeatSampler, buv).rgb;
+                                    indirect = emitAlbedo * max(bounceMat.materialParams.x, 0.8) * 0.22;
+                                } else {
+                                    indirect = float3(0.035);
+                                }
                             } else if (!is_null_texture(envCube)) {
                                 indirect = envCube.sample(envSampler, bounceDir).rgb * 0.06;
                             } else {
