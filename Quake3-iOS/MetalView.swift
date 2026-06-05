@@ -3305,10 +3305,19 @@ struct MetalView: UIViewRepresentable {
                             color = float3(0.0);
                             outputAlpha = 0.0;
                         } else if (mat.materialFlags.w != 0) {
-                            // Preserve raster for blended/translucent world surfaces in pure
-                            // RT mode until a proper sorted/multi-hit transparent RT path exists.
-                            color = float3(0.0);
-                            outputAlpha = 0.0;
+                            // First-pass translucency: shade blended surfaces but emit partial
+                            // alpha so the composite pass preserves raster behind/through them.
+                            float3 lightmap = float3(1.0);
+                            if (mat.lightmapSlot < 16) {
+                                lightmap = lightmapTextures[mat.lightmapSlot].sample(clampSampler, lmuv).rgb;
+                            }
+                            float ambientFloor = uniforms.rtToneParams.z;
+                            color = albedoSample.rgb * max(lightmap * 1.25, float3(ambientFloor));
+                            if (mat.materialFlags.y != 0) {
+                                color += albedoSample.rgb * mat.materialParams.x;
+                                color = min(color, float3(2.0));
+                            }
+                            outputAlpha = clamp(max(albedoSample.a, 0.35), 0.20, 0.70);
                         } else {
                             float3 lightmap = float3(1.0);
                             if (mat.lightmapSlot < 16) {
@@ -3546,8 +3555,8 @@ struct MetalView: UIViewRepresentable {
                             _pad0: 0,
                             alphaTcModControl: SIMD4<Float>(alphaThreshold, Float(tcCount), 0, 0),
                             // flags: x=sky, y=emissive, z=alpha-test, w=blended/translucent.
-                            // RT keeps blended/translucent world surfaces as raster fallback
-                            // so grates/flames/portals do not become opaque black blockers.
+                            // RT shades blended/translucent world surfaces with partial alpha
+                            // so grates/flames/portals preserve raster behind them.
                             materialFlags: SIMD4<UInt32>(isSkyDraw ? 1 : 0,
                                                          isEmissive ? 1 : 0,
                                                          alphaThreshold != 0 ? 1 : 0,
