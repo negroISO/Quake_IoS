@@ -3004,7 +3004,10 @@ struct MetalView: UIViewRepresentable {
         private var worldAccelerationStructure: MTLAccelerationStructure?
         private var rtPipelineState: MTLComputePipelineState?
         private var rtBlendPipelineState: MTLComputePipelineState?
+        private var rtAccumPipelineState: MTLComputePipelineState?
         private var rtTexture: MTLTexture?
+        private var rtAccumTexture: MTLTexture?
+        private var rtHistoryTexture: MTLTexture?
         private var rtCompositeTexture: MTLTexture?
         private var rtWhiteTexture: MTLTexture?
         private var rtTextureSize = MTLSize(width: 0, height: 0, depth: 1)
@@ -3025,6 +3028,8 @@ struct MetalView: UIViewRepresentable {
         private var rtLogPrintedOnce = false
         private var rtOverlayLogPrintedOnce = false
         private var rtLastMaterialRefreshTime: Float = 0
+        private var rtHistoryValid = false
+        private var rtJitterFrame: UInt32 = 0
 
         private struct PostprocessUniforms {
             var intensity: Float
@@ -3321,6 +3326,19 @@ struct MetalView: UIViewRepresentable {
                 output.write(float4(saturate(color), saturate(outputAlpha)), tid);
             }
 
+            kernel void accumulateRT(texture2d<float, access::read> current [[texture(0)]],
+                                     texture2d<float, access::read> history [[texture(1)]],
+                                     texture2d<float, access::write> output [[texture(2)]],
+                                     constant float &alpha [[buffer(0)]],
+                                     uint2 tid [[thread_position_in_grid]]) {
+                if (tid.x >= output.get_width() || tid.y >= output.get_height()) return;
+                float4 c = current.read(tid);
+                float4 h = history.read(tid);
+                float a = saturate(alpha);
+                float3 rgb = mix(h.rgb, c.rgb, a);
+                output.write(float4(rgb, c.a), tid);
+            }
+
             kernel void blendRT(texture2d<float, access::sample> rt [[texture(0)]],
                                 texture2d<float, access::read> raster [[texture(1)]],
                                 texture2d<float, access::write> output [[texture(2)]],
@@ -3370,6 +3388,16 @@ struct MetalView: UIViewRepresentable {
             catch { print("[RT] blend pipeline state error: \(error)"); return nil }
         }
 
+
+        @MainActor
+        private func ensureRTAccumPipeline(device: MTLDevice) -> MTLComputePipelineState? {
+            if let rtAccumPipelineState { return rtAccumPipelineState }
+            guard let lib = makeRTLibrary(device: device), let fn = lib.makeFunction(name: "accumulateRT") else {
+                print("[RT] failed to create accumulateRT"); return nil
+            }
+            do { let pso = try device.makeComputePipelineState(function: fn); rtAccumPipelineState = pso; print("[RT] accumulateRT pipeline ready"); return pso }
+            catch { print("[RT] accumulate pipeline state error: \(error)"); return nil }
+        }
 
         @MainActor
         private func buildRTPrimitiveMaterials(device: MTLDevice, primitiveCount: Int, log: Bool = true) {
@@ -3638,7 +3666,7 @@ struct MetalView: UIViewRepresentable {
                                       pixelFormat: MTLPixelFormat) -> Bool {
             let tw = max(traceWidth, 1), th = max(traceHeight, 1)
             let cw = max(compositeWidth, 1), ch = max(compositeHeight, 1)
-            if rtTexture != nil && rtCompositeTexture != nil &&
+            if rtTexture != nil && rtAccumTexture != nil && rtHistoryTexture != nil && rtCompositeTexture != nil &&
                 rtTextureSize.width == tw && rtTextureSize.height == th &&
                 rtCompositeTextureSize.width == cw && rtCompositeTextureSize.height == ch {
                 return true
@@ -3648,12 +3676,18 @@ struct MetalView: UIViewRepresentable {
             let compDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: pixelFormat, width: cw, height: ch, mipmapped: false)
             compDesc.usage = [.shaderRead, .shaderWrite]; compDesc.storageMode = .private
             rtTexture = device.makeTexture(descriptor: rtDesc)
+            rtAccumTexture = device.makeTexture(descriptor: rtDesc)
+            rtHistoryTexture = device.makeTexture(descriptor: rtDesc)
             rtCompositeTexture = device.makeTexture(descriptor: compDesc)
-            rtTexture?.label = "Q3.RT.output.halfres"; rtCompositeTexture?.label = "Q3.RT.composite"
+            rtTexture?.label = "Q3.RT.output.halfres"
+            rtAccumTexture?.label = "Q3.RT.accum.halfres"
+            rtHistoryTexture?.label = "Q3.RT.history.halfres"
+            rtCompositeTexture?.label = "Q3.RT.composite"
             rtTextureSize = MTLSize(width: tw, height: th, depth: 1)
             rtCompositeTextureSize = MTLSize(width: cw, height: ch, depth: 1)
-            print("[RT] textures trace=\(tw)x\(th) composite=\(cw)x\(ch)")
-            return rtTexture != nil && rtCompositeTexture != nil
+            rtHistoryValid = false
+            print("[RT] textures trace=\(tw)x\(th) composite=\(cw)x\(ch) history=reset")
+            return rtTexture != nil && rtAccumTexture != nil && rtHistoryTexture != nil && rtCompositeTexture != nil
         }
 
 
@@ -3700,7 +3734,9 @@ struct MetalView: UIViewRepresentable {
                 }
             }
             guard let primitiveMaterialBuffer = rtPrimitiveMaterialBuffer else { return nil }
-            guard let rtPSO = ensureRTPipeline(device: device), let blendPSO = ensureRTBlendPipeline(device: device) else { return nil }
+            guard let rtPSO = ensureRTPipeline(device: device),
+                  let accumPSO = ensureRTAccumPipeline(device: device),
+                  let blendPSO = ensureRTBlendPipeline(device: device) else { return nil }
             let traceW = max(1, renderW / 2)
             let traceH = max(1, renderH / 2)
             guard ensureRTTextures(device: device,
@@ -3709,7 +3745,25 @@ struct MetalView: UIViewRepresentable {
                                    compositeWidth: renderW,
                                    compositeHeight: renderH,
                                    pixelFormat: rasterTexture.pixelFormat),
-                  let rtTex = rtTexture, let compositeTex = rtCompositeTexture else { return nil }
+                  let rtTex = rtTexture,
+                  let accumTex = rtAccumTexture,
+                  let historyTex = rtHistoryTexture,
+                  let compositeTex = rtCompositeTexture else { return nil }
+
+            func halton(_ index: UInt32, _ base: UInt32) -> Float {
+                var i = index
+                var f: Float = 1
+                var r: Float = 0
+                while i > 0 {
+                    f /= Float(base)
+                    r += f * Float(i % base)
+                    i /= base
+                }
+                return r
+            }
+            rtJitterFrame &+= 1
+            let jitter = SIMD2<Float>((halton(rtJitterFrame, 2) - 0.5) / Float(max(traceW, 1)),
+                                      (halton(rtJitterFrame, 3) - 0.5) / Float(max(traceH, 1)))
 
             let viewProj = makeWorldViewProjection(sceneView)
             let cameraPos = SIMD3<Float>(sceneView.viewOrigin.0, sceneView.viewOrigin.1, sceneView.viewOrigin.2)
@@ -3722,7 +3776,7 @@ struct MetalView: UIViewRepresentable {
                                               cameraForward: SIMD4<Float>(forward.x, forward.y, forward.z, 0),
                                               cameraRight: SIMD4<Float>(right.x, right.y, right.z, 0),
                                               cameraUp: SIMD4<Float>(up.x, up.y, up.z, 0),
-                                              jitterNearFar: SIMD4<Float>(0, 0, 4.0, 8192.0),
+                                              jitterNearFar: SIMD4<Float>(jitter.x, jitter.y, 4.0, 8192.0),
                                               fovParams: SIMD4<Float>(tan(sceneView.fovX * .pi / 360.0), tan(sceneView.fovY * .pi / 360.0), Float(CACurrentMediaTime() - frameTimeOrigin), entityAccelerationStructure == nil ? 0 : 1),
                                               rtToneParams: SIMD4<Float>(Q3_RTExposure(), Q3_RTGamma(), Q3_RTAmbient(), Q3_RTNormalMix()))
             if !rtOverlayLogPrintedOnce {
@@ -3753,11 +3807,32 @@ struct MetalView: UIViewRepresentable {
                 enc.dispatchThreadgroups(traceGroups, threadsPerThreadgroup: tg)
                 enc.endEncoding()
             }
+            var accumAlpha: Float = rtHistoryValid ? 0.10 : 1.0
+            if let enc = commandBuffer.makeComputeCommandEncoder() {
+                enc.label = "Q3.RT.accumulate"
+                enc.setComputePipelineState(accumPSO)
+                enc.setTexture(rtTex, index: 0)
+                enc.setTexture(historyTex, index: 1)
+                enc.setTexture(accumTex, index: 2)
+                enc.setBytes(&accumAlpha, length: MemoryLayout<Float>.stride, index: 0)
+                enc.dispatchThreadgroups(traceGroups, threadsPerThreadgroup: tg)
+                enc.endEncoding()
+            }
+            if let blit = commandBuffer.makeBlitCommandEncoder() {
+                blit.label = "Q3.RT.copyAccumToHistory"
+                blit.copy(from: accumTex, sourceSlice: 0, sourceLevel: 0,
+                          sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                          sourceSize: MTLSize(width: traceW, height: traceH, depth: 1),
+                          to: historyTex, destinationSlice: 0, destinationLevel: 0,
+                          destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+                blit.endEncoding()
+                rtHistoryValid = true
+            }
             var m = mixValue
             if let enc = commandBuffer.makeComputeCommandEncoder() {
                 enc.label = "Q3.RT.blend"
                 enc.setComputePipelineState(blendPSO)
-                enc.setTexture(rtTex, index: 0)
+                enc.setTexture(accumTex, index: 0)
                 enc.setTexture(rasterTexture, index: 1)
                 enc.setTexture(compositeTex, index: 2)
                 enc.setBytes(&m, length: MemoryLayout<Float>.stride, index: 0)
