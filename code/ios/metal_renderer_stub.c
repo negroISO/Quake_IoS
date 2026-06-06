@@ -10044,6 +10044,14 @@ int Q3_PBRWorldClassMatchEnabled(void) {
     return cv ? cv->integer : 1;
 }
 
+int Q3_PBROnlyTextures(void) {
+    if (ri.Cvar_Get == NULL) return 1;
+    /* Diagnostics: when enabled, Swift binds a visible placeholder instead
+     * of falling back to the original pak0/classic texture on missing PBR. */
+    cvar_t *cv = ri.Cvar_Get("r_pbr_only_textures", "1", CVAR_ARCHIVE);
+    return cv ? cv->integer : 1;
+}
+
 float Q3_RTMix(void) {
     if (ri.Cvar_Get == NULL) return 0.0f;
     cvar_t *cv = ri.Cvar_Get("r_rt_mix", "0", CVAR_ARCHIVE);
@@ -10123,8 +10131,11 @@ float Q3_RTBounces(void) {
 }
 
 float Q3_RTTAA(void) {
-    if (ri.Cvar_Get == NULL) return 1.0f;
-    cvar_t *cv = ri.Cvar_Get("r_rt_taa", "1", CVAR_ARCHIVE);
+    if (ri.Cvar_Get == NULL) return 0.0f;
+    // Default OFF until motion vectors / robust reprojection exist.
+    // The old default accumulated stale history while moving and produced
+    // the reported fever-dream smear. Users can still opt in with r_rt_taa 1.
+    cvar_t *cv = ri.Cvar_Get("r_rt_taa", "0", CVAR_ARCHIVE);
     return (cv && cv->integer == 0) ? 0.0f : 1.0f;
 }
 

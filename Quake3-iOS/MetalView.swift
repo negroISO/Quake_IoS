@@ -2355,12 +2355,23 @@ struct MetalView: UIViewRepresentable {
                                          uniforms.alphaTestThreshold != 0.0 ||
                                          uniforms.alphaGenMode == 5u ||
                                          uniforms.alphaGenMode == 6u);
-            if (entityAlphaSensitive && texel.a >= 0.995) {
+            if (entityAlphaSensitive && (uniforms.forceLuminanceAlpha != 0u || texel.a >= 0.995)) {
                 float lumAlpha = max(max(texel.r, texel.g), texel.b);
                 float2 centered = texCoord - 0.5;
                 float radial = saturate(1.0 - dot(centered, centered) * 2.0);
                 radial = radial * radial * (3.0 - 2.0 * radial);
-                float synthA = saturate(lumAlpha * radial);
+                /* forceLuminanceAlpha modes:
+                 *   1 = luminance mask for black-background additive FX
+                 *       (plasma bolts, muzzle flashes, bright cores).
+                 *   2 = inverse-luminance mask for white-background smoke /
+                 *       explosion captures. Apply forced modes regardless of
+                 *       sampled alpha: several replacement/source effect
+                 *       textures have bad semi-opaque alpha, not exactly 1.0,
+                 *       so the old alpha>=0.995 gate left white quads alive. */
+                float baseAlpha = (uniforms.forceLuminanceAlpha == 2u)
+                                ? (1.0 - lumAlpha)
+                                : lumAlpha;
+                float synthA = saturate(baseAlpha * radial);
                 texel.rgb *= synthA;
                 texel.a = synthA;
             }
@@ -3034,6 +3045,7 @@ struct MetalView: UIViewRepresentable {
         private var rtHistoryTexture: MTLTexture?
         private var rtCompositeTexture: MTLTexture?
         private var rtWhiteTexture: MTLTexture?
+        private var pbrMissingTexture: MTLTexture?
         private var rtTextureSize = MTLSize(width: 0, height: 0, depth: 1)
         private var rtCompositeTextureSize = MTLSize(width: 0, height: 0, depth: 1)
         private var worldASBuilt = false
@@ -3059,6 +3071,8 @@ struct MetalView: UIViewRepresentable {
         private var rtLastMetricsLogTime: CFTimeInterval = 0
         private var rtLastCameraPos: SIMD3<Float>?
         private var rtLastCameraForward: SIMD3<Float>?
+        private var loggedPBROnlyWorldMisses: Set<UInt32> = []
+        private var loggedPBROnlyEntityMisses: Set<UInt32> = []
 
         private struct PostprocessUniforms {
             var intensity: Float
@@ -3814,6 +3828,102 @@ struct MetalView: UIViewRepresentable {
         }
 
         @MainActor
+        private func ensurePBRMissingTexture(device: MTLDevice) -> MTLTexture? {
+            if let pbrMissingTexture { return pbrMissingTexture }
+            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm,
+                                                                width: 1,
+                                                                height: 1,
+                                                                mipmapped: false)
+            desc.usage = [.shaderRead]
+            desc.storageMode = .shared
+            guard let tex = device.makeTexture(descriptor: desc) else { return nil }
+            var pixel: [UInt8] = [255, 0, 255, 255] // magenta = missing PBR
+            pixel.withUnsafeBytes { bytes in
+                tex.replace(region: MTLRegionMake2D(0, 0, 1, 1),
+                            mipmapLevel: 0,
+                            withBytes: bytes.baseAddress!,
+                            bytesPerRow: 4)
+            }
+            tex.label = "Q3.PBR.missing.magenta"
+            pbrMissingTexture = tex
+            return tex
+        }
+
+        private func textureNameForLog(_ handle: UInt32) -> String {
+            Q3MetalRenderer_GetTextureName(handle).map { String(cString: $0) } ?? "unknown"
+        }
+
+        private func shouldAllowClassicFallbackInPBROnly(_ textureName: String, isEntity: Bool) -> Bool {
+            let n = textureName.lowercased()
+            if n == "unknown" || n == "*white" || n.hasPrefix("*lightmap:") { return true }
+
+            // PBR-only is a world-material diagnostic, not an FX validator. These
+            // paths are Q3 shader/effect assets whose correct rendering depends on
+            // alphaGen/rgbGen/blendFunc/depth sorting, and many intentionally have
+            // no Remix PBR replacement. Let them use the classic texture so magenta
+            // only marks actionable missing PBR world materials.
+            let classicPrefixes = [
+                "sprites/", "gfx/", "icons/", "menu/", "levelshots/", "powerups/",
+                "models/weaphits/", "models/ammo/", "models/powerups/",
+                "models/mapobjects/teleporter/", "models/mapobjects/slamp/",
+                "models/mapobjects/chain/", "models/mapobjects/bitch/"
+            ]
+            if classicPrefixes.contains(where: { n.hasPrefix($0) }) { return true }
+
+            let fxTokens = [
+                "smoke", "puff", "explosion", "boom", "muzzle", "tracer",
+                "flame", "fire", "plasma", "rail", "rocket", "teleport",
+                "quad", "sphere", "energy", "glass", "transparency", "flare",
+                "glow", "spark", "tesla", "slime", "laser", "balloon"
+            ]
+            if fxTokens.contains(where: { n.contains($0) }) { return true }
+
+            // Entity submissions are mostly models/items/effects. If a model really
+            // has a PBR material pbrAlbedoTexture(for:) already returned it above;
+            // otherwise prefer the original skin over magenta debug geometry.
+            if isEntity && n.hasPrefix("models/") { return true }
+            return false
+        }
+
+        @MainActor
+        private func worldBaseTextureForPBRDebug(handle: UInt32, fallback: MTLTexture) -> MTLTexture {
+            if let pbr = pbrAlbedoTexture(for: handle) { return pbr }
+            if Q3_PBROnlyTextures() != 0 {
+                let name = textureNameForLog(handle)
+                if shouldAllowClassicFallbackInPBROnly(name, isEntity: false) {
+                    if loggedPBROnlyWorldMisses.insert(handle).inserted {
+                        pbrLog("[Q3-PBR-ONLY] world FX/classic fallback handle=\(handle) name='\(name)'")
+                    }
+                    return fallback
+                }
+                if loggedPBROnlyWorldMisses.insert(handle).inserted {
+                    pbrLog("[Q3-PBR-ONLY] world missing PBR handle=\(handle) name='\(name)' -> magenta")
+                }
+                return ensurePBRMissingTexture(device: fallback.device) ?? fallback
+            }
+            return fallback
+        }
+
+        @MainActor
+        private func entityBaseTextureForPBRDebug(handle: UInt32, fallback: MTLTexture) -> MTLTexture {
+            if let pbr = pbrAlbedoTexture(for: handle) { return pbr }
+            if Q3_PBROnlyTextures() != 0 {
+                let name = textureNameForLog(handle)
+                if shouldAllowClassicFallbackInPBROnly(name, isEntity: true) {
+                    if loggedPBROnlyEntityMisses.insert(handle).inserted {
+                        pbrLog("[Q3-PBR-ONLY] entity FX/classic fallback handle=\(handle) name='\(name)'")
+                    }
+                    return fallback
+                }
+                if loggedPBROnlyEntityMisses.insert(handle).inserted {
+                    pbrLog("[Q3-PBR-ONLY] entity missing PBR handle=\(handle) name='\(name)' -> magenta")
+                }
+                return ensurePBRMissingTexture(device: fallback.device) ?? fallback
+            }
+            return fallback
+        }
+
+        @MainActor
         private func encodeRTOverlay(commandBuffer: MTLCommandBuffer,
                                      rasterTexture: MTLTexture,
                                      outputDrawableTexture: MTLTexture,
@@ -4182,24 +4292,37 @@ struct MetalView: UIViewRepresentable {
             }
         }
 
-        private static func textureNameNeedsLuminanceAlpha(_ name: String) -> Bool {
+        private static func textureAlphaSynthesisMode(_ name: String) -> UInt32 {
             let n = name.lowercased()
+            // White-background captures: alpha is the inverse of luminance.
+            // These were the visible white square / white blob artifacts.
+            if n.contains("smoke") || n.contains("puff") ||
+               n.contains("explosion") || n.contains("boom") ||
+               n.contains("balloon") || n.contains("blood") {
+                return 2
+            }
+            // Black-background additive/effect captures: alpha follows luminance.
             if n.hasPrefix("sprites/") || n.hasPrefix("gfx/misc/") ||
                n.hasPrefix("gfx/damage/") || n.hasPrefix("models/weaphits/") ||
                n.hasPrefix("models/ammo/rocket/rockfl") {
-                return true
+                return 1
             }
-            if n == "smokepuff" || n == "shotgunsmokepuff" ||
-               n == "plasmaexplosion" || n == "teleporteffect" ||
-               n == "viewbloodblend" || n == "gfx/misc/tracer" {
-                return true
+            if n == "teleporteffect" || n == "gfx/misc/tracer" ||
+               n == "railcore" || n == "rail_core" ||
+               n.contains("railcore") || n.contains("rail_core") ||
+               n.contains("railcorethin") {
+                return 1
             }
             if n.contains("/f_") || n.contains("f_machinegun") ||
                n.contains("f_rocketl") || n.contains("f_shotgun") ||
                n.contains("f_plasma") {
-                return true
+                return 1
             }
-            return false
+            return 0
+        }
+
+        private static func textureNameNeedsLuminanceAlpha(_ name: String) -> Bool {
+            return textureAlphaSynthesisMode(name) != 0
         }
 
         /* PBR Phase 1: per-Q3-handle HD albedo cache. When the C-side
@@ -5514,7 +5637,9 @@ struct MetalView: UIViewRepresentable {
                             pbrMetallic: stage.pbrMetallic,
                             _pad0: (draw.flags & combinedLightmapBit) != 0 ? 1.0 : 0.0
                         )
-                        let worldBaseTexture = pbrAlbedoTexture(for: stage.textureHandle) ?? baseTexture
+                        let worldBaseTexture = (stage.useLightmap == 0)
+                            ? worldBaseTextureForPBRDebug(handle: stage.textureHandle, fallback: baseTexture)
+                            : baseTexture
                         encoder.setFragmentTexture(worldBaseTexture, index: 0)
                         encoder.setFragmentTexture(lightmapTexture, index: 1)
                         // PBR Phase 3 — bind generic world normal map at
@@ -6042,7 +6167,14 @@ struct MetalView: UIViewRepresentable {
                                 pbrMetallic: stage.pbrMetallic,
                                 _pad0: (draw.flags & combinedLightmapBit) != 0 ? 1.0 : 0.0
                             )
-                            setWorldFragmentTextureCached(baseTexture, index: 0)
+                            // Use authored PBR albedo for normal world color stages.
+                            // The non-batched path was still binding the vanilla Q3
+                            // base texture here, so most world geometry looked stock
+                            // unless it happened to route through encodeNormalWorldDraw().
+                            let worldBaseTexture = (stage.useLightmap == 0)
+                                ? worldBaseTextureForPBRDebug(handle: stage.textureHandle, fallback: baseTexture)
+                                : baseTexture
+                            setWorldFragmentTextureCached(worldBaseTexture, index: 0)
                             setWorldFragmentTextureCached(lightmapTexture, index: 1)
                             encoder.setFragmentBytes(&drawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 0)
                             // Vertex shader reads deformWave + timeSeconds
@@ -6371,7 +6503,7 @@ struct MetalView: UIViewRepresentable {
                         // back to the original on miss / DDS-load fail.
                         let pbrTex = pbrAlbedoTexture(for: draw.textureHandle)
                         let q3Name = Q3MetalRenderer_GetTextureName(draw.textureHandle).map { String(cString: $0) } ?? "unknown"
-                        entityUniforms.forceLuminanceAlpha = Self.textureNameNeedsLuminanceAlpha(q3Name) ? 1 : 0
+                        entityUniforms.forceLuminanceAlpha = Self.textureAlphaSynthesisMode(q3Name)
                         encoder.setVertexBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
                         encoder.setFragmentBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
                         if (isEntityAdditive || isEntityAdditiveFull || isEntityAlpha || isScenePoly || (draw.flags & aTestGT0Bit) != 0),
@@ -6382,7 +6514,7 @@ struct MetalView: UIViewRepresentable {
                             let srcLabel = texture.label ?? "nil"
                             logAlphaTextureDiagnostic("[ALPHA-TEX] handle=\(draw.textureHandle) name='\(q3Name)' pass=\(drawPass) flags=0x\(String(draw.flags, radix: 16)) alphaFunc=\(info.alphaFunc) rgbGen=\(info.rgbGen) alphaGen=\(info.alphaGen) forceLum=\(entityUniforms.forceLuminanceAlpha) pbr='\(pbrLabel)' src='\(srcLabel)' size=\(info.width)x\(info.height)")
                         }
-                        encoder.setFragmentTexture(pbrTex ?? texture, index: 0)
+                        encoder.setFragmentTexture(entityBaseTextureForPBRDebug(handle: draw.textureHandle, fallback: texture), index: 0)
                         // PBR Phase 2 — bind normal map to slot 1 if the
                         // material ships one. Nil bind leaves the slot
                         // unbound; q3_entity_fragment uses is_null_texture
@@ -6591,8 +6723,9 @@ struct MetalView: UIViewRepresentable {
                         guard draw.indexCount > 0 else { continue }
                         guard let texture = texture(for: draw.textureHandle, device: view.device) else { continue }
                         // PBR Phase 1 — entity sub-pass (HUD heads,
-                        // ammo rotations, scoreboard portraits). Same
-                        // PBR-or-fallback rule as the main entity pass.
+                        // ammo rotations, scoreboard portraits). Keep classic
+                        // fallback here; PBR-only diagnostics are for 3D world/main
+                        // entity surfaces, not HUD/UI overlays.
                         let pbrTex = pbrAlbedoTexture(for: draw.textureHandle)
                         encoder.setFragmentTexture(pbrTex ?? texture, index: 0)
                         // PBR Phase 2 — bind normal map to slot 1 if the
@@ -6681,7 +6814,9 @@ struct MetalView: UIViewRepresentable {
                             encoder.setRenderPipelineState(pipeline)
                         }
                         if let texture = texture(for: draw.textureHandle, device: view.device) {
-                            // PBR Phase 1 — final fallback / overlay path
+                            // PBR Phase 1 — final fallback / overlay path. Keep classic
+                            // fallback for UI overlays; PBR-only diagnostics are for
+                            // 3D world/main entity surfaces.
                             let pbrTex = pbrAlbedoTexture(for: draw.textureHandle)
                             encoder.setFragmentTexture(pbrTex ?? texture, index: 0)
                             encoder.drawPrimitives(type: .triangle, vertexStart: Int(draw.firstVertex), vertexCount: Int(draw.vertexCount))

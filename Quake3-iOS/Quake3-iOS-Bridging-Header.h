@@ -138,6 +138,7 @@ int   Q3_PBRWorldEnabled(void);
 float Q3_PBRWorldAmbientBoost(void);
 float Q3_PBRWorldSpecBoost(void);
 int   Q3_PBRWorldClassMatchEnabled(void);
+int   Q3_PBROnlyTextures(void);
 float Q3_RTMix(void);
 float Q3_SetRTMix(float mix);
 float Q3_RTExposure(void);
