@@ -3924,23 +3924,45 @@ struct MetalView: UIViewRepresentable {
             return false
         }
 
+        private struct WorldTextureSelection {
+            let texture: MTLTexture
+            let useWorldPBR: Bool
+            let classicFX: Bool
+        }
+
         @MainActor
-        private func worldBaseTextureForPBRDebug(handle: UInt32, fallback: MTLTexture) -> MTLTexture {
-            if let pbr = pbrAlbedoTexture(for: handle) { return pbr }
+        private func worldTextureSelectionForPBRDebug(handle: UInt32,
+                                                      fallback: MTLTexture,
+                                                      stage: Q3MetalWorldStage) -> WorldTextureSelection {
+            let name = textureNameForLog(handle)
+            let isFXStage = stage.blendMode != 0 ||
+                            stage.alphaFunc != 0 ||
+                            stage.tcModCount != 0 ||
+                            shouldPreferClassicTextureForAlphaFX(name, isEntity: false)
+            if isFXStage {
+                if Q3_PBROnlyTextures() != 0 && loggedPBROnlyWorldMisses.insert(handle).inserted {
+                    pbrLog("[Q3-PBR-ONLY] world FX/classic fallback handle=\(handle) name='\(name)'")
+                }
+                return WorldTextureSelection(texture: fallback, useWorldPBR: false, classicFX: true)
+            }
+            if let pbr = pbrAlbedoTexture(for: handle) {
+                return WorldTextureSelection(texture: pbr, useWorldPBR: true, classicFX: false)
+            }
             if Q3_PBROnlyTextures() != 0 {
-                let name = textureNameForLog(handle)
                 if shouldAllowClassicFallbackInPBROnly(name, isEntity: false) {
                     if loggedPBROnlyWorldMisses.insert(handle).inserted {
                         pbrLog("[Q3-PBR-ONLY] world FX/classic fallback handle=\(handle) name='\(name)'")
                     }
-                    return fallback
+                    return WorldTextureSelection(texture: fallback, useWorldPBR: false, classicFX: true)
                 }
                 if loggedPBROnlyWorldMisses.insert(handle).inserted {
                     pbrLog("[Q3-PBR-ONLY] world missing PBR handle=\(handle) name='\(name)' -> magenta")
                 }
-                return ensurePBRMissingTexture(device: fallback.device) ?? fallback
+                return WorldTextureSelection(texture: ensurePBRMissingTexture(device: fallback.device) ?? fallback,
+                                             useWorldPBR: false,
+                                             classicFX: false)
             }
-            return fallback
+            return WorldTextureSelection(texture: fallback, useWorldPBR: false, classicFX: false)
         }
 
         @MainActor
@@ -5676,27 +5698,24 @@ struct MetalView: UIViewRepresentable {
                             pbrMetallic: stage.pbrMetallic,
                             _pad0: (draw.flags & combinedLightmapBit) != 0 ? 1.0 : 0.0
                         )
-                        let worldBaseTexture = (stage.useLightmap == 0)
-                            ? worldBaseTextureForPBRDebug(handle: stage.textureHandle, fallback: baseTexture)
-                            : baseTexture
-                        encoder.setFragmentTexture(worldBaseTexture, index: 0)
+                        let worldSelection = (stage.useLightmap == 0)
+                            ? worldTextureSelectionForPBRDebug(handle: stage.textureHandle, fallback: baseTexture, stage: stage)
+                            : WorldTextureSelection(texture: baseTexture, useWorldPBR: false, classicFX: false)
+                        encoder.setFragmentTexture(worldSelection.texture, index: 0)
                         encoder.setFragmentTexture(lightmapTexture, index: 1)
-                        // PBR Phase 3 — bind generic world normal map at
-                        // slot 2 for tangent-space relief. nil bind leaves
-                        // slot unbound; q3_world_fragment guards with
-                        // is_null_texture() so the vanilla path is preserved.
-                        encoder.setFragmentTexture(ensurePBRWorldNormal(), index: 2)
-                        // PBR Phase 8 — bind IBL env cube + sampler for the
-                        // Cook-Torrance + IBL block on world surfaces. Same
-                        // cube as entity binding (Phase 6 v3 auto-detected).
-                        if Q3_PBRIBLEnabled() != 0 && Q3_PBRWorldEnabled() != 0 {
+                        // FX/alpha/additive/tcMod stages must stay in the authored
+                        // Q3 shader path. Binding the generic PBR normal/IBL here
+                        // makes sprites, beams, jump pads, and translucent cards
+                        // read as opaque or mis-lit replacement material sheets.
+                        encoder.setFragmentTexture(worldSelection.useWorldPBR ? ensurePBRWorldNormal() : nil, index: 2)
+                        if worldSelection.useWorldPBR && Q3_PBRIBLEnabled() != 0 && Q3_PBRWorldEnabled() != 0 {
                             encoder.setFragmentTexture(ensurePBREnvCube(), index: 3)
                             encoder.setFragmentSamplerState(ensurePBREnvSampler(), index: 1)
                         } else {
                             encoder.setFragmentTexture(nil, index: 3)
                         }
                         var pbrWorldParams = SIMD4<Float>(
-                            Q3_PBRWorldEnabled() != 0 ? 1.0 : 0.0,
+                            (worldSelection.useWorldPBR && Q3_PBRWorldEnabled() != 0) ? 1.0 : 0.0,
                             Q3_PBRWorldAmbientBoost(),
                             Q3_PBRWorldSpecBoost(),
                             Q3_PBRWorldClassMatchEnabled() != 0 ? 1.0 : 0.0)
@@ -6053,17 +6072,12 @@ struct MetalView: UIViewRepresentable {
                             }
                             encoder.setFragmentTexture(lightmapTexture, index: 0)
                             encoder.setFragmentTexture(lightmapTexture, index: 1)
-                            // PBR Phase 3 — see main world bind site for rationale.
-                            encoder.setFragmentTexture(ensurePBRWorldNormal(), index: 2)
-                            // PBR Phase 8 — IBL env cube binding (fog pass).
-                            if Q3_PBRIBLEnabled() != 0 && Q3_PBRWorldEnabled() != 0 {
-                                encoder.setFragmentTexture(ensurePBREnvCube(), index: 3)
-                                encoder.setFragmentSamplerState(ensurePBREnvSampler(), index: 1)
-                            } else {
-                                encoder.setFragmentTexture(nil, index: 3)
-                            }
+                            // Fog volumes are classic translucent overlays, not
+                            // physical world materials.
+                            encoder.setFragmentTexture(nil, index: 2)
+                            encoder.setFragmentTexture(nil, index: 3)
                             var pbrWorldFogParams = SIMD4<Float>(
-                                Q3_PBRWorldEnabled() != 0 ? 1.0 : 0.0,
+                                0.0,
                                 Q3_PBRWorldAmbientBoost(),
                                 Q3_PBRWorldSpecBoost(),
                                 0.0)
@@ -6210,11 +6224,24 @@ struct MetalView: UIViewRepresentable {
                             // The non-batched path was still binding the vanilla Q3
                             // base texture here, so most world geometry looked stock
                             // unless it happened to route through encodeNormalWorldDraw().
-                            let worldBaseTexture = (stage.useLightmap == 0)
-                                ? worldBaseTextureForPBRDebug(handle: stage.textureHandle, fallback: baseTexture)
-                                : baseTexture
-                            setWorldFragmentTextureCached(worldBaseTexture, index: 0)
+                            let worldSelection = (stage.useLightmap == 0)
+                                ? worldTextureSelectionForPBRDebug(handle: stage.textureHandle, fallback: baseTexture, stage: stage)
+                                : WorldTextureSelection(texture: baseTexture, useWorldPBR: false, classicFX: false)
+                            setWorldFragmentTextureCached(worldSelection.texture, index: 0)
                             setWorldFragmentTextureCached(lightmapTexture, index: 1)
+                            setWorldFragmentTextureCached(worldSelection.useWorldPBR ? ensurePBRWorldNormal() : nil, index: 2)
+                            if worldSelection.useWorldPBR && Q3_PBRIBLEnabled() != 0 && Q3_PBRWorldEnabled() != 0 {
+                                setWorldFragmentTextureCached(ensurePBREnvCube(), index: 3)
+                                encoder.setFragmentSamplerState(ensurePBREnvSampler(), index: 1)
+                            } else {
+                                setWorldFragmentTextureCached(nil, index: 3)
+                            }
+                            var pbrWorldParams = SIMD4<Float>(
+                                (worldSelection.useWorldPBR && Q3_PBRWorldEnabled() != 0) ? 1.0 : 0.0,
+                                Q3_PBRWorldAmbientBoost(),
+                                Q3_PBRWorldSpecBoost(),
+                                Q3_PBRWorldClassMatchEnabled() != 0 ? 1.0 : 0.0)
+                            encoder.setFragmentBytes(&pbrWorldParams, length: 16, index: 3)
                             encoder.setFragmentBytes(&drawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 0)
                             // Vertex shader reads deformWave + timeSeconds
                             // from WorldDrawUniforms. Bound at vertex
