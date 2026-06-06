@@ -3853,6 +3853,33 @@ struct MetalView: UIViewRepresentable {
             Q3MetalRenderer_GetTextureName(handle).map { String(cString: $0) } ?? "unknown"
         }
 
+        private func shouldPreferClassicTextureForAlphaFX(_ textureName: String, isEntity: Bool) -> Bool {
+            let raw = textureName.lowercased()
+            let n: String
+            if raw.hasPrefix("*entity-stage:"), let lastColon = raw.lastIndex(of: ":") {
+                n = String(raw[raw.index(after: lastColon)...])
+            } else {
+                n = raw
+            }
+            if n.hasPrefix("sprites/") || n.hasPrefix("gfx/") || n.hasPrefix("models/weaphits/") ||
+               n.hasPrefix("models/ammo/rocket/rockfl") || n.hasPrefix("models/mapobjects/teleporter/") ||
+               n.hasPrefix("textures/sfx/") || n.hasPrefix("textures/effects/") {
+                return true
+            }
+            let tokens = [
+                "smoke", "puff", "explosion", "boom", "muzzle", "tracer",
+                "flame", "fire", "plasma", "rail", "teleport", "quadweapon",
+                "sphere", "energy", "glass", "transparency", "flare", "glow",
+                "spark", "laser", "balloon", "beam", "jumppad", "launchpad", "bouncepad"
+            ]
+            if tokens.contains(where: { n.contains($0) }) { return true }
+            // Q3 model/effect overlay stages frequently have no useful alpha in
+            // Remix captures. Keep them in the original shader path unless they
+            // are the opaque base skins that already have working PBR.
+            if isEntity && (n.hasPrefix("powerups/") || n.hasPrefix("models/powerups/")) { return true }
+            return false
+        }
+
         private func shouldAllowClassicFallbackInPBROnly(_ textureName: String, isEntity: Bool) -> Bool {
             let raw = textureName.lowercased()
             // Synthetic entity-stage labels look like
@@ -6513,25 +6540,31 @@ struct MetalView: UIViewRepresentable {
                         // and we bind the HD DDS albedo here instead of
                         // the original pak0 JPG-decoded texture. Falls
                         // back to the original on miss / DDS-load fail.
-                        let pbrTex = pbrAlbedoTexture(for: draw.textureHandle)
                         let q3Name = Q3MetalRenderer_GetTextureName(draw.textureHandle).map { String(cString: $0) } ?? "unknown"
                         entityUniforms.forceLuminanceAlpha = Self.textureAlphaSynthesisMode(q3Name)
+                        let preferClassicFX = isEntityAdditive || isEntityAdditiveFull || isEntityAlpha || isScenePoly ||
+                                              entityUniforms.forceLuminanceAlpha != 0 ||
+                                              shouldPreferClassicTextureForAlphaFX(q3Name, isEntity: true)
+                        let pbrTex = preferClassicFX ? nil : pbrAlbedoTexture(for: draw.textureHandle)
                         encoder.setVertexBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
                         encoder.setFragmentBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
-                        if (isEntityAdditive || isEntityAdditiveFull || isEntityAlpha || isScenePoly || (draw.flags & aTestGT0Bit) != 0),
+                        if (preferClassicFX || (draw.flags & aTestGT0Bit) != 0),
                            loggedAlphaEffectTextures.insert(draw.textureHandle).inserted {
                             var info = Q3MetalTextureInfo()
                             _ = Q3MetalRenderer_GetTextureInfo(draw.textureHandle, &info)
                             let pbrLabel = pbrTex?.label ?? "nil"
                             let srcLabel = texture.label ?? "nil"
-                            logAlphaTextureDiagnostic("[ALPHA-TEX] handle=\(draw.textureHandle) name='\(q3Name)' pass=\(drawPass) flags=0x\(String(draw.flags, radix: 16)) alphaFunc=\(info.alphaFunc) rgbGen=\(info.rgbGen) alphaGen=\(info.alphaGen) forceLum=\(entityUniforms.forceLuminanceAlpha) pbr='\(pbrLabel)' src='\(srcLabel)' size=\(info.width)x\(info.height)")
+                            logAlphaTextureDiagnostic("[ALPHA-TEX] handle=\(draw.textureHandle) name='\(q3Name)' pass=\(drawPass) flags=0x\(String(draw.flags, radix: 16)) alphaFunc=\(info.alphaFunc) rgbGen=\(info.rgbGen) alphaGen=\(info.alphaGen) forceLum=\(entityUniforms.forceLuminanceAlpha) classicFX=\(preferClassicFX ? 1 : 0) pbr='\(pbrLabel)' src='\(srcLabel)' size=\(info.width)x\(info.height)")
                         }
-                        encoder.setFragmentTexture(entityBaseTextureForPBRDebug(handle: draw.textureHandle, fallback: texture), index: 0)
-                        // PBR Phase 2 — bind normal map to slot 1 if the
-                        // material ships one. Nil bind leaves the slot
-                        // unbound; q3_entity_fragment uses is_null_texture
-                        // to skip the normal-mapped lighting branch.
-                        encoder.setFragmentTexture(pbrNormalTexture(for: draw.textureHandle), index: 1)
+                        let entityColorTexture = preferClassicFX
+                            ? texture
+                            : entityBaseTextureForPBRDebug(handle: draw.textureHandle, fallback: texture)
+                        encoder.setFragmentTexture(entityColorTexture, index: 0)
+                        // PBR Phase 2 — bind normal map only for opaque PBR entity
+                        // base skins. Alpha/additive FX stages keep the original Q3
+                        // shader texture/alpha behaviour; a normal map on those
+                        // quads creates white blobs and bogus lighting.
+                        encoder.setFragmentTexture(preferClassicFX ? nil : pbrNormalTexture(for: draw.textureHandle), index: 1)
                         // PBR Phase 4 — viewmodel-vs-world entity gating.
                         // Viewmodels (RF_DEPTHHACK) get the wide
                         // (0.6..1.2) range for prominent surface relief;
@@ -6738,7 +6771,9 @@ struct MetalView: UIViewRepresentable {
                         // ammo rotations, scoreboard portraits). Keep classic
                         // fallback here; PBR-only diagnostics are for 3D world/main
                         // entity surfaces, not HUD/UI overlays.
-                        let pbrTex = pbrAlbedoTexture(for: draw.textureHandle)
+                        let q3Name = Q3MetalRenderer_GetTextureName(draw.textureHandle).map { String(cString: $0) } ?? "unknown"
+                        let preferClassicFX = shouldPreferClassicTextureForAlphaFX(q3Name, isEntity: true)
+                        let pbrTex = preferClassicFX ? nil : pbrAlbedoTexture(for: draw.textureHandle)
                         encoder.setFragmentTexture(pbrTex ?? texture, index: 0)
                         // PBR Phase 2 — bind normal map to slot 1 if the
                         // material ships one. Nil bind leaves the slot
