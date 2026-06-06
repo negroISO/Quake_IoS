@@ -3854,7 +3854,16 @@ struct MetalView: UIViewRepresentable {
         }
 
         private func shouldAllowClassicFallbackInPBROnly(_ textureName: String, isEntity: Bool) -> Bool {
-            let n = textureName.lowercased()
+            let raw = textureName.lowercased()
+            // Synthetic entity-stage labels look like
+            // "*entity-stage:0:models/powerups/ammo/rockammo.tga". Classify using
+            // the underlying texture path, not the diagnostic prefix.
+            let n: String
+            if raw.hasPrefix("*entity-stage:"), let lastColon = raw.lastIndex(of: ":") {
+                n = String(raw[raw.index(after: lastColon)...])
+            } else {
+                n = raw
+            }
             if n == "unknown" || n == "*white" || n.hasPrefix("*lightmap:") { return true }
 
             // PBR-only is a world-material diagnostic, not an FX validator. These
@@ -3865,8 +3874,9 @@ struct MetalView: UIViewRepresentable {
             let classicPrefixes = [
                 "sprites/", "gfx/", "icons/", "menu/", "levelshots/", "powerups/",
                 "models/weaphits/", "models/ammo/", "models/powerups/",
-                "models/mapobjects/teleporter/", "models/mapobjects/slamp/",
-                "models/mapobjects/chain/", "models/mapobjects/bitch/"
+                "models/mapobjects/", "models/weapons2/",
+                "textures/sfx/", "textures/effects/", "textures/base_light/",
+                "textures/gothic_light/", "textures/base_trim/techborder_fx"
             ]
             if classicPrefixes.contains(where: { n.hasPrefix($0) }) { return true }
 
@@ -3874,14 +3884,16 @@ struct MetalView: UIViewRepresentable {
                 "smoke", "puff", "explosion", "boom", "muzzle", "tracer",
                 "flame", "fire", "plasma", "rail", "rocket", "teleport",
                 "quad", "sphere", "energy", "glass", "transparency", "flare",
-                "glow", "spark", "tesla", "slime", "laser", "balloon"
+                "glow", "spark", "tesla", "slime", "laser", "balloon",
+                "blend", "light", "beam", "jumppad", "launchpad", "bouncepad",
+                "comp3text", "steed"
             ]
             if fxTokens.contains(where: { n.contains($0) }) { return true }
 
-            // Entity submissions are mostly models/items/effects. If a model really
-            // has a PBR material pbrAlbedoTexture(for:) already returned it above;
-            // otherwise prefer the original skin over magenta debug geometry.
-            if isEntity && n.hasPrefix("models/") { return true }
+            // Entity submissions are mostly models/items/effects. If a model/item
+            // really has a PBR material pbrAlbedoTexture(for:) already returned it
+            // above; otherwise prefer the original skin over magenta debug geometry.
+            if isEntity { return true }
             return false
         }
 
