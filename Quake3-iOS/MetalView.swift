@@ -4353,13 +4353,29 @@ struct MetalView: UIViewRepresentable {
             }
         }
 
+        private static func normalizedQ3TextureName(_ name: String) -> String {
+            let raw = name.lowercased()
+            if raw.hasPrefix("*entity-stage:"), let lastColon = raw.lastIndex(of: ":") {
+                return String(raw[raw.index(after: lastColon)...])
+            }
+            return raw
+        }
+
         private static func textureAlphaSynthesisMode(_ name: String) -> UInt32 {
-            let n = name.lowercased()
+            let n = normalizedQ3TextureName(name)
             // White-background captures: alpha is the inverse of luminance.
             // These were the visible white square / white blob artifacts.
+            // Health/ammo pickup shell stages and sphere/orb overlays commonly
+            // arrive from Remix as opaque white-card captures; using luminance
+            // would preserve the card, inverse-luminance cuts it out.
             if n.contains("smoke") || n.contains("puff") ||
                n.contains("explosion") || n.contains("boom") ||
-               n.contains("balloon") || n.contains("blood") {
+               n.contains("balloon") || n.contains("blood") ||
+               n.contains("sphere") || n.contains("orb") ||
+               n.contains("health") || n.contains("mega") ||
+               n.contains("ammo/") || n.contains("ammo_") ||
+               n.contains("rockammo") || n.contains("machammo") ||
+               n.contains("shotammo") || n.contains("railammo") {
                 return 2
             }
             // Black-background additive/effect captures: alpha follows luminance.
