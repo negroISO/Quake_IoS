@@ -1914,6 +1914,8 @@ struct MetalView: UIViewRepresentable {
                                           texture2d<float> lightmapTexture [[texture(1)]],
                                           texture2d<float> worldNormalMap [[texture(2)]],
                                           texturecube<float> envCube [[texture(3)]],
+                                          texture2d<float> roughnessMap [[texture(4)]],
+                                          texture2d<float> metallicMap [[texture(5)]],
                                           sampler textureSampler [[sampler(0)]],
                                           sampler envSampler [[sampler(1)]]) {
             float2 texCoord = in.texCoord;
@@ -2210,6 +2212,12 @@ struct MetalView: UIViewRepresentable {
                     // the JSON has only class/fallback roughness/metalness.
                     // Avoid fully-matte defaults and keep enough response for
                     // env/spec highlights on broad floor/wall surfaces.
+                    if (!is_null_texture(roughnessMap)) {
+                        roughness = roughnessMap.sample(textureSampler, texCoord).r;
+                    }
+                    if (!is_null_texture(metallicMap)) {
+                        metallic = metallicMap.sample(textureSampler, texCoord).r;
+                    }
                     roughness = clamp(roughness * 0.82, 0.16, 0.88);
                     metallic = clamp(metallic, 0.0, 1.0);
 
@@ -4558,7 +4566,7 @@ struct MetalView: UIViewRepresentable {
         /// vector data, so .SRGB must be false. Without that, the GPU
         /// would gamma-correct the .xyz fields and the per-pixel normals
         /// would point in the wrong direction.
-        private func pbrNormalTexture(for handle: UInt32) -> MTLTexture? {
+        private func pbrNormalTexture(for handle: UInt32, allowGenericFallback: Bool = true) -> MTLTexture? {
             if let cached = pbrNormalCache[handle] { return cached }
             if pbrNormalTried.contains(handle) { return nil }
             pbrNormalTried.insert(handle)
@@ -4572,6 +4580,13 @@ struct MetalView: UIViewRepresentable {
             // Skips when albedo is also null (shotgun's case — but shotgun
             // DOES have its own normal so this branch never fires for it).
             if mat.normal == nil {
+                if !allowGenericFallback {
+                    // World surfaces should not poison the normal-cache miss set
+                    // for entities using the same handle; they simply render
+                    // without a normal map when Remix did not provide one.
+                    pbrNormalTried.remove(handle)
+                    return nil
+                }
                 if mat.albedo != nil {
                     if let generic = pbrGenericFallbackNormal() {
                         pbrNormalCache[handle] = generic
@@ -5745,15 +5760,20 @@ struct MetalView: UIViewRepresentable {
                         encoder.setFragmentTexture(worldSelection.texture, index: 0)
                         encoder.setFragmentTexture(lightmapTexture, index: 1)
                         // FX/alpha/additive/tcMod stages must stay in the authored
-                        // Q3 shader path. Binding the generic PBR normal/IBL here
-                        // makes sprites, beams, jump pads, and translucent cards
-                        // read as opaque or mis-lit replacement material sheets.
-                        encoder.setFragmentTexture(worldSelection.useWorldPBR ? ensurePBRWorldNormal() : nil, index: 2)
+                        // Q3 shader path. For real world PBR, bind the material's
+                        // own normal/roughness/metallic maps instead of the old
+                        // global generic metal-plate normal; that was making the
+                        // world read noisy/flat and unlike the Remix reference.
+                        encoder.setFragmentTexture(worldSelection.useWorldPBR ? pbrNormalTexture(for: stage.textureHandle, allowGenericFallback: false) : nil, index: 2)
                         if worldSelection.useWorldPBR && Q3_PBRIBLEnabled() != 0 && Q3_PBRWorldEnabled() != 0 {
                             encoder.setFragmentTexture(ensurePBREnvCube(), index: 3)
                             encoder.setFragmentSamplerState(ensurePBREnvSampler(), index: 1)
+                            encoder.setFragmentTexture(pbrRoughnessTexture(for: stage.textureHandle), index: 4)
+                            encoder.setFragmentTexture(pbrMetallicTexture(for: stage.textureHandle), index: 5)
                         } else {
                             encoder.setFragmentTexture(nil, index: 3)
+                            encoder.setFragmentTexture(nil, index: 4)
+                            encoder.setFragmentTexture(nil, index: 5)
                         }
                         var pbrWorldParams = SIMD4<Float>(
                             (worldSelection.useWorldPBR && Q3_PBRWorldEnabled() != 0) ? 1.0 : 0.0,
