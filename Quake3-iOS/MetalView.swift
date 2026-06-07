@@ -2371,7 +2371,18 @@ struct MetalView: UIViewRepresentable {
                 float baseAlpha = (uniforms.forceLuminanceAlpha == 2u)
                                 ? (1.0 - lumAlpha)
                                 : lumAlpha;
-                float synthA = saturate(baseAlpha * radial);
+                /* Force FX cutouts harder. The previous soft-only mask left
+                 * semi-opaque white cards/halos on pickup orbs, muzzle
+                 * flashes, smoke puffs, and capture-derived explosions. */
+                float synthA;
+                if (uniforms.forceLuminanceAlpha == 2u) {
+                    synthA = saturate(baseAlpha * 1.65);
+                    float chroma = max(texel.r, max(texel.g, texel.b)) - min(texel.r, min(texel.g, texel.b));
+                    if (lumAlpha > 0.92 && chroma < 0.14) synthA = 0.0;
+                } else {
+                    synthA = saturate(baseAlpha * baseAlpha * 1.35);
+                }
+                synthA *= radial;
                 texel.rgb *= synthA;
                 texel.a = synthA;
             }
@@ -5235,20 +5246,25 @@ struct MetalView: UIViewRepresentable {
                 target = CGSize(width: isPad ? 1280 : 960,
                                 height: isPad ? 960 : 444)
             } else {
-                // Normal play. Lock the drawable to TRUE device-native
-                // pixels so MetalFX's spatial upscale outputs directly to
-                // the panel-pixel grid with NO Core Animation downstream
-                // scale. iPhone 17 Pro Max = 2868×1320 landscape, iPad
-                // Pro 13" M4 = 2752×2064 landscape. UIScreen.nativeBounds
-                // is portrait; swap with max/min for landscape.
-                // Previous build used 1920×888 / 2560×1920 fixed targets
-                // and relied on Core Animation linear-scale to the panel —
-                // soft on OLED. With MetalFX spatial + drawable at native
-                // pixels, the result is 1:1 on the display and crisp.
+                // Normal play. Lock near native pixels, but preserve the
+                // current MTKView aspect. Forcing nativeBounds max/min (4:3
+                // on iPad) made RT/HUD/entity projection appear off-screen
+                // whenever SwiftUI/recording provided a wide drawable.
                 let nb = UIScreen.main.nativeBounds.size
-                let _ = isPad   // pad/phone branch no longer needed
-                target = CGSize(width: max(nb.width, nb.height),
-                                height: min(nb.width, nb.height))
+                let nativeLong = max(nb.width, nb.height)
+                let nativeShort = min(nb.width, nb.height)
+                let fallbackAspect = nativeLong / max(nativeShort, 1)
+                let callbackAspect = (size.width.isFinite && size.height.isFinite && size.width > 0 && size.height > 0)
+                    ? (size.width / size.height)
+                    : fallbackAspect
+                let aspect = max(0.25, min(callbackAspect, 4.0))
+                if aspect >= 1.0 {
+                    target = CGSize(width: nativeLong,
+                                    height: max(1, floor(nativeLong / aspect)))
+                } else {
+                    target = CGSize(width: max(1, floor(nativeShort * aspect)),
+                                    height: nativeShort)
+                }
             }
             print("[Metal] Drawable size: \(size) (target \(target))")
             if size.width.isFinite && size.height.isFinite
@@ -6617,9 +6633,10 @@ struct MetalView: UIViewRepresentable {
                         // rotating geometry.
                         var pbrNormalScaleEntity: Float = wantsDepthHack ? 1.0 : 0.0
                         encoder.setFragmentBytes(&pbrNormalScaleEntity, length: 4, index: 3)
-                        // PBR Phase F — runtime tunable rim params at buffer(4).
-                        var pbrRimParamsEntity = SIMD2<Float>(
-                            Q3_PBRRimIntensity(), Q3_PBRRimFalloff())
+                        // PBR Phase F — rim params at buffer(4). Disable the
+                        // Fresnel rim for now: it reads as a white outline on
+                        // weapons/items with the current RTX/PBR assets.
+                        var pbrRimParamsEntity = SIMD2<Float>(0.0, Q3_PBRRimFalloff())
                         encoder.setFragmentBytes(&pbrRimParamsEntity, length: 8, index: 4)
                         // PBR Phase 4 — Cook-Torrance specular textures.
                         // Roughness at slot 3, metallic at slot 4. The
@@ -6826,10 +6843,8 @@ struct MetalView: UIViewRepresentable {
                         // PBR Phase 4 — HUD/scoreboard sub-pass: world-style tight range.
                         var pbrNormalScaleSub: Float = 0.0
                         encoder.setFragmentBytes(&pbrNormalScaleSub, length: 4, index: 3)
-                        // PBR Phase F — rim params at buffer(4) — same defaults as main entity pass
-                        // so HUD entities (rotating weapon icons) read sensibly.
-                        var pbrRimParamsSub = SIMD2<Float>(
-                            Q3_PBRRimIntensity(), Q3_PBRRimFalloff())
+                        // PBR Phase F — rim params at buffer(4).
+                        var pbrRimParamsSub = SIMD2<Float>(0.0, Q3_PBRRimFalloff())
                         encoder.setFragmentBytes(&pbrRimParamsSub, length: 8, index: 4)
                         encoder.drawIndexedPrimitives(
                             type: .triangle,
