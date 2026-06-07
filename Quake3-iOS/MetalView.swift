@@ -7906,6 +7906,7 @@ final class GameControllerBridge {
 
     private var started = false
     private var activeController: GCController?
+    private var activeMouse: GCMouse?
     private var state = State()
     private var lastLoggedState: State?
 
@@ -7929,6 +7930,20 @@ final class GameControllerBridge {
             name: .GCControllerDidDisconnect,
             object: nil
         )
+        if #available(iOS 14.0, *) {
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(mouseDidConnect(_:)),
+                name: .GCMouseDidConnect,
+                object: nil
+            )
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(mouseDidDisconnect(_:)),
+                name: .GCMouseDidDisconnect,
+                object: nil
+            )
+        }
 
         print("[GCController] existing controllers: \(GCController.controllers().count)")
         for controller in GCController.controllers() {
@@ -7942,6 +7957,9 @@ final class GameControllerBridge {
             }
         }
         pickActiveController()
+        if #available(iOS 14.0, *) {
+            pickActiveMouse()
+        }
     }
 
     @objc private func controllerDidConnect(_ notification: Notification) {
@@ -7997,6 +8015,69 @@ final class GameControllerBridge {
         }
         ingest(gamepad: gamepad, source: nil)
         print("[GCController] using \(describe(controller))")
+    }
+
+    @available(iOS 14.0, *)
+    @objc private func mouseDidConnect(_ notification: Notification) {
+        if let mouse = notification.object as? GCMouse {
+            print("[GCMouse] connected \(mouse.vendorName ?? "unknown")")
+            pickActiveMouse(preferred: mouse)
+        } else {
+            print("[GCMouse] connected unknown mouse")
+            pickActiveMouse()
+        }
+    }
+
+    @available(iOS 14.0, *)
+    @objc private func mouseDidDisconnect(_ notification: Notification) {
+        let mouse = notification.object as? GCMouse
+        if activeMouse === mouse {
+            activeMouse?.mouseInput?.mouseMovedHandler = nil
+            activeMouse?.mouseInput?.leftButton.pressedChangedHandler = nil
+            activeMouse?.mouseInput?.rightButton?.pressedChangedHandler = nil
+            activeMouse?.mouseInput?.middleButton?.pressedChangedHandler = nil
+            activeMouse = nil
+        }
+        if let mouse {
+            print("[GCMouse] disconnected \(mouse.vendorName ?? "unknown")")
+        }
+        pickActiveMouse()
+    }
+
+    @available(iOS 14.0, *)
+    private func pickActiveMouse(preferred: GCMouse? = nil) {
+        let nextMouse = preferred ?? activeMouse ?? GCMouse.mice().first
+        guard activeMouse !== nextMouse else { return }
+
+        activeMouse?.mouseInput?.mouseMovedHandler = nil
+        activeMouse?.mouseInput?.leftButton.pressedChangedHandler = nil
+        activeMouse?.mouseInput?.rightButton?.pressedChangedHandler = nil
+        activeMouse?.mouseInput?.middleButton?.pressedChangedHandler = nil
+        activeMouse = nextMouse
+
+        guard let mouse = nextMouse, let input = mouse.mouseInput else {
+            print("[GCMouse] no mouse/trackpad selected")
+            return
+        }
+
+        input.mouseMovedHandler = { _, deltaX, deltaY in
+            let scale: Float = 1.35
+            let dx = Int32((deltaX * scale).rounded())
+            let dy = Int32((-deltaY * scale).rounded())
+            if dx != 0 || dy != 0 {
+                Q3Sys_MouseMove(dx, dy)
+            }
+        }
+        input.leftButton.pressedChangedHandler = { _, _, pressed in
+            Q3Sys_KeyEvent(178, pressed ? 1 : 0) // K_MOUSE1
+        }
+        input.rightButton?.pressedChangedHandler = { _, _, pressed in
+            Q3Sys_KeyEvent(179, pressed ? 1 : 0) // K_MOUSE2
+        }
+        input.middleButton?.pressedChangedHandler = { _, _, pressed in
+            Q3Sys_KeyEvent(180, pressed ? 1 : 0) // K_MOUSE3
+        }
+        print("[GCMouse] using \(mouse.vendorName ?? "unknown")")
     }
 
     private func ingest(gamepad: GCExtendedGamepad, source: GCControllerElement?) {
@@ -8142,6 +8223,8 @@ final class Q3InputView: MTKView {
     }
 
     private func setupInput() {
+        isUserInteractionEnabled = true
+
         let pan = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
         if #available(iOS 13.4, *) {
             pan.allowedScrollTypesMask = .all
@@ -8153,6 +8236,11 @@ final class Q3InputView: MTKView {
             tap.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
         }
         addGestureRecognizer(tap)
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        _ = becomeFirstResponder()
+        super.touchesBegan(touches, with: event)
     }
 
     override func didMoveToWindow() {
@@ -8198,6 +8286,12 @@ final class Q3InputView: MTKView {
         var handled = false
         for press in presses {
             guard let key = press.key else { continue }
+            if key.keyCode == .keyboardGraveAccentAndTilde {
+                // Desktop Q3 uses pseudo-key K_CONSOLE, not ASCII '`'.
+                Q3Sys_KeyEvent(275, 1) // K_CONSOLE
+                handled = true
+                continue
+            }
             if let q3 = Q3InputView.q3Keycode(for: key) {
                 Q3Sys_KeyEvent(q3, 1)
                 handled = true
@@ -8222,7 +8316,10 @@ final class Q3InputView: MTKView {
     override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
         var handled = false
         for press in presses {
-            if let key = press.key, let q3 = Q3InputView.q3Keycode(for: key) {
+            if let key = press.key, key.keyCode == .keyboardGraveAccentAndTilde {
+                Q3Sys_KeyEvent(275, 0) // K_CONSOLE
+                handled = true
+            } else if let key = press.key, let q3 = Q3InputView.q3Keycode(for: key) {
                 Q3Sys_KeyEvent(q3, 0)
                 handled = true
             }
@@ -8233,7 +8330,7 @@ final class Q3InputView: MTKView {
     /// Map iOS `UIKey` to a Q3 keycode. Values mirror
     /// `code/client/keycodes.h`:
     /// - ASCII for letters/digits/punctuation (Q3's K_A..K_Z = 'a'..'z')
-    /// - 9 K_TAB, 13 K_ENTER, 27 K_ESCAPE, 32 K_SPACE, 96 ` (toggleconsole)
+    /// - 9 K_TAB, 13 K_ENTER, 27 K_ESCAPE, 32 K_SPACE
     /// - 127 K_BACKSPACE
     /// - 132–135 arrow keys, 136 K_ALT, 137 K_CTRL, 138 K_SHIFT
     /// - 145–156 K_F1..K_F12
