@@ -8339,6 +8339,18 @@ final class Q3InputView: MTKView {
                 handled = true
                 continue
             }
+            if key.keyCode == .keyboardDeleteOrBackspace {
+                /*
+                 * Q3's edit fields handle backspace through SE_CHAR ctrl-H
+                 * (0x08), not through the K_BACKSPACE key event. CL_CharEvent
+                 * explicitly drops 0x7f and Field_KeyDownEvent only handles
+                 * K_DEL as forward-delete. Magic Keyboard's Delete key was
+                 * therefore reaching Q3 as a key press but never deleting text
+                 * in the console. Emit ctrl-H on key-down, while still sending
+                 * K_BACKSPACE below for bind compatibility.
+                 */
+                Q3Sys_CharEvent(8)
+            }
             if let q3 = Q3InputView.q3Keycode(for: key) {
                 Q3Sys_KeyEvent(q3, 1)
                 handled = true
@@ -8390,10 +8402,9 @@ final class Q3InputView: MTKView {
         case .keyboardDeleteOrBackspace: return 127
         // iPad Magic Keyboard's only "delete" key is keyboardDeleteOrBackspace
         // above. Some external keyboards / Fn-Delete combos report
-        // keyboardDeleteForward — Q3 has no separate forward-delete; map
-        // it to the same K_BACKSPACE so the user's expectation of "delete
-        // removes a character" holds in both cases.
-        case .keyboardDeleteForward: return 127
+        // keyboardDeleteForward — Q3's Field_KeyDownEvent handles that as
+        // K_DEL (forward delete), not K_BACKSPACE.
+        case .keyboardDeleteForward: return 140
         case .keyboardLeftArrow: return 134
         case .keyboardRightArrow: return 135
         case .keyboardUpArrow: return 132
