@@ -2801,7 +2801,17 @@ struct MetalView: UIViewRepresentable {
                         base.rgb * 1.25 + 0.15,
                         metallic
                     );
-                    float rimStrength = fresnel * mix(0.20, pbrRimParams.x, 1.0 - roughness);
+                    /*
+                     * pbrRimParams.x is an actual intensity gate. The old
+                     * mix(0.20, intensity, ...) left a non-zero rim even when
+                     * Swift intentionally bound intensity=0 for entities, which
+                     * showed up as the white halo/outline around weapons and
+                     * pickups. Keep the roughness shaping, but multiply by the
+                     * requested peak so 0 really means OFF.
+                     */
+                    float rimStrength = fresnel
+                                      * pbrRimParams.x
+                                      * mix(0.35, 1.0, 1.0 - roughness);
                     // GGX-path entities (full PBR) get a much subtler rim
                     // accent than rim-only entities — they already have
                     // proper specular from the BRDF.
@@ -6290,12 +6300,22 @@ struct MetalView: UIViewRepresentable {
                                 : WorldTextureSelection(texture: baseTexture, useWorldPBR: false, classicFX: false)
                             setWorldFragmentTextureCached(worldSelection.texture, index: 0)
                             setWorldFragmentTextureCached(lightmapTexture, index: 1)
-                            setWorldFragmentTextureCached(worldSelection.useWorldPBR ? ensurePBRWorldNormal() : nil, index: 2)
+                            // Match encodeNormalWorldDraw(): bind the
+                            // selected material maps, not the old global
+                            // generic normal. The non-batched path is used by
+                            // many q3dm4/q3dm17 surfaces, so leaving the global
+                            // normal here made the world look flat/noisy and
+                            // ignored authored roughness/metallic maps.
+                            setWorldFragmentTextureCached(worldSelection.useWorldPBR ? pbrNormalTexture(for: stage.textureHandle, allowGenericFallback: false) : nil, index: 2)
                             if worldSelection.useWorldPBR && Q3_PBRIBLEnabled() != 0 && Q3_PBRWorldEnabled() != 0 {
                                 setWorldFragmentTextureCached(ensurePBREnvCube(), index: 3)
                                 encoder.setFragmentSamplerState(ensurePBREnvSampler(), index: 1)
+                                setWorldFragmentTextureCached(pbrRoughnessTexture(for: stage.textureHandle), index: 4)
+                                setWorldFragmentTextureCached(pbrMetallicTexture(for: stage.textureHandle), index: 5)
                             } else {
                                 setWorldFragmentTextureCached(nil, index: 3)
+                                setWorldFragmentTextureCached(nil, index: 4)
+                                setWorldFragmentTextureCached(nil, index: 5)
                             }
                             var pbrWorldParams = SIMD4<Float>(
                                 (worldSelection.useWorldPBR && Q3_PBRWorldEnabled() != 0) ? 1.0 : 0.0,
