@@ -7,6 +7,23 @@ import GameController
 import QuartzCore
 import simd
 
+/// Runtime output pixel target for the active iOS/iPadOS screen.
+///
+/// Keep boot-time Q3 `r_customwidth/height` and MTKView drawableSize in the
+/// same coordinate system. `nativeBounds` can describe the physical panel while
+/// SwiftUI/MTKView are using a different logical screen (iPad/OLED/external
+/// display), which crops the 2D menu/HUD. `bounds * nativeScale` tracks the
+/// actual UIKit screen and is normalized to landscape.
+@MainActor
+func Q3MetalOutputTargetSize(screen: UIScreen = UIScreen.main) -> CGSize {
+    let scale = screen.nativeScale > 0 ? screen.nativeScale : screen.scale
+    let px = CGSize(width: screen.bounds.width * scale,
+                    height: screen.bounds.height * scale)
+    let w = max(1, floor(max(px.width, px.height)))
+    let h = max(1, floor(min(px.width, px.height)))
+    return CGSize(width: w, height: h)
+}
+
 /// MetalFX upscale quality picker. Persists via UserDefaults; the launcher
 /// menu sets it before Quake3_Init runs. C-side cmdline picks up the input
 /// render resolution via Q3_SetRenderResolution; Coordinator creates an
@@ -192,7 +209,7 @@ struct MetalView: UIViewRepresentable {
         let maxFPS = max(UIScreen.main.maximumFramesPerSecond, 120)
         #endif
         view.preferredFramesPerSecond = maxFPS
-        print("[Metal] display config screenMaxFPS=\(UIScreen.main.maximumFramesPerSecond) preferredFPS=\(view.preferredFramesPerSecond) lowPower=\(ProcessInfo.processInfo.isLowPowerModeEnabled ? 1 : 0) nativeBounds=\(UIScreen.main.nativeBounds) nativeScale=\(UIScreen.main.nativeScale)")
+        print("[Metal] display config screenMaxFPS=\(UIScreen.main.maximumFramesPerSecond) preferredFPS=\(view.preferredFramesPerSecond) lowPower=\(ProcessInfo.processInfo.isLowPowerModeEnabled ? 1 : 0) bounds=\(UIScreen.main.bounds) nativeBounds=\(UIScreen.main.nativeBounds) nativeScale=\(UIScreen.main.nativeScale) outputTarget=\(Q3MetalOutputTargetSize())")
         view.enableSetNeedsDisplay = false
         view.isPaused = true
         context.coordinator.configureFramePacer(for: view, preferredFPS: maxFPS)
@@ -2189,6 +2206,12 @@ struct MetalView: UIViewRepresentable {
                     // across flat bricks.
                     float roughness = (pbrWorldParams.w > 0.5) ? drawUniforms.pbrRoughness : 0.45;
                     float metallic = (pbrWorldParams.w > 0.5) ? drawUniforms.pbrMetallic : 0.30;
+                    // The RTX replacement world should read as PBR even when
+                    // the JSON has only class/fallback roughness/metalness.
+                    // Avoid fully-matte defaults and keep enough response for
+                    // env/spec highlights on broad floor/wall surfaces.
+                    roughness = clamp(roughness * 0.82, 0.16, 0.88);
+                    metallic = clamp(metallic, 0.0, 1.0);
 
                     float maxMipF = float(envCube.get_num_mip_levels() - 1);
                     float3 diffuseIBL = envCube.sample(envSampler, worldN, level(maxMipF)).rgb;
@@ -2222,11 +2245,11 @@ struct MetalView: UIViewRepresentable {
                     // video).
                     float litLuma = dot(lit, float3(0.2126, 0.7152, 0.0722));
                     float shadowMask  = 1.0 - saturate(litLuma);
-                    float fresnelGate = pow(1.0 - NdotV, 2.0);
+                    float fresnelGate = pow(1.0 - NdotV, 1.35);
                     float fillScale = ambBoost * shadowMask;
                     float specMask  = specBoost
-                                    * (0.5 * shadowMask + 0.5)   // half shadow-driven
-                                    * (0.3 + 0.7 * fresnelGate); // mostly edge-driven
+                                    * (0.35 * shadowMask + 0.65)  // keep highlights visible on lit faces
+                                    * (0.45 + 0.55 * fresnelGate); // edge-weighted but not edge-only
                     lit = lit
                         + kD_v * diffuseIBL * fillScale
                         + F_v  * specularIBL * specMask;
@@ -5246,25 +5269,11 @@ struct MetalView: UIViewRepresentable {
                 target = CGSize(width: isPad ? 1280 : 960,
                                 height: isPad ? 960 : 444)
             } else {
-                // Normal play. Lock near native pixels, but preserve the
-                // current MTKView aspect. Forcing nativeBounds max/min (4:3
-                // on iPad) made RT/HUD/entity projection appear off-screen
-                // whenever SwiftUI/recording provided a wide drawable.
-                let nb = UIScreen.main.nativeBounds.size
-                let nativeLong = max(nb.width, nb.height)
-                let nativeShort = min(nb.width, nb.height)
-                let fallbackAspect = nativeLong / max(nativeShort, 1)
-                let callbackAspect = (size.width.isFinite && size.height.isFinite && size.width > 0 && size.height > 0)
-                    ? (size.width / size.height)
-                    : fallbackAspect
-                let aspect = max(0.25, min(callbackAspect, 4.0))
-                if aspect >= 1.0 {
-                    target = CGSize(width: nativeLong,
-                                    height: max(1, floor(nativeLong / aspect)))
-                } else {
-                    target = CGSize(width: max(1, floor(nativeShort * aspect)),
-                                    height: nativeShort)
-                }
+                // Normal play. Use the same active-screen target as app boot
+                // (`Q3_SetRenderResolution`). Mixing nativeBounds with the
+                // MTKView callback aspect makes Q3's 2D UI projection and the
+                // drawable disagree, which crops the iPad/OLED menu.
+                target = Q3MetalOutputTargetSize(screen: view.window?.screen ?? UIScreen.main)
             }
             print("[Metal] Drawable size: \(size) (target \(target))")
             if size.width.isFinite && size.height.isFinite
@@ -7002,11 +7011,9 @@ struct MetalView: UIViewRepresentable {
             view.autoResizeDrawable = false
             view.contentScaleFactor = 1.0
             if ProcessInfo.processInfo.environment["Q3_MATCH_PROFILE"] == "native_ipad_25" {
-                let nativeSize = UIScreen.main.nativeBounds.size
-                view.drawableSize = CGSize(width: max(nativeSize.width, nativeSize.height),
-                                           height: min(nativeSize.width, nativeSize.height))
+                view.drawableSize = Q3MetalOutputTargetSize(screen: view.window?.screen ?? UIScreen.main)
             } else {
-                view.drawableSize = CGSize(width: 960, height: 444)
+                view.drawableSize = Q3MetalOutputTargetSize(screen: view.window?.screen ?? UIScreen.main)
             }
             // Allow CPU readback of the drawable texture for the `video`
             // command capture path (RE_TakeVideoFrame). MTKView defaults

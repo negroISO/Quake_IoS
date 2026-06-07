@@ -10023,17 +10023,17 @@ int   Q3_PBRWorldEnabled(void) {
     return cv ? cv->integer : 1;
 }
 float Q3_PBRWorldAmbientBoost(void) {
-    if (ri.Cvar_Get == NULL) return 0.30f;
-    cvar_t *cv = ri.Cvar_Get("r_pbr_world_ambient_boost", "0.30", CVAR_ARCHIVE);
-    float v = cv ? cv->value : 0.30f;
+    if (ri.Cvar_Get == NULL) return 0.42f;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_world_ambient_boost", "0.42", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.42f;
     if (v < 0.0f) v = 0.0f;
     if (v > 1.5f) v = 1.5f;
     return v;
 }
 float Q3_PBRWorldSpecBoost(void) {
-    if (ri.Cvar_Get == NULL) return 0.60f;
-    cvar_t *cv = ri.Cvar_Get("r_pbr_world_spec_boost", "0.60", CVAR_ARCHIVE);
-    float v = cv ? cv->value : 0.60f;
+    if (ri.Cvar_Get == NULL) return 1.05f;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_world_spec_boost", "1.05", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 1.05f;
     if (v < 0.0f) v = 0.0f;
     if (v > 2.0f) v = 2.0f;
     return v;

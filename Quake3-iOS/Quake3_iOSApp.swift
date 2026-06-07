@@ -98,20 +98,19 @@ struct Quake3_iOSApp: App {
                              * override (0,0) → engine uses the default
                              * native-target sizing path. */
                             let quality = Q3UpscaleQuality.current
-                            // True device-native pixel dimensions in
-                            // landscape orientation. iPhone 17 Pro Max =
-                            // 2868×1320, iPad Pro 13" M4 = 2752×2064.
-                            // UIScreen.nativeBounds reports portrait; we
-                            // swap with max/min so width is the long axis.
-                            let nb = UIScreen.main.nativeBounds.size
-                            let outputW = max(nb.width, nb.height)
-                            let outputH = min(nb.width, nb.height)
-                            let outputSize = CGSize(width: outputW, height: outputH)
+                            // Active UIKit screen pixels in landscape.
+                            // Must match MetalView's drawable lock; using
+                            // nativeBounds here but bounds/nativeScale in
+                            // MTKView makes Q3's 2D menu/HUD projection crop
+                            // on iPad/OLED/external-screen routes.
+                            let outputSize = Q3MetalOutputTargetSize()
+                            let outputW = outputSize.width
+                            let outputH = outputSize.height
                             if quality != .native {
                                 let rs = quality.renderSize(forOutput: outputSize)
                                 let w = Int32(rs.width)
                                 let h = Int32(rs.height)
-                                NSLog("[Q3-BOOT] MetalFX quality=%@ render=%dx%d (output target %dx%d native)",
+                                NSLog("[Q3-BOOT] MetalFX quality=%@ render=%dx%d (output target %dx%d screen)",
                                       quality.label, w, h, Int32(outputW), Int32(outputH))
                                 Q3_SetRenderResolution(w, h)
                             } else {
