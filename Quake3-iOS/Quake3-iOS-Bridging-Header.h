@@ -149,5 +149,6 @@ float Q3_RTResolutionScale(void);
 float Q3_RTBounces(void);
 float Q3_RTTAA(void);
 float Q3_RTTAAAlpha(void);
+int   Q3_RTEntities(void);
 
 #endif

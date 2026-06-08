@@ -482,6 +482,8 @@ static void load_named_materials_from_json(const char *json, const char *json_en
         }
         q3_pbr_named_t *e = &g_named[g_named_count];
         memset(e, 0, sizeof(*e));
+        e->mat.roughness_constant = -1.0f;
+        e->mat.metallic_constant = -1.0f;
         size_t nl = strlen(key);
         if (nl >= sizeof(e->name)) nl = sizeof(e->name) - 1;
         memcpy(e->name, key, nl);
@@ -498,6 +500,12 @@ static void load_named_materials_from_json(const char *json, const char *json_en
         double dv;
         if (json_num(find_key(body, body_end, "emissive_intensity"), body_end, &dv)) {
             e->mat.emissive_intensity = (float)dv;
+        }
+        if (json_num(find_key(body, body_end, "roughness_constant"), body_end, &dv)) {
+            e->mat.roughness_constant = (float)dv;
+        }
+        if (json_num(find_key(body, body_end, "metallic_constant"), body_end, &dv)) {
+            e->mat.metallic_constant = (float)dv;
         }
         g_named_count++;
         p = body_end;
@@ -688,6 +696,8 @@ int q3_pbr_table_load(const char *jsonPath, const char *assetRoot) {
         q3_pbr_material_t *m = &g_materials[g_materials_count++];
         memset(m, 0, sizeof(*m));
         m->hash = hash;
+        m->roughness_constant = -1.0f;
+        m->metallic_constant = -1.0f;
 
         char *s;
         if ((s = json_str_dup(find_key(body, body_end, "albedo"),    body_end))) { m->albedo    = resolve_path(assetRoot, s); free(s); }
@@ -700,6 +710,12 @@ int q3_pbr_table_load(const char *jsonPath, const char *assetRoot) {
         double dv = 0;
         if (json_num(find_key(body, body_end, "emissive_intensity"), body_end, &dv)) {
             m->emissive_intensity = (float)dv;
+        }
+        if (json_num(find_key(body, body_end, "roughness_constant"), body_end, &dv)) {
+            m->roughness_constant = (float)dv;
+        }
+        if (json_num(find_key(body, body_end, "metallic_constant"), body_end, &dv)) {
+            m->metallic_constant = (float)dv;
         }
         /* emissive_color is an array — find_key returns pointer right
          * after the ':' so scan for '[' then 3 numbers. */

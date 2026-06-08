@@ -2428,6 +2428,13 @@ struct MetalView: UIViewRepresentable {
                 if (texel.a < uniforms.alphaTestThreshold) discard_fragment();
             } else if (uniforms.alphaTestThreshold < 0.0) {
                 if (texel.a >= -uniforms.alphaTestThreshold) discard_fragment();
+            } else if (texel.a <= 0.025) {
+                /* Several RTX/classic alias textures carry transparent UV
+                 * padding but their Q3 shader stage has no explicit
+                 * alphaFunc. Dropping fully transparent texels here removes
+                 * the white fringe/outline around weapons, pickups, and ammo
+                 * without changing normally opaque model interiors. */
+                discard_fragment();
             }
             /* rgbGen: identity (0) — ignore the per-vertex Lambert,
              * render at full brightness. Matches upstream CGEN_IDENTITY
@@ -3713,6 +3720,11 @@ struct MetalView: UIViewRepresentable {
         @MainActor
         private func encodeEntityAccelerationStructureBuild(device: MTLDevice,
                                                             commandBuffer: MTLCommandBuffer) -> MTLAccelerationStructure? {
+            guard Q3_RTEntities() != 0 else {
+                entityAccelerationStructure = nil
+                entityASSize = 0
+                return nil
+            }
             guard device.supportsRaytracing,
                   let snapshot = Q3MetalRenderer_GetFrameSnapshot()?.pointee,
                   let vb = entityVertexBuffer,
@@ -4000,6 +4012,17 @@ struct MetalView: UIViewRepresentable {
             if let pbr = pbrAlbedoTexture(for: handle) {
                 return WorldTextureSelection(texture: pbr, useWorldPBR: true, classicFX: false)
             }
+            // Some bridge entries intentionally have no authored albedo but do
+            // carry useful PBR side data (normal/roughness/metalness constants
+            // or maps). Keep the original Q3 diffuse as base color, but still
+            // enable the world PBR/IBL path so those surfaces do not fall all
+            // the way back to flat classic lighting.
+            if pbrMaterialHasAuxSlots(handle) {
+                if loggedPBROnlyWorldMisses.insert(handle).inserted {
+                    pbrLog("[Q3-PBR] world classic-albedo + PBR-sidecars handle=\(handle) name='\(name)'")
+                }
+                return WorldTextureSelection(texture: fallback, useWorldPBR: true, classicFX: false)
+            }
             if Q3_PBROnlyTextures() != 0 {
                 if shouldAllowClassicFallbackInPBROnly(name, isEntity: false) {
                     if loggedPBROnlyWorldMisses.insert(handle).inserted {
@@ -4008,11 +4031,11 @@ struct MetalView: UIViewRepresentable {
                     return WorldTextureSelection(texture: fallback, useWorldPBR: false, classicFX: true)
                 }
                 if loggedPBROnlyWorldMisses.insert(handle).inserted {
-                    pbrLog("[Q3-PBR-ONLY] world missing PBR handle=\(handle) name='\(name)' -> magenta")
+                    pbrLog("[Q3-PBR-ONLY] world missing PBR handle=\(handle) name='\(name)' -> classic fallback")
                 }
-                return WorldTextureSelection(texture: ensurePBRMissingTexture(device: fallback.device) ?? fallback,
+                return WorldTextureSelection(texture: fallback,
                                              useWorldPBR: false,
-                                             classicFX: false)
+                                             classicFX: true)
             }
             return WorldTextureSelection(texture: fallback, useWorldPBR: false, classicFX: false)
         }
@@ -4029,9 +4052,9 @@ struct MetalView: UIViewRepresentable {
                     return fallback
                 }
                 if loggedPBROnlyEntityMisses.insert(handle).inserted {
-                    pbrLog("[Q3-PBR-ONLY] entity missing PBR handle=\(handle) name='\(name)' -> magenta")
+                    pbrLog("[Q3-PBR-ONLY] entity missing PBR handle=\(handle) name='\(name)' -> classic fallback")
                 }
-                return ensurePBRMissingTexture(device: fallback.device) ?? fallback
+                return fallback
             }
             return fallback
         }
@@ -4118,7 +4141,7 @@ struct MetalView: UIViewRepresentable {
                                               cameraRight: SIMD4<Float>(right.x, right.y, right.z, 0),
                                               cameraUp: SIMD4<Float>(up.x, up.y, up.z, 0),
                                               jitterNearFar: SIMD4<Float>(jitter.x, jitter.y, 4.0, 8192.0),
-                                              fovParams: SIMD4<Float>(tan(sceneView.fovX * .pi / 360.0), tan(sceneView.fovY * .pi / 360.0), Float(CACurrentMediaTime() - frameTimeOrigin), entityAccelerationStructure == nil ? 0 : 1),
+                                              fovParams: SIMD4<Float>(tan(sceneView.fovX * .pi / 360.0), tan(sceneView.fovY * .pi / 360.0), Float(CACurrentMediaTime() - frameTimeOrigin), (entityAccelerationStructure == nil || Q3_RTEntities() == 0) ? 0 : 1),
                                               rtToneParams: SIMD4<Float>(Q3_RTExposure(), Q3_RTGamma(), Q3_RTAmbient(), Q3_RTNormalMix()),
                                               rtControlParams: SIMD4<Float>(rtResolutionScale, rtBounceCount, rtTAAAlpha, rtTAAEnabled ? 1.0 : 0.0))
             if !rtOverlayLogPrintedOnce {
@@ -4424,19 +4447,30 @@ struct MetalView: UIViewRepresentable {
                n.contains("explosion") || n.contains("boom") ||
                n.contains("balloon") || n.contains("blood") ||
                n.contains("sphere") || n.contains("orb") ||
+               n.contains("quad") || n.contains("regen") ||
+               n.contains("haste") || n.contains("invis") ||
                n.contains("health") || n.contains("mega") ||
                n.contains("ammo/") || n.contains("ammo_") ||
                n.contains("rockammo") || n.contains("machammo") ||
-               n.contains("shotammo") || n.contains("railammo") {
+               n.contains("shotammo") || n.contains("railammo") ||
+               n.contains("tinfx") || n.contains("envmapgold") ||
+               n.contains("envmapyel") || n.contains("envmaprail") ||
+               n.contains("energy_red") || n.contains("energy_blue") ||
+               n.contains("energy_grn") || n.contains("energygreen") ||
+               n.contains("newred") || n.contains("newyellow") ||
+               n.contains("newgreen") || n.contains("armor/energy") {
                 return 2
             }
             // Black-background additive/effect captures: alpha follows luminance.
             if n.hasPrefix("sprites/") || n.hasPrefix("gfx/misc/") ||
                n.hasPrefix("gfx/damage/") || n.hasPrefix("models/weaphits/") ||
+               n.hasPrefix("textures/sfx/") || n.hasPrefix("textures/effects/") ||
                n.hasPrefix("models/ammo/rocket/rockfl") {
                 return 1
             }
             if n == "teleporteffect" || n == "gfx/misc/tracer" ||
+               n.contains("laser") || n.contains("beam") ||
+               n.contains("bolt") || n.contains("lightning") ||
                n == "railcore" || n == "rail_core" ||
                n.contains("railcore") || n.contains("rail_core") ||
                n.contains("railcorethin") {
@@ -4533,6 +4567,14 @@ struct MetalView: UIViewRepresentable {
             }
         }
 
+        private func pbrMaterialHasAuxSlots(_ handle: UInt32) -> Bool {
+            guard let matPtr = Q3MetalRenderer_GetPBRMaterial(handle) else { return false }
+            let mat = matPtr.pointee
+            return mat.normal != nil || mat.roughness != nil || mat.metallic != nil ||
+                   mat.emissive != nil || mat.height != nil ||
+                   mat.roughness_constant >= 0.0 || mat.metallic_constant >= 0.0
+        }
+
         private func pbrAlbedoTexture(for handle: UInt32) -> MTLTexture? {
             if let cached = pbrAlbedoCache[handle] { return cached }
             if pbrTriedAndMissed.contains(handle) { return nil }
@@ -4541,7 +4583,7 @@ struct MetalView: UIViewRepresentable {
             }
             let mat = matPtr.pointee
             guard let albedoCStr = mat.albedo else {
-                pbrLog("[Q3-PBR-SWIFT] no-albedo handle=\(handle) (material found but albedo slot is NULL)")
+                pbrLog("[Q3-PBR-SWIFT] no-albedo handle=\(handle) name='\(textureNameForLog(handle))' (material found but albedo slot is NULL)")
                 pbrTriedAndMissed.insert(handle); return nil
             }
             let path = String(cString: albedoCStr)
@@ -5161,6 +5203,14 @@ struct MetalView: UIViewRepresentable {
             // 1×1 R8 default constant when the material has any other PBR
             // slot. This is the Phase 6+ coverage extension for the lower-
             // tier weapons.
+            if mat.roughness_constant >= 0.0 {
+                let v = max(0.0, min(1.0, mat.roughness_constant))
+                if let tex = makeConstantR8Texture(value: v, label: "Q3.pbr.roughness.const_\(v).h\(handle)") {
+                    pbrRoughnessCache[handle] = tex
+                    pbrLog("[Q3-PBR-SWIFT] roughness CONSTANT fallback handle=\(handle) value=\(v)")
+                    return tex
+                }
+            }
             if mat.albedo != nil || mat.normal != nil {
                 if let fallback = pbrRoughnessDefault() {
                     pbrRoughnessCache[handle] = fallback
@@ -5209,6 +5259,14 @@ struct MetalView: UIViewRepresentable {
                 }
             }
             // Phase 6+ default fallback (see pbrRoughnessTexture comment).
+            if mat.metallic_constant >= 0.0 {
+                let v = max(0.0, min(1.0, mat.metallic_constant))
+                if let tex = makeConstantR8Texture(value: v, label: "Q3.pbr.metallic.const_\(v).h\(handle)") {
+                    pbrMetallicCache[handle] = tex
+                    pbrLog("[Q3-PBR-SWIFT] metallic CONSTANT fallback handle=\(handle) value=\(v)")
+                    return tex
+                }
+            }
             if mat.albedo != nil || mat.normal != nil {
                 if let fallback = pbrMetallicDefault() {
                     pbrMetallicCache[handle] = fallback
@@ -6706,14 +6764,14 @@ struct MetalView: UIViewRepresentable {
                         // (phase5 × ibl) needs both cvars: r_pbr_phase5=0
                         // → no GGX peak, no IBL; r_pbr_ibl=0 → IBL replaced
                         // by 0.35 ambient floor (Phase 5 GGX still fires).
-                        let phase5Enabled = Q3_PBRPhase5Enabled() != 0
+                        let phase5Enabled = Q3_PBRPhase5Enabled() != 0 && !preferClassicFX
                         encoder.setFragmentTexture(phase5Enabled ? pbrRoughnessTexture(for: draw.textureHandle) : nil, index: 3)
                         encoder.setFragmentTexture(phase5Enabled ? pbrMetallicTexture(for: draw.textureHandle) : nil, index: 4)
                         // Phase 6 IBL — procedural env cubemap + dedicated
                         // clampToEdge sampler. Bound nil-safe; MSL guards via
                         // is_null_texture so a fail-to-alloc falls back to
                         // Phase 5 ambient floor without crashing.
-                        if Q3_PBRIBLEnabled() != 0 {
+                        if Q3_PBRIBLEnabled() != 0 && !preferClassicFX {
                             encoder.setFragmentTexture(ensurePBREnvCube(), index: 5)
                             encoder.setFragmentSamplerState(ensurePBREnvSampler(), index: 1)
                         } else {
@@ -6888,7 +6946,7 @@ struct MetalView: UIViewRepresentable {
                         // material ships one. Nil bind leaves the slot
                         // unbound; q3_entity_fragment uses is_null_texture
                         // to skip the normal-mapped lighting branch.
-                        encoder.setFragmentTexture(pbrNormalTexture(for: draw.textureHandle), index: 1)
+                        encoder.setFragmentTexture(preferClassicFX ? nil : pbrNormalTexture(for: draw.textureHandle), index: 1)
                         // PBR Phase 4 — HUD/scoreboard sub-pass: world-style tight range.
                         var pbrNormalScaleSub: Float = 0.0
                         encoder.setFragmentBytes(&pbrNormalScaleSub, length: 4, index: 3)

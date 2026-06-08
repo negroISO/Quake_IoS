@@ -39,6 +39,8 @@ typedef struct {
     const char *emissive;
     const char *height;
     float       emissive_intensity;
+    float       roughness_constant;   /* <0 = unset */
+    float       metallic_constant;    /* <0 = unset */
 } Q3PBRMaterialPaths;
 
 /* A single PBR material entry. Slot pointers are owned by the table and
@@ -62,6 +64,8 @@ typedef struct q3_pbr_material_s {
     float       emissive_color_g;
     float       emissive_color_b;
     int         has_emissive_color;   /* 1 if emissive_color_* are set */
+    float       roughness_constant;   /* <0 when not set */
+    float       metallic_constant;    /* <0 when not set */
 } q3_pbr_material_t;
 
 /* One-shot init. Loads the JSON table produced by

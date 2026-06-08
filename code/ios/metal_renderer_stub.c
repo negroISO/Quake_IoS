@@ -1464,6 +1464,11 @@ static qboolean TextureNeedsLuminanceAlpha(const char *path) {
     if (path == NULL || path[0] == '\0') return qfalse;
     if (!Q_stricmpn(path, "sprites/", 8)) return qtrue;
     if (!Q_stricmpn(path, "models/weaphits/", 16)) return qtrue;
+    if (!Q_stricmpn(path, "models/powerups/", 16)) return qtrue;
+    if (!Q_stricmpn(path, "models/ammo/", 12)) return qtrue;
+    if (!Q_stricmpn(path, "models/weapons2/", 16)) return qtrue;
+    if (!Q_stricmpn(path, "textures/sfx/", 13)) return qtrue;
+    if (!Q_stricmpn(path, "textures/effects/", 17)) return qtrue;
     if (!Q_stricmpn(path, "gfx/damage/", 11)) return qtrue;
     if (!Q_stricmpn(path, "gfx/misc/", 9)) return qtrue;
     if (!Q_stricmpn(path, "gfx/2d/", 7)) return qtrue;
@@ -9928,6 +9933,8 @@ const Q3PBRMaterialPaths *Q3MetalRenderer_GetPBRMaterial(unsigned int textureHan
     s_paths.emissive  = m->emissive;
     s_paths.height    = m->height;
     s_paths.emissive_intensity = m->emissive_intensity;
+    s_paths.roughness_constant = m->roughness_constant;
+    s_paths.metallic_constant = m->metallic_constant;
     return &s_paths;
 }
 
@@ -10146,6 +10153,16 @@ float Q3_RTTAAAlpha(void) {
     if (v < 0.02f) v = 0.02f;
     if (v > 1.0f) v = 1.0f;
     return v;
+}
+
+int Q3_RTEntities(void) {
+    if (ri.Cvar_Get == NULL) return 0;
+    /* Default OFF: raster draws weapons/items/HUD on top already. The RT
+     * entity AS currently shades entities as debug grey and causes white
+     * halos/ghost silhouettes around weapons and pickups when composited.
+     * Keep a cvar for A/B testing once real entity RT materials land. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_entities", "0", CVAR_ARCHIVE);
+    return (cv && cv->integer != 0) ? 1 : 0;
 }
 
 /* PBR Phase 6 v2 — map-specific skybox IBL source.
