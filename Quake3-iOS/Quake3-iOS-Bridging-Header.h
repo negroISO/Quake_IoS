@@ -40,6 +40,10 @@ void Q3_SetRenderResolution(int width, int height);
  * if that texture had no PBR match at registration time. Cheap O(1)
  * lookup keyed on textureHandle. */
 const Q3PBRMaterialPaths *Q3MetalRenderer_GetPBRMaterial(unsigned int textureHandle);
+/* Name-based fallback for indirect-name cases (e.g. entity envmap stages
+ * bound under `models/powerups/health/yellow` but whose atlas metadata
+ * is keyed in materials.json under `textures/effects/envmapyel`). */
+const Q3PBRMaterialPaths *Q3MetalRenderer_GetPBRMaterialByName(const char *name);
 
 /* Swift→C PBR logging bridge. Wraps the C-side telemetry pipeline so the
  * Swift renderer's DDS-load events land in Documents/q3_diag.log next to
@@ -138,6 +142,46 @@ int   Q3_PBRWorldEnabled(void);
 float Q3_PBRWorldAmbientBoost(void);
 float Q3_PBRWorldSpecBoost(void);
 int   Q3_PBRWorldClassMatchEnabled(void);
+int   Q3_PBRBakedLightmaps(void);
+int   Q3_PBRSunShadows(void);
+/* r_pbr_viewmodel_floor (default 0.35) — viewmodel-only PBR floor that
+ * keeps fully-metallic first-person weapons readable under the neutral
+ * low-energy procedural envCube. Applied per-fragment as
+ * `base.rgb = max(base.rgb, texel.rgb * floor)` ONLY for RF_DEPTHHACK
+ * draws (viewmodel). World surfaces, entity pickups, and HUD draws are
+ * unchanged. Test range 0.0..0.6. Range-clamped 0..1 in the accessor. */
+float Q3_PBRViewmodelFloor(void);
+/* r_world_debug_mode (default 0, not archived) — runtime swap for what was
+ * a compile-time `Coordinator.worldDebugMode` constant. Drives the world
+ * fragment shader's debug-mode branch: 0=normal, 1=base only, 2=lightmap
+ * only, 3=UV1 viz, 4=vertex color only. Clamped to [0..4]. Not archived
+ * so it doesn't stick across sessions. Use at the console: `r_world_debug_mode 2`. */
+int Q3_WorldDebugMode(void);
+/* r_pbr_envcube_grey (default 0.08, archived, clamped 0..1) — uniform
+ * grey value the procedural envCube fills its faces with. The CVAR is
+ * stored verbatim (`Q3_PBREnvCubeGreyRequested()` returns the raw user
+ * value), but the EFFECTIVE value used to build the cube is clamped to
+ * `max(requested, 0.04)` to keep full-metal world entities (chrome
+ * pickups, dropped weapons) from rendering pure-black when the cube
+ * goes too dim — a sweep showed `grey < 0.04` reliably broke metallic
+ * pickup readability. Override the floor for debug captures by setting
+ * `r_pbr_envcube_grey_debug 1`. Tunable per map family: q3dm17/space
+ * 0.02 (debug) or 0.04 (production); dungeon/indoor 0.08; brighter
+ * outdoor 0.12-0.15. `ensurePBREnvCube()` invalidates the cached
+ * procedural cube when the EFFECTIVE value changes. */
+float Q3_PBREnvCubeGrey(void);
+float Q3_PBREnvCubeGreyRequested(void);
+/* r_pbr_emissive_intensity_max (default 1.5, archived, clamped 0..16) —
+ * hard ceiling on the per-material emissive intensity that
+ * `emissiveParamsForPBRMaterial` writes into `EntityUniforms.emissive
+ * Params.w` and `WorldDrawUniforms.emissiveParams.w`. materials.json
+ * authors values up to 982 (RTX Remix HDR pipeline) and the historical
+ * default was 4.0 — but after the 2026-06-10 entity-side emissive
+ * ordering fix made emissive actually reach the GPU on entity draws,
+ * 4.0 saturated the BGRA8 backbuffer to white on chrome/envmap entities
+ * (quad shell, health/armor pickups, weapon hot-bits). 1.5 keeps a
+ * slight HDR-style overshoot for bright highlights without clipping. */
+float Q3_PBREmissiveIntensityMax(void);
 int   Q3_PBROnlyTextures(void);
 float Q3_RTMix(void);
 float Q3_SetRTMix(float mix);
@@ -150,5 +194,37 @@ float Q3_RTBounces(void);
 float Q3_RTTAA(void);
 float Q3_RTTAAAlpha(void);
 int   Q3_RTEntities(void);
+/* P0.2 — RT composite entity preservation (see
+ * docs/2026-06-10-rt-gap-analysis-vs-rtx-remix.md).
+ * Q3_RTPreserveEntities: 1 (default) = composite before entity/HUD passes
+ * so raster viewmodel/pickups draw on top of the traced world; 0 = legacy
+ * A/B mode, composite deferred until after the main entity pass.
+ * Q3_RTDebugEntityMask: 1 = main-scene entity fragments render solid white
+ * (coverage visualization of what is preserved over the RT composite). */
+int   Q3_RTPreserveEntities(void);
+int   Q3_RTDebugEntityMask(void);
+/* P1 RT lights (NEE shadow rays). Light data baked offline from RTX Remix
+ * per-map <map>_lights.usda into Resources/baseq3/pbr/lights/<map>.json.
+ * Q3MetalRenderer_GetWorldMapName: current BSP path ("maps/q3dm6.bsp").
+ * r_rt_lights (default 1) gates the kernel NEE block; r_rt_light_scale
+ * (default 1.0) is a global intensity multiplier for on-device tuning. */
+const char *Q3MetalRenderer_GetWorldMapName(void);
+int   Q3_RTLights(void);
+float Q3_RTLightScale(void);
+/* P3 RT reflections. r_rt_reflections (default 1) gates the one-level
+ * specular reflect ray; r_rt_refl_roughness_max (default 0.45) is the
+ * roughness ceiling above which no reflection ray is cast. */
+int   Q3_RTReflections(void);
+float Q3_RTReflRoughnessMax(void);
+/* P2 RT HDR+bloom. r_rt_hdr keeps RT trace/accum in rgba16F; r_rt_bloom
+ * spreads values above r_rt_bloom_threshold in blendRT before final LDR
+ * composite. Radius is in RT-trace texels. */
+int   Q3_RTHDR(void);
+float Q3_RTBloom(void);
+float Q3_RTBloomThreshold(void);
+float Q3_RTBloomRadius(void);
+/* Height-map parallax for world surfaces (r_pbr_parallax_scale, default
+ * 0.02, 0 = off). Only applied when the material ships a height DDS. */
+float Q3_PBRParallaxScale(void);
 
 #endif

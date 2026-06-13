@@ -2763,7 +2763,7 @@ int inflate_blocks(inflate_blocks_statef *s, z_streamp z, int r)
       Tracev(("inflate:       bits tree ok\n"));
       s->mode = DTREE;
     case DTREE:
-      while (t = s->sub.trees.table,
+          while ((void)(t = s->sub.trees.table),
              s->sub.trees.index < 258 + (t & 0x1f) + ((t >> 5) & 0x1f))
       {
         inflate_huft *h;

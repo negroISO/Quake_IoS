@@ -288,10 +288,6 @@ struct LaunchMenuView: View {
                                    subtitle: "Faster respawn / infinite ammo · bot deathmatch") {
                             choose(command: "mod:excessiveplus|map q3dm17", label: "ExcessivePlus — q3dm17")
                         }
-                        DemoButton(title: "SexyFraggers — q3dm6",
-                                   subtitle: "Cosmetic announcer mod") {
-                            choose(command: "mod:sexyfraggers|map q3dm6", label: "SexyFraggers — q3dm6")
-                        }
                     }
                     .padding(.horizontal, 24)
                     .frame(maxWidth: 560)

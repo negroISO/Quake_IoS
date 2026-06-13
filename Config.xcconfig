@@ -1,0 +1,10 @@
+//
+//  Config.xcconfig
+//  Quake3-RT
+//
+//  Created by targus on 6/8/26.
+//
+PRODUCT_NAME = Q3_RT
+PRODUCT_BUNDLE_IDENTIFIER = com.quake3ios.rt
+// Configuration settings file format documentation can be found at:
+// https://developer.apple.com/documentation/xcode/adding-a-build-configuration-file-to-your-project

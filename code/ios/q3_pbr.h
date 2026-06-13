@@ -39,8 +39,23 @@ typedef struct {
     const char *emissive;
     const char *height;
     float       emissive_intensity;
+    /* Emissive color tint (linear RGB). Multiplied into the sampled
+     * emissive DDS texel. 1,1,1 is "no tint". has_emissive_color==0 means
+     * Swift should treat it as (1,1,1). */
+    float       emissive_color_r;
+    float       emissive_color_g;
+    float       emissive_color_b;
+    int         has_emissive_color;
     float       roughness_constant;   /* <0 = unset */
     float       metallic_constant;    /* <0 = unset */
+    /* RTX Remix sprite-sheet atlas (animMap material). When sprite_cols
+     * or sprite_rows > 0, the albedo (+ companion normal/roughness/metallic/
+     * emissive) DDS is a 2D grid of cols×rows frames. Shader sub-samples
+     * frame index = floor(time*fps) % (cols*rows), col = idx%cols,
+     * row = idx/cols. (0,0) = static. */
+    int         sprite_cols;
+    int         sprite_rows;
+    float       sprite_fps;
 } Q3PBRMaterialPaths;
 
 /* A single PBR material entry. Slot pointers are owned by the table and
@@ -66,6 +81,11 @@ typedef struct q3_pbr_material_s {
     int         has_emissive_color;   /* 1 if emissive_color_* are set */
     float       roughness_constant;   /* <0 when not set */
     float       metallic_constant;    /* <0 when not set */
+    /* Sprite-sheet metadata (remixConstants.sprite_sheet_cols/rows/fps).
+     * 0 = static texture (no atlas). See Q3PBRMaterialPaths above. */
+    int         sprite_cols;
+    int         sprite_rows;
+    float       sprite_fps;
 } q3_pbr_material_t;
 
 /* One-shot init. Loads the JSON table produced by
@@ -139,6 +159,8 @@ void q3_pbr_log_classification(const char *name, q3_pbr_world_mat_t mat);
  * regardless so we can audit hash matches independent of the
  * shader path. */
 int q3_pbr_enabled(void);
+int Q3_PBRBakedLightmaps(void);
+int Q3_PBRSunShadows(void);
 
 /* Stats for debugging — emitted in NSLog at boot. */
 typedef struct {

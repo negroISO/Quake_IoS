@@ -188,7 +188,7 @@ typedef struct {
 
 #define Q3_METAL_MAX_STAGES 8
 
-#define Q3_METAL_MAX_LIGHTS 32
+#define Q3_METAL_MAX_LIGHTS 128
 #define Q3_METAL_TEXTURE_FLAG_LIGHTMAP 0x00000001u
 
 /* Dynamic light (point). Emitted by cgame for muzzle flashes, rocket/plasma

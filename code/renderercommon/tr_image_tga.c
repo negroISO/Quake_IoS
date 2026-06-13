@@ -207,25 +207,23 @@ void R_LoadTGA ( const char *name, byte **pic, int *width, int *height)
 				if (packetHeader & 0x80) {        // run-length packet
 					if(buf_p + targa_header.pixel_size/8 > end)
 						ri.Error (ERR_DROP, "LoadTGA: file truncated (%s)", name);
-					switch (targa_header.pixel_size) {
-						case 24:
-								blue = *buf_p++;
-								green = *buf_p++;
-								red = *buf_p++;
-								alphabyte = 255;
-								break;
-						case 32:
-								blue = *buf_p++;
-								green = *buf_p++;
-								red = *buf_p++;
-								alphabyte = *buf_p++;
-								break;
-						default:
-							ri.Error( ERR_DROP, "LoadTGA: illegal pixel_size '%d' in file '%s'", targa_header.pixel_size, name );
-							red = green = blue = alphabyte = 0; // silence compiler warning
-							break;
-					}
-
+                    switch (targa_header.pixel_size) {
+                        case 24:
+                            blue = *buf_p++;
+                            green = *buf_p++;
+                            red = *buf_p++;
+                            alphabyte = 255;
+                            break;
+                        case 32:
+                            blue = *buf_p++;
+                            green = *buf_p++;
+                            red = *buf_p++;
+                            alphabyte = *buf_p++;
+                            break;
+                        default:
+                            ri.Error( ERR_DROP, "LoadTGA: illegal pixel_size '%d' in file '%s'", targa_header.pixel_size, name );
+                            return;  // Explicit return to satisfy control flow analysis
+                    }
 					for(j=0;j<packetSize;j++) {
 						*pixbuf++=red;
 						*pixbuf++=green;

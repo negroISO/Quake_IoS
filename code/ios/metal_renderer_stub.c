@@ -41,18 +41,46 @@ If a visual issue exists, fix the generic mismatch against ioq3/Kenny behavior.
 #include "q3_pbr.h"
 #include <os/log.h>
 #include <stdio.h>
+#include <errno.h>
 #include <sys/stat.h>   /* GetRefAPI PBR bundle-path probe */
 
-/* Append a line to ~/Documents/q3_diag.log inside the app sandbox. */
+/* Append a line to Documents/q3_diag.log inside the app sandbox.
+ * Catalyst launched directly from scripts may expose HOME as the real user
+ * home, which is sandbox-denied. Prefer CFFIXED_USER_HOME when present; it
+ * points at ~/Library/Containers/<bundle>/Data on Catalyst and the app
+ * container on iOS. */
 static void Q3_FileLogf(const char *fmt, ...) {
     static char path[1024] = {0};
     if (path[0] == '\0') {
-        const char *home = getenv("HOME");
-        if (home == NULL) home = ".";
-        snprintf(path, sizeof(path), "%s/Documents/q3_diag.log", home);
+        char docs[1024];
+        const char *home = getenv("CFFIXED_USER_HOME");
+        if (home == NULL || home[0] == '\0') home = getenv("HOME");
+        if (home == NULL || home[0] == '\0') home = ".";
+        snprintf(docs, sizeof(docs), "%s/Documents", home);
+        mkdir(docs, 0755);
+        snprintf(path, sizeof(path), "%s/q3_diag.log", docs);
     }
     FILE *f = fopen(path, "a");
-    if (!f) return;
+    if (!f) {
+        /* Direct Catalyst launches can still inherit HOME=/Users/<name>.
+         * Fall back to the known app-group container path used by the runner. */
+        const char *home = getenv("HOME");
+        if (home != NULL && home[0] != '\0') {
+            char docs[1024];
+            snprintf(docs, sizeof(docs), "%s/Library/Containers/com.quake3ios.rt/Data/Documents", home);
+            mkdir(docs, 0755);
+            snprintf(path, sizeof(path), "%s/q3_diag.log", docs);
+            f = fopen(path, "a");
+        }
+    }
+    if (!f) {
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "[Q3-DIAG] q3_diag fopen failed path=%s errno=%d\n", path, errno);
+        }
+        return;
+    }
     va_list ap;
     va_start(ap, fmt);
     vfprintf(f, fmt, ap);
@@ -69,7 +97,13 @@ static void Q3_FileLogf(const char *fmt, ...) {
 #define LL(x) x=LittleLong(x)
 
 #define Q3_METAL_MAX_VERTICES 65536
-#define Q3_METAL_MAX_DRAWS 8192
+/* Raised 2026-06-09 from 8192 → 32768. q3dm11 emits 15344 world draws,
+ * silently truncated at 8192 caused missing geometry. 32768 covers all
+ * shipped maps with margin; per-cmd cost ≈ static array growth is acceptable
+ * on iPad M4 (cmd struct ~96 bytes → ~3 MB resident). Keep as static to
+ * avoid realloc plumbing touching every accessor; revisit if a future map
+ * exceeds this. */
+#define Q3_METAL_MAX_DRAWS 65536
 #define Q3_METAL_MAX_TEXTURES 1024
 #define Q3_METAL_MAX_MODELS 1024
 #define Q3_METAL_MAX_REFENTITIES 1024
@@ -593,6 +627,12 @@ typedef struct {
      * still tag the shader. Consulting this flag at surface classification
      * time makes sky detection prefix-independent. */
     qboolean isSky;
+    /* `surfaceparm nodraw` — utility brushes (caulk, hint, clip family,
+     * areaportal, clusterportal, donotenter, trigger, origin, skip).
+     * Vanilla Q3 silently SKIPS rendering these. Without the skip they
+     * appear as translucent grey cones, opaque utility planes covering
+     * the sky, and gray "carrier rectangles" co-located with torches. */
+    qboolean isNoDraw;
     Q3MetalStage stages[Q3_MAX_STAGES];
     int stageCount;
     q3_pbr_world_mat_t pbrMatClass;
@@ -1441,6 +1481,41 @@ static void CopyTextureTcModsToDrawCmd(uint32_t cursor, qhandle_t textureHandle)
  * alpha the full billboard quad draws opaque, producing hard-edged
  * orbs/rectangles instead of just the bright center. Synthesize alpha
  * from luminance for paths known to be FX-only. */
+/* True when the basename suggests an FX overlay (glow, flare, glass,
+ * explosion, etc.) rather than a solid model skin. Used to gate the
+ * luminance-alpha synth on models/weapons2/, models/ammo/,
+ * models/powerups/ — those dirs hold BOTH solid base skins (rocketl.tga,
+ * plasma.tga) and FX overlays (rocketl_flare.tga, plasma_glo.tga, f_*.tga).
+ * Applying the radial soft-mask to a solid skin tears the model apart at
+ * UV regions near texture corners, so restrict to known FX name patterns. */
+static qboolean PathHasFXNameMarker(const char *path) {
+    const char *base = path;
+    const char *p;
+    if (path == NULL) return qfalse;
+    for (p = path; *p; ++p) {
+        if (*p == '/' || *p == '\\') base = p + 1;
+    }
+    if (Q_stristr(base, "_glo")   != NULL) return qtrue;  /* _glo / _glow */
+    if (Q_stristr(base, "_fx")    != NULL) return qtrue;
+    if (Q_stristr(base, "fx_")    != NULL) return qtrue;
+    if (Q_stristr(base, "_flare") != NULL) return qtrue;
+    if (Q_stristr(base, "_flame") != NULL) return qtrue;
+    if (Q_stristr(base, "_glass") != NULL) return qtrue;
+    if (Q_stristr(base, "_trail") != NULL) return qtrue;
+    if (Q_stristr(base, "_e.")    != NULL) return qtrue;  /* emissive companion */
+    if (Q_stristr(base, "explos") != NULL) return qtrue;
+    if (Q_stristr(base, "smoke")  != NULL) return qtrue;
+    if (Q_stristr(base, "puff")   != NULL) return qtrue;
+    if (Q_stristr(base, "spark")  != NULL) return qtrue;
+    if (Q_stristr(base, "beam")   != NULL) return qtrue;
+    if (Q_stristr(base, "bullet") != NULL) return qtrue;
+    if (Q_stristr(base, "blood")  != NULL) return qtrue;
+    if (Q_stristr(base, "muzzle") != NULL) return qtrue;
+    if (Q_stristr(base, "tracer") != NULL) return qtrue;
+    if ((base[0] == 'f' || base[0] == 'F') && base[1] == '_') return qtrue; /* f_* = flash */
+    return qfalse;
+}
+
 static qboolean TextureNeedsLuminanceAlpha(const char *path) {
     /* Synthesize alpha for textures whose .tga was authored with a
      * DARK (near-black) background + bright emissive core. Max(R,G,B)
@@ -1463,10 +1538,14 @@ static qboolean TextureNeedsLuminanceAlpha(const char *path) {
      * without alpha is the right outcome. */
     if (path == NULL || path[0] == '\0') return qfalse;
     if (!Q_stricmpn(path, "sprites/", 8)) return qtrue;
-    if (!Q_stricmpn(path, "models/weaphits/", 16)) return qtrue;
-    if (!Q_stricmpn(path, "models/powerups/", 16)) return qtrue;
-    if (!Q_stricmpn(path, "models/ammo/", 12)) return qtrue;
-    if (!Q_stricmpn(path, "models/weapons2/", 16)) return qtrue;
+    if (!Q_stricmpn(path, "models/weaphits/", 16)) return qtrue;  /* all FX */
+    /* For the three model subdirs that mix solid skins and FX overlays,
+     * synth only when the basename matches an FX name pattern. Avoids
+     * radial-mask wrecking solid plasma/rail/shotgun/ammo skins when the
+     * .tga is missing and we fall back to the .jpg base color. */
+    if (!Q_stricmpn(path, "models/powerups/", 16)) return PathHasFXNameMarker(path);
+    if (!Q_stricmpn(path, "models/ammo/", 12))     return PathHasFXNameMarker(path);
+    if (!Q_stricmpn(path, "models/weapons2/", 16)) return PathHasFXNameMarker(path);
     if (!Q_stricmpn(path, "textures/sfx/", 13)) return qtrue;
     if (!Q_stricmpn(path, "textures/effects/", 17)) return qtrue;
     if (!Q_stricmpn(path, "gfx/damage/", 11)) return qtrue;
@@ -1983,6 +2062,101 @@ static qhandle_t RegisterTexture(const char *name) {
                             &texture->deformWaveFreq);
     if (Q_stricmp(name, resolvedName)) {
         MetalTelemetryPrintf("metal_asset_loaded", PRINT_ALL, "Metal stub: loaded '%s' from '%s' (%dx%d)\n", name, resolvedName, width, height);
+    }
+    /* Corner-pixel diag for additive FX textures: GL_ONE/GL_ONE adds
+     * source RGB as-is, so nonzero RGB in the dark borders of flame/
+     * smoke/spark sprites paints a visible "carrier rectangle" on the
+     * wall behind. Logs RGB at the 4 corners + center of any *flame*
+     * texture so we can tell whether the source is clean (.tga authored
+     * with strict black borders) or noisy (.jpg fallback). Gated on the
+     * shader-name strstr so the log doesn't flood for non-FX assets. */
+    if (rgba != NULL && width > 0 && height > 0 &&
+        (strstr(name, "flame") || strstr(name, "Flame"))) {
+        const int W = width, H = height;
+        const byte *p = rgba;
+        #define PX(x, y) (&p[((y) * W + (x)) * 4])
+        const byte *tl = PX(0, 0);
+        const byte *tr = PX(W - 1, 0);
+        const byte *bl = PX(0, H - 1);
+        const byte *br = PX(W - 1, H - 1);
+        const byte *ct = PX(W / 2, H / 2);
+        #undef PX
+        const char *ext = strrchr(resolvedName, '.');
+        MetalTelemetryPrintf("metal_fx_corner", PRINT_ALL,
+            "[Q3-DIAG-FX] '%s' from '%s' (%s) %dx%d corners "
+            "TL=(%u,%u,%u,%u) TR=(%u,%u,%u,%u) BL=(%u,%u,%u,%u) "
+            "BR=(%u,%u,%u,%u) CT=(%u,%u,%u,%u)\n",
+            name, resolvedName, ext ? ext : "?", W, H,
+            tl[0], tl[1], tl[2], tl[3],
+            tr[0], tr[1], tr[2], tr[3],
+            bl[0], bl[1], bl[2], bl[3],
+            br[0], br[1], br[2], br[3],
+            ct[0], ct[1], ct[2], ct[3]);
+
+        /* Proactive Case-1 clamp: zero out near-black pixels regardless
+         * of .tga or .jpg source. GL_ONE/GL_ONE additive blend treats
+         * every RGB byte as a direct contribution to the wall behind,
+         * so a single border row of (2,2,2) JPG noise on a 256-wide
+         * sprite paints a 256-pixel-wide ~6% gray rectangle on the
+         * torch sconce. The existing SynthesizeAlphaFromLuminance only
+         * fires for .jpg fallbacks via TextureNeedsLuminanceAlpha; this
+         * clamp runs unconditionally for flame textures so the carrier
+         * disappears whether the source is .jpg (noisy) or .tga (with
+         * a stray off-by-one authored border). Threshold of 10 on the
+         * R+G+B sum gates anything ~3/255 per channel — well below any
+         * actual flame highlight, well above quiet JPEG / TGA noise. */
+        const int pixelCount = W * H;
+        byte *q = rgba;
+        for (int i = 0; i < pixelCount; ++i) {
+            if ((int)q[0] + (int)q[1] + (int)q[2] < 10) {
+                q[0] = 0; q[1] = 0; q[2] = 0;
+            }
+            q += 4;
+        }
+    }
+    /* One-shot alpha-channel diag for the q3dm1 floor ring shader
+     * (textures/gothic_floor/center2trn.tga). The shader layers two
+     * GL_SRC_ALPHA/GL_ONE_MINUS_SRC_ALPHA passes of this TGA on top of
+     * a fireswirl base; the ring detail lives entirely in the alpha
+     * channel. If the on-device TGA loads with alpha=0 (no real alpha
+     * channel preserved, or all-zero authored alpha) the overlay
+     * collapses to a passthrough and the ring disappears, leaving the
+     * fire visible on a near-black quad — the reported bug. No RGB
+     * clamp here: this texture relies on its alpha mask. */
+    if (rgba != NULL && width > 0 && height > 0 &&
+        strstr(name, "center2trn") != NULL) {
+        const int W = width, H = height;
+        const byte *p = rgba;
+        const byte *tl = &p[(0 * W + 0) * 4];
+        const byte *tr = &p[(0 * W + (W - 1)) * 4];
+        const byte *bl = &p[((H - 1) * W + 0) * 4];
+        const byte *br = &p[((H - 1) * W + (W - 1)) * 4];
+        const byte *ct = &p[((H / 2) * W + (W / 2)) * 4];
+        const int pixelCount = W * H;
+        int aMin = 255, aMax = 0;
+        int a0 = 0, a255 = 0;
+        for (int i = 0; i < pixelCount; ++i) {
+            int a = rgba[i * 4 + 3];
+            if (a < aMin) aMin = a;
+            if (a > aMax) aMax = a;
+            if (a == 0)   ++a0;
+            if (a == 255) ++a255;
+        }
+        const char *ext = strrchr(resolvedName, '.');
+        MetalTelemetryPrintf("metal_center2trn_diag", PRINT_ALL,
+            "[Q3-DIAG-CENTER2TRN] '%s' from '%s' (%s) %dx%d "
+            "alpha min=%d max=%d a0=%d/%d (%.1f%%) a255=%d/%d (%.1f%%) "
+            "TL=(%u,%u,%u,%u) TR=(%u,%u,%u,%u) BL=(%u,%u,%u,%u) "
+            "BR=(%u,%u,%u,%u) CT=(%u,%u,%u,%u)\n",
+            name, resolvedName, ext ? ext : "?", W, H,
+            aMin, aMax,
+            a0, pixelCount, pixelCount ? (100.0 * a0 / pixelCount) : 0.0,
+            a255, pixelCount, pixelCount ? (100.0 * a255 / pixelCount) : 0.0,
+            tl[0], tl[1], tl[2], tl[3],
+            tr[0], tr[1], tr[2], tr[3],
+            bl[0], bl[1], bl[2], bl[3],
+            br[0], br[1], br[2], br[3],
+            ct[0], ct[1], ct[2], ct[3]);
     }
     return texture->handle;
 }
@@ -4740,6 +4914,16 @@ static void MetalWorldEmitSurfaceStages(const char *shaderName,
         return;
     }
 
+    /* surfaceparm nodraw: utility brushes (caulk, hint, clip family,
+     * areaportal, clusterportal, donotenter, trigger, origin, skip) must
+     * never reach the GPU. Skipping the emission here suppresses the
+     * translucent grey light-projection cones, the gigantic opaque sky-
+     * cover plane on q3dm17, and the gray "carrier rectangle" co-located
+     * with torches that was being misattributed to flame texture noise. */
+    if (_e != NULL && _e->isNoDraw) {
+        return;
+    }
+
     if (_e != NULL && _e->stageCount > 0) {
         for (_s = 0; _s < _e->stageCount; ++_s) {
             const Q3MetalStage *_st = &_e->stages[_s];
@@ -5039,6 +5223,22 @@ static qboolean LoadWorldMapData(const char *name) {
             ri.Printf(PRINT_ALL,
                 "Metal world: %d fog volumes (%d with resolved fogparms)\n",
                 fogCount, withColor);
+            /* Task #19 diagnostic: per-volume load-site ground truth in
+             * q3_diag.log — shader lookup result, resolved color/distance,
+             * and the brush-derived AABB the ray-box pass will use. */
+            for (fi = 0; fi < fogCount; ++fi) {
+                MetalTelemetryPrintf("metal_fog", PRINT_ALL,
+                    "[Q3-FOG] volume#%d shader='%s' resolved=%d color=(%.3f,%.3f,%.3f) dist=%.0f "
+                    "hasBounds=%d bounds=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f) hasSurface=%d\n",
+                    fi, s_worldFogs[fi].shaderName,
+                    s_worldFogs[fi].hasColor ? 1 : 0,
+                    s_worldFogs[fi].color[0], s_worldFogs[fi].color[1], s_worldFogs[fi].color[2],
+                    s_worldFogs[fi].distance,
+                    s_worldFogs[fi].hasBounds ? 1 : 0,
+                    s_worldFogs[fi].bounds[0][0], s_worldFogs[fi].bounds[0][1], s_worldFogs[fi].bounds[0][2],
+                    s_worldFogs[fi].bounds[1][0], s_worldFogs[fi].bounds[1][1], s_worldFogs[fi].bounds[1][2],
+                    s_worldFogs[fi].hasSurface ? 1 : 0);
+            }
         }
     }
 
@@ -6305,6 +6505,7 @@ static void ParseShaderText(const char *text) {
         qboolean gotLightmapStage;
         qboolean gotFlare;
         qboolean gotSky;
+        qboolean gotNoDraw;   /* surfaceparm nodraw — skip surface entirely */
         float fogColor[3];
         float fogDistance;
         Q3MetalStage cur;
@@ -6350,6 +6551,7 @@ static void ParseShaderText(const char *text) {
         gotLightmapStage = qfalse;
         gotFlare = qfalse;
         gotSky = qfalse;
+        gotNoDraw = qfalse;
         fogColor[0] = fogColor[1] = fogColor[2] = 0.0f;
         fogDistance = 0.0f;
         Com_Memset(&cur, 0, sizeof(cur));
@@ -6408,20 +6610,31 @@ static void ParseShaderText(const char *text) {
                     }
                     gotSky = qtrue;   /* skyparms always implies sky */
                 } else if (!Q_stricmp(token, "surfaceparm")) {
-                    /* surfaceparm <keyword>. We only care about `sky`
-                     * right now — everything else (trans, nolightmap,
-                     * nomarks, noimpact, fog, etc.) is ignored but we
-                     * still consume the argument so the parser
-                     * advances. NOTE: `surfaceparm fog` is NOT used
-                     * here to mark a fog volume — q3dm6 and other
-                     * pak0 shaders use it on regular floor brushes
-                     * where `surfaceparm` is a content tag rather
-                     * than a "this brush is a fog volume" signal.
-                     * The reliable fog-volume marker is `fogparms`,
-                     * which only true fog volumes declare. */
+                    /* surfaceparm <keyword>. We care about:
+                     *   `sky`    — render via sky stages / IBL auto-detect
+                     *   `nodraw` — utility brush (caulk, hint, clip,
+                     *              weapclip, origin, areaportal,
+                     *              clusterportal, donotenter, trigger,
+                     *              skip). Vanilla Q3 silently SKIPS these
+                     *              surfaces at render time; without the
+                     *              skip they appear as translucent grey
+                     *              cones / opaque utility planes (light
+                     *              projection cones in q3dm10/dm17,
+                     *              huge black sky-cover plane, gray
+                     *              carrier rectangles behind torch flames).
+                     *              15 shaders in pak0/scripts/common.shader
+                     *              and 1 in base_light.shader carry it.
+                     * NOTE: `surfaceparm fog` is NOT used here to mark a
+                     * fog volume — q3dm6 and other pak0 shaders use it
+                     * on regular floor brushes where `surfaceparm` is a
+                     * content tag rather than a "this brush is a fog
+                     * volume" signal. The reliable fog-volume marker is
+                     * `fogparms`, which only true fog volumes declare. */
                     token = COM_ParseExt(&p, qfalse);
                     if (token[0] && !Q_stricmp(token, "sky")) {
                         gotSky = qtrue;
+                    } else if (token[0] && !Q_stricmp(token, "nodraw")) {
+                        gotNoDraw = qtrue;
                     }
                 } else if (!gotPortal && !Q_stricmp(token, "portal")) {
                     gotPortal = qtrue;
@@ -6579,6 +6792,20 @@ static void ParseShaderText(const char *text) {
                     cleanGraph.fogColor[1] = fogColor[1];
                     cleanGraph.fogColor[2] = fogColor[2];
                     cleanGraph.fogDistance = fogDistance;
+                    /* Task #19 diagnostic: parse-site ground truth in
+                     * q3_diag.log — exactly what color/distance each
+                     * fogparms resolved to, one line per definition. */
+                    MetalTelemetryPrintf("metal_fog", PRINT_ALL,
+                        "[Q3-FOG] parsed fogparms shader='%s' color=(%.3f,%.3f,%.3f) dist=%.0f\n",
+                        shaderName, fogColor[0], fogColor[1], fogColor[2], fogDistance);
+                    /* Author-typo guard (e.g. mkc_fog_dm4 ships `64 0 0`,
+                     * almost certainly meant .64): keep data fidelity, just
+                     * flag out-of-range channels so captures surface it. */
+                    if (fogColor[0] > 1.5f || fogColor[1] > 1.5f || fogColor[2] > 1.5f) {
+                        MetalTelemetryPrintf("metal_fog", PRINT_ALL,
+                            "[Q3-FOG] WARN out-of-range fog channel shader='%s' raw=(%.3f,%.3f,%.3f)\n",
+                            shaderName, fogColor[0], fogColor[1], fogColor[2]);
+                    }
                 }
                 continue;
             }
@@ -7134,6 +7361,7 @@ static void ParseShaderText(const char *text) {
                 last->hasLightmapStage = gotLightmapStage;
                 last->hasFlare = gotFlare;
                 last->isSky = gotSky;
+                last->isNoDraw = gotNoDraw;
                 /* === [METAL-SHADER] PC-port comparison instrumentation ====
                  * Mirrors the [QE-SHADER] dump baked into Quake3e's
                  * renderer/tr_shader.c FinishShader (see Q2_too_ios
@@ -7347,6 +7575,16 @@ static void ParseShaderText(const char *text) {
                 if (gotSkyParms) {
                     Q_strncpyz(last->skyBoxBase, skyBoxBase, sizeof(last->skyBoxBase));
                 }
+                /* Do NOT default skyBoxBase for `surfaceparm sky` shaders
+                 * that lack skyparms (cloud-layer skies, blacksky variants).
+                 * GetSkyFaceTextureForSurface uses skyBoxBase to OVERRIDE
+                 * the visible sky face — defaulting to env/space1 broke
+                 * q3dm17 by drawing the asteroid cube over the authored
+                 * blacksky stages. IBL still works via the r_pbr_ibl_skybox
+                 * cvar default (env/space1) set at engine boot. The
+                 * "sky-face lookup MISS" log is harmless — the caller
+                 * correctly falls back to the shader's own parsed stages,
+                 * which IS the right visible-sky render path here. */
                 /* STEP 4: the previous code here cached stages[0].blendMode,
                  * alphaFunc, and a few tcMod params onto the shader-map
                  * entry as globals. All consumers now read stages[0].* via
@@ -7702,12 +7940,22 @@ static qhandle_t RE_RegisterSkin(const char *name) {
 }
 qhandle_t RE_RegisterShader(const char *name) { return RegisterTexture(name); }
 qhandle_t RE_RegisterShaderNoMip(const char *name) { return RegisterTexture(name); }
+/* Current world map name (e.g. "maps/q3dm6.bsp"). Swift uses the basename
+ * to load the per-map RT light list (Resources/baseq3/pbr/lights/<map>.json,
+ * baked offline from the RTX Remix <map>_lights.usda authoring files). */
+static char s_worldMapName[MAX_QPATH];
+const char *Q3MetalRenderer_GetWorldMapName(void) {
+    return s_worldMapName;
+}
+
 static void RE_LoadWorldMap(const char *name) {
     if (name == NULL || name[0] == '\0') {
+        s_worldMapName[0] = '\0';
         FreeWorldMapData();
         return;
     }
 
+    Q_strncpyz(s_worldMapName, name, sizeof(s_worldMapName));
     if (!LoadWorldMapData(name)) {
         ri.Printf(PRINT_WARNING, "Metal world: falling back to empty world for '%s'\n", name);
     }
@@ -9924,8 +10172,29 @@ const Q3PBRMaterialPaths *Q3MetalRenderer_GetPBRMaterial(unsigned int textureHan
     static Q3PBRMaterialPaths s_paths;  /* not thread-safe; Swift renderer is single-threaded */
     if (textureHandle == 0) return NULL;
     const metalTexture_t *tex = FindTextureByHandle((qhandle_t)textureHandle);
-    if (tex == NULL || tex->pbrMaterial == NULL) return NULL;
+    if (tex == NULL) return NULL;
     const q3_pbr_material_t *m = (const q3_pbr_material_t *)tex->pbrMaterial;
+    /* Composite-handle fallback. Entity per-stage handles register with
+     * composite names like "*entity-stage:N:models/.../plasammo.tga"
+     * (created at line 2198) and do NOT bind a pbrMaterial at registration.
+     * Without this fallback, the Swift PBR getters (pbrAlbedoTexture,
+     * pbrNormalTexture, etc.) early-bail and the authored RTX Remix maps
+     * (e.g. plasammo hash 18180F4164BB190D albedo + 426C8DBA4F14F12C normal
+     * + height) never load — even though they're in materials_by_name. Re-
+     * resolve via the name table by stripping the "*entity-stage:N:" prefix
+     * so authored materials reach the entity draw path. */
+    if (m == NULL && tex->name[0] != '\0') {
+        const char *resolve = tex->name;
+        if (resolve[0] == '*') {
+            const char *firstColon = strchr(resolve + 1, ':');
+            if (firstColon) {
+                const char *secondColon = strchr(firstColon + 1, ':');
+                if (secondColon && secondColon[1]) resolve = secondColon + 1;
+            }
+        }
+        m = q3_pbr_lookup_by_name(resolve);
+    }
+    if (m == NULL) return NULL;
     s_paths.albedo    = m->albedo;
     s_paths.normal    = m->normal;
     s_paths.roughness = m->roughness;
@@ -9933,8 +10202,45 @@ const Q3PBRMaterialPaths *Q3MetalRenderer_GetPBRMaterial(unsigned int textureHan
     s_paths.emissive  = m->emissive;
     s_paths.height    = m->height;
     s_paths.emissive_intensity = m->emissive_intensity;
+    s_paths.emissive_color_r   = m->emissive_color_r;
+    s_paths.emissive_color_g   = m->emissive_color_g;
+    s_paths.emissive_color_b   = m->emissive_color_b;
+    s_paths.has_emissive_color = m->has_emissive_color;
     s_paths.roughness_constant = m->roughness_constant;
     s_paths.metallic_constant = m->metallic_constant;
+    s_paths.sprite_cols = m->sprite_cols;
+    s_paths.sprite_rows = m->sprite_rows;
+    s_paths.sprite_fps  = m->sprite_fps;
+    return &s_paths;
+}
+
+/* Name-based PBR material lookup for indirect-name cases (entity envmap
+ * stages bound under the shader name like models/powerups/health/yellow
+ * but whose atlas metadata is keyed in materials.json by the underlying
+ * envmap source path like textures/effects/envmapyel). Mirrors the
+ * handle-based getter; consumers use this when the handle lookup yields
+ * no sprite_sheet data. */
+const Q3PBRMaterialPaths *Q3MetalRenderer_GetPBRMaterialByName(const char *name) {
+    static Q3PBRMaterialPaths s_paths;
+    if (name == NULL || name[0] == '\0') return NULL;
+    const q3_pbr_material_t *m = q3_pbr_lookup_by_name(name);
+    if (m == NULL) return NULL;
+    s_paths.albedo    = m->albedo;
+    s_paths.normal    = m->normal;
+    s_paths.roughness = m->roughness;
+    s_paths.metallic  = m->metallic;
+    s_paths.emissive  = m->emissive;
+    s_paths.height    = m->height;
+    s_paths.emissive_intensity = m->emissive_intensity;
+    s_paths.emissive_color_r   = m->emissive_color_r;
+    s_paths.emissive_color_g   = m->emissive_color_g;
+    s_paths.emissive_color_b   = m->emissive_color_b;
+    s_paths.has_emissive_color = m->has_emissive_color;
+    s_paths.roughness_constant = m->roughness_constant;
+    s_paths.metallic_constant = m->metallic_constant;
+    s_paths.sprite_cols = m->sprite_cols;
+    s_paths.sprite_rows = m->sprite_rows;
+    s_paths.sprite_fps  = m->sprite_fps;
     return &s_paths;
 }
 
@@ -10020,10 +10326,15 @@ int Q3_PBRPhase5Enabled(void) {
  * compensation).
  *
  *   r_pbr_world_textures      gate, default "1"
- *   r_pbr_world_ambient_boost [0..1] additive diffuse-IBL fraction,
- *                             default "0.20" — light shadow-side fill
- *   r_pbr_world_spec_boost    [0..1] specular IBL highlight intensity,
- *                             default "0.40" — chrome cue strength */
+ *   r_pbr_world_ambient_boost [0..1.5] additive diffuse-IBL fraction,
+ *                             default "0.42" — light shadow-side fill.
+ *                             Tune upward at runtime via console if RT
+ *                             scenes still read too dark; common bump:
+ *                             `r_pbr_world_ambient_boost 0.6`.
+ *   r_pbr_world_spec_boost    [0..2] specular IBL highlight intensity,
+ *                             default "1.05" — chrome cue strength.
+ *                             Tune via `r_pbr_world_spec_boost <v>` if
+ *                             highlights become too hot post-neutral-cube. */
 int   Q3_PBRWorldEnabled(void) {
     if (ri.Cvar_Get == NULL) return 1;
     cvar_t *cv = ri.Cvar_Get("r_pbr_world_textures", "1", CVAR_ARCHIVE);
@@ -10045,10 +10356,128 @@ float Q3_PBRWorldSpecBoost(void) {
     if (v > 2.0f) v = 2.0f;
     return v;
 }
+/* r_pbr_viewmodel_floor (default 0.35) — viewmodel-only PBR base-color
+ * floor. Most weapon viewmodels are authored metallic=1.0; with our
+ * neutral 0.08 procedural envCube an IBL-only metal surface comes out
+ * near-black regardless of orientation. The floor clamps `base.rgb` to
+ * `max(base.rgb, texel.rgb * floor)` ONLY for RF_DEPTHHACK draws in
+ * `q3_entity_fragment`. World, entity-pickup, and HUD paths are unchanged.
+ * 0.0 = off (pure PBR look). 0.25/0.35/0.45 are the suggested test sweep.
+ * Range-clamped 0..1 to avoid blown-out viewmodels at silly values. */
+/* r_pbr_envcube_grey (default 0.08, CVAR_ARCHIVE, clamped 0..1) — the
+ * uniform linear grey value used to fill every face of the procedural
+ * fallback envCube in `ensurePBREnvCube()`. Defaults match indoor /
+ * dungeon maps; tune at runtime per scene mood:
+ *   r_pbr_envcube_grey 0.02   - space / void (q3dm17 family)
+ *   r_pbr_envcube_grey 0.08   - default (q3dm6 / q3dm10 / q3dm11 / indoor)
+ *   r_pbr_envcube_grey 0.15   - brighter outdoor fill
+ *   r_pbr_envcube_grey 0      - pure black (extreme test)
+ * Swift caches the value used for the last-built procedural cube and
+ * invalidates when the cvar moves, so a console set takes effect on
+ * the next draw without an app relaunch. */
+/* Production effective minimum for the procedural envCube grey. Below
+ * this value, full-metal world entities (chrome pickups, dropped
+ * weapons) render pure-black because their IBL specular sample IS the
+ * cube — viewmodel weapons are saved by `r_pbr_viewmodel_floor` but
+ * non-RF_DEPTHHACK entities have no equivalent floor and crater visibly.
+ * Sweep across {0.50, 0.12, 0.08, 0.02, 0.00} showed the artifact
+ * appears reliably below ~0.04. Keep the raw cvar tunable for tooling
+ * but clamp the effective value to this minimum for normal gameplay. */
+#define Q3_PBR_ENVCUBE_GREY_MIN 0.04f
+
+/* Returns the cvar value verbatim (no production floor). Used by the
+ * diagnostic log to surface requested-vs-effective in `[Q3-PBR-IBL]
+ * procedural envCube ready ... requestedGrey=X effectiveGrey=Y`. */
+float Q3_PBREnvCubeGreyRequested(void) {
+    if (ri.Cvar_Get == NULL) return 0.08f;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_envcube_grey", "0.08", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.08f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    return v;
+}
+
+float Q3_PBREnvCubeGrey(void) {
+    float requested = Q3_PBREnvCubeGreyRequested();
+    if (ri.Cvar_Get == NULL) return requested;
+    /* Debug-only bypass for capturing the true cvar value (e.g. taking
+     * pure-PBR reference screenshots for the docs). When set != 0 the
+     * production floor is skipped — DON'T leave this on for gameplay
+     * unless you accept the black-pickup artifact. */
+    cvar_t *dbg = ri.Cvar_Get("r_pbr_envcube_grey_debug", "0", CVAR_ARCHIVE);
+    int bypassFloor = dbg ? dbg->integer : 0;
+    if (bypassFloor) return requested;
+    return (requested > Q3_PBR_ENVCUBE_GREY_MIN) ? requested : Q3_PBR_ENVCUBE_GREY_MIN;
+}
+
+/* r_pbr_emissive_intensity_max (default 1.5, CVAR_ARCHIVE, clamped
+ * 0..16) — emissive intensity ceiling used by `emissiveParamsForPBRMaterial`
+ * to cap `materials.json::emissive_intensity` values before they reach
+ * the GPU. MSL gate adds `eSample * tint * intensity` to the per-pixel
+ * colour; with the BGRA8 backbuffer the result clips to white above
+ * ~1.0 luminance. Historical default of 4.0 was set when entity emissive
+ * was silently broken (`emissiveParams` mutation happened post-encoder-
+ * upload, so the GPU never saw it). Once the 2026-06-10 ordering fix
+ * wired entity emissive correctly, the 4.0 ceiling exposed itself as
+ * white blobs on chrome/envmap entities (quad shell, health/armor
+ * pickups, viewmodel hot-bits). 1.5 keeps a slight overshoot for
+ * bright highlights without saturating. Tune upward to 2-3 for more
+ * bloom feeling once HDR backbuffer + tone mapping land. */
+float Q3_PBREmissiveIntensityMax(void) {
+    if (ri.Cvar_Get == NULL) return 1.5f;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_emissive_intensity_max", "1.5", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 1.5f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 16.0f) v = 16.0f;
+    return v;
+}
+
+float Q3_PBRViewmodelFloor(void) {
+    if (ri.Cvar_Get == NULL) return 0.35f;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_viewmodel_floor", "0.35", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.35f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    return v;
+}
+
+/* r_world_debug_mode — runtime swap for what was a compile-time constant
+ * (MetalView.swift Coordinator.worldDebugMode). Drives the world fragment
+ * shader's debug-mode branch:
+ *   0 = normal (default), 1 = base texture only, 2 = lightmap only,
+ *   3 = UV1 visualization, 4 = vertex color only.
+ * Not archived: this is a developer diag toggle; we don't want it sticking
+ * across sessions if someone forgets it on. Clamped to [0..4]. */
+int Q3_WorldDebugMode(void) {
+    if (ri.Cvar_Get == NULL) return 0;
+    cvar_t *cv = ri.Cvar_Get("r_world_debug_mode", "0", 0);
+    int v = cv ? cv->integer : 0;
+    if (v < 0) v = 0;
+    if (v > 4) v = 4;
+    return v;
+}
+
 int Q3_PBRWorldClassMatchEnabled(void) {
     if (ri.Cvar_Get == NULL) return 1;
     cvar_t *cv = ri.Cvar_Get("r_pbr_world_class_match", "1", CVAR_ARCHIVE);
     return cv ? cv->integer : 1;
+}
+
+int Q3_PBRBakedLightmaps(void) {
+    if (ri.Cvar_Get == NULL) return 0;
+    /* Diagnostic parity toggle: when enabled, Swift suppresses Q3 tcMod
+     * chains on world surfaces that have authored Remix/PBR materials,
+     * approximating RTX Remix baked-lightmap/static-surface behavior.
+     * Not archived: this is a test switch, not a user preference. */
+    cvar_t *cv = ri.Cvar_Get("r_pbr_baked_lightmaps", "0", 0);
+    return (cv && cv->integer != 0) ? 1 : 0;
+}
+
+int Q3_PBRSunShadows(void) {
+    if (ri.Cvar_Get == NULL) return 1;
+    /* Raster-path DistantLight PCF shadow map. Not archived: test/tuning switch. */
+    cvar_t *cv = ri.Cvar_Get("r_pbr_sun_shadows", "1", 0);
+    return (cv && cv->integer != 0) ? 1 : 0;
 }
 
 int Q3_PBROnlyTextures(void) {
@@ -10162,6 +10591,114 @@ int Q3_RTEntities(void) {
      * halos/ghost silhouettes around weapons and pickups when composited.
      * Keep a cvar for A/B testing once real entity RT materials land. */
     cvar_t *cv = ri.Cvar_Get("r_rt_entities", "0", CVAR_ARCHIVE);
+    return (cv && cv->integer != 0) ? 1 : 0;
+}
+
+int Q3_RTPreserveEntities(void) {
+    if (ri.Cvar_Get == NULL) return 1;
+    /* 1 (default): RT composite is encoded BEFORE the raster entity/HUD
+     * passes (MetalView.swift "RT world composite must happen before
+     * raster entities/HUD" block), so the viewmodel/pickups always draw
+     * on top of the traced world. 0: legacy A/B mode — the composite is
+     * deferred until AFTER the main entity pass, reproducing the old
+     * "RT world overwrites the gun" behavior for comparison captures.
+     * P0.2 of docs/2026-06-10-rt-gap-analysis-vs-rtx-remix.md. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_preserve_entities", "1", CVAR_ARCHIVE);
+    return (cv && cv->integer != 0) ? 1 : 0;
+}
+
+float Q3_PBRParallaxScale(void) {
+    if (ri.Cvar_Get == NULL) return 0.02f;
+    /* Height-map parallax strength for world surfaces that ship a
+     * *_height.h.rtex.dds. 0 disables. Q3 world UV density makes
+     * values above ~0.05 swim; default 0.02 is subtle-but-visible. */
+    cvar_t *cv = ri.Cvar_Get("r_pbr_parallax_scale", "0.02", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.02f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 0.08f) v = 0.08f;
+    return v;
+}
+
+int Q3_RTLights(void) {
+    if (ri.Cvar_Get == NULL) return 1;
+    /* P1: gates the NEE direct-light + shadow-ray block in rtKernel.
+     * Light data is the RTX Remix authored per-map light set baked into
+     * Resources/baseq3/pbr/lights/<map>.json. Default ON in RT mode. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_lights", "1", CVAR_ARCHIVE);
+    return (cv && cv->integer != 0) ? 1 : 0;
+}
+
+float Q3_RTLightScale(void) {
+    if (ri.Cvar_Get == NULL) return 1.0f;
+    /* Global multiplier mapping Remix-authored intensities (USDA units,
+     * up to several hundred) onto our LDR composite. Tune on device. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_light_scale", "1.0", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 1.0f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 100.0f) v = 100.0f;
+    return v;
+}
+
+int Q3_RTReflections(void) {
+    if (ri.Cvar_Get == NULL) return 1;
+    /* P3: gates the one-level specular reflect ray in rtKernel. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_reflections", "1", CVAR_ARCHIVE);
+    return (cv && cv->integer != 0) ? 1 : 0;
+}
+
+float Q3_RTReflRoughnessMax(void) {
+    if (ri.Cvar_Get == NULL) return 0.45f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_refl_roughness_max", "0.45", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.45f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    return v;
+}
+
+int Q3_RTHDR(void) {
+    if (ri.Cvar_Get == NULL) return 1;
+    /* P2: keep RT trace/accum in rgba16Float so authored lights/emissives
+     * can bloom before final LDR composite. 0 = legacy rgba8 clamp path. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_hdr", "1", CVAR_ARCHIVE);
+    return (cv && cv->integer == 0) ? 0 : 1;
+}
+
+float Q3_RTBloom(void) {
+    if (ri.Cvar_Get == NULL) return 0.35f;
+    /* P2 quick bloom intensity. This is intentionally modest; use
+     * r_rt_light_scale for source strength and this for glow spread. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_bloom", "0.35", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.35f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 3.0f) v = 3.0f;
+    return v;
+}
+
+float Q3_RTBloomThreshold(void) {
+    if (ri.Cvar_Get == NULL) return 0.85f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_bloom_threshold", "0.85", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.85f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 8.0f) v = 8.0f;
+    return v;
+}
+
+float Q3_RTBloomRadius(void) {
+    if (ri.Cvar_Get == NULL) return 3.0f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_bloom_radius", "3.0", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 3.0f;
+    if (v < 0.5f) v = 0.5f;
+    if (v > 12.0f) v = 12.0f;
+    return v;
+}
+
+int Q3_RTDebugEntityMask(void) {
+    if (ri.Cvar_Get == NULL) return 0;
+    /* Debug view: main-scene entity fragments output solid white,
+     * visualizing exactly which pixels the raster entity pass covers —
+     * i.e. what survives on top of the RT composite under
+     * r_rt_preserve_entities 1. Not archived; debug only. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_debug_entity_mask", "0", 0);
     return (cv && cv->integer != 0) ? 1 : 0;
 }
 

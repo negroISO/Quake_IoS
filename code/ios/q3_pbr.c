@@ -247,6 +247,7 @@ static const char *find_key(const char *p, const char *end, const char *key);
 static char *json_str_dup(const char *v, const char *end);
 static int json_num(const char *v, const char *end, double *out);
 static const char *resolve_path(const char *root, const char *rel);
+static int parse_hex64(const char *s, uint64_t *out);
 
 /* Parallel array: distinct entries keyed by descriptive stem ("rocket",
  * "shotgun", …). Backed by the same string arena as g_materials. */
@@ -399,6 +400,37 @@ const q3_pbr_material_t *q3_pbr_lookup_by_name(const char *q3_shader_name) {
         }
     }
 
+    /* Full-path alias table. Q3 shader names sometimes differ from the
+     * RTX Remix mod material entry by a trailing letter or stripped
+     * suffix (e.g. `metalbridge06broke` shipped by id but the mod ingest
+     * key is `metalbridge06brokeb`). Cheap explicit table so we don't
+     * miss exact matches that are off by a single character. */
+    static const struct {
+        const char *q3_full;
+        const char *mod_full;
+    } kPbrFullPathAliases[] = {
+        { "textures/gothic_floor/metalbridge06broke",
+          "textures/gothic_floor/metalbridge06brokeb" },
+        { NULL, NULL }
+    };
+    for (int a = 0; kPbrFullPathAliases[a].q3_full != NULL; ++a) {
+        char aliasFull[128];
+        q3_pbr_normalize_full_name(kPbrFullPathAliases[a].q3_full,
+                                   aliasFull, sizeof(aliasFull));
+        if (strcmp(aliasFull, fullKey) != 0) continue;
+        const char *target = kPbrFullPathAliases[a].mod_full;
+        char targetFull[128];
+        q3_pbr_normalize_full_name(target, targetFull, sizeof(targetFull));
+        for (int i = 0; i < g_named_count; ++i) {
+            char namedFull[128];
+            q3_pbr_normalize_full_name(g_named[i].name, namedFull, sizeof(namedFull));
+            if (strcmp(namedFull, targetFull) == 0) {
+                return &g_named[i].mat;
+            }
+        }
+        return NULL;
+    }
+
     /* Basename/stem match for legacy small bundles and model aliases. */
     for (int i = 0; i < g_named_count; ++i) {
         char namedStem[64];
@@ -507,6 +539,89 @@ static void load_named_materials_from_json(const char *json, const char *json_en
         if (json_num(find_key(body, body_end, "metallic_constant"), body_end, &dv)) {
             e->mat.metallic_constant = (float)dv;
         }
+
+        /* materials_by_name entries carry a "hash" field that points back
+         * to the parent hash-keyed material. The bundled JSON (as of Phase
+         * 9) stores roughness_constant / metallic_constant ONLY in the
+         * hash-keyed block, so a name-match returns NULL constants and
+         * every PBR surface falls back to the global 0.55/0.50 default.
+         * Inherit the parent's constants when the named entry doesn't
+         * supply its own. */
+        if (e->mat.roughness_constant < 0.0f || e->mat.metallic_constant < 0.0f ||
+            e->mat.sprite_cols == 0 ||
+            e->mat.albedo == NULL || e->mat.normal == NULL ||
+            e->mat.roughness == NULL || e->mat.metallic == NULL) {
+            const char *hv = find_key(body, body_end, "hash");
+            if (hv && hv < body_end && *hv == '"') {
+                const char *hs = hv + 1;
+                if (hs + 16 < body_end && hs[16] == '"') {
+                    uint64_t parent_hash;
+                    if (parse_hex64(hs, &parent_hash)) {
+                        for (int hi = 0; hi < g_materials_count; ++hi) {
+                            if (g_materials[hi].hash == parent_hash) {
+                                if (e->mat.roughness_constant < 0.0f) {
+                                    e->mat.roughness_constant = g_materials[hi].roughness_constant;
+                                }
+                                if (e->mat.metallic_constant < 0.0f) {
+                                    e->mat.metallic_constant = g_materials[hi].metallic_constant;
+                                }
+                                /* Atlas metadata only lives on the hash-keyed
+                                 * parent (remixConstants block). Named lookups
+                                 * need it inherited or atlas sub-sampling
+                                 * won't engage when shaders resolve by name. */
+                                if (e->mat.sprite_cols == 0) {
+                                    e->mat.sprite_cols = g_materials[hi].sprite_cols;
+                                    e->mat.sprite_rows = g_materials[hi].sprite_rows;
+                                    e->mat.sprite_fps  = g_materials[hi].sprite_fps;
+                                }
+                                /* Texture paths also only live on the hash
+                                 * parent for minimal named entries (e.g.
+                                 * `textures/effects/envmapyel` is just a
+                                 * `hash` back-ref + sourceTexture). Without
+                                 * this, named lookups return NULL paths even
+                                 * though the atlas DDS exists on disk and is
+                                 * reachable via the parent's `albedo` field.
+                                 * Required for entity envmap atlas animation
+                                 * on health/armor/ammo pickups. */
+                                if (e->mat.albedo == NULL) {
+                                    e->mat.albedo = g_materials[hi].albedo;
+                                }
+                                if (e->mat.normal == NULL) {
+                                    e->mat.normal = g_materials[hi].normal;
+                                }
+                                if (e->mat.roughness == NULL) {
+                                    e->mat.roughness = g_materials[hi].roughness;
+                                }
+                                if (e->mat.metallic == NULL) {
+                                    e->mat.metallic = g_materials[hi].metallic;
+                                }
+                                /* Emissive path + tint + intensity inherit
+                                 * from the parent. Required for materials
+                                 * whose JSON named entry is minimal (just
+                                 * `hash` + `sourceTexture`), but whose
+                                 * parent hash entry has the emissive DDS
+                                 * and color/intensity. */
+                                if (e->mat.emissive == NULL) {
+                                    e->mat.emissive = g_materials[hi].emissive;
+                                }
+                                if (e->mat.emissive_intensity == 0.0f) {
+                                    e->mat.emissive_intensity = g_materials[hi].emissive_intensity;
+                                }
+                                if (!e->mat.has_emissive_color &&
+                                    g_materials[hi].has_emissive_color) {
+                                    e->mat.emissive_color_r = g_materials[hi].emissive_color_r;
+                                    e->mat.emissive_color_g = g_materials[hi].emissive_color_g;
+                                    e->mat.emissive_color_b = g_materials[hi].emissive_color_b;
+                                    e->mat.has_emissive_color = 1;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         g_named_count++;
         p = body_end;
     }
@@ -716,6 +831,55 @@ int q3_pbr_table_load(const char *jsonPath, const char *assetRoot) {
         }
         if (json_num(find_key(body, body_end, "metallic_constant"), body_end, &dv)) {
             m->metallic_constant = (float)dv;
+        }
+        /* Sprite-sheet atlas: scoped to the nested "remixConstants" object
+         * because the top-level entry doesn't carry these keys. */
+        {
+            const char *rc = find_key(body, body_end, "remixConstants");
+            if (rc) {
+                while (rc < body_end && *rc != '{') rc++;
+                if (rc < body_end) {
+                    const char *rc_end = rc + 1;
+                    int rcd = 1;
+                    while (rc_end < body_end && rcd > 0) {
+                        if (*rc_end == '{') rcd++;
+                        else if (*rc_end == '}') rcd--;
+                        rc_end++;
+                    }
+                    /* sprite_sheet_* are stringified in JSON ("6"). json_num
+                     * scans past the leading quote via strtod's whitespace
+                     * skip plus our find_key already lands past the colon —
+                     * but strtod won't parse through `"`. Use a tiny helper
+                     * that consumes the optional quote. */
+                    const char *sv;
+                    sv = find_key(rc, rc_end, "sprite_sheet_cols");
+                    if (sv) {
+                        const char *p2 = sv;
+                        if (p2 < rc_end && *p2 == '"') p2++;
+                        if (json_num(p2, rc_end, &dv)) m->sprite_cols = (int)dv;
+                    }
+                    sv = find_key(rc, rc_end, "sprite_sheet_rows");
+                    if (sv) {
+                        const char *p2 = sv;
+                        if (p2 < rc_end && *p2 == '"') p2++;
+                        if (json_num(p2, rc_end, &dv)) m->sprite_rows = (int)dv;
+                    }
+                    sv = find_key(rc, rc_end, "sprite_sheet_fps");
+                    if (sv) {
+                        const char *p2 = sv;
+                        if (p2 < rc_end && *p2 == '"') p2++;
+                        if (json_num(p2, rc_end, &dv)) m->sprite_fps = (float)dv;
+                    }
+                    /* Remix often omits sprite_sheet_rows for horizontal
+                     * strips. Treat that as a single-row atlas instead of
+                     * disabling atlas sampling. This affects launch pads,
+                     * techborder/blue-line columns, and other *_animation
+                     * strips that only declare sprite_sheet_cols + fps. */
+                    if (m->sprite_cols > 0 && m->sprite_rows <= 0) {
+                        m->sprite_rows = 1;
+                    }
+                }
+            }
         }
         /* emissive_color is an array — find_key returns pointer right
          * after the ':' so scan for '[' then 3 numbers. */

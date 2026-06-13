@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-BUNDLE_ID="com.quake3ios.app"
+BUNDLE_ID="${BUNDLE_ID:-com.quake3ios.rt}"
 RUN_SECS="${RUN_SECS:-90}"
 DEMO="${DEMO:-four}"
 VIDEO_NAME="${VIDEO_NAME:-$DEMO}"
@@ -34,11 +34,19 @@ DERIVED="${DERIVED:-$HOME/Library/Developer/Xcode/DerivedData}"
 # silently use a different binary than xcodebuild produced. Pick by NEWEST
 # mtime instead, and skip Index.noindex (Xcode's source-indexer build, not
 # the actual install product).
-APP=$(/usr/bin/find "$DERIVED" -maxdepth 6 -type d -name "Quake3-iOS.app" \
+APP=$(/usr/bin/find "$DERIVED" -maxdepth 6 -type d \( -name "Quake3-iOS.app" -o -name "Q3_RT.app" \) \
         -path "*Debug-iphoneos*" -not -path "*Index.noindex*" 2>/dev/null \
-        | while read -r p; do echo "$(/usr/bin/stat -f '%m' "$p") $p"; done \
+        | while read -r p; do
+            plist="$p/Info.plist"
+            if [[ -f "$plist" ]]; then
+                bid=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$plist" 2>/dev/null)
+                if [[ "$bid" == "$BUNDLE_ID" ]]; then
+                    echo "$(/usr/bin/stat -f '%m' "$p") $p"
+                fi
+            fi
+          done \
         | sort -rn | head -1 | cut -d' ' -f2-)
-[[ -z "$APP" ]] && { echo "ERR: Debug-iphoneos .app not found — build for device first" >&2; exit 1; }
+[[ -z "$APP" ]] && { echo "ERR: Debug-iphoneos .app for $BUNDLE_ID not found in $DERIVED — build for device first" >&2; exit 1; }
 
 if [[ -z "${DEVICE:-}" ]]; then
     # Match lines like:
@@ -68,21 +76,36 @@ echo "→ runtime: ${RUN_SECS}s"
 echo "→ command: $LAUNCH_COMMAND"
 
 # Reinstall to flush any prior crash state. devicectl install is
-# idempotent and atomic; on second run it overwrites in place.
-xcrun devicectl device install app --device "$DEVICE" "$APP" >/dev/null 2>&1
-echo "→ installed"
+# idempotent and atomic, but this bundle is huge; set SKIP_INSTALL=1
+# after a successful install when only command-line cvars/maps change.
+if [[ "${SKIP_INSTALL:-0}" == "1" ]]; then
+    echo "→ installed: SKIPPED (SKIP_INSTALL=1)"
+else
+    xcrun devicectl device install app --device "$DEVICE" "$APP" >/dev/null 2>&1
+    echo "→ installed"
+fi
 
 # Push autoexec.cfg if present. Forces logfile=2/developer=1 so
 # qconsole.log captures the boot/shader trace for cross-engine diff
 # against q3dev_run_ioq3.sh runs.
 AUTOEXEC="Resources/baseq3/autoexec.cfg"
-if [[ -f "$AUTOEXEC" ]]; then
-    xcrun devicectl device copy to --device "$DEVICE" \
-        --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
-        --source "$AUTOEXEC" \
-        --destination "Documents/baseq3/autoexec.cfg" >/dev/null 2>&1 \
-        && echo "→ cfg:    pushed autoexec.cfg"
+TMP_AUTOEXEC=""
+if [[ ! -f "$AUTOEXEC" ]]; then
+    TMP_AUTOEXEC=$(mktemp /tmp/q3_autoexec.XXXXXX.cfg)
+    cat > "$TMP_AUTOEXEC" <<'CFG'
+seta logfile 2
+seta developer 1
+seta r_logFile 0
+seta com_speeds 0
+CFG
+    AUTOEXEC="$TMP_AUTOEXEC"
 fi
+xcrun devicectl device copy to --device "$DEVICE" \
+    --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
+    --source "$AUTOEXEC" \
+    --destination "Documents/baseq3/autoexec.cfg" >/dev/null 2>&1 \
+    && echo "→ cfg:    pushed autoexec.cfg"
+[[ -n "$TMP_AUTOEXEC" ]] && rm -f "$TMP_AUTOEXEC"
 
 # Seed any local demos onto the device. The .app bundle does NOT
 # carry baseq3 resources (pk3s ship via Files-app sharing into
@@ -109,7 +132,7 @@ fi
 xcrun devicectl device process launch \
     --device "$DEVICE" \
     --environment-variables "{\"Q3_LAUNCH_COMMAND\":\"$LAUNCH_COMMAND\"}" \
-    --console com.quake3ios.app \
+    --console "$BUNDLE_ID" \
     > "$OUTDIR/stdout.log" 2>&1 &
 LAUNCH_PID=$!
 echo "→ launched (wrapper pid $LAUNCH_PID)"
@@ -135,6 +158,16 @@ if xcrun devicectl device copy from \
     echo "→ qlog:   $OUTDIR/qconsole.log ($QC_LINES lines)"
 else
     echo "→ qlog:   FAILED to pull (autoexec.cfg pushed? logfile cvar live?)"
+fi
+
+# Pull q3_diag.log — C/Swift renderer telemetry lands in Documents/.
+if xcrun devicectl device copy from \
+    --device "$DEVICE" \
+    --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
+    --source "Documents/q3_diag.log" \
+    --destination "$OUTDIR/q3_diag.log" >/dev/null 2>&1; then
+    DIAG_LINES=$(wc -l < "$OUTDIR/q3_diag.log" 2>/dev/null || echo 0)
+    echo "→ diag:   $OUTDIR/q3_diag.log ($DIAG_LINES lines)"
 fi
 
 # Pull the AVI out of the app sandbox via devicectl. Path is

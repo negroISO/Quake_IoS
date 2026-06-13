@@ -709,7 +709,7 @@ static void CM_SetBorderInward( facet_t *facet, const cGrid_t *grid, int gridPla
 						  int i, int j, int which ) {
 	int		k, l;
 	const float *points[4];
-	int		numPoints;
+    int		numPoints = 0;
 
 	switch ( which ) {
 	case -1:
@@ -730,10 +730,6 @@ static void CM_SetBorderInward( facet_t *facet, const cGrid_t *grid, int gridPla
 		points[1] = grid->points[i][j+1];
 		points[2] = grid->points[i][j];
 		numPoints = 3;
-		break;
-	default:
-		Com_Error( ERR_FATAL, "CM_SetBorderInward: bad parameter" );
-		numPoints = 0;
 		break;
 	}
 

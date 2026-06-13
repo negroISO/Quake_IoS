@@ -57,9 +57,10 @@ final class Q3AudioManager: @unchecked Sendable {
             return
         }
         let node = AVAudioSourceNode(format: sourceFormat) { _, _, frameCount, audioBufferList -> OSStatus in
-            let abl = UnsafeMutableAudioBufferListPointer(audioBufferList)
-            guard let buffer = abl[0].mData else { return noErr }
-            let dest = buffer.assumingMemoryBound(to: Int16.self)
+            // Access the first buffer directly from the AudioBufferList
+            let firstBuffer = audioBufferList.pointee.mBuffers
+            guard let mData = firstBuffer.mData else { return noErr }
+            let dest = mData.assumingMemoryBound(to: Int16.self)
             _ = Q3IOS_AudioPullStereo16(dest, Int32(frameCount))
             return noErr
         }
