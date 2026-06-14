@@ -7190,14 +7190,15 @@ struct MetalView: UIViewRepresentable {
             }
             let hasEmissive = (mat.emissive != nil)
             // 2026-06-10: ceiling is now tunable via `r_pbr_emissive_intensity_max`
-            // cvar (default 1.5). Hard-coded 4.0 was the historical default
+            // cvar (default 3.0). Hard-coded 4.0 was the historical default
             // back when entity-side emissive was silently broken (params
             // mutation happened post-upload). Once today's ordering fix
             // wired emissive correctly on entity draws, 4.0 turned chrome/
             // envmap entities (quad shell, health/armor pickups, viewmodel
             // hot-bits) into white blobs because BGRA8 saturates above
-            // ~1.0 luminance. 1.5 keeps a slight HDR-style overshoot for
-            // bright highlights without clipping. materials.json values
+            // ~1.0 luminance. q3dm17 Catalyst sweeps on 2026-06-14 showed
+            // 3.0 restores the authored space-map emissive punch without
+            // returning to the old all-white 4.0/8.0 look. materials.json values
             // range up to 982 (RTX Remix HDR authoring); they all clamp
             // down to the ceiling. Real fix is `.rgba16Float` backbuffer
             // + tone mapping — deferred.

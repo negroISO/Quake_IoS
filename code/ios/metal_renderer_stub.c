@@ -10428,7 +10428,7 @@ float Q3_PBREnvCubeGrey(void) {
     return (requested > Q3_PBR_ENVCUBE_GREY_MIN) ? requested : Q3_PBR_ENVCUBE_GREY_MIN;
 }
 
-/* r_pbr_emissive_intensity_max (default 1.5, CVAR_ARCHIVE, clamped
+/* r_pbr_emissive_intensity_max (default 3.0, CVAR_ARCHIVE, clamped
  * 0..16) — emissive intensity ceiling used by `emissiveParamsForPBRMaterial`
  * to cap `materials.json::emissive_intensity` values before they reach
  * the GPU. MSL gate adds `eSample * tint * intensity` to the per-pixel
@@ -10438,13 +10438,13 @@ float Q3_PBREnvCubeGrey(void) {
  * upload, so the GPU never saw it). Once the 2026-06-10 ordering fix
  * wired entity emissive correctly, the 4.0 ceiling exposed itself as
  * white blobs on chrome/envmap entities (quad shell, health/armor
- * pickups, viewmodel hot-bits). 1.5 keeps a slight overshoot for
- * bright highlights without saturating. Tune upward to 2-3 for more
- * bloom feeling once HDR backbuffer + tone mapping land. */
+ * pickups, viewmodel hot-bits). Catalyst q3dm17 sweeps on 2026-06-14
+ * showed 3.0 restores the authored RTX Remix-style space-map emissive
+ * punch while staying below the old all-white 4.0/8.0 look. */
 float Q3_PBREmissiveIntensityMax(void) {
-    if (ri.Cvar_Get == NULL) return 1.5f;
-    cvar_t *cv = ri.Cvar_Get("r_pbr_emissive_intensity_max", "1.5", CVAR_ARCHIVE);
-    float v = cv ? cv->value : 1.5f;
+    if (ri.Cvar_Get == NULL) return 3.0f;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_emissive_intensity_max", "3.0", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 3.0f;
     if (v < 0.0f) v = 0.0f;
     if (v > 16.0f) v = 16.0f;
     return v;
