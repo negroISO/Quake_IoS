@@ -323,10 +323,18 @@ static int s_worldFlareCount;
 static uint32_t s_flareTextureHandle;
 
 typedef struct {
+    vec3_t mins;
+    vec3_t maxs;
+    int firstSurface;
+    int numSurfaces;
+} metalInlineModel_t;
+
+typedef struct {
     qboolean inUse;
     qhandle_t handle;
     char name[MAX_QPATH];
     md3Header_t *md3;
+    int inlineModelIndex; /* >0 for BSP inline brush models: "*1", "*2", ... */
 } metalModel_t;
 
 typedef struct {
@@ -390,6 +398,8 @@ typedef struct {
     vec3_t lightGridOrigin;
     vec3_t lightGridSize;     /* cell dims — default (64,64,128) */
     int    lightGridBounds[3]; /* cell counts per axis */
+    metalInlineModel_t *inlineModels;
+    int inlineModelCount;
     char name[MAX_QPATH];
 } metalWorld_t;
 
@@ -2498,6 +2508,9 @@ static void FreeWorldMapData(void) {
     if (s_world.animShaderSlots != NULL) {
         ri.Free(s_world.animShaderSlots);
     }
+    if (s_world.inlineModels != NULL) {
+        ri.Free(s_world.inlineModels);
+    }
     if (s_worldLightmapHandles != NULL) {
         ri.Free(s_worldLightmapHandles);
         s_worldLightmapHandles = NULL;
@@ -3071,10 +3084,55 @@ static qboolean TryRegisterModelPath(const char *name, metalModel_t *modelSlot) 
     return qtrue;
 }
 
+static qhandle_t RegisterInlineBrushModel(const char *name) {
+    int idx;
+    metalModel_t *existing;
+    metalModel_t *modelSlot;
+
+    if (name == NULL || name[0] != '*' || name[1] == '\0') {
+        return 0;
+    }
+
+    idx = atoi(name + 1);
+    if (idx <= 0 || idx >= s_world.inlineModelCount || s_world.inlineModels == NULL) {
+        return 0;
+    }
+
+    existing = FindModelByName(name);
+    if (existing != NULL) {
+        return existing->handle;
+    }
+
+    modelSlot = AllocModelSlot();
+    if (modelSlot == NULL) {
+        ri.Printf(PRINT_WARNING, "Metal model: model registry full, dropping inline '%s'\n", name);
+        return 0;
+    }
+
+    Q_strncpyz(modelSlot->name, name, sizeof(modelSlot->name));
+    modelSlot->md3 = NULL;
+    modelSlot->inlineModelIndex = idx;
+    if (MetalRenderAuditEnabled()) {
+        const metalInlineModel_t *im = &s_world.inlineModels[idx];
+        ri.Printf(PRINT_ALL,
+                  "[Q3-BMODEL] registered %s surfaces=%d..%d bounds=(%.0f %.0f %.0f)-(%.0f %.0f %.0f)\n",
+                  name,
+                  im->firstSurface,
+                  im->firstSurface + im->numSurfaces - 1,
+                  im->mins[0], im->mins[1], im->mins[2],
+                  im->maxs[0], im->maxs[1], im->maxs[2]);
+    }
+    return modelSlot->handle;
+}
+
 static qhandle_t ResolveAndRegisterModel(const char *name) {
     metalModel_t *existing;
     metalModel_t *modelSlot;
     char candidate[MAX_QPATH];
+
+    if (name != NULL && name[0] == '*') {
+        return RegisterInlineBrushModel(name);
+    }
 
     existing = FindModelByName(name);
     if (existing != NULL) {
@@ -4634,6 +4692,224 @@ static uint32_t MetalWorldStageRenderPass(const Q3MetalWorldStage *stage) {
     return 0;
 }
 
+static qboolean MetalInlineBrushModelValid(const metalModel_t *model) {
+    int idx;
+    if (model == NULL || model->inlineModelIndex <= 0) return qfalse;
+    idx = model->inlineModelIndex;
+    if (s_world.inlineModels == NULL || idx >= s_world.inlineModelCount) return qfalse;
+    if (s_world.surfaceDrawRanges == NULL || s_world.draws == NULL) return qfalse;
+    return qtrue;
+}
+
+static int MetalWorldDrawRenderableStageCount(const Q3MetalWorldDrawCmd *draw) {
+    uint32_t si;
+    uint32_t stageCount;
+    int count = 0;
+    if (draw == NULL) return 0;
+    stageCount = draw->stageCount;
+    if (stageCount > Q3_METAL_MAX_STAGES) stageCount = Q3_METAL_MAX_STAGES;
+    for (si = 0; si < stageCount; ++si) {
+        const Q3MetalWorldStage *stage = &draw->stages[si];
+        if (stage->useLightmap != 0) continue;
+        if (stage->textureHandle == 0) continue;
+        count++;
+    }
+    return count;
+}
+
+static void MetalMeasureInlineBrushModel(const metalModel_t *model,
+                                         uint32_t *outVerts,
+                                         uint32_t *outIndices,
+                                         uint32_t *outDraws) {
+    const metalInlineModel_t *im;
+    int si;
+    if (outVerts != NULL) *outVerts = 0;
+    if (outIndices != NULL) *outIndices = 0;
+    if (outDraws != NULL) *outDraws = 0;
+    if (!MetalInlineBrushModelValid(model)) return;
+
+    im = &s_world.inlineModels[model->inlineModelIndex];
+    for (si = 0; si < im->numSurfaces; ++si) {
+        int surfaceIndex = im->firstSurface + si;
+        Q3MetalSurfaceDrawRange range;
+        uint32_t di;
+        if (surfaceIndex < 0 || surfaceIndex >= s_world.surfaceDrawRangeCount) continue;
+        range = s_world.surfaceDrawRanges[surfaceIndex];
+        if (range.firstDraw >= s_world.drawCount) continue;
+        if (range.firstDraw + range.drawCount > s_world.drawCount) {
+            range.drawCount = s_world.drawCount - range.firstDraw;
+        }
+        for (di = 0; di < range.drawCount; ++di) {
+            const Q3MetalWorldDrawCmd *draw = &s_world.draws[range.firstDraw + di];
+            int stageDraws = MetalWorldDrawRenderableStageCount(draw);
+            if (stageDraws <= 0 || draw->indexCount == 0) continue;
+            if (outVerts != NULL) *outVerts += draw->indexCount;
+            if (outIndices != NULL) *outIndices += draw->indexCount;
+            if (outDraws != NULL) *outDraws += (uint32_t)stageDraws;
+        }
+    }
+}
+
+static uint32_t EntityFlagsForWorldStage(const Q3MetalWorldStage *stage,
+                                         qhandle_t textureHandle) {
+    uint32_t flags = 0;
+    int blendMode;
+    if (stage == NULL) return flags;
+    if (stage->cullMode == METAL_SHADER_CULL_DISABLE) {
+        flags |= Q3_METAL_ENTITY_DRAWFLAG_NOCULL;
+    }
+    blendMode = MetalWorldBlendClass(stage->srcBlend, stage->dstBlend);
+    if (blendMode == 1) flags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+    else if (blendMode == 2) flags |= Q3_METAL_ENTITY_DRAWFLAG_ALPHA;
+    else if (blendMode == 3) flags |= Q3_METAL_ENTITY_DRAWFLAG_FILTER;
+    else if (blendMode == 4) flags |= Q3_METAL_ENTITY_DRAWFLAG_SUBTRACT;
+    else if (blendMode == 5) flags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE_FULL;
+
+    if (stage->tcGen == 1) flags |= Q3_METAL_ENTITY_DRAWFLAG_TCGEN_ENV;
+    if (stage->wrapClampMode != 0) flags |= Q3_METAL_ENTITY_DRAWFLAG_CLAMPMAP;
+    if (stage->alphaFunc == 1) flags |= Q3_METAL_ENTITY_DRAWFLAG_ATEST_GT0;
+
+    flags = EntityFlagsForTexture(textureHandle, flags, qfalse);
+    return flags;
+}
+
+static void CopyWorldStageTcModsToDrawCmd(uint32_t cursor,
+                                          const Q3MetalWorldStage *stage) {
+    uint32_t n;
+    uint32_t i;
+    if (stage == NULL) {
+        s_entityDraws[cursor].tcModCount = 0;
+        return;
+    }
+    n = stage->tcModCount;
+    if (n > Q3_MAX_TCMODS) n = Q3_MAX_TCMODS;
+    s_entityDraws[cursor].tcModCount = n;
+    for (i = 0; i < n; ++i) {
+        s_entityDraws[cursor].tcMods[i] = stage->tcMods[i];
+    }
+}
+
+static void MetalTransformInlineBrushPoint(const refEntity_t *ent,
+                                           const float in[3],
+                                           float out[3]) {
+    out[0] = ent->origin[0]
+        + ent->axis[0][0] * in[0]
+        + ent->axis[1][0] * in[1]
+        + ent->axis[2][0] * in[2];
+    out[1] = ent->origin[1]
+        + ent->axis[0][1] * in[0]
+        + ent->axis[1][1] * in[1]
+        + ent->axis[2][1] * in[2];
+    out[2] = ent->origin[2]
+        + ent->axis[0][2] * in[0]
+        + ent->axis[1][2] * in[1]
+        + ent->axis[2][2] * in[2];
+}
+
+static void MetalTransformInlineBrushNormal(const refEntity_t *ent,
+                                            const float in[3],
+                                            float out[3]) {
+    out[0] = ent->axis[0][0] * in[0]
+        + ent->axis[1][0] * in[1]
+        + ent->axis[2][0] * in[2];
+    out[1] = ent->axis[0][1] * in[0]
+        + ent->axis[1][1] * in[1]
+        + ent->axis[2][1] * in[2];
+    out[2] = ent->axis[0][2] * in[0]
+        + ent->axis[1][2] * in[1]
+        + ent->axis[2][2] * in[2];
+    VectorNormalize(out);
+}
+
+static void MetalEmitInlineBrushVertex(uint32_t dstIndex,
+                                       const Q3MetalWorldVertex *src,
+                                       const refEntity_t *ent) {
+    float er = 1.0f, eg = 1.0f, eb = 1.0f, ea = 1.0f;
+    if (ent->shader.rgba[3] != 0) {
+        er = (float)ent->shader.rgba[0] / 255.0f;
+        eg = (float)ent->shader.rgba[1] / 255.0f;
+        eb = (float)ent->shader.rgba[2] / 255.0f;
+        ea = (float)ent->shader.rgba[3] / 255.0f;
+    }
+    MetalTransformInlineBrushPoint(ent, src->position, s_entityVertices[dstIndex].position);
+    s_entityVertices[dstIndex].texCoord[0] = src->texCoord[0];
+    s_entityVertices[dstIndex].texCoord[1] = src->texCoord[1];
+    s_entityVertices[dstIndex].color[0] = src->color[0] * er;
+    s_entityVertices[dstIndex].color[1] = src->color[1] * eg;
+    s_entityVertices[dstIndex].color[2] = src->color[2] * eb;
+    s_entityVertices[dstIndex].color[3] = src->color[3] * ea;
+    MetalTransformInlineBrushNormal(ent, src->normal, s_entityVertices[dstIndex].normal);
+}
+
+static void MetalEmitInlineBrushModel(const metalSceneEntity_t *sceneEntity,
+                                      const metalModel_t *model,
+                                      uint32_t *vertexCursor,
+                                      uint32_t *indexCursor,
+                                      uint32_t *drawCursor) {
+    const metalInlineModel_t *im;
+    int si;
+    if (sceneEntity == NULL || !MetalInlineBrushModelValid(model)) return;
+    if (vertexCursor == NULL || indexCursor == NULL || drawCursor == NULL) return;
+
+    im = &s_world.inlineModels[model->inlineModelIndex];
+    for (si = 0; si < im->numSurfaces; ++si) {
+        int surfaceIndex = im->firstSurface + si;
+        Q3MetalSurfaceDrawRange range;
+        uint32_t di;
+        if (surfaceIndex < 0 || surfaceIndex >= s_world.surfaceDrawRangeCount) continue;
+        range = s_world.surfaceDrawRanges[surfaceIndex];
+        if (range.firstDraw >= s_world.drawCount) continue;
+        if (range.firstDraw + range.drawCount > s_world.drawCount) {
+            range.drawCount = s_world.drawCount - range.firstDraw;
+        }
+        for (di = 0; di < range.drawCount; ++di) {
+            const Q3MetalWorldDrawCmd *draw = &s_world.draws[range.firstDraw + di];
+            uint32_t firstIndex;
+            uint32_t tri;
+            uint32_t stageCount;
+            uint32_t st;
+            if (MetalWorldDrawRenderableStageCount(draw) <= 0 || draw->indexCount == 0) continue;
+            firstIndex = *indexCursor;
+
+            for (tri = 0; tri + 2 < draw->indexCount; tri += 3) {
+                uint32_t order[3];
+                int oi;
+                if (sceneEntity->mirrored) {
+                    order[0] = 0; order[1] = 2; order[2] = 1;
+                } else {
+                    order[0] = 0; order[1] = 1; order[2] = 2;
+                }
+                for (oi = 0; oi < 3; ++oi) {
+                    uint32_t srcIndex = s_world.indices[draw->firstIndex + tri + order[oi]];
+                    uint32_t dstIndex = *vertexCursor;
+                    if (srcIndex >= s_world.vertexCount) continue;
+                    MetalEmitInlineBrushVertex(dstIndex, &s_world.vertices[srcIndex], &sceneEntity->entity);
+                    s_entityIndices[*indexCursor] = dstIndex;
+                    *vertexCursor += 1;
+                    *indexCursor += 1;
+                }
+            }
+
+            stageCount = draw->stageCount;
+            if (stageCount > Q3_METAL_MAX_STAGES) stageCount = Q3_METAL_MAX_STAGES;
+            for (st = 0; st < stageCount; ++st) {
+                const Q3MetalWorldStage *stage = &draw->stages[st];
+                qhandle_t stageHandle = (qhandle_t)stage->textureHandle;
+                if (stage->useLightmap != 0 || stageHandle == 0) continue;
+                s_entityDraws[*drawCursor].firstIndex = firstIndex;
+                s_entityDraws[*drawCursor].indexCount = *indexCursor - firstIndex;
+                s_entityDraws[*drawCursor].textureHandle = (uint32_t)stageHandle;
+                s_entityDraws[*drawCursor].flags = EntityFlagsForWorldStage(stage, stageHandle);
+                s_entityDraws[*drawCursor].fogIndex = draw->fogIndex;
+                EmitMetalEntityStageAuditForHandle(stageHandle, "bmodel");
+                SetEntityDrawColor(*drawCursor, &sceneEntity->entity, stageHandle);
+                CopyWorldStageTcModsToDrawCmd(*drawCursor, stage);
+                *drawCursor += 1;
+            }
+        }
+    }
+}
+
 static qboolean MetalWorldDrawHasLightmapStageC(const Q3MetalWorldDrawCmd *draw) {
     uint32_t i;
     uint32_t count;
@@ -5356,7 +5632,23 @@ static qboolean LoadWorldMapData(const char *name) {
                                                     LittleLong(header->lumps[LUMP_MODELS].fileofs));
         int modelLen = LittleLong(header->lumps[LUMP_MODELS].filelen);
         if (modelLen >= (int)sizeof(dmodel_t)) {
+            int modelCount = modelLen / (int)sizeof(dmodel_t);
+            int mi;
             LoadLightgrid(header, &models[0]);
+            s_world.inlineModels = ri.Malloc(modelCount * sizeof(*s_world.inlineModels));
+            if (s_world.inlineModels != NULL) {
+                Com_Memset(s_world.inlineModels, 0, modelCount * sizeof(*s_world.inlineModels));
+                s_world.inlineModelCount = modelCount;
+                for (mi = 0; mi < modelCount; ++mi) {
+                    int axis;
+                    for (axis = 0; axis < 3; ++axis) {
+                        s_world.inlineModels[mi].mins[axis] = LittleFloat(models[mi].mins[axis]);
+                        s_world.inlineModels[mi].maxs[axis] = LittleFloat(models[mi].maxs[axis]);
+                    }
+                    s_world.inlineModels[mi].firstSurface = LittleLong(models[mi].firstSurface);
+                    s_world.inlineModels[mi].numSurfaces = LittleLong(models[mi].numSurfaces);
+                }
+            }
         }
     }
 
@@ -8486,6 +8778,14 @@ static void RE_RenderScene(const refdef_t *fd) {
             }
 
             model = FindModelByHandle(sceneEntity->entity.hModel);
+            if (MetalInlineBrushModelValid(model)) {
+                uint32_t bVerts = 0, bIndices = 0, bDraws = 0;
+                MetalMeasureInlineBrushModel(model, &bVerts, &bIndices, &bDraws);
+                totalEntityVerts += bVerts;
+                totalEntityIndices += bIndices;
+                totalEntityDraws += bDraws;
+                continue;
+            }
             if (model == NULL || model->md3 == NULL) {
                 continue;
             }
@@ -8958,6 +9258,13 @@ static void RE_RenderScene(const refdef_t *fd) {
                 }
 
                 model = FindModelByHandle(sceneEntity->entity.hModel);
+                if (MetalInlineBrushModelValid(model)) {
+                    MetalEmitInlineBrushModel(sceneEntity, model,
+                                              &entityVertexCursor,
+                                              &entityIndexCursor,
+                                              &entityDrawCursor);
+                    continue;
+                }
                 if (model == NULL || model->md3 == NULL) {
                     continue;
                 }
