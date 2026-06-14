@@ -2945,10 +2945,17 @@ struct MetalView: UIViewRepresentable {
                     float chroma = max(texel.r, max(texel.g, texel.b)) - min(texel.r, min(texel.g, texel.b));
                     if (lumAlpha > 0.92 && chroma < 0.14) synthA = 0.0;
                 } else {
-                    synthA = saturate(baseAlpha * baseAlpha * 1.35);
+                    /* Dark-background additive FX (muzzle flashes, beams,
+                     * plasma/rail cores) are authored as straight RGB on
+                     * black, not premultiplied alpha. The old squared alpha
+                     * plus RGB premultiply made weapon shots nearly vanish,
+                     * especially through the GL_SRC_ALPHA/GL_ONE path. */
+                    synthA = saturate(baseAlpha * 1.50);
                 }
                 synthA *= radial;
-                texel.rgb *= synthA;
+                if (uniforms.forceLuminanceAlpha != 1u) {
+                    texel.rgb *= synthA;
+                }
                 texel.a = synthA;
             }
             /* Entity alphaFunc discard — mirrors upstream GLS_ATEST_GT_0 /
