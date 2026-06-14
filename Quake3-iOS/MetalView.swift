@@ -6222,7 +6222,19 @@ struct MetalView: UIViewRepresentable {
                 pbrLog("[Q3-PBR-SWIFT] atlas-load handle=\(handle) name='\(textureNameForLog(handle))' cols=\(mat.sprite_cols) rows=\(mat.sprite_rows) fps=\(mat.sprite_fps)")
             }
             guard let albedoCStr = mat.albedo else {
-                pbrLog("[Q3-PBR-SWIFT] no-albedo handle=\(handle) name='\(textureNameForLog(handle))' (material found but albedo slot is NULL)")
+                func hasNonEmptyPath(_ ptr: UnsafePointer<CChar>?) -> Bool {
+                    guard let ptr else { return false }
+                    return ptr.pointee != 0
+                }
+                let hasSidecarPayload =
+                    hasNonEmptyPath(mat.normal) ||
+                    hasNonEmptyPath(mat.roughness) ||
+                    hasNonEmptyPath(mat.metallic) ||
+                    hasNonEmptyPath(mat.emissive) ||
+                    hasNonEmptyPath(mat.height)
+                if hasSidecarPayload {
+                    pbrLog("[Q3-PBR-SWIFT] no-albedo handle=\(handle) name='\(textureNameForLog(handle))' (material found but albedo slot is NULL)")
+                }
                 pbrTriedAndMissed.insert(handle); return nil
             }
             let path = String(cString: albedoCStr)
