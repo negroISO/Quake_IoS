@@ -6752,6 +6752,41 @@ static void ShaderMap_RegisterAnimated(const char *name,
     s_shaderMapCount += 1;
 }
 
+static qboolean NormalizeFogColorChannels(const char *shaderName, float fogColor[3]) {
+    float raw[3];
+    float maxChannel;
+    float scale = 0.0f;
+    raw[0] = fogColor[0];
+    raw[1] = fogColor[1];
+    raw[2] = fogColor[2];
+    maxChannel = raw[0];
+    if (raw[1] > maxChannel) maxChannel = raw[1];
+    if (raw[2] > maxChannel) maxChannel = raw[2];
+    if (maxChannel <= 1.5f) {
+        return qfalse;
+    }
+    /* Q3 fogparms are authored in 0..1, but some community shaders
+     * shipped percentage-style colors (`64 0 0` == .64 red). Treat
+     * 0..100 as percent, and only fall back to byte normalization for
+     * larger 0..255 values. */
+    if (maxChannel <= 100.0f) {
+        scale = 100.0f;
+    } else if (maxChannel <= 255.0f) {
+        scale = 255.0f;
+    }
+    if (scale > 0.0f) {
+        fogColor[0] = raw[0] / scale;
+        fogColor[1] = raw[1] / scale;
+        fogColor[2] = raw[2] / scale;
+        MetalTelemetryPrintf("metal_fog", PRINT_ALL,
+            "[Q3-FOG] normalized fogparms shader='%s' source=(%.3f,%.3f,%.3f) raw=(%.3f,%.3f,%.3f) scale=%.0f\n",
+            shaderName, raw[0], raw[1], raw[2],
+            fogColor[0], fogColor[1], fogColor[2], scale);
+        return qtrue;
+    }
+    return qfalse;
+}
+
 static void ParseShaderText(const char *text) {
     const char *p = text;
     const char *token;
@@ -7079,6 +7114,7 @@ static void ParseShaderText(const char *text) {
                         t = COM_ParseExt(&p, qfalse); if (t[0]) fogDistance = (float)atof(t);
                         (void)COM_ParseExt(&p, qfalse);
                     }
+                    NormalizeFogColorChannels(shaderName, fogColor);
                     gotFog = qtrue;
                     cleanGraph.fogColor[0] = fogColor[0];
                     cleanGraph.fogColor[1] = fogColor[1];
@@ -7090,9 +7126,9 @@ static void ParseShaderText(const char *text) {
                     MetalTelemetryPrintf("metal_fog", PRINT_ALL,
                         "[Q3-FOG] parsed fogparms shader='%s' color=(%.3f,%.3f,%.3f) dist=%.0f\n",
                         shaderName, fogColor[0], fogColor[1], fogColor[2], fogDistance);
-                    /* Author-typo guard (e.g. mkc_fog_dm4 ships `64 0 0`,
-                     * almost certainly meant .64): keep data fidelity, just
-                     * flag out-of-range channels so captures surface it. */
+                    /* Author-typo guard: NormalizeFogColorChannels() handles
+                     * percentage/byte-style values. Anything still above
+                     * range is genuinely suspicious and should surface. */
                     if (fogColor[0] > 1.5f || fogColor[1] > 1.5f || fogColor[2] > 1.5f) {
                         MetalTelemetryPrintf("metal_fog", PRINT_ALL,
                             "[Q3-FOG] WARN out-of-range fog channel shader='%s' raw=(%.3f,%.3f,%.3f)\n",
