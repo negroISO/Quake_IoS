@@ -4654,12 +4654,36 @@ struct MetalView: UIViewRepresentable {
             var albedoWeights: [UInt32: Int] = [:]
             var lightmapWeights: [UInt32: Int] = [:]
             let fogOnlyBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY)
+
+            func rtRepresentativeStage(for draw: Q3MetalWorldDrawCmd) -> Q3MetalWorldStage? {
+                let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+                guard stageCount > 0 else { return nil }
+
+                func candidates(_ predicate: (Q3MetalWorldStage) -> Bool) -> Q3MetalWorldStage? {
+                    for i in 0..<stageCount {
+                        let s = Self.worldStage(draw, i)
+                        if s.useLightmap == 0 && s.textureHandle != 0 && predicate(s) { return s }
+                    }
+                    return nil
+                }
+
+                // RT has one material per primitive. Several stock Q3 shaders
+                // place envmap/chrome/lightmap overlay stages before the real
+                // base texture (q3tourney4: chrome_metal, pewter_shiney, etc.).
+                // Using stage 0 makes solid walls sample chrome/water-like FX.
+                // Prefer the first non-env opaque base stage, then any non-env
+                // base stage, and only fall back to stage 0 when no better
+                // albedo-bearing stage exists.
+                if let s = candidates({ $0.tcGen != 1 && Self.worldBlendClass(for: $0) == 0 }) { return s }
+                if let s = candidates({ $0.tcGen != 1 }) { return s }
+                if let s = candidates({ _ in true }) { return s }
+                return nil
+            }
+
             for draw in draws where draw.indexCount >= 3 {
                 if (draw.flags & fogOnlyBit) != 0 { continue }
-                let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
-                guard stageCount > 0 else { continue }
+                guard let stage = rtRepresentativeStage(for: draw) else { continue }
                 let triCount = max(1, Int(draw.indexCount / 3))
-                let stage = Self.worldStage(draw, 0)
                 if stage.useLightmap == 0 && stage.textureHandle != 0 {
                     albedoWeights[stage.textureHandle, default: 0] += triCount
                 }
@@ -4692,9 +4716,7 @@ struct MetalView: UIViewRepresentable {
             var skippedOverwrite = 0
             for draw in draws where draw.indexCount >= 3 {
                 if (draw.flags & fogOnlyBit) != 0 { continue }
-                let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
-                guard stageCount > 0 else { continue }
-                let stage = Self.worldStage(draw, 0)
+                guard let stage = rtRepresentativeStage(for: draw) else { continue }
                 let skyFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
                 let isSkyDraw = (draw.flags & skyFlagBit) != 0
                 let aSlotOptional = albedoSlots[stage.textureHandle]
