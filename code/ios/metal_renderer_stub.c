@@ -10971,13 +10971,20 @@ int Q3_RTPreserveEntities(void) {
 float Q3_PBRParallaxScale(void) {
     if (ri.Cvar_Get == NULL) return 0.02f;
     /* Height-map parallax strength for world surfaces that ship a
-     * *_height.h.rtex.dds. 0 disables. Q3 world UV density makes
-     * values above ~0.05 swim; default 0.02 is subtle-but-visible. */
+     * *_height.h.rtex.dds. 0 disables. Default 0.02 is subtle; allow
+     * larger diagnostic sweeps so r_pbr_parallax_tint/scale tests can
+     * prove whether the MSL UV offset actually changes the image. */
     cvar_t *cv = ri.Cvar_Get("r_pbr_parallax_scale", "0.02", CVAR_ARCHIVE);
     float v = cv ? cv->value : 0.02f;
     if (v < 0.0f) v = 0.0f;
-    if (v > 0.08f) v = 0.08f;
+    if (v > 2.0f) v = 2.0f;
     return v;
+}
+
+int Q3_PBRParallaxTint(void) {
+    if (ri.Cvar_Get == NULL) return 0;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_parallax_tint", "0", 0);
+    return (cv && cv->integer != 0) ? 1 : 0;
 }
 
 int Q3_RTLights(void) {

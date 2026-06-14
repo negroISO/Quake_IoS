@@ -505,7 +505,7 @@ struct MetalView: UIViewRepresentable {
             /* Parallax (height map) params — MUST stay the LAST field and
              * mirror the MSL struct tail exactly. .x = parallax scale
              * (r_pbr_parallax_scale, 0 = off / no height map bound),
-             * .y/.z/.w = pad. */
+             * .y/.z = pad, .w = parallax debug tint gate (r_pbr_parallax_tint). */
             var parallaxParams: SIMD4<Float> = SIMD4(0, 0, 0, 0)
         }
 
@@ -1715,7 +1715,7 @@ struct MetalView: UIViewRepresentable {
             float pbrMetallic;
             float _pad0;
             // Parallax params — LAST field, mirrors Swift struct tail.
-            // .x = scale (0 = off), .y/.z/.w = pad.
+            // .x = scale (0 = off), .y/.z = pad, .w = debug tint gate.
             float4 parallaxParams;
         };
 
@@ -2391,8 +2391,10 @@ struct MetalView: UIViewRepresentable {
              * relationship. Mutates texCoord in place so albedo, normal,
              * roughness, metallic, and emissive all sample the displaced
              * UV. */
+            bool parallaxDebugTint = false;
             if (drawUniforms.parallaxParams.x > 0.0001 && tcGenMode == 0 &&
                 !is_null_texture(heightMap)) {
+                parallaxDebugTint = drawUniforms.parallaxParams.w > 0.5;
                 float3 pdx = dfdx(in.worldPos);
                 float3 pdy = dfdy(in.worldPos);
                 float2 tdx = dfdx(texCoord);
@@ -2772,6 +2774,9 @@ struct MetalView: UIViewRepresentable {
             if (drawUniforms.emissiveParams.w > 0.0) {
                 float3 eSample = emissiveTexture.sample(textureSampler, texCoord).rgb;
                 lit += eSample * drawUniforms.emissiveParams.xyz * drawUniforms.emissiveParams.w;
+            }
+            if (parallaxDebugTint) {
+                lit *= float3(0.6, 0.6, 1.4);
             }
             return float4(lit, texel.a * va);
         }
@@ -7946,6 +7951,7 @@ struct MetalView: UIViewRepresentable {
                         // exactly where authored height data drops out.
                         let heightTex = worldSelection.useWorldPBR ? pbrHeightTexture(for: stage.textureHandle) : nil
                         let parallaxScale: Float = (heightTex == nil) ? 0.0 : Q3_PBRParallaxScale()
+                        let parallaxTint: Float = (heightTex == nil || Q3_PBRParallaxTint() == 0) ? 0.0 : 1.0
                         logParallaxBind(handle: stage.textureHandle,
                                         stage: stage,
                                         selection: worldSelection,
@@ -7954,7 +7960,7 @@ struct MetalView: UIViewRepresentable {
                                         site: "primary")
                         if let heightTex {
                             encoder.setFragmentTexture(heightTex, index: 7)
-                            drawUniforms.parallaxParams = SIMD4<Float>(parallaxScale, 0, 0, 0)
+                            drawUniforms.parallaxParams = SIMD4<Float>(parallaxScale, 0, 0, parallaxTint)
                         } else {
                             encoder.setFragmentTexture(pbrEmissiveDefault(), index: 7)
                             drawUniforms.parallaxParams = SIMD4<Float>(0, 0, 0, 0)
@@ -8561,6 +8567,7 @@ struct MetalView: UIViewRepresentable {
                             // Height/parallax @ 7 — mirror of the primary site.
                             let heightTex = worldSelection.useWorldPBR ? pbrHeightTexture(for: stage.textureHandle) : nil
                             let parallaxScale: Float = (heightTex == nil) ? 0.0 : Q3_PBRParallaxScale()
+                            let parallaxTint: Float = (heightTex == nil || Q3_PBRParallaxTint() == 0) ? 0.0 : 1.0
                             logParallaxBind(handle: stage.textureHandle,
                                             stage: stage,
                                             selection: worldSelection,
@@ -8569,7 +8576,7 @@ struct MetalView: UIViewRepresentable {
                                             site: "cached")
                             if let heightTex {
                                 setWorldFragmentTextureCached(heightTex, index: 7)
-                                drawUniforms.parallaxParams = SIMD4<Float>(parallaxScale, 0, 0, 0)
+                                drawUniforms.parallaxParams = SIMD4<Float>(parallaxScale, 0, 0, parallaxTint)
                             } else {
                                 setWorldFragmentTextureCached(pbrEmissiveDefault(), index: 7)
                                 drawUniforms.parallaxParams = SIMD4<Float>(0, 0, 0, 0)

@@ -226,5 +226,6 @@ float Q3_RTBloomRadius(void);
 /* Height-map parallax for world surfaces (r_pbr_parallax_scale, default
  * 0.02, 0 = off). Only applied when the material ships a height DDS. */
 float Q3_PBRParallaxScale(void);
+int   Q3_PBRParallaxTint(void);
 
 #endif
