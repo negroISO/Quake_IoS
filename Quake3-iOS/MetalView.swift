@@ -9382,14 +9382,16 @@ struct MetalView: UIViewRepresentable {
             commandBuffer.present(drawable)
             commandBuffer.commit()
 
-            // Video capture: when the engine is recording an AVI, read
+            // Video/debug capture: when the engine is recording an AVI, read
             // the just-rendered drawable back to CPU and stash the BGRA
             // bytes in a shared buffer. The engine's per-frame
             // CL_TakeVideoFrame → RE_TakeVideoFrame hook (in
             // metal_renderer_stub.c) pulls from that buffer and converts
             // to the packed RGB layout the AVI muxer expects. Gated by
-            // CL_VideoRecording() so idle runs incur no readback cost.
-            if CL_VideoRecording() != 0 {
+            // CL_VideoRecording() / Q3_CAPTURE_FRAMES so idle runs incur no
+            // readback cost.
+            let debugCaptureFrame = nextDebugFrameCaptureNumber()
+            if CL_VideoRecording() != 0 || debugCaptureFrame != nil {
                 commandBuffer.waitUntilCompleted()
                 let w = tex.width
                 let h = tex.height
@@ -9404,12 +9406,89 @@ struct MetalView: UIViewRepresentable {
                                  from: MTLRegion(origin: MTLOrigin(x: 0, y: 0, z: 0),
                                                  size: MTLSize(width: w, height: h, depth: 1)),
                                  mipmapLevel: 0)
-                    Q3MetalRenderer_StoreVideoFrame(ptr.baseAddress, Int32(w), Int32(h))
+                    if CL_VideoRecording() != 0 {
+                        Q3MetalRenderer_StoreVideoFrame(ptr.baseAddress, Int32(w), Int32(h))
+                    }
+                    if let debugCaptureFrame {
+                        writeDebugFrameCapture(ptr.baseAddress,
+                                               width: w,
+                                               height: h,
+                                               byteCount: byteCount,
+                                               frame: debugCaptureFrame)
+                    }
                 }
             }
         }
         /* Reusable BGRA readback buffer sized on first recorded frame. */
         private var videoReadbackBuffer: [UInt8]?
+        private var debugCaptureConfigured = false
+        private var debugCaptureDir: URL?
+        private var debugCaptureRemaining = 0
+        private var debugCaptureStartFrame: UInt32 = 120
+        private var debugCaptureStride: UInt32 = 60
+        private var debugCaptureLastFrame: UInt32?
+
+        private func configureDebugFrameCaptureIfNeeded() {
+            guard !debugCaptureConfigured else { return }
+            debugCaptureConfigured = true
+            let env = ProcessInfo.processInfo.environment
+            guard let dir = env["Q3_CAPTURE_FRAME_DIR"], !dir.isEmpty else { return }
+            let requested = Int(env["Q3_CAPTURE_FRAMES"] ?? "0") ?? 0
+            guard requested > 0 else { return }
+            debugCaptureDir = URL(fileURLWithPath: dir, isDirectory: true)
+            debugCaptureRemaining = requested
+            debugCaptureStartFrame = UInt32(max(0, Int(env["Q3_CAPTURE_START_FRAME"] ?? "120") ?? 120))
+            debugCaptureStride = UInt32(max(1, Int(env["Q3_CAPTURE_STRIDE"] ?? "60") ?? 60))
+            do {
+                try FileManager.default.createDirectory(at: debugCaptureDir!,
+                                                        withIntermediateDirectories: true)
+                print("[Q3-CAPTURE] enabled dir=\(dir) frames=\(requested) start=\(debugCaptureStartFrame) stride=\(debugCaptureStride)")
+            } catch {
+                print("[Q3-CAPTURE] failed to create dir \(dir): \(error)")
+                debugCaptureDir = nil
+                debugCaptureRemaining = 0
+            }
+        }
+
+        private func nextDebugFrameCaptureNumber() -> UInt32? {
+            configureDebugFrameCaptureIfNeeded()
+            guard debugCaptureRemaining > 0,
+                  debugCaptureDir != nil,
+                  debugFrameCounter >= debugCaptureStartFrame else { return nil }
+            if let last = debugCaptureLastFrame,
+               debugFrameCounter &- last < debugCaptureStride {
+                return nil
+            }
+            debugCaptureRemaining -= 1
+            debugCaptureLastFrame = debugFrameCounter
+            return debugFrameCounter
+        }
+
+        private func writeDebugFrameCapture(_ bgra: UnsafeRawPointer?,
+                                            width: Int,
+                                            height: Int,
+                                            byteCount: Int,
+                                            frame: UInt32) {
+            guard let bgra, let dir = debugCaptureDir else { return }
+            guard width > 0, height > 0, width <= 65535, height <= 65535 else { return }
+            var header = [UInt8](repeating: 0, count: 18)
+            header[2] = 2               // uncompressed true-colour TGA
+            header[12] = UInt8(width & 0xff)
+            header[13] = UInt8((width >> 8) & 0xff)
+            header[14] = UInt8(height & 0xff)
+            header[15] = UInt8((height >> 8) & 0xff)
+            header[16] = 32             // BGRA8
+            header[17] = 0x28           // 8 alpha bits, top-left origin
+            var data = Data(header)
+            data.append(bgra.assumingMemoryBound(to: UInt8.self), count: byteCount)
+            let url = dir.appendingPathComponent(String(format: "frame_%06u.tga", frame))
+            do {
+                try data.write(to: url, options: .atomic)
+                print("[Q3-CAPTURE] wrote \(url.path) \(width)x\(height)")
+            } catch {
+                print("[Q3-CAPTURE] write failed \(url.path): \(error)")
+            }
+        }
 
         @MainActor
         private func configureRenderer(for view: MTKView) {
