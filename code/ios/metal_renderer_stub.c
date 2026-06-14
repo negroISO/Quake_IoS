@@ -8711,6 +8711,7 @@ static void RE_RenderScene(const refdef_t *fd) {
                     const float *end = sceneEntity->entity.oldorigin;
                     vec3_t beamDir, v1, v2, right;
                     float len;
+                    float sideLen;
                     float r, g, b, a;
                     int i;
 
@@ -8719,11 +8720,26 @@ static void RE_RenderScene(const refdef_t *fd) {
                     if (len == 0.0f) continue;
 
                     VectorSubtract(start, vieworg, v1);
-                    VectorNormalize(v1);
+                    if (VectorNormalize(v1) < 0.001f) {
+                        VectorCopy(axis0, v1);
+                    }
                     VectorSubtract(end, vieworg, v2);
-                    VectorNormalize(v2);
+                    if (VectorNormalize(v2) < 0.001f) {
+                        VectorCopy(axis0, v2);
+                    }
                     CrossProduct(v1, v2, right);
-                    VectorNormalize(right);
+                    sideLen = VectorNormalize(right);
+                    if (sideLen < 0.001f) {
+                        CrossProduct(beamDir, axis2, right);
+                        sideLen = VectorNormalize(right);
+                    }
+                    if (sideLen < 0.001f) {
+                        CrossProduct(beamDir, axis1, right);
+                        sideLen = VectorNormalize(right);
+                    }
+                    if (sideLen < 0.001f) {
+                        PerpendicularVector(right, beamDir);
+                    }
 
                     r = (float)sceneEntity->entity.shader.rgba[0] / 255.0f;
                     g = (float)sceneEntity->entity.shader.rgba[1] / 255.0f;
@@ -8747,6 +8763,8 @@ static void RE_RenderScene(const refdef_t *fd) {
                         EntityFlagsForTexture((qhandle_t)sceneEntity->entity.customShader,
                                               Q3_METAL_ENTITY_DRAWFLAG_NOCULL,
                                               qfalse);
+                    s_entityDraws[entityDrawCursor].flags &=
+                        ~Q3_METAL_ENTITY_DRAWFLAG_CLAMPMAP;
                     EmitMetalEntityStageAuditForHandle(
                         (qhandle_t)sceneEntity->entity.customShader,
                         "lightning");

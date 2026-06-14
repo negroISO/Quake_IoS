@@ -2886,6 +2886,11 @@ struct MetalView: UIViewRepresentable {
             if (entityModCount > 1) texCoord = applyTcMod(texCoord, in.worldPos, int(uniforms.tcModType.y + 0.5), uniforms.tcModParams1, uniforms.timeSeconds);
             if (entityModCount > 2) texCoord = applyTcMod(texCoord, in.worldPos, int(uniforms.tcModType.z + 0.5), uniforms.tcModParams2, uniforms.timeSeconds);
             if (entityModCount > 3) texCoord = applyTcMod(texCoord, in.worldPos, int(uniforms.tcModType.w + 0.5), uniforms.tcModParams3, uniforms.timeSeconds);
+            /* Alpha synthesis radial masks must operate in local tile UVs,
+             * not the repeated/scrolling beam coordinate. RT_LIGHTNING uses
+             * s=len/256 so final texCoord.x often exceeds 1.0; using that
+             * directly drove radial to zero and erased most of the beam. */
+            float2 alphaMaskUV = fract(texCoord);
 
             /* RTX Remix sprite-sheet atlas sub-rect sampling for entity
              * draws. Mirrors the world fragment block (see line ~1990).
@@ -2922,7 +2927,7 @@ struct MetalView: UIViewRepresentable {
                                          uniforms.alphaGenMode == 6u);
             if (entityAlphaSensitive && (uniforms.forceLuminanceAlpha != 0u || texel.a >= 0.995)) {
                 float lumAlpha = max(max(texel.r, texel.g), texel.b);
-                float2 centered = texCoord - 0.5;
+                float2 centered = alphaMaskUV - 0.5;
                 float radial = saturate(1.0 - dot(centered, centered) * 2.0);
                 radial = radial * radial * (3.0 - 2.0 * radial);
                 /* forceLuminanceAlpha modes:
@@ -2955,6 +2960,15 @@ struct MetalView: UIViewRepresentable {
                 synthA *= radial;
                 if (uniforms.forceLuminanceAlpha != 1u) {
                     texel.rgb *= synthA;
+                } else if (uniforms.suppressDlights != 0u) {
+                    /* GL_ONE/GL_ONE and GL_SRC_ALPHA/GL_ONE Q3 FX are
+                     * authored for the classic overbright/additive path and
+                     * often have very dark JPG RGB (lightning3new mean is
+                     * ~0.04/0.06/0.09). Boost only black-background additive
+                     * FX after reconstructing their mask so weapon shots read
+                     * as visible beams/flashes without reviving white-card
+                     * inverse-luminance smoke/orb artifacts. */
+                    texel.rgb *= 2.75;
                 }
                 texel.a = synthA;
             }
