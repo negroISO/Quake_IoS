@@ -3714,6 +3714,9 @@ struct MetalView: UIViewRepresentable {
         private var rtLightCount: Int = 0
         private var rtLightMapName: String = ""
         private var rtDlightDiagLast: String = ""
+        private var rtShadowCounterBuffers: [MTLBuffer] = []
+        private var rtShadowCounterCursor: Int = 0
+        private var rtLastShadowCounterLog: String = ""
         // CPU copy for raster-side dlight injection (currentBakedDlights).
         private var rtLightsCPU: [RTLightGPU] = []
         // Authored lights sorted for RT truncation: slot-0 sun first, then locals by intensity.
@@ -3837,6 +3840,36 @@ struct MetalView: UIViewRepresentable {
                 pbrLog(msg)
             }
             return (rtLightBuffer, rtLightCount)
+        }
+
+        private func nextRTShadowCounterBuffer(device: MTLDevice) -> MTLBuffer? {
+            let counterCount = 4
+            let length = counterCount * MemoryLayout<UInt32>.stride
+            while rtShadowCounterBuffers.count < 3 {
+                guard let buf = device.makeBuffer(length: length, options: .storageModeShared) else {
+                    return nil
+                }
+                buf.label = "Q3.RT.sunShadowCounters.\(rtShadowCounterBuffers.count)"
+                memset(buf.contents(), 0, length)
+                rtShadowCounterBuffers.append(buf)
+            }
+            let buf = rtShadowCounterBuffers[rtShadowCounterCursor]
+            let ptr = buf.contents().bindMemory(to: UInt32.self, capacity: counterCount)
+            let candidates = ptr[0]
+            let occluded = ptr[1]
+            let unoccluded = ptr[2]
+            let sunPixels = ptr[3]
+            if candidates != 0 || occluded != 0 || unoccluded != 0 || sunPixels != 0 {
+                let sig = "\(rtLightMapName):\(sunPixels):\(candidates):\(occluded):\(unoccluded)"
+                if sig != rtLastShadowCounterLog {
+                    rtLastShadowCounterLog = sig
+                    let msg = "[RT] sun shadow rays map='\(rtLightMapName)' sunPixels=\(sunPixels) candidates=\(candidates) occluded=\(occluded) unoccluded=\(unoccluded)"
+                    print(msg)
+                    pbrLog(msg)
+                }
+            }
+            rtShadowCounterCursor = (rtShadowCounterCursor + 1) % rtShadowCounterBuffers.count
+            return buf
         }
 
         private func populateEntitySun(_ uniforms: inout EntityUniforms) {
@@ -4129,6 +4162,7 @@ struct MetalView: UIViewRepresentable {
                                  const device RTPrimitiveMaterial *primitiveMaterials [[buffer(4)]],
                                  acceleration_structure<> entityAS [[buffer(5)]],
                                  const device RTLight *rtLights [[buffer(6)]],
+                                 device atomic_uint *rtShadowCounters [[buffer(7)]],
                                  uint2 tid [[thread_position_in_grid]]) {
                 if (tid.x >= output.get_width() || tid.y >= output.get_height()) return;
                 float2 uv = (float2(tid) + 0.5) / float2(output.get_width(), output.get_height());
@@ -4337,14 +4371,21 @@ struct MetalView: UIViewRepresentable {
                                 // sorts distant lights to slot 0).
                                 if (rtLights[0].dirType.w < 0.5) {
                                     firstLocal = 1;
+                                    atomic_fetch_add_explicit(&rtShadowCounters[3], 1u, memory_order_relaxed);
                                     float3 L = -normalize(rtLights[0].dirType.xyz);
                                     float ndl = max(dot(N, L), 0.0);
                                     if (ndl > 0.0) {
+                                        atomic_fetch_add_explicit(&rtShadowCounters[0], 1u, memory_order_relaxed);
                                         ray sray(hitPos + N * 0.75, L, 0.1, 20000.0);
                                         auto sh = i.intersect(sray, worldAS);
-                                        if (sh.type != intersection_type::triangle) {
+                                        bool shadowBlocked = sh.type == intersection_type::triangle &&
+                                                             primitiveMaterials[sh.primitive_id].materialFlags.x == 0;
+                                        if (!shadowBlocked) {
+                                            atomic_fetch_add_explicit(&rtShadowCounters[2], 1u, memory_order_relaxed);
                                             direct += rtLights[0].colorIntensity.rgb *
                                                       (rtLights[0].colorIntensity.w * 0.3 * lightScale) * ndl;
+                                        } else {
+                                            atomic_fetch_add_explicit(&rtShadowCounters[1], 1u, memory_order_relaxed);
                                         }
                                     }
                                 }
@@ -4387,7 +4428,9 @@ struct MetalView: UIViewRepresentable {
                                     if (ndl > 0.0 && E * ndl > 0.004) {
                                         ray sray(hitPos + N * 0.75, L, 0.1, max(dist - r - 1.0, 0.2));
                                         auto sh = i.intersect(sray, worldAS);
-                                        if (sh.type != intersection_type::triangle) {
+                                        bool shadowBlocked = sh.type == intersection_type::triangle &&
+                                                             primitiveMaterials[sh.primitive_id].materialFlags.x == 0;
+                                        if (!shadowBlocked) {
                                             direct += Lgt.colorIntensity.rgb * min(E * ndl, 3.0);
                                         }
                                     }
@@ -5364,6 +5407,14 @@ struct MetalView: UIViewRepresentable {
             let tg = MTLSize(width: 16, height: 16, depth: 1)
             let traceGroups = MTLSize(width: (traceW + 15) / 16, height: (traceH + 15) / 16, depth: 1)
             let compositeGroups = MTLSize(width: (renderW + 15) / 16, height: (renderH + 15) / 16, depth: 1)
+            guard let shadowCounterBuffer = nextRTShadowCounterBuffer(device: device) else { return nil }
+            if let blit = commandBuffer.makeBlitCommandEncoder() {
+                blit.label = "Q3.RT.clearSunShadowCounters"
+                blit.fill(buffer: shadowCounterBuffer,
+                          range: 0..<shadowCounterBuffer.length,
+                          value: 0)
+                blit.endEncoding()
+            }
             if let enc = commandBuffer.makeComputeCommandEncoder() {
                 enc.label = "Q3.RT.trace"
                 enc.setComputePipelineState(rtPSO)
@@ -5391,6 +5442,7 @@ struct MetalView: UIViewRepresentable {
                 enc.setBuffer(primitiveMaterialBuffer, offset: 0, index: 4)
                 enc.setAccelerationStructure(entityAccelerationStructure ?? worldAS, bufferIndex: 5)
                 enc.setBuffer(lightInfo.buffer, offset: 0, index: 6)
+                enc.setBuffer(shadowCounterBuffer, offset: 0, index: 7)
                 enc.dispatchThreadgroups(traceGroups, threadsPerThreadgroup: tg)
                 enc.endEncoding()
             }
