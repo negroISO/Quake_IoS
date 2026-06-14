@@ -7223,6 +7223,19 @@ struct MetalView: UIViewRepresentable {
             }
         }
 
+        private var loggedParallaxHandles: Set<UInt32> = []
+        private func logParallaxBind(handle: UInt32,
+                                     stage: Q3MetalWorldStage,
+                                     selection: WorldTextureSelection,
+                                     heightTex: MTLTexture?,
+                                     scale: Float,
+                                     site: String) {
+            guard loggedParallaxHandles.insert(handle).inserted else { return }
+            let name = textureNameForLog(handle)
+            let heightState = (heightTex == nil) ? "nil" : "yes"
+            pbrLog("[Q3-PARALLAX] site=\(site) handle=\(handle) name='\(name)' useWorldPBR=\(selection.useWorldPBR ? 1 : 0) heightTex=\(heightState) scale=\(scale) tcGen=\(stage.tcGen) blendMode=\(stage.blendMode) classicFX=\(selection.classicFX ? 1 : 0)")
+        }
+
         /// Pack (color_r, color_g, color_b, intensity) for the MSL fragment.
         /// Returns (1,1,1, intensity) when the material doesn't ship its
         /// own color tint, so the MSL multiply is a no-op against the
@@ -7928,11 +7941,20 @@ struct MetalView: UIViewRepresentable {
                         encoder.setFragmentTexture(worldEmissiveTex, index: 6)
                         drawUniforms.emissiveParams = emissiveParamsForPBRMaterial(handle: stage.textureHandle)
                         // Height/parallax slot @ 7 — only active (scale > 0)
-                        // when the material ships a real height DDS.
-                        if worldSelection.useWorldPBR,
-                           let heightTex = pbrHeightTexture(for: stage.textureHandle) {
+                        // when the material ships a real height DDS. Log both
+                        // the active and fallthrough paths so q3_diag shows
+                        // exactly where authored height data drops out.
+                        let heightTex = worldSelection.useWorldPBR ? pbrHeightTexture(for: stage.textureHandle) : nil
+                        let parallaxScale: Float = (heightTex == nil) ? 0.0 : Q3_PBRParallaxScale()
+                        logParallaxBind(handle: stage.textureHandle,
+                                        stage: stage,
+                                        selection: worldSelection,
+                                        heightTex: heightTex,
+                                        scale: parallaxScale,
+                                        site: "primary")
+                        if let heightTex {
                             encoder.setFragmentTexture(heightTex, index: 7)
-                            drawUniforms.parallaxParams = SIMD4<Float>(Q3_PBRParallaxScale(), 0, 0, 0)
+                            drawUniforms.parallaxParams = SIMD4<Float>(parallaxScale, 0, 0, 0)
                         } else {
                             encoder.setFragmentTexture(pbrEmissiveDefault(), index: 7)
                             drawUniforms.parallaxParams = SIMD4<Float>(0, 0, 0, 0)
@@ -8537,10 +8559,17 @@ struct MetalView: UIViewRepresentable {
                             // emissive when present, zero default otherwise.
                             setWorldFragmentTextureCached(pbrEmissiveTexture(for: stage.textureHandle) ?? pbrEmissiveDefault(), index: 6)
                             // Height/parallax @ 7 — mirror of the primary site.
-                            if worldSelection.useWorldPBR,
-                               let heightTex = pbrHeightTexture(for: stage.textureHandle) {
+                            let heightTex = worldSelection.useWorldPBR ? pbrHeightTexture(for: stage.textureHandle) : nil
+                            let parallaxScale: Float = (heightTex == nil) ? 0.0 : Q3_PBRParallaxScale()
+                            logParallaxBind(handle: stage.textureHandle,
+                                            stage: stage,
+                                            selection: worldSelection,
+                                            heightTex: heightTex,
+                                            scale: parallaxScale,
+                                            site: "cached")
+                            if let heightTex {
                                 setWorldFragmentTextureCached(heightTex, index: 7)
-                                drawUniforms.parallaxParams = SIMD4<Float>(Q3_PBRParallaxScale(), 0, 0, 0)
+                                drawUniforms.parallaxParams = SIMD4<Float>(parallaxScale, 0, 0, 0)
                             } else {
                                 setWorldFragmentTextureCached(pbrEmissiveDefault(), index: 7)
                                 drawUniforms.parallaxParams = SIMD4<Float>(0, 0, 0, 0)
@@ -10173,6 +10202,7 @@ struct MetalView: UIViewRepresentable {
             entityAtlasAlbedoMissed.removeAll(keepingCapacity: false)
             pbrEmissiveTried.removeAll(keepingCapacity: false)
             pbrHeightTried.removeAll(keepingCapacity: false)
+            loggedParallaxHandles.removeAll(keepingCapacity: false)
             textureCache.removeAll(keepingCapacity: false)
             rtASVertexBuffer = nil
             rtASIndexBuffer = nil
