@@ -7334,6 +7334,7 @@ struct MetalView: UIViewRepresentable {
         private var entityIndexBufferCapacity = 0
         private var debugFrameCounter: UInt32 = 0
         private var fogVolumeLogged = false
+        private var fogOverlayInsideClipLogged: Set<Int> = []
         private var frameTimeOrigin = CACurrentMediaTime()
         private var lastPerfLogTime = CACurrentMediaTime()
         private var lastPerfLogFrame: UInt32 = 0
@@ -8260,6 +8261,9 @@ struct MetalView: UIViewRepresentable {
                         var fogCD = SIMD4<Float>(0, 0, 0, 0)
                         var fogParams = SIMD4<Float>(0, 0, 0, 0)
                         var fogSurface = SIMD4<Float>(0, 0, 0, 0)
+                        var fogHasBounds: UInt32 = 0
+                        var fogBoundsMin = SIMD3<Float>(0, 0, 0)
+                        var fogBoundsMax = SIMD3<Float>(0, 0, 0)
                         if draw.fogIndex != noFog {
                             let count = Q3MetalRenderer_GetWorldFogCount()
                             if Int(draw.fogIndex) < count,
@@ -8268,6 +8272,9 @@ struct MetalView: UIViewRepresentable {
                                 fogCD = SIMD4(f.color.0, f.color.1, f.color.2, f.distance)
                                 fogParams = SIMD4(f.tcScale, f.hasSurface != 0 ? 1.0 : 0.0, 0, 0)
                                 fogSurface = SIMD4(f.surface.0, f.surface.1, f.surface.2, f.surface.3)
+                                fogHasBounds = f.hasBounds
+                                fogBoundsMin = SIMD3<Float>(f.boundsMin.0, f.boundsMin.1, f.boundsMin.2)
+                                fogBoundsMax = SIMD3<Float>(f.boundsMax.0, f.boundsMax.1, f.boundsMax.2)
                             }
                         }
                         if worldPass == 5 {
@@ -8277,6 +8284,26 @@ struct MetalView: UIViewRepresentable {
                                   let worldAlphaPipelineState else {
                                 entryCursor += 1
                                 continue
+                            }
+                            let fogOverlayDraw = (draw.flags & fogOverlayBit) != 0
+                            if fogOverlayDraw && fogHasBounds != 0 {
+                                let bmin = simd_min(fogBoundsMin, fogBoundsMax)
+                                let bmax = simd_max(fogBoundsMin, fogBoundsMax)
+                                let margin: Float = 0.5
+                                if worldUniforms.cameraPos.x >= bmin.x - margin,
+                                   worldUniforms.cameraPos.x <= bmax.x + margin,
+                                   worldUniforms.cameraPos.y >= bmin.y - margin,
+                                   worldUniforms.cameraPos.y <= bmax.y + margin,
+                                   worldUniforms.cameraPos.z >= bmin.z - margin,
+                                   worldUniforms.cameraPos.z <= bmax.z + margin {
+                                    let fogKey = Int(draw.fogIndex)
+                                    if fogOverlayInsideClipLogged.insert(fogKey).inserted {
+                                        NSLog("[Q3-FOG] clipped fog overlay inside bounds fogIndex=%d bounds=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f)",
+                                              fogKey, bmin.x, bmin.y, bmin.z, bmax.x, bmax.y, bmax.z)
+                                    }
+                                    entryCursor += 1
+                                    continue
+                                }
                             }
                             let stage = Self.worldStage(draw, 0)
                             let chain = Self.fillTcMods(stage)
@@ -8328,7 +8355,6 @@ struct MetalView: UIViewRepresentable {
                                 _pad0: (draw.flags & fogOverlayBit) != 0 ? 1.0 : 0.0
                             )
                             encoder.setRenderPipelineState(worldAlphaPipelineState)
-                            let fogOverlayDraw = (draw.flags & fogOverlayBit) != 0
                             /* Regular fog passes and explicit fog-volume
                              * boundary sheets use LEQUAL so BSP depth occludes
                              * them. The previous always-pass state was safe only
