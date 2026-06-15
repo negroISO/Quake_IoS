@@ -1303,6 +1303,7 @@ static void AddWorldDrawStage(Q3MetalWorldDrawCmd *draw,
     stage->wrapClampMode = (uint32_t)src->wrapClampMode;
     stage->pbrRoughness = (src->pbrRoughness > 0.0f) ? src->pbrRoughness : 0.55f;
     stage->pbrMetallic = (src->pbrRoughness > 0.0f) ? src->pbrMetallic : 0.30f;
+    stage->pbrMaterialHandle = (uint32_t)textureHandle;
 }
 
 /* Fallback for draws with no parsed .shader entry — construct a minimal
@@ -2183,6 +2184,55 @@ static qboolean IsPickupEntityShaderName(const char *name) {
     return name != NULL &&
         (!Q_stricmpn(name, "models/powerups/health/", 23) ||
          !Q_stricmpn(name, "models/powerups/ammo/", 21));
+}
+
+static qboolean WorldMapPathIsClassicEffectLayer(const char *path) {
+    if (path == NULL || path[0] == '\0') return qfalse;
+    return (!Q_stricmpn(path, "textures/sfx/", 13) ||
+            !Q_stricmpn(path, "textures/liquids/", 17)) ? qtrue : qfalse;
+}
+
+static qboolean PBRMaterialHasWorldSidecar(const q3_pbr_material_t *m) {
+    if (m == NULL || m->albedo == NULL) return qfalse;
+    if (m->normal != NULL || m->roughness != NULL || m->metallic != NULL ||
+        m->emissive != NULL || m->height != NULL) {
+        return qtrue;
+    }
+    if (m->roughness_constant >= 0.0f || m->metallic_constant >= 0.0f) {
+        return qtrue;
+    }
+    return qfalse;
+}
+
+static qboolean TextureHandleHasWorldPBRSidecar(qhandle_t handle) {
+    const metalTexture_t *tex;
+    if (handle == 0) return qfalse;
+    tex = FindTextureByHandle(handle);
+    if (tex == NULL) return qfalse;
+    return PBRMaterialHasWorldSidecar((const q3_pbr_material_t *)tex->pbrMaterial);
+}
+
+static qhandle_t WorldShaderOwnerPBRHandle(const metalShaderMap_t *entry) {
+    int s;
+    if (entry == NULL || entry->stageCount <= 1) return 0;
+
+    /* Prefer the last concrete, non-FX, non-lightmap stage. Several stock Q3
+     * shaders put animated sfx overlays first and the actual world material
+     * later (q3dm6 blocks18cgeomtrnx: fireswirl2blue -> blocks18cgeomtrnx).
+     * RTX Remix keys the PBR material to that concrete world texture. */
+    for (s = entry->stageCount - 1; s >= 0; --s) {
+        const Q3MetalStage *st = &entry->stages[s];
+        const q3_pbr_material_t *m;
+        qhandle_t h;
+        if (st->useLightmap || st->mapPath[0] == '\0') continue;
+        if (WorldMapPathIsClassicEffectLayer(st->mapPath)) continue;
+        m = q3_pbr_lookup_by_name(st->mapPath);
+        if (!PBRMaterialHasWorldSidecar(m)) continue;
+        h = RegisterTexture(st->mapPath);
+        if (h != 0) return h;
+    }
+
+    return 0;
 }
 
 static int EntityPickupStageDrawCount(const char *shaderName) {
@@ -5246,6 +5296,7 @@ static void MetalWorldEmitSurfaceStages(const char *shaderName,
     int _emitted;
     int _combinedLightmapBaseStage;
     qboolean _combinedLightmap;
+    qhandle_t _pbrOwnerTex = 0;
 
     if (shaderName == NULL || drawCursorPtr == NULL || indexCountForDraw == 0) {
         return;
@@ -5294,6 +5345,7 @@ static void MetalWorldEmitSurfaceStages(const char *shaderName,
     }
 
     if (_e != NULL && _e->stageCount > 0) {
+        _pbrOwnerTex = WorldShaderOwnerPBRHandle(_e);
         for (_s = 0; _s < _e->stageCount; ++_s) {
             const Q3MetalStage *_st = &_e->stages[_s];
             Q3MetalStage _drawStage;
@@ -5339,6 +5391,34 @@ static void MetalWorldEmitSurfaceStages(const char *shaderName,
                 s_world.animatedDrawCount += 1;
             }
             AddWorldDrawStage(&s_world.draws[_dstIdx], _tex, &_drawStage);
+            if (_pbrOwnerTex != 0 &&
+                _pbrOwnerTex != _tex &&
+                WorldMapPathIsClassicEffectLayer(_st->mapPath) &&
+                s_world.draws[_dstIdx].stageCount > 0) {
+                uint32_t _stageSlot = s_world.draws[_dstIdx].stageCount - 1;
+                s_world.draws[_dstIdx].stages[_stageSlot].pbrMaterialHandle = (uint32_t)_pbrOwnerTex;
+                if (MetalVerboseAuditEnabled()) {
+                    static char s_ownerSeen[32][MAX_QPATH];
+                    static int s_ownerSeenCount = 0;
+                    qboolean seen = qfalse;
+                    int oi;
+                    for (oi = 0; oi < s_ownerSeenCount; ++oi) {
+                        if (!Q_stricmp(s_ownerSeen[oi], shaderName)) { seen = qtrue; break; }
+                    }
+                    if (!seen) {
+                        const metalTexture_t *ownerTex = FindTextureByHandle(_pbrOwnerTex);
+                        if (s_ownerSeenCount < (int)(sizeof(s_ownerSeen) / sizeof(s_ownerSeen[0]))) {
+                            Q_strncpyz(s_ownerSeen[s_ownerSeenCount++], shaderName, MAX_QPATH);
+                        }
+                        MetalTelemetryPrintf("metal_pbr_owner", PRINT_ALL,
+                            "[Q3-PBR] world owner-material shader='%s' fx='%s' ownerHandle=%u owner='%s'\n",
+                            shaderName,
+                            _st->mapPath,
+                            (unsigned)_pbrOwnerTex,
+                            ownerTex ? ownerTex->name : "(no-tex)");
+                    }
+                }
+            }
             EmitMetalDrawPlan(shaderName, _s, &s_world.draws[_dstIdx], &_drawStage, _tex, qfalse);
             _emitted += 1;
         }

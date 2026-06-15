@@ -594,6 +594,10 @@ struct MetalView: UIViewRepresentable {
             }
         }
 
+        private static func worldPBRMaterialHandle(for stage: Q3MetalWorldStage) -> UInt32 {
+            (stage.pbrMaterialHandle != 0) ? stage.pbrMaterialHandle : stage.textureHandle
+        }
+
         private struct WorldPassEntry {
             let drawIndex: Int
             /* -1 = sky draw (all sky stages), -2 = fog-only draw. */
@@ -666,6 +670,7 @@ struct MetalView: UIViewRepresentable {
             hashCombine(&h, UInt64(draw.fogIndex))
             hashCombine(&h, Self.worldDrawHasLightmapStage(draw) ? 1 : 0)
             hashCombine(&h, UInt64(stage.textureHandle))
+            hashCombine(&h, UInt64(Self.worldPBRMaterialHandle(for: stage)))
             hashCombine(&h, UInt64(stage.srcBlend))
             hashCombine(&h, UInt64(stage.dstBlend))
             hashCombine(&h, UInt64(stage.depthFunc))
@@ -742,6 +747,7 @@ struct MetalView: UIViewRepresentable {
                   a.alphaConst == b.alphaConst,
                   a.pbrRoughness == b.pbrRoughness,
                   a.pbrMetallic == b.pbrMetallic,
+                  Self.worldPBRMaterialHandle(for: a) == Self.worldPBRMaterialHandle(for: b),
                   float4Equal(a.tcGenVec0, b.tcGenVec0),
                   float4Equal(a.tcGenVec1, b.tcGenVec1) else {
                 return false
@@ -3897,6 +3903,7 @@ struct MetalView: UIViewRepresentable {
         private var rtLastCameraPos: SIMD3<Float>?
         private var rtLastCameraForward: SIMD3<Float>?
         private var loggedPBROnlyWorldMisses: Set<UInt32> = []
+        private var loggedWorldOwnerMaterialRoutes: Set<UInt64> = []
         private var loggedPBROnlyEntityMisses: Set<UInt32> = []
         /// RING-DIAG: dedup per (handle, pass) so the center2trn overlay diag
         /// fires once per surface stage, not every frame. Keyed by
@@ -4752,8 +4759,9 @@ struct MetalView: UIViewRepresentable {
                 if (draw.flags & fogOnlyBit) != 0 { continue }
                 guard let stage = rtRepresentativeStage(for: draw) else { continue }
                 let triCount = max(1, Int(draw.indexCount / 3))
+                let materialHandle = Self.worldPBRMaterialHandle(for: stage)
                 if stage.useLightmap == 0 && stage.textureHandle != 0 {
-                    albedoWeights[stage.textureHandle, default: 0] += triCount
+                    albedoWeights[materialHandle, default: 0] += triCount
                 }
                 if draw.lightmapTextureHandle != 0 {
                     lightmapWeights[draw.lightmapTextureHandle, default: 0] += triCount
@@ -4787,7 +4795,8 @@ struct MetalView: UIViewRepresentable {
                 guard let stage = rtRepresentativeStage(for: draw) else { continue }
                 let skyFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
                 let isSkyDraw = (draw.flags & skyFlagBit) != 0
-                let aSlotOptional = albedoSlots[stage.textureHandle]
+                let materialHandle = Self.worldPBRMaterialHandle(for: stage)
+                let aSlotOptional = albedoSlots[materialHandle]
                 let lSlotOptional = lightmapSlots[draw.lightmapTextureHandle]
                 guard stage.useLightmap == 0 else { continue }
                 // Task 1 RT fallback: an opaque world primitive only needs its
@@ -4808,8 +4817,8 @@ struct MetalView: UIViewRepresentable {
                 // logEnabled: false — this 30 Hz RT prepass runs before any
                 // draw and was poisoning the one-shot world-atlas log with
                 // atlasTime=0.000 entries (dedup set is shared).
-                let rtAtlasParams = pbrSpriteAtlasParams(for: stage.textureHandle, atlasTime: 0, logEnabled: false)
-                if let matPtr = Q3MetalRenderer_GetPBRMaterial(stage.textureHandle) {
+                let rtAtlasParams = pbrSpriteAtlasParams(for: materialHandle, atlasTime: 0, logEnabled: false)
+                if let matPtr = Q3MetalRenderer_GetPBRMaterial(materialHandle) {
                     let m = matPtr.pointee
                     if m.roughness_constant >= 0 { rtRough = m.roughness_constant }
                     if m.metallic_constant >= 0 { rtMetal = m.metallic_constant }
@@ -5187,13 +5196,76 @@ struct MetalView: UIViewRepresentable {
             let useWorldPBR: Bool
             let classicFX: Bool
             let atlasParams: SIMD4<Float>?
+            let materialHandle: UInt32
+        }
+
+        @MainActor
+        private func worldOwnerMaterialHandle(for draw: Q3MetalWorldDrawCmd,
+                                              stageIndex: Int,
+                                              stage: Q3MetalWorldStage) -> UInt32 {
+            let currentHandle = stage.textureHandle
+            guard stage.useLightmap == 0 else { return currentHandle }
+
+            let explicitOwner = stage.pbrMaterialHandle
+            if explicitOwner != 0 && explicitOwner != currentHandle {
+                let logKey = (UInt64(currentHandle) << 32) | UInt64(explicitOwner)
+                if loggedWorldOwnerMaterialRoutes.insert(logKey).inserted {
+                    pbrLog("[Q3-PBR] world FX owner-material handle=\(currentHandle) name='\(textureNameForLog(currentHandle))' materialHandle=\(explicitOwner) material='\(textureNameForLog(explicitOwner))'")
+                }
+                return explicitOwner
+            }
+
+            let currentName = textureNameForLog(currentHandle).lowercased()
+            let isClassicEffectLayer =
+                currentName.hasPrefix("textures/sfx/") ||
+                currentName.hasPrefix("textures/liquids/")
+            guard isClassicEffectLayer else { return currentHandle }
+
+            let count = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+            guard count > 1 else { return currentHandle }
+
+            for i in stride(from: count - 1, through: 0, by: -1) where i != stageIndex {
+                let candidate = Self.worldStage(draw, i)
+                guard candidate.useLightmap == 0,
+                      candidate.textureHandle != 0,
+                      candidate.textureHandle != currentHandle else { continue }
+                let candidateName = textureNameForLog(candidate.textureHandle).lowercased()
+                guard !candidateName.hasPrefix("textures/sfx/"),
+                      !candidateName.hasPrefix("textures/liquids/") else { continue }
+                guard let info = pbrMaterialInfo(for: candidate.textureHandle),
+                      info.albedo != nil,
+                      info.hasAuxSlots else { continue }
+
+                let logKey = (UInt64(currentHandle) << 32) | UInt64(candidate.textureHandle)
+                if loggedWorldOwnerMaterialRoutes.insert(logKey).inserted {
+                    pbrLog("[Q3-PBR] world FX owner-material handle=\(currentHandle) name='\(textureNameForLog(currentHandle))' materialHandle=\(candidate.textureHandle) material='\(textureNameForLog(candidate.textureHandle))'")
+                }
+                return candidate.textureHandle
+            }
+
+            if currentName.contains("fireswirl2blue") {
+                let logKey = UInt64(currentHandle) << 32
+                if loggedWorldOwnerMaterialRoutes.insert(logKey).inserted {
+                    var candidates: [String] = []
+                    for i in 0..<count {
+                        let s = Self.worldStage(draw, i)
+                        candidates.append("#\(i):h\(s.textureHandle):\(textureNameForLog(s.textureHandle)):lm\(s.useLightmap)")
+                    }
+                    let candidateList = candidates.joined(separator: ",")
+                    pbrLog("[Q3-PBR] world FX owner-material miss handle=\(currentHandle) name='\(textureNameForLog(currentHandle))' stageIndex=\(stageIndex) count=\(count) candidates=\(candidateList)")
+                }
+            }
+
+            return currentHandle
         }
 
         @MainActor
         private func worldTextureSelectionForPBRDebug(handle: UInt32,
                                                       fallback: MTLTexture,
-                                                      stage: Q3MetalWorldStage) -> WorldTextureSelection {
+                                                      stage: Q3MetalWorldStage,
+                                                      materialHandle: UInt32? = nil) -> WorldTextureSelection {
             let name = textureNameForLog(handle)
+            let pbrHandle = materialHandle ?? handle
             let isFXStage = stage.blendMode != 0 ||
                             stage.alphaFunc != 0 ||
                             shouldPreferClassicTextureForAlphaFX(name, isEntity: false)
@@ -5215,7 +5287,8 @@ struct MetalView: UIViewRepresentable {
                     return WorldTextureSelection(texture: pbr,
                                                  useWorldPBR: false,
                                                  classicFX: true,
-                                                 atlasParams: fxAtlasParams)
+                                                 atlasParams: fxAtlasParams,
+                                                 materialHandle: handle)
                 }
                 // RTX-Remix authored emissive/PBR floor + wall shaders
                 // (q3dm1 textures/gothic_floor/largerblock3b_ow,
@@ -5228,37 +5301,43 @@ struct MetalView: UIViewRepresentable {
                 // Promote to useWorldPBR:true ONLY for FX stages where the
                 // material has real authored sidecar maps; pure FX sprites
                 // without sidecars stay on the classic path.
-                if pbrMaterialHasAuxSlots(handle), let pbr = pbrAlbedoTexture(for: handle) {
+                if pbrMaterialHasAuxSlots(pbrHandle), let pbr = pbrAlbedoTexture(for: pbrHandle) {
                     if loggedPBROnlyWorldMisses.insert(handle).inserted {
-                        pbrLog("[Q3-PBR] world FX-stage + PBR-sidecars handle=\(handle) name='\(name)'")
+                        let materialName = (pbrHandle != handle) ? " materialHandle=\(pbrHandle) material='\(textureNameForLog(pbrHandle))'" : ""
+                        pbrLog("[Q3-PBR] world FX-stage + PBR-sidecars handle=\(handle) name='\(name)'\(materialName)")
                     }
-                    return WorldTextureSelection(texture: pbr, useWorldPBR: true, classicFX: true, atlasParams: nil)
+                    return WorldTextureSelection(texture: pbr,
+                                                 useWorldPBR: true,
+                                                 classicFX: true,
+                                                 atlasParams: nil,
+                                                 materialHandle: pbrHandle)
                 }
                 if Q3_PBROnlyTextures() != 0 && loggedPBROnlyWorldMisses.insert(handle).inserted {
                     pbrLog("[Q3-PBR-ONLY] world FX/classic fallback handle=\(handle) name='\(name)'")
                 }
-                return WorldTextureSelection(texture: fallback, useWorldPBR: false, classicFX: true, atlasParams: nil)
+                return WorldTextureSelection(texture: fallback, useWorldPBR: false, classicFX: true, atlasParams: nil, materialHandle: handle)
             }
-            if let pbr = pbrAlbedoTexture(for: handle) {
-                return WorldTextureSelection(texture: pbr, useWorldPBR: true, classicFX: false, atlasParams: nil)
+            if let pbr = pbrAlbedoTexture(for: pbrHandle) {
+                return WorldTextureSelection(texture: pbr, useWorldPBR: true, classicFX: false, atlasParams: nil, materialHandle: pbrHandle)
             }
             // Some bridge entries intentionally have no authored albedo but do
             // carry useful PBR side data (normal/roughness/metalness constants
             // or maps). Keep the original Q3 diffuse as base color, but still
             // enable the world PBR/IBL path so those surfaces do not fall all
             // the way back to flat classic lighting.
-            if pbrMaterialHasAuxSlots(handle) {
+            if pbrMaterialHasAuxSlots(pbrHandle) {
                 if loggedPBROnlyWorldMisses.insert(handle).inserted {
-                    pbrLog("[Q3-PBR] world classic-albedo + PBR-sidecars handle=\(handle) name='\(name)'")
+                    let materialName = (pbrHandle != handle) ? " materialHandle=\(pbrHandle) material='\(textureNameForLog(pbrHandle))'" : ""
+                    pbrLog("[Q3-PBR] world classic-albedo + PBR-sidecars handle=\(handle) name='\(name)'\(materialName)")
                 }
-                return WorldTextureSelection(texture: fallback, useWorldPBR: true, classicFX: false, atlasParams: nil)
+                return WorldTextureSelection(texture: fallback, useWorldPBR: true, classicFX: false, atlasParams: nil, materialHandle: pbrHandle)
             }
             if Q3_PBROnlyTextures() != 0 {
                 if shouldAllowClassicFallbackInPBROnly(name, isEntity: false) {
                     if loggedPBROnlyWorldMisses.insert(handle).inserted {
                         pbrLog("[Q3-PBR-ONLY] world FX/classic fallback handle=\(handle) name='\(name)'")
                     }
-                    return WorldTextureSelection(texture: fallback, useWorldPBR: false, classicFX: true, atlasParams: nil)
+                    return WorldTextureSelection(texture: fallback, useWorldPBR: false, classicFX: true, atlasParams: nil, materialHandle: handle)
                 }
                 if loggedPBROnlyWorldMisses.insert(handle).inserted {
                     pbrLog("[Q3-PBR-ONLY] world missing PBR handle=\(handle) name='\(name)' -> classic fallback")
@@ -5266,9 +5345,10 @@ struct MetalView: UIViewRepresentable {
                 return WorldTextureSelection(texture: fallback,
                                              useWorldPBR: false,
                                              classicFX: true,
-                                             atlasParams: nil)
+                                             atlasParams: nil,
+                                             materialHandle: handle)
             }
-            return WorldTextureSelection(texture: fallback, useWorldPBR: false, classicFX: false, atlasParams: nil)
+            return WorldTextureSelection(texture: fallback, useWorldPBR: false, classicFX: false, atlasParams: nil, materialHandle: handle)
         }
 
         @MainActor
@@ -7764,6 +7844,7 @@ struct MetalView: UIViewRepresentable {
 
                     func encodeNormalWorldDraw(_ draw: Q3MetalWorldDrawCmd,
                                                _ stage: Q3MetalWorldStage,
+                                               _ stageIndex: Int,
                                                _ worldPass: Int,
                                                _ activeIndexBuffer: MTLBuffer,
                                                _ activeIndexOffset: Int,
@@ -7907,9 +7988,10 @@ struct MetalView: UIViewRepresentable {
                             pbrMetallic: stage.pbrMetallic,
                             _pad0: (draw.flags & combinedLightmapBit) != 0 ? 1.0 : 0.0
                         )
+                        let materialHandle = worldOwnerMaterialHandle(for: draw, stageIndex: stageIndex, stage: stage)
                         let worldSelection = (stage.useLightmap == 0)
-                            ? worldTextureSelectionForPBRDebug(handle: stage.textureHandle, fallback: baseTexture, stage: stage)
-                            : WorldTextureSelection(texture: baseTexture, useWorldPBR: false, classicFX: false, atlasParams: nil)
+                            ? worldTextureSelectionForPBRDebug(handle: stage.textureHandle, fallback: baseTexture, stage: stage, materialHandle: materialHandle)
+                            : WorldTextureSelection(texture: baseTexture, useWorldPBR: false, classicFX: false, atlasParams: nil, materialHandle: stage.textureHandle)
                         encoder.setFragmentTexture(worldSelection.texture, index: 0)
                         encoder.setFragmentTexture(lightmapTexture, index: 1)
                         // FX/alpha/additive/tcMod stages must stay in the authored
@@ -7924,14 +8006,14 @@ struct MetalView: UIViewRepresentable {
                         // sees defined data. envCube falls back to the
                         // procedural cube via ensurePBREnvCube().
                         let worldNormalTex = worldSelection.useWorldPBR
-                            ? (pbrNormalTexture(for: stage.textureHandle, allowGenericFallback: false) ?? pbrFlatNormalDefault())
+                            ? (pbrNormalTexture(for: worldSelection.materialHandle, allowGenericFallback: false) ?? pbrFlatNormalDefault())
                             : pbrFlatNormalDefault()
                         encoder.setFragmentTexture(worldNormalTex, index: 2)
                         if worldSelection.useWorldPBR && Q3_PBRIBLEnabled() != 0 && Q3_PBRWorldEnabled() != 0 {
                             encoder.setFragmentTexture(ensurePBREnvCube(), index: 3)
                             encoder.setFragmentSamplerState(ensurePBREnvSampler(), index: 1)
-                            encoder.setFragmentTexture(pbrRoughnessTexture(for: stage.textureHandle) ?? pbrRoughnessDefault(), index: 4)
-                            encoder.setFragmentTexture(pbrMetallicTexture(for: stage.textureHandle) ?? pbrMetallicDefault(), index: 5)
+                            encoder.setFragmentTexture(pbrRoughnessTexture(for: worldSelection.materialHandle) ?? pbrRoughnessDefault(), index: 4)
+                            encoder.setFragmentTexture(pbrMetallicTexture(for: worldSelection.materialHandle) ?? pbrMetallicDefault(), index: 5)
                         } else {
                             encoder.setFragmentTexture(ensurePBREnvCube(), index: 3)
                             encoder.setFragmentSamplerState(ensurePBREnvSampler(), index: 1)
@@ -7942,17 +8024,17 @@ struct MetalView: UIViewRepresentable {
                         // when material ships no emissive DDS). drawUniforms.
                         // emissiveParams carries (color, intensity); MSL
                         // gates the sample + add on intensity > 0.
-                        let worldEmissiveTex = pbrEmissiveTexture(for: stage.textureHandle) ?? pbrEmissiveDefault()
+                        let worldEmissiveTex = pbrEmissiveTexture(for: worldSelection.materialHandle) ?? pbrEmissiveDefault()
                         encoder.setFragmentTexture(worldEmissiveTex, index: 6)
-                        drawUniforms.emissiveParams = emissiveParamsForPBRMaterial(handle: stage.textureHandle)
+                        drawUniforms.emissiveParams = emissiveParamsForPBRMaterial(handle: worldSelection.materialHandle)
                         // Height/parallax slot @ 7 — only active (scale > 0)
                         // when the material ships a real height DDS. Log both
                         // the active and fallthrough paths so q3_diag shows
                         // exactly where authored height data drops out.
-                        let heightTex = worldSelection.useWorldPBR ? pbrHeightTexture(for: stage.textureHandle) : nil
+                        let heightTex = worldSelection.useWorldPBR ? pbrHeightTexture(for: worldSelection.materialHandle) : nil
                         let parallaxScale: Float = (heightTex == nil) ? 0.0 : Q3_PBRParallaxScale()
                         let parallaxTint: Float = (heightTex == nil || Q3_PBRParallaxTint() == 0) ? 0.0 : 1.0
-                        logParallaxBind(handle: stage.textureHandle,
+                        logParallaxBind(handle: worldSelection.materialHandle,
                                         stage: stage,
                                         selection: worldSelection,
                                         heightTex: heightTex,
@@ -7977,7 +8059,7 @@ struct MetalView: UIViewRepresentable {
                         // MSL fragment so it sub-rect-samples the current frame.
                         // Non-atlas materials leave x=0, keeping the atlas branch off.
                         drawUniforms.spriteAtlasParams = worldSelection.atlasParams
-                            ?? (worldSelection.useWorldPBR ? pbrSpriteAtlasParams(for: stage.textureHandle, atlasTime: atlasTimeSeconds) : SIMD4<Float>(0, 0, 0, 0))
+                            ?? (worldSelection.useWorldPBR ? pbrSpriteAtlasParams(for: worldSelection.materialHandle, atlasTime: atlasTimeSeconds) : SIMD4<Float>(0, 0, 0, 0))
                         encoder.setFragmentBytes(&drawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 0)
                         encoder.setVertexBytes(&drawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 2)
                         encoder.drawIndexedPrimitives(
@@ -8102,6 +8184,7 @@ struct MetalView: UIViewRepresentable {
                                     let stage = Self.worldStage(draw, batch.stageIndex)
                                     if encodeNormalWorldDraw(draw,
                                                              stage,
+                                                             batch.stageIndex,
                                                              worldPass,
                                                              batchedIndexBuffer,
                                                              batch.firstMergedIndex * MemoryLayout<UInt32>.stride,
@@ -8563,9 +8646,10 @@ struct MetalView: UIViewRepresentable {
                             // The non-batched path was still binding the vanilla Q3
                             // base texture here, so most world geometry looked stock
                             // unless it happened to route through encodeNormalWorldDraw().
+                            let materialHandle = worldOwnerMaterialHandle(for: draw, stageIndex: stageIndex, stage: stage)
                             let worldSelection = (stage.useLightmap == 0)
-                                ? worldTextureSelectionForPBRDebug(handle: stage.textureHandle, fallback: baseTexture, stage: stage)
-                                : WorldTextureSelection(texture: baseTexture, useWorldPBR: false, classicFX: false, atlasParams: nil)
+                                ? worldTextureSelectionForPBRDebug(handle: stage.textureHandle, fallback: baseTexture, stage: stage, materialHandle: materialHandle)
+                                : WorldTextureSelection(texture: baseTexture, useWorldPBR: false, classicFX: false, atlasParams: nil, materialHandle: stage.textureHandle)
                             setWorldFragmentTextureCached(worldSelection.texture, index: 0)
                             setWorldFragmentTextureCached(lightmapTexture, index: 1)
                             // Match encodeNormalWorldDraw(): bind the
@@ -8574,12 +8658,12 @@ struct MetalView: UIViewRepresentable {
                             // many q3dm4/q3dm17 surfaces, so leaving the global
                             // normal here made the world look flat/noisy and
                             // ignored authored roughness/metallic maps.
-                            setWorldFragmentTextureCached(worldSelection.useWorldPBR ? pbrNormalTexture(for: stage.textureHandle, allowGenericFallback: false) : nil, index: 2)
+                            setWorldFragmentTextureCached(worldSelection.useWorldPBR ? pbrNormalTexture(for: worldSelection.materialHandle, allowGenericFallback: false) : nil, index: 2)
                             if worldSelection.useWorldPBR && Q3_PBRIBLEnabled() != 0 && Q3_PBRWorldEnabled() != 0 {
                                 setWorldFragmentTextureCached(ensurePBREnvCube(), index: 3)
                                 encoder.setFragmentSamplerState(ensurePBREnvSampler(), index: 1)
-                                setWorldFragmentTextureCached(pbrRoughnessTexture(for: stage.textureHandle), index: 4)
-                                setWorldFragmentTextureCached(pbrMetallicTexture(for: stage.textureHandle), index: 5)
+                                setWorldFragmentTextureCached(pbrRoughnessTexture(for: worldSelection.materialHandle), index: 4)
+                                setWorldFragmentTextureCached(pbrMetallicTexture(for: worldSelection.materialHandle), index: 5)
                             } else {
                                 setWorldFragmentTextureCached(nil, index: 3)
                                 setWorldFragmentTextureCached(nil, index: 4)
@@ -8588,12 +8672,12 @@ struct MetalView: UIViewRepresentable {
                             // Emissive @ 6 — same fallback chain as the
                             // primary non-batched site. Material-specific
                             // emissive when present, zero default otherwise.
-                            setWorldFragmentTextureCached(pbrEmissiveTexture(for: stage.textureHandle) ?? pbrEmissiveDefault(), index: 6)
+                            setWorldFragmentTextureCached(pbrEmissiveTexture(for: worldSelection.materialHandle) ?? pbrEmissiveDefault(), index: 6)
                             // Height/parallax @ 7 — mirror of the primary site.
-                            let heightTex = worldSelection.useWorldPBR ? pbrHeightTexture(for: stage.textureHandle) : nil
+                            let heightTex = worldSelection.useWorldPBR ? pbrHeightTexture(for: worldSelection.materialHandle) : nil
                             let parallaxScale: Float = (heightTex == nil) ? 0.0 : Q3_PBRParallaxScale()
                             let parallaxTint: Float = (heightTex == nil || Q3_PBRParallaxTint() == 0) ? 0.0 : 1.0
-                            logParallaxBind(handle: stage.textureHandle,
+                            logParallaxBind(handle: worldSelection.materialHandle,
                                             stage: stage,
                                             selection: worldSelection,
                                             heightTex: heightTex,
@@ -8615,8 +8699,8 @@ struct MetalView: UIViewRepresentable {
                             // Phase 2 atlas wiring (mirror of the primary
                             // draw site — see comment above the other copy).
                             drawUniforms.spriteAtlasParams = worldSelection.atlasParams
-                                ?? (worldSelection.useWorldPBR ? pbrSpriteAtlasParams(for: stage.textureHandle, atlasTime: atlasTimeSeconds) : SIMD4<Float>(0, 0, 0, 0))
-                            drawUniforms.emissiveParams = emissiveParamsForPBRMaterial(handle: stage.textureHandle)
+                                ?? (worldSelection.useWorldPBR ? pbrSpriteAtlasParams(for: worldSelection.materialHandle, atlasTime: atlasTimeSeconds) : SIMD4<Float>(0, 0, 0, 0))
+                            drawUniforms.emissiveParams = emissiveParamsForPBRMaterial(handle: worldSelection.materialHandle)
                             encoder.setFragmentBytes(&drawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 0)
                             // Vertex shader reads deformWave + timeSeconds
                             // from WorldDrawUniforms. Bound at vertex
@@ -8664,6 +8748,7 @@ struct MetalView: UIViewRepresentable {
                                 let stage = Self.worldStage(batch.draw, stageIndex)
                                 if encodeNormalWorldDraw(batch.draw,
                                                          stage,
+                                                         stageIndex,
                                                          worldPass,
                                                          batchIndexBuffer,
                                                          Int(batch.firstIndex) * MemoryLayout<UInt32>.stride,

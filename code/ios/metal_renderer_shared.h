@@ -184,6 +184,11 @@ typedef struct {
      * r_pbr_world_class_match is enabled. */
     float pbrRoughness;
     float pbrMetallic;
+    /* Optional owner material texture handle for multi-stage shaders whose
+     * visible FX/base stage is authored in Q3 as textures/sfx/* but the RTX
+     * Remix PBR material is keyed to a later concrete world texture stage.
+     * 0/default = use textureHandle. */
+    uint32_t pbrMaterialHandle;
 } Q3MetalWorldStage;
 
 #define Q3_METAL_MAX_STAGES 8
