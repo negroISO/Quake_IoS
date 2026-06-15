@@ -9126,11 +9126,22 @@ static void RE_RenderScene(const refdef_t *fd) {
                     g = (float)sceneEntity->entity.shader.rgba[1] / 255.0f;
                     b = (float)sceneEntity->entity.shader.rgba[2] / 255.0f;
                     a = (float)sceneEntity->entity.shader.rgba[3] / 255.0f;
+                    /* CG_LightningBolt zero-inits refEntity_t and does not
+                     * author shaderRGBA. Keep the beam visible even before
+                     * shader rgbGen wave modulation is applied. */
+                    if (r <= 0.0f && g <= 0.0f && b <= 0.0f) {
+                        r = 1.0f;
+                        g = 1.0f;
+                        b = 1.0f;
+                    }
+                    if (a <= 0.0f) {
+                        a = 1.0f;
+                    }
 
                     for (i = 0; i < 4; ++i) {
                         vec3_t temp;
                         MetalEmitRailCore(&entityVertexCursor, &entityIndexCursor,
-                                          start, end, right, len, 8.0f,
+                                          start, end, right, len, 18.0f,
                                           r, g, b, a);
                         RotatePointAroundVector(temp, beamDir, right, 45.0f);
                         VectorCopy(temp, right);
@@ -9144,8 +9155,18 @@ static void RE_RenderScene(const refdef_t *fd) {
                         EntityFlagsForTexture((qhandle_t)sceneEntity->entity.customShader,
                                               Q3_METAL_ENTITY_DRAWFLAG_NOCULL,
                                               qfalse);
+                    /* lightningBoltNew is authored GL_ONE/GL_ONE. Force the
+                     * beam through the additive-full visible path even if a
+                     * texture/material metadata miss leaves blendMode at 0. */
                     s_entityDraws[entityDrawCursor].flags &=
-                        ~Q3_METAL_ENTITY_DRAWFLAG_CLAMPMAP;
+                        ~(Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE |
+                          Q3_METAL_ENTITY_DRAWFLAG_ALPHA |
+                          Q3_METAL_ENTITY_DRAWFLAG_FILTER |
+                          Q3_METAL_ENTITY_DRAWFLAG_SUBTRACT |
+                          Q3_METAL_ENTITY_DRAWFLAG_CLAMPMAP);
+                    s_entityDraws[entityDrawCursor].flags |=
+                        Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE_FULL |
+                        Q3_METAL_ENTITY_DRAWFLAG_ATEST_GT0;
                     EmitMetalEntityStageAuditForHandle(
                         (qhandle_t)sceneEntity->entity.customShader,
                         "lightning");

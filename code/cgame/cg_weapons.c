@@ -970,15 +970,34 @@ static void CG_LightningBolt( centity_t *cent, vec3_t origin ) {
 	vec3_t   forward;
 	vec3_t   muzzlePoint, endPoint;
 	int      anim;
+	qboolean predictedLocalLightning = qfalse;
+
+	if (cent->currentState.number == cg.predictedPlayerState.clientNum &&
+		cg.predictedPlayerState.weapon == WP_LIGHTNING) {
+		predictedLocalLightning = qtrue;
+	}
 
 	if (cent->currentState.weapon != WP_LIGHTNING) {
-		return;
+		/* First-person LG uses the non-predicted centity so the trace end
+		 * matches the server-corrected direction. In the native iOS path that
+		 * cent can lag one snapshot behind the predicted playerState weapon,
+		 * so the guard dropped the visual beam even while ammo was consumed
+		 * and the muzzle flash/dlight rendered. Trust the predicted local
+		 * weapon for this visibility guard; remote players still require the
+		 * entityState weapon to be WP_LIGHTNING. */
+		if (cent->currentState.number != cg.predictedPlayerState.clientNum ||
+			cg.predictedPlayerState.weapon != WP_LIGHTNING) {
+			return;
+		}
 	}
 
 	memset( &beam, 0, sizeof( beam ) );
 
 	// CPMA  "true" lightning
-	if ((cent->currentState.number == cg.predictedPlayerState.clientNum) && (cg_trueLightning.value != 0)) {
+	if (predictedLocalLightning) {
+		AngleVectors(cg.refdefViewAngles, forward, NULL, NULL);
+		VectorCopy(cent->lerpOrigin, muzzlePoint );
+	} else if ((cent->currentState.number == cg.predictedPlayerState.clientNum) && (cg_trueLightning.value != 0)) {
 		vec3_t angle;
 		int i;
 
