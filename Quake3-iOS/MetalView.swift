@@ -903,7 +903,6 @@ struct MetalView: UIViewRepresentable {
             ("models/powerups/armor",         "textures/effects/envmapgold"),
             ("models/powerups/ammo",          "textures/effects/envmapyel"),
             ("models/powerups/instant/bfg",   "textures/effects/envmapbfg"),
-            ("powerups/quad",                 "textures/effects/envmapgold"),
             ("powerups/regen",                "textures/effects/envmapgold"),
             ("powerups/battlesuit",           "textures/effects/envmapgold"),
         ]
