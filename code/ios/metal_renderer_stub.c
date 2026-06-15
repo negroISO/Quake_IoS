@@ -132,6 +132,10 @@ typedef struct {
                     * Stored per-texture so the entity fragment can skip
                     * the baked-in Lambert color for chrome shells that
                     * upstream treats as full-bright (CGEN_IDENTITY). */
+    int rgbGenExplicit; /* true when the shader authored an rgbGen token.
+                         * Distinguishes explicit rgbGen identity from the
+                         * parser's zero-initialized default/no-directive
+                         * path used by ordinary lit MD3 skins. */
     int alphaGen;  /* 0=identity (force alpha 1.0), 1=vertex, 3=wave.
                     * Parallels rgbGen and matches upstream AGEN_IDENTITY,
                     * which overrides vertex alpha with 255 so stages that
@@ -512,6 +516,7 @@ typedef struct {
     uint32_t rawDstBlend;
     uint32_t depthFunc;
     int rgbGen;
+    int rgbGenExplicit;
     int alphaGen;
     int alphaFunc;
     int tcGen;
@@ -1736,6 +1741,7 @@ static int ShaderMap_GetBlendMode(const char *name);
 static int ShaderMap_GetAlphaFunc(const char *name);
 static int ShaderMap_GetTcGenEnv(const char *name);
 static int ShaderMap_GetRgbGen(const char *name);
+static int ShaderMap_GetRgbGenExplicit(const char *name);
 static int ShaderMap_GetAlphaGen(const char *name);
 static void ShaderMap_GetRgbWave(const char *name, int *func, float *base, float *amp, float *phase, float *freq);
 static void ShaderMap_GetAlphaWave(const char *name, int *func, float *base, float *amp, float *phase, float *freq);
@@ -1841,6 +1847,7 @@ static qhandle_t RegisterTexture(const char *name) {
                 animTex->alphaFunc = ShaderMap_GetAlphaFunc(name);
                 animTex->tcGenEnv = ShaderMap_GetTcGenEnv(name);
                 animTex->rgbGen = ShaderMap_GetRgbGen(name);
+                animTex->rgbGenExplicit = ShaderMap_GetRgbGenExplicit(name);
                 animTex->alphaGen = ShaderMap_GetAlphaGen(name);
                 ShaderMap_GetRgbWave(name, &animTex->rgbWaveFunc,
                                      &animTex->rgbWaveBase, &animTex->rgbWaveAmp,
@@ -2051,6 +2058,7 @@ static qhandle_t RegisterTexture(const char *name) {
     texture->alphaFunc = ShaderMap_GetAlphaFunc(name);
     texture->tcGenEnv = ShaderMap_GetTcGenEnv(name);
     texture->rgbGen = ShaderMap_GetRgbGen(name);
+    texture->rgbGenExplicit = ShaderMap_GetRgbGenExplicit(name);
     texture->alphaGen = ShaderMap_GetAlphaGen(name);
     ShaderMap_GetRgbWave(name, &texture->rgbWaveFunc,
                          &texture->rgbWaveBase, &texture->rgbWaveAmp,
@@ -2195,6 +2203,7 @@ static void CopyStageMetadataToTexture(metalTexture_t *texture, const Q3MetalSta
     texture->alphaFunc = stage->alphaFunc;
     texture->tcGenEnv = (stage->tcGen == 1);
     texture->rgbGen = stage->rgbGen;
+    texture->rgbGenExplicit = stage->rgbGenExplicit;
     texture->alphaGen = stage->alphaGen;
     texture->rgbWaveFunc = stage->rgbWaveFunc;
     texture->rgbWaveBase = stage->rgbWaveBase;
@@ -2250,6 +2259,40 @@ static qhandle_t RegisterEntityStageTexture(const char *shaderName, int stageInd
     texture->generation = base->generation;
     CopyStageMetadataToTexture(texture, stage);
     return texture->handle;
+}
+
+static qboolean EntityTextureWantsExplicitIdentityFullbright(qhandle_t textureHandle,
+                                                             const char *shaderName) {
+    const metalTexture_t *tex = FindTextureByHandle(textureHandle);
+    const metalShaderMap_t *entry;
+    if (tex == NULL || tex->rgbGen != 0 || !tex->rgbGenExplicit) return qfalse;
+    if (shaderName != NULL && shaderName[0] != '\0') {
+        entry = ShaderMap_LookupEntry(shaderName);
+        if (entry != NULL && entry->stageCount > 1) return qfalse;
+    }
+    return qtrue;
+}
+
+static void EmitEntityFullbrightAudit(const char *shaderName, qhandle_t textureHandle) {
+    static char seen[32][MAX_QPATH];
+    static int seenCount = 0;
+    const metalTexture_t *tex;
+    const char *key;
+    int i;
+    char stored[MAX_QPATH];
+    tex = FindTextureByHandle(textureHandle);
+    key = (shaderName != NULL && shaderName[0] != '\0') ? shaderName :
+          (tex != NULL ? tex->name : "(unknown)");
+    for (i = 0; i < seenCount; ++i) {
+        if (!Q_stricmp(seen[i], key)) return;
+    }
+    if (seenCount < (int)(sizeof(seen) / sizeof(seen[0]))) {
+        Q_strncpyz(seen[seenCount++], key, sizeof(seen[0]));
+    }
+    Q_strncpyz(stored, key, sizeof(stored));
+    MetalTelemetryPrintf("metal_entity_rgbgen", PRINT_ALL,
+        "[Q3-ENTITY-RGBGEN] explicit identity fullbright shader='%s' tex='%s' handle=%u\n",
+        stored, tex != NULL ? tex->name : "(no-tex)", (unsigned)textureHandle);
 }
 
 static void EmitMetalEntityStageAudit(const char *shaderName, const char *source) {
@@ -6589,6 +6632,14 @@ static int ShaderMap_GetRgbGen(const char *name) {
     return entry->stages[0].rgbGen;
 }
 
+static int ShaderMap_GetRgbGenExplicit(const char *name) {
+    const metalShaderMap_t *entry;
+    if (name == NULL || name[0] == '\0') return 0;
+    entry = ShaderMap_LookupEntry(name);
+    if (entry == NULL || entry->stageCount <= 0) return 0;
+    return entry->stages[0].rgbGenExplicit ? 1 : 0;
+}
+
 /* Stage 0 alphaGen. Entity fragment honors identity by forcing alpha
  * to 1.0 regardless of per-vertex alpha, matching upstream
  * AGEN_IDENTITY semantics. */
@@ -7393,6 +7444,7 @@ static void ParseShaderText(const char *text) {
                     }
                 } else if (!Q_stricmp(token, "rgbGen") || !Q_stricmp(token, "rgbgen")) {
                     token = COM_ParseExt(&p, qfalse);
+                    cur.rgbGenExplicit = 1;
                     if (!Q_stricmp(token, "vertex")) cur.rgbGen = 1;
                     else if (!Q_stricmp(token, "exactVertex") ||
                              !Q_stricmp(token, "exactvertex")) cur.rgbGen = 1;
@@ -9478,8 +9530,13 @@ static void RE_RenderScene(const refdef_t *fd) {
                         drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_DEPTHHACK;
                     }
                     baseDrawFlags = drawFlags;
+                    qboolean surfaceExplicitIdentityFullbright =
+                        EntityTextureWantsExplicitIdentityFullbright(textureHandle, shaderNameForStages);
                     {
                         drawFlags = EntityFlagsForTexture(textureHandle, drawFlags, qtrue);
+                        if (surfaceExplicitIdentityFullbright) {
+                            EmitEntityFullbrightAudit(shaderNameForStages, textureHandle);
+                        }
                         /* === [QUAD-EMIT] runtime trace for chrome-shell draws ===
                          * When the entity uses a customShader whose texture name
                          * contains "quad" (powerups/quadWeapon for the viewmodel
@@ -9626,12 +9683,18 @@ static void RE_RenderScene(const refdef_t *fd) {
                                   + worldN[2] * entityLightDir[2];
                             if (ndotl < 0.0f) ndotl = 0.0f;
 
-                            rgb0 = (entityAmbient[0] + entityDirected[0] * ndotl) * entityColor[0];
-                            rgb1 = (entityAmbient[1] + entityDirected[1] * ndotl) * entityColor[1];
-                            rgb2 = (entityAmbient[2] + entityDirected[2] * ndotl) * entityColor[2];
-                            if (rgb0 > 1.0f) rgb0 = 1.0f;
-                            if (rgb1 > 1.0f) rgb1 = 1.0f;
-                            if (rgb2 > 1.0f) rgb2 = 1.0f;
+                            if (surfaceExplicitIdentityFullbright) {
+                                rgb0 = entityColor[0];
+                                rgb1 = entityColor[1];
+                                rgb2 = entityColor[2];
+                            } else {
+                                rgb0 = (entityAmbient[0] + entityDirected[0] * ndotl) * entityColor[0];
+                                rgb1 = (entityAmbient[1] + entityDirected[1] * ndotl) * entityColor[1];
+                                rgb2 = (entityAmbient[2] + entityDirected[2] * ndotl) * entityColor[2];
+                                if (rgb0 > 1.0f) rgb0 = 1.0f;
+                                if (rgb1 > 1.0f) rgb1 = 1.0f;
+                                if (rgb2 > 1.0f) rgb2 = 1.0f;
+                            }
 
                             outVertex->color[0] = rgb0;
                             outVertex->color[1] = rgb1;
