@@ -2388,51 +2388,41 @@ struct MetalView: UIViewRepresentable {
                 texCoord = float2((localUV.x + col) / aCols,
                                   (localUV.y + row) / aRows);
             }
-            /* Parallax (height-map) offset — derivative-built tangent
-             * frame, 8-step linear search. Gated on parallaxParams.x > 0
-             * (cvar r_pbr_parallax_scale, only written when the material
-             * actually ships a height map) and base tcGen only —
-             * environment/vector/lightmap UVs have no meaningful height
-             * relationship. Mutates texCoord in place so albedo, normal,
-             * roughness, metallic, and emissive all sample the displaced
-             * UV. */
+            /* Parallax (height-map) offset. The old derivative frame built
+             * T/B from perpendicular vectors without solving the UV
+             * Jacobian, so many planar Q3 surfaces produced a near-zero
+             * tangent-space view direction and scale=0 vs scale=2 frames
+             * were visually identical. Solve the screen-space UV Jacobian
+             * explicitly, then apply a bounded view-dependent offset before
+             * albedo/normal/roughness/metallic/emissive sampling. */
             bool parallaxDebugTint = false;
             if (drawUniforms.parallaxParams.x > 0.0001 && tcGenMode == 0 &&
                 !is_null_texture(heightMap)) {
                 parallaxDebugTint = drawUniforms.parallaxParams.w > 0.5;
                 float3 pdx = dfdx(in.worldPos);
                 float3 pdy = dfdy(in.worldPos);
-                float2 tdx = dfdx(texCoord);
-                float2 tdy = dfdy(texCoord);
+                float2 duvDx = dfdx(texCoord);
+                float2 duvDy = dfdy(texCoord);
+                float det = duvDx.x * duvDy.y - duvDx.y * duvDy.x;
                 float3 Np = normalize(cross(pdx, pdy));
                 float3 V = normalize(uniforms.cameraPos - in.worldPos);
                 if (dot(Np, V) < 0.0) { Np = -Np; }
-                float3 dp2perp = cross(pdy, Np);
-                float3 dp1perp = cross(Np, pdx);
-                float3 T = dp2perp * tdx.x + dp1perp * tdy.x;
-                float3 B = dp2perp * tdx.y + dp1perp * tdy.y;
-                float invmax = rsqrt(max(max(dot(T, T), dot(B, B)), 1e-12));
-                float3 vT = float3(dot(V, T * invmax), dot(V, B * invmax), dot(V, Np));
-                if (vT.z > 0.05) {
-                    float scale = drawUniforms.parallaxParams.x;
-                    float2 dir = vT.xy / vT.z * scale;
-                    // 8-step layered search, then one secant refine.
-                    const int steps = 8;
-                    float layer = 1.0 / float(steps);
-                    float depth = 0.0;
-                    float2 uv = texCoord;
-                    float h = 1.0 - heightMap.sample(textureSampler, uv).r;
-                    float prevH = h;
-                    for (int s = 0; s < steps && depth < h; ++s) {
-                        prevH = h;
-                        uv -= dir * layer;
-                        depth += layer;
-                        h = 1.0 - heightMap.sample(textureSampler, uv).r;
+                if (abs(det) > 1.0e-7 && all(isfinite(Np)) && all(isfinite(V))) {
+                    float invDet = 1.0 / det;
+                    float3 T = normalize((pdx * duvDy.y - pdy * duvDx.y) * invDet);
+                    float3 B = normalize((pdy * duvDx.x - pdx * duvDy.x) * invDet);
+                    float vz = max(dot(V, Np), 0.08);
+                    float2 viewTS = float2(dot(V, T), dot(V, B)) / vz;
+                    viewTS = clamp(viewTS, float2(-4.0), float2(4.0));
+                    // Remix height maps are authored as scalar relief. Keep
+                    // normal gameplay default subtle (0.02), but make the
+                    // diagnostic scale=2 sweep visibly move texels.
+                    float h = heightMap.sample(textureSampler, texCoord).r;
+                    float height = (h - 0.5) * drawUniforms.parallaxParams.x * 0.15;
+                    float2 offset = viewTS * height;
+                    if (all(isfinite(offset))) {
+                        texCoord -= offset;
                     }
-                    float after = h - depth;
-                    float before = prevH - (depth - layer);
-                    float w = saturate(before / max(before - after, 1e-5));
-                    texCoord = mix(uv + dir * layer, uv, w);
                 }
             }
             /* Always sample the per-stage colorTexture using the tcGen-
