@@ -4701,6 +4701,19 @@ static qboolean MetalInlineBrushModelValid(const metalModel_t *model) {
     return qtrue;
 }
 
+static qboolean MetalInlineBrushModelStageEmitsOpaque(const Q3MetalWorldStage *stage) {
+    int blendMode;
+    if (stage == NULL) return qfalse;
+    if (stage->useLightmap != 0 || stage->textureHandle == 0) return qfalse;
+
+    /* Inline brush models (func_door / plats / movers) are submitted through
+     * the entity path, but their stages are authored as world shader stages.
+     * Treat the base/filter stage as the solid brush surface and drop overlay
+     * FX stages; otherwise surfaceparm-trans/filter doors render as ghosts. */
+    blendMode = MetalWorldBlendClass(stage->srcBlend, stage->dstBlend);
+    return (blendMode == 0 || blendMode == 3) ? qtrue : qfalse;
+}
+
 static int MetalWorldDrawRenderableStageCount(const Q3MetalWorldDrawCmd *draw) {
     uint32_t si;
     uint32_t stageCount;
@@ -4710,8 +4723,7 @@ static int MetalWorldDrawRenderableStageCount(const Q3MetalWorldDrawCmd *draw) {
     if (stageCount > Q3_METAL_MAX_STAGES) stageCount = Q3_METAL_MAX_STAGES;
     for (si = 0; si < stageCount; ++si) {
         const Q3MetalWorldStage *stage = &draw->stages[si];
-        if (stage->useLightmap != 0) continue;
-        if (stage->textureHandle == 0) continue;
+        if (!MetalInlineBrushModelStageEmitsOpaque(stage)) continue;
         count++;
     }
     return count;
@@ -4751,25 +4763,37 @@ static void MetalMeasureInlineBrushModel(const metalModel_t *model,
 }
 
 static uint32_t EntityFlagsForWorldStage(const Q3MetalWorldStage *stage,
-                                         qhandle_t textureHandle) {
+                                         qhandle_t textureHandle,
+                                         qboolean forceOpaque) {
+    const uint32_t blendFlagMask =
+        Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE |
+        Q3_METAL_ENTITY_DRAWFLAG_ALPHA |
+        Q3_METAL_ENTITY_DRAWFLAG_FILTER |
+        Q3_METAL_ENTITY_DRAWFLAG_SUBTRACT |
+        Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE_FULL;
     uint32_t flags = 0;
     int blendMode;
     if (stage == NULL) return flags;
     if (stage->cullMode == METAL_SHADER_CULL_DISABLE) {
         flags |= Q3_METAL_ENTITY_DRAWFLAG_NOCULL;
     }
-    blendMode = MetalWorldBlendClass(stage->srcBlend, stage->dstBlend);
-    if (blendMode == 1) flags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
-    else if (blendMode == 2) flags |= Q3_METAL_ENTITY_DRAWFLAG_ALPHA;
-    else if (blendMode == 3) flags |= Q3_METAL_ENTITY_DRAWFLAG_FILTER;
-    else if (blendMode == 4) flags |= Q3_METAL_ENTITY_DRAWFLAG_SUBTRACT;
-    else if (blendMode == 5) flags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE_FULL;
+    if (!forceOpaque) {
+        blendMode = MetalWorldBlendClass(stage->srcBlend, stage->dstBlend);
+        if (blendMode == 1) flags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+        else if (blendMode == 2) flags |= Q3_METAL_ENTITY_DRAWFLAG_ALPHA;
+        else if (blendMode == 3) flags |= Q3_METAL_ENTITY_DRAWFLAG_FILTER;
+        else if (blendMode == 4) flags |= Q3_METAL_ENTITY_DRAWFLAG_SUBTRACT;
+        else if (blendMode == 5) flags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE_FULL;
+    }
 
     if (stage->tcGen == 1) flags |= Q3_METAL_ENTITY_DRAWFLAG_TCGEN_ENV;
     if (stage->wrapClampMode != 0) flags |= Q3_METAL_ENTITY_DRAWFLAG_CLAMPMAP;
     if (stage->alphaFunc == 1) flags |= Q3_METAL_ENTITY_DRAWFLAG_ATEST_GT0;
 
     flags = EntityFlagsForTexture(textureHandle, flags, qfalse);
+    if (forceOpaque) {
+        flags &= ~blendFlagMask;
+    }
     return flags;
 }
 
@@ -4895,11 +4919,32 @@ static void MetalEmitInlineBrushModel(const metalSceneEntity_t *sceneEntity,
             for (st = 0; st < stageCount; ++st) {
                 const Q3MetalWorldStage *stage = &draw->stages[st];
                 qhandle_t stageHandle = (qhandle_t)stage->textureHandle;
-                if (stage->useLightmap != 0 || stageHandle == 0) continue;
+                int brushBlendMode;
+                if (!MetalInlineBrushModelStageEmitsOpaque(stage)) continue;
+                brushBlendMode = MetalWorldBlendClass(stage->srcBlend, stage->dstBlend);
+                if (brushBlendMode == 3) {
+                    const metalTexture_t *tex = FindTextureByHandle(stageHandle);
+                    static char s_inlineOpaqueSeen[16][MAX_QPATH];
+                    static int s_inlineOpaqueSeenCount = 0;
+                    const char *name = (tex != NULL && tex->name[0] != '\0') ? tex->name : "(unknown)";
+                    int seen = 0;
+                    int oi;
+                    for (oi = 0; oi < s_inlineOpaqueSeenCount; ++oi) {
+                        if (!Q_stricmp(s_inlineOpaqueSeen[oi], name)) { seen = 1; break; }
+                    }
+                    if (!seen) {
+                        if (s_inlineOpaqueSeenCount < (int)(sizeof(s_inlineOpaqueSeen) / sizeof(s_inlineOpaqueSeen[0]))) {
+                            Q_strncpyz(s_inlineOpaqueSeen[s_inlineOpaqueSeenCount++], name, MAX_QPATH);
+                        }
+                        MetalTelemetryPrintf("metal_bmodel_opaque", PRINT_ALL,
+                            "[Q3-BMODEL-OPAQUE] forced inline brush stage opaque name='%s' blend=filter\n",
+                            name);
+                    }
+                }
                 s_entityDraws[*drawCursor].firstIndex = firstIndex;
                 s_entityDraws[*drawCursor].indexCount = *indexCursor - firstIndex;
                 s_entityDraws[*drawCursor].textureHandle = (uint32_t)stageHandle;
-                s_entityDraws[*drawCursor].flags = EntityFlagsForWorldStage(stage, stageHandle);
+                s_entityDraws[*drawCursor].flags = EntityFlagsForWorldStage(stage, stageHandle, qtrue);
                 s_entityDraws[*drawCursor].fogIndex = draw->fogIndex;
                 EmitMetalEntityStageAuditForHandle(stageHandle, "bmodel");
                 SetEntityDrawColor(*drawCursor, &sceneEntity->entity, stageHandle);
