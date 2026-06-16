@@ -30,11 +30,11 @@ static unsigned long djb2_u64(uint64_t v) {
     return h;
 }
 
-/* The table itself. Allocated once on first load, freed + replaced on
- * subsequent loads. Two parallel arrays — `materials` keeps the public
- * material data, `hashTable` is a simple open-addressed hash table that
- * maps hash → index in materials[]. We never delete entries so linear
- * probe with a tombstone-free table is fine. */
+/* The active table. A fresh table is installed on each load. Old material
+ * and named arrays are intentionally preserved for process-lifetime
+ * pointer stability because metalTexture_t entries can hold pbrMaterial
+ * pointers across vid_restart. The active `hashTable` is private and can
+ * be rebuilt on reload. */
 static q3_pbr_material_t *g_materials = NULL;
 static int g_materials_count = 0;
 static int g_materials_cap = 0;
@@ -42,10 +42,8 @@ static int g_materials_cap = 0;
 static int *g_hash_table = NULL;
 static int g_hash_table_mask = 0;
 
-/* Buffer arena for the const-string slots inside materials. We
- * concatenate all path strings into one growing buffer and store
- * indices instead of pointers, then rewrite to pointers post-load.
- * Simpler than per-string malloc and reduces fragmentation. */
+/* Legacy arena symbols retained for compatibility with older callers;
+ * ownership now uses per-string heap allocations. */
 static char *g_str_arena = NULL;
 static size_t g_str_arena_used = 0;
 static size_t g_str_arena_cap = 0;
@@ -248,6 +246,9 @@ static char *json_str_dup(const char *v, const char *end);
 static int json_num(const char *v, const char *end, double *out);
 static const char *resolve_path(const char *root, const char *rel);
 static int parse_hex64(const char *s, uint64_t *out);
+static const char *json_object_end_from_value(const char *v, const char *end);
+static const char *str_arena_dup(const char *s);
+static void q3_pbr_free_table(void);
 
 /* Parallel array: distinct entries keyed by descriptive stem ("rocket",
  * "shotgun", …). Backed by the same string arena as g_materials. */
@@ -457,8 +458,8 @@ const q3_pbr_material_t *q3_pbr_lookup_by_name(const char *q3_shader_name) {
 
 /* JSON loader for the `materials_by_name` block. Called near end of
  * q3_pbr_table_load after `materials` is parsed. Reads each named
- * stem and stages it into g_named. Strings are duplicated into the
- * existing string arena. */
+ * stem and stages it into g_named. Strings are duplicated into
+ * process-lifetime heap storage. */
 static void load_named_materials_from_json(const char *json, const char *json_end,
                                            const char *assetRoot) {
     /* Find the "materials_by_name" object. */
@@ -466,18 +467,20 @@ static void load_named_materials_from_json(const char *json, const char *json_en
     if (!byNamePtr) return;
     while (byNamePtr < json_end && *byNamePtr != '{') byNamePtr++;
     if (byNamePtr >= json_end) return;
+    const char *byNameEnd = json_object_end_from_value(byNamePtr, json_end);
+    if (!byNameEnd) return;
     byNamePtr++;
 
     /* Walk entries: "<key>": { ... }, repeat. */
     const char *p = byNamePtr;
-    while (p < json_end) {
+    while (p < byNameEnd) {
         /* Skip whitespace + commas. */
-        while (p < json_end && (*p == ' ' || *p == '\t' || *p == '\n' ||
+        while (p < byNameEnd && (*p == ' ' || *p == '\t' || *p == '\n' ||
                                 *p == '\r' || *p == ',')) p++;
-        if (p >= json_end || *p == '}') break;
+        if (p >= byNameEnd || *p == '}') break;
         if (*p != '"') { p++; continue; }
         p++;  /* skip opening quote */
-        const char *keyEnd = memchr(p, '"', (size_t)(json_end - p));
+        const char *keyEnd = memchr(p, '"', (size_t)(byNameEnd - p));
         if (!keyEnd) break;
         size_t keyLen = (size_t)(keyEnd - p);
         char key[64];
@@ -491,12 +494,12 @@ static void load_named_materials_from_json(const char *json, const char *json_en
 
         /* Locate the object body. */
         const char *body = keyEnd + 1;
-        while (body < json_end && *body != '{') body++;
-        if (body >= json_end) break;
+        while (body < byNameEnd && *body != '{') body++;
+        if (body >= byNameEnd) break;
         body++;
         const char *body_end = body;
         int depth = 1;
-        while (body_end < json_end && depth > 0) {
+        while (body_end < byNameEnd && depth > 0) {
             if (*body_end == '{') depth++;
             else if (*body_end == '}') depth--;
             body_end++;
@@ -584,16 +587,16 @@ static void load_named_materials_from_json(const char *json, const char *json_en
                                  * Required for entity envmap atlas animation
                                  * on health/armor/ammo pickups. */
                                 if (e->mat.albedo == NULL) {
-                                    e->mat.albedo = g_materials[hi].albedo;
+                                    e->mat.albedo = str_arena_dup(g_materials[hi].albedo);
                                 }
                                 if (e->mat.normal == NULL) {
-                                    e->mat.normal = g_materials[hi].normal;
+                                    e->mat.normal = str_arena_dup(g_materials[hi].normal);
                                 }
                                 if (e->mat.roughness == NULL) {
-                                    e->mat.roughness = g_materials[hi].roughness;
+                                    e->mat.roughness = str_arena_dup(g_materials[hi].roughness);
                                 }
                                 if (e->mat.metallic == NULL) {
-                                    e->mat.metallic = g_materials[hi].metallic;
+                                    e->mat.metallic = str_arena_dup(g_materials[hi].metallic);
                                 }
                                 /* Emissive path + tint + intensity inherit
                                  * from the parent. Required for materials
@@ -602,7 +605,7 @@ static void load_named_materials_from_json(const char *json, const char *json_en
                                  * parent hash entry has the emissive DDS
                                  * and color/intensity. */
                                 if (e->mat.emissive == NULL) {
-                                    e->mat.emissive = g_materials[hi].emissive;
+                                    e->mat.emissive = str_arena_dup(g_materials[hi].emissive);
                                 }
                                 if (e->mat.emissive_intensity == 0.0f) {
                                     e->mat.emissive_intensity = g_materials[hi].emissive_intensity;
@@ -663,24 +666,77 @@ static int parse_hex64(const char *s, uint64_t *out) {
     return 1;
 }
 
-/* str_arena_dup: appends s + NUL to the arena and returns the
- * stored char* (which is stable for the life of the arena). If
- * s == NULL, returns NULL. Grows the arena geometrically. */
+static const char *json_object_end_from_value(const char *v, const char *end) {
+    if (!v) return NULL;
+    while (v < end && (*v == ' ' || *v == '\t' || *v == '\n' || *v == '\r')) v++;
+    if (v >= end || *v != '{') return NULL;
+
+    int depth = 0;
+    int in_string = 0;
+    int escaped = 0;
+    for (const char *p = v; p < end; ++p) {
+        char c = *p;
+        if (in_string) {
+            if (escaped) {
+                escaped = 0;
+            } else if (c == '\\') {
+                escaped = 1;
+            } else if (c == '"') {
+                in_string = 0;
+            }
+            continue;
+        }
+        if (c == '"') {
+            in_string = 1;
+        } else if (c == '{') {
+            depth++;
+        } else if (c == '}') {
+            depth--;
+            if (depth == 0) {
+                return p + 1;
+            }
+        }
+    }
+    return NULL;
+}
+
+/* str_arena_dup: own and return a heap copy of s. */
 static const char *str_arena_dup(const char *s) {
     if (!s) return NULL;
-    /* The original "arena" used realloc() and returned direct pointers
-     * into the backing buffer. Every growth could move the buffer and
-     * silently invalidate all previously returned material paths. That
-     * showed up on-device as empty/garbage DDS paths and partial PBR
-     * binding. Use individually stable allocations instead; the table is
-     * process-lifetime data and only ~800 named materials in the iOS
-     * bundle, so this tiny leak-on-reload is preferable to dangling
-     * pointers. */
     size_t len = strlen(s) + 1;
     char *dst = (char *)malloc(len);
     if (!dst) return NULL;
     memcpy(dst, s, len);
     return dst;
+}
+
+static void q3_pbr_free_table(void) {
+    /* We do NOT free the individual material strings or the g_materials /
+     * g_named arrays here. metalTexture_t entries hold pbrMaterial
+     * pointers into these arrays and may still be alive when the
+     * renderer is reinitialized (vid_restart → GetRefAPI → this
+     * function). Freeing the backing memory while textures reference it
+     * causes SIGSEGV in Swift's String(cString:) path
+     * (EXC_BAD_ACCESS at _platform_strlen). The table is 1-2 MB and
+     * reloaded only on vid_restart, so leaking the old allocation is
+     * the safest path — it keeps every tex->pbrMaterial pointer valid
+     * for the process lifetime, matching the API contract documented in
+     * q3_pbr.h: "Strings remain valid for the process lifetime." */
+    g_materials = NULL;
+    g_materials_count = 0;
+    g_materials_cap = 0;
+
+    g_named = NULL;
+    g_named_count = 0;
+    g_named_cap = 0;
+
+    free(g_hash_table);
+    g_hash_table = NULL;
+    g_hash_table_mask = 0;
+
+    g_str_arena = NULL;
+    g_str_arena_used = 0;
+    g_str_arena_cap = 0;
 }
 
 /* The JSON is well-formed and produced by our own Python tool, so we
@@ -733,6 +789,7 @@ static char *json_str_dup(const char *v, const char *end) {
 }
 
 static int json_num(const char *v, const char *end, double *out) {
+    (void)end;
     if (!v) return 0;
     char *e;
     double d = strtod(v, &e);
@@ -751,13 +808,7 @@ static const char *resolve_path(const char *root, const char *rel) {
 
 int q3_pbr_table_load(const char *jsonPath, const char *assetRoot) {
     /* Reset previous state. */
-    free(g_materials); g_materials = NULL;
-    g_materials_count = 0; g_materials_cap = 0;
-    free(g_hash_table); g_hash_table = NULL; g_hash_table_mask = 0;
-    free(g_str_arena); g_str_arena = NULL;
-    g_str_arena_used = 0; g_str_arena_cap = 0;
-    free(g_named); g_named = NULL;
-    g_named_count = 0; g_named_cap = 0;
+    q3_pbr_free_table();
 
     if (!jsonPath || !assetRoot) return 0;
 
@@ -773,13 +824,19 @@ int q3_pbr_table_load(const char *jsonPath, const char *assetRoot) {
     const char *mats = find_key(json, end, "materials");
     if (!mats) { plog("[Q3-PBR] no 'materials' in JSON\n"); free(json); return 0; }
 
+    const char *mats_end = json_object_end_from_value(mats, end);
+    if (!mats_end) { plog("[Q3-PBR] malformed 'materials' object in JSON\n"); free(json); return 0; }
+
     const char *p = mats;
-    while (p < end) {
+    while (p < mats_end && *p != '{') p++;
+    if (p >= mats_end) { plog("[Q3-PBR] malformed 'materials' object in JSON\n"); free(json); return 0; }
+    p++;
+    while (p < mats_end) {
         /* Find next 16-hex key. */
-        const char *q = memchr(p, '"', (size_t)(end - p));
+        const char *q = memchr(p, '"', (size_t)(mats_end - p));
         if (!q) break;
         q++;
-        if (q + 16 >= end) break;
+        if (q + 16 >= mats_end) break;
         uint64_t hash;
         if (!parse_hex64(q, &hash) || q[16] != '"') {
             p = q;
@@ -787,12 +844,12 @@ int q3_pbr_table_load(const char *jsonPath, const char *assetRoot) {
         }
         /* OK, we have a hash. Find the object body. */
         const char *body = q + 17;
-        while (body < end && *body != '{' && *body != ']') body++;
-        if (body >= end || *body == ']') break;
+        while (body < mats_end && *body != '{') body++;
+        if (body >= mats_end) break;
         body++;
         const char *body_end = body;
         int depth = 1;
-        while (body_end < end && depth > 0) {
+        while (body_end < mats_end && depth > 0) {
             if (*body_end == '{') depth++;
             else if (*body_end == '}') depth--;
             body_end++;

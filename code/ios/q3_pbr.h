@@ -59,8 +59,10 @@ typedef struct {
 } Q3PBRMaterialPaths;
 
 /* A single PBR material entry. Slot pointers are owned by the table and
- * remain valid for the lifetime of the process. NULL = slot not present
- * in the mod (use a sensible default in the shader). */
+ * remain valid for the lifetime of the process. Old table allocations are
+ * intentionally preserved across reloads so existing metalTexture_t
+ * pbrMaterial pointers survive vid_restart. NULL = slot not present in
+ * the mod (use a sensible default in the shader). */
 typedef struct q3_pbr_material_s {
     /* The 64-bit Remix content hash this entry was keyed by. */
     uint64_t hash;
@@ -97,7 +99,9 @@ typedef struct q3_pbr_material_s {
  *               to (typically <mod>/rtx-remix/mods/q3rtx_v07/).
  *
  * Returns the number of materials loaded, or 0 on any failure. Safe to
- * call multiple times — subsequent calls free + reload. */
+ * call multiple times — subsequent calls install a fresh active table while
+ * intentionally preserving old allocations for process-lifetime pointer
+ * stability across vid_restart. */
 int q3_pbr_table_load(const char *jsonPath, const char *assetRoot);
 
 /* True if the table has been loaded with at least one material. */
@@ -109,7 +113,7 @@ int q3_pbr_table_ready(void);
 uint64_t q3_pbr_hash_rgba(const unsigned char *rgba, int width, int height);
 
 /* Look up a material by content hash. Returns NULL if not present.
- * The returned pointer remains valid until the table is reloaded. */
+ * The returned pointer remains valid for the lifetime of the process. */
 const q3_pbr_material_t *q3_pbr_lookup(uint64_t hash);
 
 /* Phase 1 Path A: look up a material by descriptive name (e.g.
@@ -161,6 +165,9 @@ void q3_pbr_log_classification(const char *name, q3_pbr_world_mat_t mat);
 int q3_pbr_enabled(void);
 int Q3_PBRBakedLightmaps(void);
 int Q3_PBRSunShadows(void);
+int Q3_PBRSSREnabled(void);
+float Q3_PBRShadowPCFRadius(void);
+float Q3_PBRNormalScale(void);
 
 /* Stats for debugging — emitted in NSLog at boot. */
 typedef struct {
