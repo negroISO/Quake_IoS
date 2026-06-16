@@ -664,12 +664,14 @@ static char s_drawPlanAuditSeen[METAL_DRAW_PLAN_AUDIT_MAX][MAX_QPATH];
 static int s_drawPlanAuditSeenCount = 0;
 static char s_entityStageAuditSeen[METAL_ENTITY_STAGE_AUDIT_MAX][MAX_QPATH];
 static int s_entityStageAuditSeenCount = 0;
+static int s_surfaceProbeEmitted = 0;
 
 static void ResetMetalWorldAudits(void) {
     s_worldMapAuditActive = qfalse;
     s_stageAuditSeenCount = 0;
     s_drawPlanAuditSeenCount = 0;
     s_entityStageAuditSeenCount = 0;
+    s_surfaceProbeEmitted = 0;
     Com_Memset(s_stageAuditSeen, 0, sizeof(s_stageAuditSeen));
     Com_Memset(s_drawPlanAuditSeen, 0, sizeof(s_drawPlanAuditSeen));
     Com_Memset(s_entityStageAuditSeen, 0, sizeof(s_entityStageAuditSeen));
@@ -916,6 +918,252 @@ static void EmitMetalDrawPlan(const char *shaderName,
         tex ? tex->name : "(none)",
         draw->fogIndex == Q3_METAL_NO_FOG ? -1 : (int)draw->fogIndex,
         MetalCullName(stage->cullMode));
+}
+
+static int MetalSurfaceProbeEnabled(void) {
+    if (ri.Cvar_Get == NULL) {
+        return 0;
+    }
+    return ri.Cvar_Get("r_surface_probe", "0", 0)->integer != 0;
+}
+
+static int MetalSurfaceProbeLimit(void) {
+    int limit = 16;
+    if (ri.Cvar_Get != NULL) {
+        cvar_t *cv = ri.Cvar_Get("r_surface_probe_limit", "16", 0);
+        if (cv != NULL) {
+            limit = cv->integer;
+        }
+    }
+    if (limit < 1) limit = 1;
+    if (limit > 128) limit = 128;
+    return limit;
+}
+
+static int MetalSurfaceProbeDrawFilter(void) {
+    if (ri.Cvar_Get == NULL) {
+        return -1;
+    }
+    return ri.Cvar_Get("r_surface_probe_draw", "-1", 0)->integer;
+}
+
+static void MetalSurfaceProbeShaderFilter(char *out, int outSize) {
+    if (out == NULL || outSize <= 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (ri.Cvar_VariableStringBuffer != NULL) {
+        ri.Cvar_VariableStringBuffer("r_surface_probe_shader", out, outSize);
+    } else if (ri.Cvar_Get != NULL) {
+        const cvar_t *cv = ri.Cvar_Get("r_surface_probe_shader", "", 0);
+        if (cv != NULL && cv->string != NULL) {
+            Q_strncpyz(out, cv->string, outSize);
+        }
+    }
+}
+
+static qboolean MetalSurfaceProbeShaderMatches(const char *shaderName, const char *filter) {
+    char shaderLower[MAX_QPATH];
+    char filterLower[MAX_QPATH];
+    int i;
+    if (filter == NULL || filter[0] == '\0') {
+        return qtrue;
+    }
+    if (shaderName == NULL || shaderName[0] == '\0') {
+        return qfalse;
+    }
+    Q_strncpyz(shaderLower, shaderName, sizeof(shaderLower));
+    Q_strncpyz(filterLower, filter, sizeof(filterLower));
+    for (i = 0; shaderLower[i] != '\0'; ++i) {
+        if (shaderLower[i] >= 'A' && shaderLower[i] <= 'Z') shaderLower[i] += 'a' - 'A';
+    }
+    for (i = 0; filterLower[i] != '\0'; ++i) {
+        if (filterLower[i] >= 'A' && filterLower[i] <= 'Z') filterLower[i] += 'a' - 'A';
+    }
+    return strstr(shaderLower, filterLower) != NULL ? qtrue : qfalse;
+}
+
+static const char *MetalProbePath(const char *path) {
+    return (path != NULL && path[0] != '\0') ? path : "-";
+}
+
+static const char *MetalAlphaFuncName(uint32_t alphaFunc) {
+    switch (alphaFunc) {
+        case 1: return "GT0";
+        case 2: return "GE128";
+        case 3: return "LT128";
+        case 0:
+        default: return "none";
+    }
+}
+
+static void MetalTcModsToString(const Q3MetalWorldStage *stage, char *out, size_t outSize) {
+    int i;
+    size_t used = 0;
+    if (out == NULL || outSize == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (stage == NULL || stage->tcModCount == 0) {
+        Q_strncpyz(out, "[]", (int)outSize);
+        return;
+    }
+    used += (size_t)Com_sprintf(out + used, (int)(outSize - used), "[");
+    for (i = 0; i < (int)stage->tcModCount && i < Q3_MAX_TCMODS && used < outSize; ++i) {
+        const Q3TcMod *tc = &stage->tcMods[i];
+        used += (size_t)Com_sprintf(out + used, (int)(outSize - used),
+                                    "%s{%u %.4g %.4g %.4g %.4g}",
+                                    (i == 0) ? "" : ",",
+                                    (unsigned)tc->type,
+                                    tc->params[0], tc->params[1],
+                                    tc->params[2], tc->params[3]);
+    }
+    if (used + 2 < outSize) {
+        Com_sprintf(out + used, (int)(outSize - used), "]");
+    } else {
+        out[outSize - 1] = '\0';
+    }
+}
+
+static float MetalSurfaceProbeParallaxScale(void) {
+    cvar_t *cv;
+    if (ri.Cvar_Get == NULL) {
+        return 0.02f;
+    }
+    cv = ri.Cvar_Get("r_pbr_parallax_scale", "0.02", CVAR_ARCHIVE);
+    return cv ? cv->value : 0.02f;
+}
+
+static void EmitQ3SurfaceProbe(const char *mapName,
+                               int surfaceIndex,
+                               const char *shaderName,
+                               uint32_t firstDraw,
+                               uint32_t endDraw,
+                               uint32_t worldFlags,
+                               qhandle_t lightmapHandle,
+                               qboolean hasLightmap,
+                               uint32_t fogIndex) {
+    char shaderFilter[MAX_QPATH];
+    const metalTexture_t *lightmapTex;
+    int drawFilter;
+    int limit;
+    uint32_t drawIndex;
+    uint32_t drawCount;
+
+    if (!MetalSurfaceProbeEnabled()) {
+        return;
+    }
+    drawCount = (endDraw > firstDraw) ? (endDraw - firstDraw) : 0;
+    if (drawCount == 0) {
+        return;
+    }
+    MetalSurfaceProbeShaderFilter(shaderFilter, sizeof(shaderFilter));
+    drawFilter = MetalSurfaceProbeDrawFilter();
+    if (!MetalSurfaceProbeShaderMatches(shaderName, shaderFilter)) {
+        return;
+    }
+    if (drawFilter >= 0 && ((uint32_t)drawFilter < firstDraw || (uint32_t)drawFilter >= endDraw)) {
+        return;
+    }
+    limit = MetalSurfaceProbeLimit();
+    if (s_surfaceProbeEmitted >= limit && drawFilter < 0) {
+        return;
+    }
+
+    lightmapTex = FindTextureByHandle(lightmapHandle);
+    MetalTelemetryPrintf("q3_surface_probe", PRINT_ALL,
+        "[Q3-SURFACE-PROBE] map='%s' surfaceIndex=%d shaderName='%s' drawRange=%u..%u drawCount=%u worldFlags=0x%08x lightmap=%u/'%s' hasLightmap=%d fog=%d filterShader='%s' filterDraw=%d limit=%d\n",
+        mapName ? mapName : "-",
+        surfaceIndex,
+        shaderName ? shaderName : "-",
+        (unsigned)firstDraw,
+        (unsigned)endDraw,
+        (unsigned)drawCount,
+        (unsigned)worldFlags,
+        (unsigned)lightmapHandle,
+        lightmapTex ? lightmapTex->name : "-",
+        hasLightmap ? 1 : 0,
+        fogIndex == Q3_METAL_NO_FOG ? -1 : (int)fogIndex,
+        shaderFilter,
+        drawFilter,
+        limit);
+
+    for (drawIndex = firstDraw; drawIndex < endDraw; ++drawIndex) {
+        const Q3MetalWorldDrawCmd *draw;
+        uint32_t stageIndex;
+        if (drawFilter >= 0 && drawIndex != (uint32_t)drawFilter) {
+            continue;
+        }
+        if (drawIndex >= s_world.drawCount && drawIndex >= endDraw) {
+            continue;
+        }
+        draw = &s_world.draws[drawIndex];
+        for (stageIndex = 0; stageIndex < draw->stageCount && stageIndex < Q3_METAL_MAX_STAGES; ++stageIndex) {
+            const Q3MetalWorldStage *stage = &draw->stages[stageIndex];
+            const metalTexture_t *tex = FindTextureByHandle((qhandle_t)stage->textureHandle);
+            const metalTexture_t *matTex = NULL;
+            const q3_pbr_material_t *mat = NULL;
+            const char *materialSource = "none";
+            uint32_t materialHandle = stage->pbrMaterialHandle ? stage->pbrMaterialHandle : stage->textureHandle;
+            char tcMods[256];
+            float parallaxScale = MetalSurfaceProbeParallaxScale();
+
+            matTex = FindTextureByHandle((qhandle_t)materialHandle);
+            if (matTex != NULL) {
+                mat = (const q3_pbr_material_t *)matTex->pbrMaterial;
+                if (mat != NULL) {
+                    materialSource = "hash";
+                } else if (matTex->name[0] != '\0') {
+                    mat = q3_pbr_lookup_by_name(matTex->name);
+                    if (mat != NULL) {
+                        materialSource = "name-fallback";
+                    }
+                }
+            }
+            MetalTcModsToString(stage, tcMods, sizeof(tcMods));
+            MetalTelemetryPrintf("q3_stage_dump", PRINT_ALL,
+                "[Q3-STAGE-DUMP] map='%s' surfaceIndex=%d drawIndex=%u stage=%u stageCount=%u shader='%s' texture=%u/'%s' materialHandle=%u materialName='%s' materialHash=%016llx materialSource=%s albedo='%s' normal='%s' roughness='%s' metallic='%s' emissive='%s' height='%s' heightScale=%.4g parallaxEnabled=%d parallaxScale=%.4g parallaxBias=0 atlas=%dx%d@%.3g blendMode=%u srcBlend=%s dstBlend=%s tcGen=%s tcMods=%s rgbGen=%s alphaGen=%u alphaFunc=%s cull=%s depthWrite=%u useLightmap=%u flags=0x%08x firstIndex=%u indexCount=%u\n",
+                mapName ? mapName : "-",
+                surfaceIndex,
+                (unsigned)drawIndex,
+                (unsigned)stageIndex,
+                (unsigned)draw->stageCount,
+                shaderName ? shaderName : "-",
+                (unsigned)stage->textureHandle,
+                tex ? tex->name : "-",
+                (unsigned)materialHandle,
+                matTex ? matTex->name : "-",
+                (unsigned long long)(matTex ? matTex->pbrContentHash : 0ull),
+                materialSource,
+                mat ? MetalProbePath(mat->albedo) : "-",
+                mat ? MetalProbePath(mat->normal) : "-",
+                mat ? MetalProbePath(mat->roughness) : "-",
+                mat ? MetalProbePath(mat->metallic) : "-",
+                mat ? MetalProbePath(mat->emissive) : "-",
+                mat ? MetalProbePath(mat->height) : "-",
+                (mat && mat->height) ? parallaxScale : 0.0f,
+                (mat && mat->height && parallaxScale > 0.0f) ? 1 : 0,
+                parallaxScale,
+                mat ? mat->sprite_cols : 0,
+                mat ? mat->sprite_rows : 0,
+                mat ? mat->sprite_fps : 0.0f,
+                (unsigned)stage->blendMode,
+                MetalRawBlendName(stage->srcBlend),
+                MetalRawBlendName(stage->dstBlend),
+                MetalTcGenName((int)stage->tcGen),
+                tcMods,
+                MetalRgbGenName((int)stage->rgbGen),
+                (unsigned)stage->alphaGen,
+                MetalAlphaFuncName(stage->alphaFunc),
+                MetalCullName((int)stage->cullMode),
+                (unsigned)stage->depthWrite,
+                (unsigned)stage->useLightmap,
+                (unsigned)draw->flags,
+                (unsigned)draw->firstIndex,
+                (unsigned)draw->indexCount);
+        }
+    }
+    s_surfaceProbeEmitted += 1;
 }
 
 static void CopyColor(float *dst, const float *src) {
@@ -6055,6 +6303,9 @@ static qboolean LoadWorldMapData(const char *name) {
                                             &drawCursor);
             }
             MetalWorldSetSurfaceDrawRange(i, surfaceFirstDraw, drawCursor);
+            EmitQ3SurfaceProbe(name, i, shaders[shaderNum].shader,
+                               surfaceFirstDraw, drawCursor, worldFlags,
+                               lightmapHandle, hasLightmap, fogIndex);
             continue;
         }
 
@@ -6095,6 +6346,9 @@ static qboolean LoadWorldMapData(const char *name) {
             }
         }
         MetalWorldSetSurfaceDrawRange(i, surfaceFirstDraw, drawCursor);
+        EmitQ3SurfaceProbe(name, i, shaders[shaderNum].shader,
+                           surfaceFirstDraw, drawCursor, worldFlags,
+                           lightmapHandle, hasLightmap, fogIndex);
     }
 
 	    s_world.loaded = qtrue;
