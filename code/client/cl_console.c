@@ -402,6 +402,33 @@ static void Con_GetPos_f( void ) {
 
 /*
 ================
+Con_SetPos_f
+================
+*/
+static void Con_SetPos_f( void ) {
+	vec3_t pos;
+
+	if ( Cmd_Argc() != 4 ) {
+		Com_Printf( "Usage: setpos <x> <y> <z>\n" );
+		return;
+	}
+
+	if ( !cl.snap.valid ) {
+		Com_Printf( "Can't setpos - not in game\n" );
+		return;
+	}
+
+	pos[0] = atof( Cmd_Argv( 1 ) );
+	pos[1] = atof( Cmd_Argv( 2 ) );
+	pos[2] = atof( Cmd_Argv( 3 ) );
+
+	VectorCopy( pos, cl.snap.ps.origin );
+	Com_Printf( "Position set to %.0f %.0f %.0f\n", pos[0], pos[1], pos[2] );
+}
+
+
+/*
+================
 Con_Init
 ================
 */
@@ -429,6 +456,7 @@ void Con_Init( void )
 	Cmd_AddCommand( "messagemode3", Con_MessageMode3_f );
 	Cmd_AddCommand( "messagemode4", Con_MessageMode4_f );
 	Cmd_AddCommand( "getpos", Con_GetPos_f );
+	Cmd_AddCommand( "setpos", Con_SetPos_f );
 }
 
 
@@ -447,6 +475,7 @@ void Con_Shutdown( void )
 	Cmd_RemoveCommand( "messagemode3" );
 	Cmd_RemoveCommand( "messagemode4" );
 	Cmd_RemoveCommand( "getpos" );
+	Cmd_RemoveCommand( "setpos" );
 }
 
 
