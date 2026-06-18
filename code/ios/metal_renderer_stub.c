@@ -5610,6 +5610,19 @@ static void MetalWorldEmitSurfaceStages(const char *shaderName,
                 RawBlendFromMode(_drawStage.blendMode, &_drawStage.rawSrcBlend, &_drawStage.rawDstBlend);
                 _drawStage.depthWrite = 1;
             }
+            /* Suppress rgbGen=wave on light-fixture stages with additivefull (GL_ONE/GL_ONE) blending.
+             * Light overlays like textures/base_light/s_proto_light should be static, not pulsing.
+             * The wave animation creates visible "rotating ovals" artifacts around the lights. */
+            if (shaderName != NULL && Q_stristr(shaderName, "light") != NULL &&
+                _drawStage.blendMode == 5 && /* 5 = additivefull (GL_ONE/GL_ONE) */
+                _drawStage.rgbGen == 3) {  /* 3 = wave */
+                _drawStage.rgbGen = 0;     /* 0 = identity (static, no animation) */
+                _drawStage.rgbWaveFunc = 0;
+                _drawStage.rgbWaveBase = 0.0f;
+                _drawStage.rgbWaveAmp = 0.0f;
+                _drawStage.rgbWavePhase = 0.0f;
+                _drawStage.rgbWaveFreq = 0.0f;
+            }
             if (_st->animFrameCount > 0) {
                 int _idx;
                 float _fps = (_st->animFps > 0.0f) ? _st->animFps : 8.0f;
