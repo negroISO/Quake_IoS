@@ -388,6 +388,20 @@ static void Cmd_CompleteTxtName(const char *args, int argNum ) {
 
 /*
 ================
+Con_GetPos_f
+================
+*/
+static void Con_GetPos_f( void ) {
+	if ( cl.snap.valid ) {
+		Com_Printf( "setpos %.0f %.0f %.0f\n", cl.snap.ps.origin[0], cl.snap.ps.origin[1], cl.snap.ps.origin[2] );
+	} else {
+		Com_Printf( "No valid player position (not in game)\n" );
+	}
+}
+
+
+/*
+================
 Con_Init
 ================
 */
@@ -414,6 +428,7 @@ void Con_Init( void )
 	Cmd_AddCommand( "messagemode2", Con_MessageMode2_f );
 	Cmd_AddCommand( "messagemode3", Con_MessageMode3_f );
 	Cmd_AddCommand( "messagemode4", Con_MessageMode4_f );
+	Cmd_AddCommand( "getpos", Con_GetPos_f );
 }
 
 
@@ -431,6 +446,7 @@ void Con_Shutdown( void )
 	Cmd_RemoveCommand( "messagemode2" );
 	Cmd_RemoveCommand( "messagemode3" );
 	Cmd_RemoveCommand( "messagemode4" );
+	Cmd_RemoveCommand( "getpos" );
 }
 
 

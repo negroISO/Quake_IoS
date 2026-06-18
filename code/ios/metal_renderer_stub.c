@@ -2005,6 +2005,33 @@ static float s_pendingScrollT;
 static int s_pendingBlendMode;
 static int s_pendingAlphaFunc;
 
+static qboolean PBRPathExists(const char *path) {
+    struct stat st;
+    return path != NULL && path[0] != '\0' && stat(path, &st) == 0 && st.st_size > 0;
+}
+
+static qboolean PBRMaterialHasAnyPath(const q3_pbr_material_t *m) {
+    return m != NULL &&
+           (m->albedo || m->normal || m->roughness ||
+            m->metallic || m->emissive || m->height);
+}
+
+static qboolean PBRMaterialHasExistingPath(const q3_pbr_material_t *m) {
+    return m != NULL &&
+           (PBRPathExists(m->albedo) ||
+            PBRPathExists(m->normal) ||
+            PBRPathExists(m->roughness) ||
+            PBRPathExists(m->metallic) ||
+            PBRPathExists(m->emissive) ||
+            PBRPathExists(m->height));
+}
+
+static qboolean PBRMaterialUsableForStagedAssets(const q3_pbr_material_t *m) {
+    if (m == NULL) return qfalse;
+    if (!PBRMaterialHasAnyPath(m)) return qtrue;
+    return PBRMaterialHasExistingPath(m);
+}
+
 static qhandle_t RegisterTexture(const char *name) {
     metalTexture_t *existing;
     metalTexture_t *texture;
@@ -2274,11 +2301,24 @@ static qhandle_t RegisterTexture(const char *name) {
         texture->pbrContentHash = h;
         q3_pbr_stats_inc_hashes_seen();
         const q3_pbr_material_t *m = q3_pbr_lookup(h);
+        const q3_pbr_material_t *mn = NULL;
+        if (m != NULL && !PBRMaterialUsableForStagedAssets(m)) {
+            mn = q3_pbr_lookup_by_name(name);
+            if (mn != NULL) {
+                m = mn;
+            } else {
+                MetalTelemetryPrintf("metal_pbr_hit", PRINT_ALL,
+                    "[Q3-PBR] hash-match skipped missing-assets name='%s' hash=%016llX\n",
+                    name, (unsigned long long)h);
+                m = NULL;
+            }
+        }
         if (m != NULL) {
             texture->pbrMaterial = m;
             q3_pbr_stats_inc_hashes_matched();
             MetalTelemetryPrintf("metal_pbr_hit", PRINT_ALL,
-                "[Q3-PBR] hash-match name='%s' hash=%016llX albedo=%s normal=%s\n",
+                "[Q3-PBR] %s name='%s' hash=%016llX albedo=%s normal=%s\n",
+                mn ? "name-fallback-for-missing-hash-assets" : "hash-match",
                 name, (unsigned long long)h,
                 m->albedo ? "yes" : "-",
                 m->normal ? "yes" : "-");
@@ -5609,6 +5649,46 @@ static void MetalWorldEmitSurfaceStages(const char *shaderName,
                 _drawStage.blendMode = 0;
                 RawBlendFromMode(_drawStage.blendMode, &_drawStage.rawSrcBlend, &_drawStage.rawDstBlend);
                 _drawStage.depthWrite = 1;
+            }
+            /* Remix/PBR owner routing: some stock Q3 shaders use an
+             * animated sfx/liquid layer as an opaque GL_ONE/GL_ZERO
+             * underlay, then put the concrete wall/floor material in a
+             * later alpha stage. Remix keyed authored PBR sidecars to that
+             * concrete stage, not to the fire/swirly underlay. If the
+             * owner material is staged and usable, skip only the opaque
+             * classic FX underlay so it does not become a black/dark
+             * depth-writing rectangle (q3dm1 largerblock3b_ow,
+             * killblockgeomtrn). Do not skip additive/alpha FX stages:
+             * those are real Q3 visual layers. */
+            if (_pbrOwnerTex != 0 &&
+                _st->useLightmap == 0 &&
+                _drawStage.blendMode == 0 &&
+                _drawStage.rawSrcBlend == Q3_GL_ONE &&
+                _drawStage.rawDstBlend == Q3_GL_ZERO &&
+                WorldMapPathIsClassicEffectLayer(_st->mapPath)) {
+                if (s_worldMapAuditActive) {
+                    static char s_skipFXSeen[32][MAX_QPATH];
+                    static int s_skipFXSeenCount = 0;
+                    qboolean seen = qfalse;
+                    int si;
+                    for (si = 0; si < s_skipFXSeenCount; ++si) {
+                        if (!Q_stricmp(s_skipFXSeen[si], shaderName)) { seen = qtrue; break; }
+                    }
+                    if (!seen) {
+                        const metalTexture_t *ownerTex = FindTextureByHandle(_pbrOwnerTex);
+                        if (s_skipFXSeenCount < (int)(sizeof(s_skipFXSeen) / sizeof(s_skipFXSeen[0]))) {
+                            Q_strncpyz(s_skipFXSeen[s_skipFXSeenCount++], shaderName, MAX_QPATH);
+                        }
+                        MetalTelemetryPrintf("metal_draw_plan", PRINT_ALL,
+                            "[metal-draw-plan] skip classic FX underlay shader=%s stage=%d texture=%s ownerHandle=%u owner=%s reason=staged-structural-owner\n",
+                            shaderName,
+                            _s,
+                            _st->mapPath,
+                            (unsigned)_pbrOwnerTex,
+                            ownerTex ? ownerTex->name : "(unknown)");
+                    }
+                }
+                continue;
             }
             /* Suppress rgbGen=wave on light-fixture stages with additivefull (GL_ONE/GL_ONE) blending.
              * Light overlays like textures/base_light/s_proto_light should be static, not pulsing.
@@ -11025,7 +11105,7 @@ const Q3PBRMaterialPaths *Q3MetalRenderer_GetPBRMaterial(unsigned int textureHan
      * + height) never load — even though they're in materials_by_name. Re-
      * resolve via the name table by stripping the "*entity-stage:N:" prefix
      * so authored materials reach the entity draw path. */
-    if (m == NULL && tex->name[0] != '\0') {
+    if ((m == NULL || !PBRMaterialUsableForStagedAssets(m)) && tex->name[0] != '\0') {
         const char *resolve = tex->name;
         if (resolve[0] == '*') {
             const char *firstColon = strchr(resolve + 1, ':');
@@ -11034,7 +11114,12 @@ const Q3PBRMaterialPaths *Q3MetalRenderer_GetPBRMaterial(unsigned int textureHan
                 if (secondColon && secondColon[1]) resolve = secondColon + 1;
             }
         }
-        m = q3_pbr_lookup_by_name(resolve);
+        {
+            const q3_pbr_material_t *mn = q3_pbr_lookup_by_name(resolve);
+            if (mn != NULL) {
+                m = mn;
+            }
+        }
     }
     if (m == NULL) return NULL;
     s_paths.albedo    = m->albedo;
@@ -11541,6 +11626,47 @@ float Q3_RTBloomRadius(void) {
     return v;
 }
 
+float Q3_RTAtmosphereDensity(void) {
+    if (ri.Cvar_Get == NULL) return 0.0f;
+    /* Neutral RT distance-fog density in world units. Default 0 keeps
+     * historical behavior: RT misses preserve raster sky via alpha=0. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_atmosphere_density", "0", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.0f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 0.02f) v = 0.02f;
+    return v;
+}
+
+float Q3_RTAtmosphereGrey(void) {
+    if (ri.Cvar_Get == NULL) return 0.22f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_atmosphere_grey", "0.22", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.22f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    return v;
+}
+
+float Q3_RTAtmosphereSkyAlpha(void) {
+    if (ri.Cvar_Get == NULL) return 0.0f;
+    /* Alpha written by RT primary misses/sky-preserve branches when
+     * atmosphere is enabled. 0 keeps raster sky; small values let the
+     * grey atmosphere slightly fill void/space maps without a hard plate. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_atmosphere_sky_alpha", "0", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.0f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    return v;
+}
+
+float Q3_RTAtmosphereMax(void) {
+    if (ri.Cvar_Get == NULL) return 0.85f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_atmosphere_max", "0.85", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.85f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    return v;
+}
+
 int Q3_RTDebugEntityMask(void) {
     if (ri.Cvar_Get == NULL) return 0;
     /* Debug view: main-scene entity fragments output solid white,
@@ -11629,36 +11755,49 @@ refexport_t *GetRefAPI(int apiVersion, refimport_t *rimp) {
     {
         const char *json = getenv("Q3_PBR_JSON");
         const char *root = getenv("Q3_PBR_ASSETS");
-        char bundleJson[1024] = {0};
-        char bundleRoot[1024] = {0};
+        char resolvedJson[1024] = {0};
+        char resolvedRoot[1024] = {0};
+        const char *resolvedSource = NULL;
 
-        /* Env-var path takes precedence (debug / dev). Otherwise fall
-         * back to the bundled subset under
-         * <Bundle.main.resourcePath>/baseq3/pbr/ that
-         * scripts/pbr_stage_named_assets.py staged into source baseq3.
-         * If neither path resolves, q3_pbr_table_load is skipped and
-         * the renderer behaves as if r_pbrMaterials was off. */
+        /* Env-var path takes precedence (debug / dev). Otherwise resolve
+         * the staged subset from either the writable Documents/baseq3
+         * seed (Catalyst/device copy workflow) or the app bundle resource
+         * root. This keeps PBR alive when the bundle was built with a
+         * baseq3-skip/minimal-resource profile but Documents was seeded. */
         if (!(json && root && json[0] && root[0])) {
             extern const char *Sys_DefaultBasePath(void);  /* ios_main.m */
-            const char *base = Sys_DefaultBasePath();
-            if (base && base[0]) {
-                Q_strncpyz(bundleJson, base, sizeof(bundleJson));
-                Q_strcat(bundleJson, sizeof(bundleJson),
-                         "/baseq3/pbr/materials.json");
-                Q_strncpyz(bundleRoot, base, sizeof(bundleRoot));
-                Q_strcat(bundleRoot, sizeof(bundleRoot),
-                         "/baseq3/pbr");
-                /* Probe with stat() — if the bundle copy is present, use it. */
+            extern const char *Sys_DefaultHomePath(void);  /* ios_main.m */
+            const char *candidateBase[2];
+            const char *candidateLabel[2] = { "documents", "bundle" };
+            int pbrCandidate;
+
+            candidateBase[0] = Sys_DefaultHomePath();
+            candidateBase[1] = Sys_DefaultBasePath();
+
+            for (pbrCandidate = 0; pbrCandidate < 2; ++pbrCandidate) {
+                const char *base = candidateBase[pbrCandidate];
                 struct stat st;
-                if (stat(bundleJson, &st) == 0 && st.st_size > 0) {
-                    json = bundleJson;
-                    root = bundleRoot;
+                if (base == NULL || base[0] == '\0') {
+                    continue;
+                }
+                Q_strncpyz(resolvedRoot, base, sizeof(resolvedRoot));
+                Q_strcat(resolvedRoot, sizeof(resolvedRoot), "/baseq3/pbr");
+                Q_strncpyz(resolvedJson, resolvedRoot, sizeof(resolvedJson));
+                Q_strcat(resolvedJson, sizeof(resolvedJson), "/materials.json");
+                if (stat(resolvedJson, &st) == 0 && st.st_size > 0) {
+                    json = resolvedJson;
+                    root = resolvedRoot;
+                    resolvedSource = candidateLabel[pbrCandidate];
+                    break;
                 }
             }
+        } else {
+            resolvedSource = "env";
         }
 
         MetalTelemetryPrintf("metal_pbr_boot", PRINT_ALL,
-            "[Q3-PBR] boot json=%s root=%s\n",
+            "[Q3-PBR] boot source=%s json=%s root=%s\n",
+            resolvedSource ? resolvedSource : "(none)",
             json ? json : "(none)", root ? root : "(none)");
         if (json && root && json[0] && root[0]) {
             int n = q3_pbr_table_load(json, root);

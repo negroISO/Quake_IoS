@@ -223,6 +223,14 @@ int   Q3_RTHDR(void);
 float Q3_RTBloom(void);
 float Q3_RTBloomThreshold(void);
 float Q3_RTBloomRadius(void);
+/* RT atmosphere/miss-fill tuning. Defaults off: density=0 keeps the
+ * historic raster-sky-preserve alpha path. When density > 0, the RT trace
+ * applies neutral-grey distance fog and can alpha-fill AS misses via
+ * r_rt_atmosphere_sky_alpha. */
+float Q3_RTAtmosphereDensity(void);
+float Q3_RTAtmosphereGrey(void);
+float Q3_RTAtmosphereSkyAlpha(void);
+float Q3_RTAtmosphereMax(void);
 /* Height-map parallax for world surfaces (r_pbr_parallax_scale, default
  * 0.02, 0 = off). Only applied when the material ships a height DDS. */
 float Q3_PBRParallaxScale(void);

@@ -392,6 +392,9 @@ struct MetalView: UIViewRepresentable {
             // P1/P3 (must mirror MSL): x=lightCount, y=r_rt_light_scale,
             // z=r_rt_reflections, w=r_rt_refl_roughness_max
             var rtLightParams: SIMD4<Float> = SIMD4(0, 1, 0, 0.45)
+            // RT atmosphere / miss-fill (must mirror MSL):
+            // x=density, y=grey, z=sky/miss alpha, w=max fog factor.
+            var rtAtmosphereParams: SIMD4<Float> = SIMD4(0, 0.22, 0, 0.85)
         }
 
         struct RTPrimitiveMaterial {
@@ -4057,6 +4060,9 @@ struct MetalView: UIViewRepresentable {
                 // P1/P3: x = light count, y = r_rt_light_scale,
                 // z = r_rt_reflections (0/1), w = r_rt_refl_roughness_max.
                 float4 rtLightParams;
+                // x = atmosphere density, y = neutral grey color,
+                // z = sky/miss alpha override, w = max surface fog factor.
+                float4 rtAtmosphereParams;
             };
 
             // P1: RTX Remix authored per-map light (baked from
@@ -4193,10 +4199,13 @@ struct MetalView: UIViewRepresentable {
 
                 float3 color;
                 float outputAlpha = 1.0;
+                float primaryDistance = uniforms.jitterNearFar.w;
                 if (useEntityHit) {
+                    primaryDistance = entityHit.distance;
                     float shade = 1.0 - saturate(entityHit.distance / uniforms.jitterNearFar.w);
                     color = mix(float3(0.35, 0.35, 0.38), float3(0.9, 0.9, 0.95), shade);
                 } else if (hit.type == intersection_type::triangle) {
+                    primaryDistance = hit.distance;
                     uint tri = hit.primitive_id;
                     uint i0 = indices[tri * 3 + 0];
                     uint i1 = indices[tri * 3 + 1];
@@ -4233,7 +4242,9 @@ struct MetalView: UIViewRepresentable {
                         // Q3.render.postRT. Preserve the raster sky for primary
                         // camera rays while still letting reflective rays sample
                         // envCube in the reflection/miss paths.
-                        outputAlpha = 0.0;
+                        outputAlpha = (uniforms.rtAtmosphereParams.x > 0.0)
+                            ? saturate(uniforms.rtAtmosphereParams.z)
+                            : 0.0;
                     } else if (mat.albedoSlot < 110) {
                         float2 uv0 = vertices[i0].texCoord;
                         float2 uv1 = vertices[i1].texCoord;
@@ -4545,7 +4556,17 @@ struct MetalView: UIViewRepresentable {
                     // miss overwrite the already-correct raster pixel. Real
                     // sky BSP surfaces still hit sky materials above and keep
                     // alpha=1, so this only preserves raster on true AS misses.
-                    outputAlpha = 0.0;
+                    outputAlpha = (uniforms.rtAtmosphereParams.x > 0.0)
+                        ? saturate(uniforms.rtAtmosphereParams.z)
+                        : 0.0;
+                }
+                if (uniforms.rtAtmosphereParams.x > 0.0) {
+                    float density = max(uniforms.rtAtmosphereParams.x, 0.0);
+                    float fogMax = saturate(uniforms.rtAtmosphereParams.w);
+                    float grey = saturate(uniforms.rtAtmosphereParams.y);
+                    float3 fogColor = float3(grey);
+                    float fogAmount = saturate((1.0 - exp(-primaryDistance * density)) * fogMax);
+                    color = mix(color, fogColor, fogAmount);
                 }
                 if (any(isnan(color)) || any(isinf(color))) { color = float3(0.0); }
                 // P2 HDR: do not clamp here when the RT target is rgba16F.
@@ -5474,6 +5495,11 @@ struct MetalView: UIViewRepresentable {
                 Q3_RTLightScale(),
                 Q3_RTReflections() != 0 ? 1.0 : 0.0,
                 Q3_RTReflRoughnessMax())
+            uniforms.rtAtmosphereParams = SIMD4<Float>(
+                Q3_RTAtmosphereDensity(),
+                Q3_RTAtmosphereGrey(),
+                Q3_RTAtmosphereSkyAlpha(),
+                Q3_RTAtmosphereMax())
             if !rtOverlayLogPrintedOnce {
                 print("[RT] overlay active mix=\(mixValue) trace=\(traceW)x\(traceH) scale=\(rtResolutionScale) bounces=\(rtBounceCount) taa=\(rtTAAEnabled ? 1 : 0) composite=\(renderW)x\(renderH) camera=\(cameraPos)")
                 rtOverlayLogPrintedOnce = true
@@ -8874,6 +8900,25 @@ struct MetalView: UIViewRepresentable {
                 // single-bind-clampToEdge here killed the quad shell.
                 encoder.setFragmentSamplerState(worldSamplerState, index: 0)
                 var entityLastSamplerWasClamp: Bool = false
+                /* RF_DEPTHHACK / first-person weapon depth range.
+                 *
+                 * Q3's GL backend calls glDepthRange(0, 0.3) for depth-hack
+                 * entities. Keeping only `.lessEqual` without the depth-range
+                 * compression lets stored world depth occlude the viewmodel
+                 * after the RT preserve path ends/reopens the render encoder.
+                 * Use Metal's viewport z range per draw so self-occlusion is
+                 * preserved while the weapon projects into the near depth
+                 * slice, then restore 0..1 for normal entities/flares/UI. */
+                var entityDepthRangeHackActive = false
+                func setEntityDepthRangeHack(_ active: Bool) {
+                    guard entityDepthRangeHackActive != active else { return }
+                    entityDepthRangeHackActive = active
+                    encoder.setViewport(MTLViewport(originX: 0, originY: 0,
+                                                    width: Double(renderW),
+                                                    height: Double(renderH),
+                                                    znear: 0.0,
+                                                    zfar: active ? 0.3 : 1.0))
+                }
 
                 // Dlights for entities (viewmodel, players, pickups lit by
                 // nearby muzzle flash / rocket glow). Same block as world pass.
@@ -8899,6 +8944,7 @@ struct MetalView: UIViewRepresentable {
                     let tcGenEnvBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_TCGEN_ENV)
                     let scenePolyBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_SCENE_POLY)
                     let aTestGT0Bit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ATEST_GT0)
+                    let rtPreserveDepthHackAlways = Q3_RTMix() > 0 && Q3_RTPreserveEntities() != 0
                     // P0.2: hoisted once per frame — feeds
                     // entityUniforms.viewmodelParams.z per draw below.
                     let rtDebugEntityMaskActive = Q3_RTDebugEntityMask() != 0
@@ -8926,6 +8972,7 @@ struct MetalView: UIViewRepresentable {
                             continue
                         }
                         let wantsDepthHack = (draw.flags & depthHackBit) != 0
+                        setEntityDepthRangeHack(wantsDepthHack)
                         // Per-draw tcGen flag — rebind EntityUniforms so the
                         // fragment shader picks up the current reflection-map
                         // switch. Default is 0 (mesh ST). Quad shell, regen,
@@ -9041,6 +9088,9 @@ struct MetalView: UIViewRepresentable {
                             let state = isScenePoly ? additiveEntityDepthStencilState
                                       : (wantsDepthHack ? depthHackDepthStencilState : depthStencilState)
                             encoder.setDepthStencilState(ensuredDepthStencilState(state, device: view.device))
+                        }
+                        if rtPreserveDepthHackAlways, wantsDepthHack, let alwaysDepth = alwaysPassDepthStencilState {
+                            encoder.setDepthStencilState(alwaysDepth)
                         }
                         // PBR Phase 1: when q3_pbr_lookup_by_name matched
                         // a Q3 shader (rocket / shotgun / bfg / etc.), the
@@ -9178,7 +9228,7 @@ struct MetalView: UIViewRepresentable {
                         // (phase5 × ibl) needs both cvars: r_pbr_phase5=0
                         // → no GGX peak, no IBL; r_pbr_ibl=0 → IBL replaced
                         // by 0.35 ambient floor (Phase 5 GGX still fires).
-                        let phase5Enabled = Q3_PBRPhase5Enabled() != 0 && !preferClassicFX
+                        let phase5Enabled = Q3_PBRPhase5Enabled() != 0 && !preferClassicFX && pbrTex != nil
                         // Roughness slot 3 + metallic slot 4: never nil.
                         // Same reasoning as the normal slot above —
                         // Q3.entity pipeline declares them, and unbound
@@ -9275,6 +9325,7 @@ struct MetalView: UIViewRepresentable {
                         )
                     }
                     } // end entityPass loop
+                    setEntityDepthRangeHack(false)
                 }
             }
 

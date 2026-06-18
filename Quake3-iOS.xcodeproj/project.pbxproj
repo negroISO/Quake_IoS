@@ -1179,21 +1179,18 @@
 /* Begin PBXShellScriptBuildPhase section */
 		C294363E705ED20C48E4A45A /* Stage baseq3 data */ = {
 			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
 			buildActionMask = 2147483647;
 			files = (
 			);
 			inputFileListPaths = (
 			);
 			inputPaths = (
-				"$(SRCROOT)/baseq3/",
-				"${SRCROOT}/Quake3-iOS/baseq3",
-				"$(SRCROOT)/Resources/baseq3",
 			);
 			name = "Stage baseq3 data";
 			outputFileListPaths = (
 			);
 			outputPaths = (
-				"$(DERIVED_FILE_DIR)/.stage_baseq3.stamp",
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;

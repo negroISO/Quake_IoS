@@ -323,6 +323,40 @@ static void q3_pbr_normalize_full_name(const char *in, char *out, size_t outSize
     }
 }
 
+static int q3_pbr_path_exists(const char *path) {
+    struct stat st;
+    return path != NULL && path[0] != '\0' && stat(path, &st) == 0 && st.st_size > 0;
+}
+
+static int q3_pbr_material_has_any_path(const q3_pbr_material_t *m) {
+    return m != NULL &&
+           (m->albedo || m->normal || m->roughness ||
+            m->metallic || m->emissive || m->height);
+}
+
+static int q3_pbr_material_has_existing_path(const q3_pbr_material_t *m) {
+    return m != NULL &&
+           (q3_pbr_path_exists(m->albedo) ||
+            q3_pbr_path_exists(m->normal) ||
+            q3_pbr_path_exists(m->roughness) ||
+            q3_pbr_path_exists(m->metallic) ||
+            q3_pbr_path_exists(m->emissive) ||
+            q3_pbr_path_exists(m->height));
+}
+
+static int q3_pbr_named_material_is_usable(const q3_pbr_material_t *m) {
+    if (m == NULL) return 0;
+    /* Explicit all-null named entries are intentional "classic fallback"
+     * entries. They must remain usable so they can suppress stale/missing
+     * hash-material sidecars for high-rotation weapons such as machinegun
+     * and plasma. If an entry does name asset paths, require at least one
+     * of those files to exist in the staged PBR subset; otherwise continue
+     * to alias/generic fallback instead of returning a guaranteed Swift
+     * DDS-load miss. */
+    if (!q3_pbr_material_has_any_path(m)) return 1;
+    return q3_pbr_material_has_existing_path(m);
+}
+
 /* Q3 ships weapon textures with stems that don't match the descriptive
  * names extracted from the RTX Remix mod USDA. Map them. Left = the
  * normalized Q3 stem from load_pic_texture_with_mipmap; right = the stem
@@ -397,7 +431,10 @@ const q3_pbr_material_t *q3_pbr_lookup_by_name(const char *q3_shader_name) {
         char namedFull[128];
         q3_pbr_normalize_full_name(g_named[i].name, namedFull, sizeof(namedFull));
         if (fullKey[0] != '\0' && strcmp(namedFull, fullKey) == 0) {
-            return &g_named[i].mat;
+            if (q3_pbr_named_material_is_usable(&g_named[i].mat)) {
+                return &g_named[i].mat;
+            }
+            break;
         }
     }
 
@@ -426,7 +463,7 @@ const q3_pbr_material_t *q3_pbr_lookup_by_name(const char *q3_shader_name) {
             char namedFull[128];
             q3_pbr_normalize_full_name(g_named[i].name, namedFull, sizeof(namedFull));
             if (strcmp(namedFull, targetFull) == 0) {
-                return &g_named[i].mat;
+                return q3_pbr_named_material_is_usable(&g_named[i].mat) ? &g_named[i].mat : NULL;
             }
         }
         return NULL;
@@ -437,7 +474,9 @@ const q3_pbr_material_t *q3_pbr_lookup_by_name(const char *q3_shader_name) {
         char namedStem[64];
         q3_pbr_normalize_name(g_named[i].name, namedStem, sizeof(namedStem));
         if (key[0] != '\0' && strcmp(namedStem, key) == 0) {
-            return &g_named[i].mat;
+            if (q3_pbr_named_material_is_usable(&g_named[i].mat)) {
+                return &g_named[i].mat;
+            }
         }
     }
 
@@ -447,7 +486,7 @@ const q3_pbr_material_t *q3_pbr_lookup_by_name(const char *q3_shader_name) {
             const char *mod_stem = kPbrAliases[a].mod_stem;
             for (int i = 0; i < g_named_count; ++i) {
                 if (strcmp(g_named[i].name, mod_stem) == 0) {
-                    return &g_named[i].mat;
+                    return q3_pbr_named_material_is_usable(&g_named[i].mat) ? &g_named[i].mat : NULL;
                 }
             }
             return NULL;  /* alias known but mod doesn't ship this material */
@@ -524,22 +563,44 @@ static void load_named_materials_from_json(const char *json, const char *json_en
         memcpy(e->name, key, nl);
         e->name[nl] = '\0';
 
-        /* Extract paths + emissive (same as hash-keyed materials). */
+        /* Extract paths + emissive (same as hash-keyed materials).
+         * Track key presence separately from string presence: explicit
+         * JSON null means "do not inherit the parent hash slot" while an
+         * absent key means "minimal named entry; inherit from parent". */
+        const char *albedoValue    = find_key(body, body_end, "albedo");
+        const char *normalValue    = find_key(body, body_end, "normal");
+        const char *roughnessValue = find_key(body, body_end, "roughness");
+        const char *metallicValue  = find_key(body, body_end, "metallic");
+        const char *emissiveValue  = find_key(body, body_end, "emissive");
+        const char *heightValue    = find_key(body, body_end, "height");
+        const char *emissiveIntensityValue = find_key(body, body_end, "emissive_intensity");
+        const char *roughnessConstantValue = find_key(body, body_end, "roughness_constant");
+        const char *metallicConstantValue  = find_key(body, body_end, "metallic_constant");
+        const int hasAlbedoKey    = (albedoValue != NULL);
+        const int hasNormalKey    = (normalValue != NULL);
+        const int hasRoughnessKey = (roughnessValue != NULL);
+        const int hasMetallicKey  = (metallicValue != NULL);
+        const int hasEmissiveKey  = (emissiveValue != NULL);
+        const int hasHeightKey    = (heightValue != NULL);
+        const int hasEmissiveIntensityKey = (emissiveIntensityValue != NULL);
+        const int hasRoughnessConstantKey = (roughnessConstantValue != NULL);
+        const int hasMetallicConstantKey  = (metallicConstantValue != NULL);
+
         char *s;
-        if ((s = json_str_dup(find_key(body, body_end, "albedo"),    body_end))) { e->mat.albedo    = resolve_path(assetRoot, s); free(s); }
-        if ((s = json_str_dup(find_key(body, body_end, "normal"),    body_end))) { e->mat.normal    = resolve_path(assetRoot, s); free(s); }
-        if ((s = json_str_dup(find_key(body, body_end, "roughness"), body_end))) { e->mat.roughness = resolve_path(assetRoot, s); free(s); }
-        if ((s = json_str_dup(find_key(body, body_end, "metallic"),  body_end))) { e->mat.metallic  = resolve_path(assetRoot, s); free(s); }
-        if ((s = json_str_dup(find_key(body, body_end, "emissive"),  body_end))) { e->mat.emissive  = resolve_path(assetRoot, s); free(s); }
-        if ((s = json_str_dup(find_key(body, body_end, "height"),    body_end))) { e->mat.height    = resolve_path(assetRoot, s); free(s); }
+        if ((s = json_str_dup(albedoValue,    body_end))) { e->mat.albedo    = resolve_path(assetRoot, s); free(s); }
+        if ((s = json_str_dup(normalValue,    body_end))) { e->mat.normal    = resolve_path(assetRoot, s); free(s); }
+        if ((s = json_str_dup(roughnessValue, body_end))) { e->mat.roughness = resolve_path(assetRoot, s); free(s); }
+        if ((s = json_str_dup(metallicValue,  body_end))) { e->mat.metallic  = resolve_path(assetRoot, s); free(s); }
+        if ((s = json_str_dup(emissiveValue,  body_end))) { e->mat.emissive  = resolve_path(assetRoot, s); free(s); }
+        if ((s = json_str_dup(heightValue,    body_end))) { e->mat.height    = resolve_path(assetRoot, s); free(s); }
         double dv;
-        if (json_num(find_key(body, body_end, "emissive_intensity"), body_end, &dv)) {
+        if (json_num(emissiveIntensityValue, body_end, &dv)) {
             e->mat.emissive_intensity = (float)dv;
         }
-        if (json_num(find_key(body, body_end, "roughness_constant"), body_end, &dv)) {
+        if (json_num(roughnessConstantValue, body_end, &dv)) {
             e->mat.roughness_constant = (float)dv;
         }
-        if (json_num(find_key(body, body_end, "metallic_constant"), body_end, &dv)) {
+        if (json_num(metallicConstantValue, body_end, &dv)) {
             e->mat.metallic_constant = (float)dv;
         }
 
@@ -550,10 +611,16 @@ static void load_named_materials_from_json(const char *json, const char *json_en
          * every PBR surface falls back to the global 0.55/0.50 default.
          * Inherit the parent's constants when the named entry doesn't
          * supply its own. */
-        if (e->mat.roughness_constant < 0.0f || e->mat.metallic_constant < 0.0f ||
+        if ((!hasRoughnessConstantKey && e->mat.roughness_constant < 0.0f) ||
+            (!hasMetallicConstantKey && e->mat.metallic_constant < 0.0f) ||
             e->mat.sprite_cols == 0 ||
-            e->mat.albedo == NULL || e->mat.normal == NULL ||
-            e->mat.roughness == NULL || e->mat.metallic == NULL) {
+            (!hasAlbedoKey && e->mat.albedo == NULL) ||
+            (!hasNormalKey && e->mat.normal == NULL) ||
+            (!hasRoughnessKey && e->mat.roughness == NULL) ||
+            (!hasMetallicKey && e->mat.metallic == NULL) ||
+            (!hasEmissiveKey && e->mat.emissive == NULL) ||
+            (!hasHeightKey && e->mat.height == NULL) ||
+            (!hasEmissiveIntensityKey && e->mat.emissive_intensity == 0.0f)) {
             const char *hv = find_key(body, body_end, "hash");
             if (hv && hv < body_end && *hv == '"') {
                 const char *hs = hv + 1;
@@ -562,10 +629,10 @@ static void load_named_materials_from_json(const char *json, const char *json_en
                     if (parse_hex64(hs, &parent_hash)) {
                         for (int hi = 0; hi < g_materials_count; ++hi) {
                             if (g_materials[hi].hash == parent_hash) {
-                                if (e->mat.roughness_constant < 0.0f) {
+                                if (!hasRoughnessConstantKey && e->mat.roughness_constant < 0.0f) {
                                     e->mat.roughness_constant = g_materials[hi].roughness_constant;
                                 }
-                                if (e->mat.metallic_constant < 0.0f) {
+                                if (!hasMetallicConstantKey && e->mat.metallic_constant < 0.0f) {
                                     e->mat.metallic_constant = g_materials[hi].metallic_constant;
                                 }
                                 /* Atlas metadata only lives on the hash-keyed
@@ -586,16 +653,16 @@ static void load_named_materials_from_json(const char *json, const char *json_en
                                  * reachable via the parent's `albedo` field.
                                  * Required for entity envmap atlas animation
                                  * on health/armor/ammo pickups. */
-                                if (e->mat.albedo == NULL) {
+                                if (!hasAlbedoKey && e->mat.albedo == NULL) {
                                     e->mat.albedo = str_arena_dup(g_materials[hi].albedo);
                                 }
-                                if (e->mat.normal == NULL) {
+                                if (!hasNormalKey && e->mat.normal == NULL) {
                                     e->mat.normal = str_arena_dup(g_materials[hi].normal);
                                 }
-                                if (e->mat.roughness == NULL) {
+                                if (!hasRoughnessKey && e->mat.roughness == NULL) {
                                     e->mat.roughness = str_arena_dup(g_materials[hi].roughness);
                                 }
-                                if (e->mat.metallic == NULL) {
+                                if (!hasMetallicKey && e->mat.metallic == NULL) {
                                     e->mat.metallic = str_arena_dup(g_materials[hi].metallic);
                                 }
                                 /* Emissive path + tint + intensity inherit
@@ -604,10 +671,10 @@ static void load_named_materials_from_json(const char *json, const char *json_en
                                  * `hash` + `sourceTexture`), but whose
                                  * parent hash entry has the emissive DDS
                                  * and color/intensity. */
-                                if (e->mat.emissive == NULL) {
+                                if (!hasEmissiveKey && e->mat.emissive == NULL) {
                                     e->mat.emissive = str_arena_dup(g_materials[hi].emissive);
                                 }
-                                if (e->mat.emissive_intensity == 0.0f) {
+                                if (!hasEmissiveIntensityKey && e->mat.emissive_intensity == 0.0f) {
                                     e->mat.emissive_intensity = g_materials[hi].emissive_intensity;
                                 }
                                 if (!e->mat.has_emissive_color &&
