@@ -1,0 +1,687 @@
+if entityIndexBuffer == nil || indexLength > entityIndexBufferCapacity {
+                let nextCapacity = max(indexLength, max(entityIndexBufferCapacity * 2, 4096))
+                entityIndexBuffer = device.makeBuffer(length: nextCapacity, options: .storageModeShared)
+                entityIndexBuffer?.label = "Q3.ib.entity"
+                entityIndexBufferCapacity = nextCapacity
+            }
+
+            guard let entityIndexBuffer,
+                  let rawIndexPointer = entityIndexBuffer.contents().bindMemory(to: UInt32.self, capacity: indexCount) as UnsafeMutablePointer<UInt32>?
+            else {
+                return nil
+            }
+
+            let sourceIndices = UnsafeBufferPointer(start: indicesPointer, count: indexCount)
+            for i in 0..<indexCount {
+                rawIndexPointer[i] = sourceIndices[i]
+            }
+
+            return entityVertexBuffer
+        }
+
+        private func texture(for handle: UInt32, device: MTLDevice?) -> MTLTexture? {
+            guard let device else { return nil }
+
+            var info = Q3MetalTextureInfo()
+            guard Q3MetalRenderer_GetTextureInfo(handle, &info) != 0,
+                  let rgbaBytes = info.rgbaBytes
+            else {
+                return nil
+            }
+
+            guard info.width > 0, info.height > 0 else {
+                return nil
+            }
+
+            if let cached = textureCache[handle], cached.generation == info.generation {
+                return cached.texture
+            }
+
+            let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .rgba8Unorm,
+                width: Int(info.width),
+                height: Int(info.height),
+                mipmapped: false
+            )
+            descriptor.usage = .shaderRead
+
+            guard let texture = device.makeTexture(descriptor: descriptor) else {
+                return nil
+            }
+            if let namePtr = Q3MetalRenderer_GetTextureName(handle) {
+                let name = String(cString: namePtr)
+                texture.label = name.isEmpty ? "Q3.tex.\(handle)" : "Q3.tex.\(handle):\(name)"
+            } else {
+                texture.label = "Q3.tex.\(handle)"
+            }
+
+            let bytesPerRow = Int(info.width) * 4
+            texture.replace(
+                region: MTLRegionMake2D(0, 0, Int(info.width), Int(info.height)),
+                mipmapLevel: 0,
+                withBytes: rgbaBytes,
+                bytesPerRow: bytesPerRow
+            )
+
+            textureCache[handle] = (generation: info.generation, texture: texture)
+            return texture
+        }
+
+        private func makeOrthoProjection(width: Float, height: Float) -> simd_float4x4 {
+            simd_float4x4(columns: (
+                SIMD4<Float>(2.0 / width, 0, 0, 0),
+                SIMD4<Float>(0, -2.0 / height, 0, 0),
+                SIMD4<Float>(0, 0, 1, 0),
+                SIMD4<Float>(-1, 1, 0, 1)
+            ))
+        }
+
+        private func makeSunShadowOrtho(width: Float, height: Float, near: Float, far: Float) -> simd_float4x4 {
+            let depth = max(far - near, 1.0)
+            return simd_float4x4(columns: (
+                SIMD4<Float>(2.0 / max(width, 1.0), 0, 0, 0),
+                SIMD4<Float>(0, 2.0 / max(height, 1.0), 0, 0),
+                SIMD4<Float>(0, 0, 1.0 / depth, 0),
+                SIMD4<Float>(0, 0, -near / depth, 1)
+            ))
+        }
+
+        private func makeSunShadowViewProjection(center: SIMD3<Float>, sunDir rawSunDir: SIMD3<Float>) -> simd_float4x4 {
+            let sunDirLen = simd_length(rawSunDir)
+            let sunDir = sunDirLen > 1e-4 ? rawSunDir / sunDirLen : SIMD3<Float>(0.3, 0.5, 0.7)
+            let forward = -sunDir
+            let upHint: SIMD3<Float> = abs(simd_dot(forward, SIMD3<Float>(0, 0, 1))) > 0.92
+                ? SIMD3<Float>(0, 1, 0)
+                : SIMD3<Float>(0, 0, 1)
+            let right = simd_normalize(simd_cross(upHint, forward))
+            let up = simd_normalize(simd_cross(forward, right))
+            let span: Float = 4096.0
+            let depth: Float = 8192.0
+            let eye = center + sunDir * (depth * 0.5)
+            let view = simd_float4x4(columns: (
+                SIMD4<Float>(right.x, up.x, forward.x, 0),
+                SIMD4<Float>(right.y, up.y, forward.y, 0),
+                SIMD4<Float>(right.z, up.z, forward.z, 0),
+                SIMD4<Float>(-simd_dot(eye, right), -simd_dot(eye, up), -simd_dot(eye, forward), 1)
+            ))
+            return makeSunShadowOrtho(width: span, height: span, near: 1.0, far: depth) * view
+        }
+
+        private func ensureSunShadowTexture(device: MTLDevice, size: Int = 512) -> MTLTexture? {
+            if let tex = sunShadowTexture,
+               sunShadowTextureSize.width == size,
+               sunShadowTextureSize.height == size {
+                return tex
+            }
+            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float,
+                                                                width: size,
+                                                                height: size,
+                                                                mipmapped: false)
+            desc.usage = [.renderTarget, .shaderRead]
+            desc.storageMode = .private
+            guard let tex = device.makeTexture(descriptor: desc) else { return nil }
+            tex.label = "Q3.sun.shadow.depth"
+            sunShadowTexture = tex
+            sunShadowTextureSize = MTLSize(width: size, height: size, depth: 1)
+            return tex
+        }
+
+        private func ensureSunShadowDummyTexture(device: MTLDevice) -> MTLTexture? {
+            if let tex = sunShadowDummyTexture { return tex }
+            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float,
+                                                                width: 1,
+                                                                height: 1,
+                                                                mipmapped: false)
+            desc.usage = .shaderRead
+            desc.storageMode = .shared
+            guard let tex = device.makeTexture(descriptor: desc) else { return nil }
+            var one: Float = 1.0
+            withUnsafeBytes(of: &one) { bytes in
+                tex.replace(region: MTLRegionMake2D(0, 0, 1, 1),
+                            mipmapLevel: 0,
+                            withBytes: bytes.baseAddress!,
+                            bytesPerRow: 4)
+            }
+            tex.label = "Q3.sun.shadow.depth.dummy"
+            sunShadowDummyTexture = tex
+            return tex
+        }
+
+        private func encodeSunShadowMap(commandBuffer: MTLCommandBuffer,
+                                        device: MTLDevice,
+                                        snapshot: Q3MetalFrameSnapshot,
+                                        sceneView: Q3MetalSceneView) -> (texture: MTLTexture, matrix: simd_float4x4)? {
+            guard Q3_PBRSunShadows() != 0,
+                  Q3_RTMix() <= 0.001,
+                  snapshot.worldCommandCount > 0,
+                  let pipeline = sunShadowPipelineState,
+                  let depthState = sunShadowDepthStencilState,
+                  let shadowTexture = ensureSunShadowTexture(device: device),
+                  let worldVertexBuffer = uploadWorldBuffers(device: device, generation: snapshot.worldGeneration),
+                  let worldIndexBuffer,
+                  let drawsPtr = Q3MetalRenderer_GetWorldDrawCommands() else {
+                return nil
+            }
+            _ = ensureRTLightBuffer(device: device)
+            guard rtLightCount > 0,
+                  let sun = rtLightsCPU.first,
+                  sun.dirType.w == 0 else {
+                return nil
+            }
+            let center = SIMD3<Float>(sceneView.viewOrigin.0, sceneView.viewOrigin.1, sceneView.viewOrigin.2)
+            let sunDir = SIMD3<Float>(sun.dirType.x, sun.dirType.y, sun.dirType.z)
+            let shadowMatrix = makeSunShadowViewProjection(center: center, sunDir: sunDir)
+            let pass = MTLRenderPassDescriptor()
+            pass.depthAttachment.texture = shadowTexture
+            pass.depthAttachment.loadAction = .clear
+            pass.depthAttachment.storeAction = .store
+            pass.depthAttachment.clearDepth = 1.0
+            guard let enc = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else { return nil }
+            enc.label = "Q3.sun.shadow"
+            enc.setViewport(MTLViewport(originX: 0, originY: 0,
+                                        width: Double(shadowTexture.width),
+                                        height: Double(shadowTexture.height),
+                                        znear: 0, zfar: 1))
+            enc.setRenderPipelineState(pipeline)
+            enc.setDepthStencilState(depthState)
+            enc.setFrontFacing(.clockwise)
+            enc.setVertexBuffer(worldVertexBuffer, offset: 0, index: 0)
+            var shadowUniforms = WorldUniforms(viewProjection: shadowMatrix,
+                                               cameraPos: center,
+                                               cameraRight: SIMD3<Float>(1, 0, 0),
+                                               cameraUp: SIMD3<Float>(0, 0, 1))
+            shadowUniforms.sunDir = sunDir
+            shadowUniforms.sunIntensity = sun.colorIntensity.w
+            shadowUniforms.sunColor = SIMD4<Float>(sun.colorIntensity.x, sun.colorIntensity.y, sun.colorIntensity.z, 1)
+            enc.setVertexBytes(&shadowUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
+
+            let draws = UnsafeBufferPointer(start: drawsPtr, count: Int(snapshot.worldCommandCount))
+            let skyFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
+            let fogOnlyBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY)
+            var castDraws = 0
+            for draw in draws {
+                if draw.indexCount == 0 || (draw.flags & skyFlagBit) != 0 || (draw.flags & fogOnlyBit) != 0 { continue }
+                let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+                if stageCount <= 0 { continue }
+                var castStage: Q3MetalWorldStage? = nil
+                for i in 0..<stageCount {
+                    let st = Self.worldStage(draw, i)
+                    if st.useLightmap == 0 && Self.worldRenderPass(for: st) == 0 {
+                        castStage = st
+                        break
+                    }
+                }
+                guard let stage = castStage else { continue }
+                let (tv0, tv1) = Self.tcGenVectors(stage)
+                var drawUniforms = WorldDrawUniforms(
+                    tcGen: Float(stage.tcGen),
+                    tcModCount: 0,
+                    rgbGen: Float(stage.rgbGen),
+                    alphaGen: Float(stage.alphaGen),
+                    blendMode: 0,
+                    timeSeconds: snapshot.shaderTime,
+                    rgbWaveFunc: stage.rgbWaveFunc,
+                    alphaWaveFunc: stage.alphaWaveFunc,
+                    tcModType: SIMD4<Float>(0, 0, 0, 0),
+                    tcModParams0: SIMD4<Float>(0, 0, 0, 0),
+                    tcModParams1: SIMD4<Float>(0, 0, 0, 0),
+                    tcModParams2: SIMD4<Float>(0, 0, 0, 0),
+                    tcModParams3: SIMD4<Float>(0, 0, 0, 0),
+                    rgbWaveParams: SIMD4(stage.rgbWaveBase, stage.rgbWaveAmp, stage.rgbWavePhase, stage.rgbWaveFreq),
+                    alphaWaveParams: SIMD4(stage.alphaWaveBase, stage.alphaWaveAmp, stage.alphaWavePhase, stage.alphaWaveFreq),
+                    rgbConstColor: SIMD4(stage.rgbConstColor.0, stage.rgbConstColor.1, stage.rgbConstColor.2, stage.alphaConst),
+                    entityColor: SIMD4(1, 1, 1, 1),
+                    fogColorDistance: SIMD4<Float>(0, 0, 0, 0),
+                    tcGenVec0: tv0,
+                    tcGenVec1: tv1,
+                    deformWaveFunc: stage.deformWaveFunc,
+                    deformWaveDiv: stage.deformWaveDiv != 0 ? stage.deformWaveDiv : 1.0,
+                    deformWaveBase: stage.deformWaveBase,
+                    deformWaveAmp: stage.deformWaveAmp,
+                    deformWavePhase: stage.deformWavePhase,
+                    deformWaveFreq: stage.deformWaveFreq,
+                    deformMoveFunc: stage.deformMoveFunc,
+                    deformMoveVector: SIMD3(stage.deformMoveVector.0, stage.deformMoveVector.1, stage.deformMoveVector.2),
+                    deformMoveBase: stage.deformMoveBase,
+                    deformMoveAmp: stage.deformMoveAmp,
+                    deformMovePhase: stage.deformMovePhase,
+                    deformMoveFreq: stage.deformMoveFreq,
+                    deformBulgeWidth: stage.deformBulgeWidth,
+                    deformBulgeHeight: stage.deformBulgeHeight,
+                    deformBulgeSpeed: stage.deformBulgeSpeed,
+                    autospriteMode: 0,
+                    debugMode: 0,
+                    forceWhiteVertColor: 0,
+                    alphaTestThreshold: 0,
+                    fogOnly: 0,
+                    stageUsesLightmap: 0,
+                    drawHasLightmapStage: 0,
+                    pbrRoughness: stage.pbrRoughness,
+                    pbrMetallic: stage.pbrMetallic,
+                    _pad0: 0)
+                enc.setCullMode(Self.metalCullMode(for: stage.cullMode))
+                enc.setVertexBytes(&drawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 2)
+                enc.drawIndexedPrimitives(type: .triangle,
+                                          indexCount: Int(draw.indexCount),
+                                          indexType: .uint32,
+                                          indexBuffer: worldIndexBuffer,
+                                          indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride)
+                castDraws += 1
+            }
+            enc.endEncoding()
+            let mapKey = rtLightMapName.isEmpty ? "<unknown>" : rtLightMapName
+            if sunShadowLoggedMaps.insert(mapKey).inserted {
+                pbrLog("[Q3-SUNSHADOW] map='\(mapKey)' size=\(shadowTexture.width)x\(shadowTexture.height) casters=\(castDraws) pcf=\(Q3_PBRShadowPCFRadius()) sunDir=(\(sunDir.x),\(sunDir.y),\(sunDir.z))")
+            }
+            return (shadowTexture, shadowMatrix)
+        }
+
+        /* Encodes the main scene's camera-facing additive flare billboards.
+         * Returns true only when a flare draw was actually encoded. When the
+         * depth-limited fog ray-box is active this must run before that fog
+         * pass so the fog attenuates light sprites instead of letting them
+         * punch bright Q3.entity.additive artifacts through the final Q3.ui
+         * framebuffer state. */
+        @discardableResult
+        private func encodeMainFlarePass(encoder: MTLRenderCommandEncoder,
+                                         sceneView: Q3MetalSceneView,
+                                         snapshot: Q3MetalFrameSnapshot,
+                                         device: MTLDevice?) -> Bool {
+            guard Q3MetalRenderer_GetFlareCount() > 0,
+                  Q3MetalRenderer_GetFlareTextureHandle() != 0,
+                  let flarePipeline = entityAdditivePipelineState,
+                  let flareDepth = additiveLessDepthStencilState ?? additiveEntityDepthStencilState,
+                  let flareTexture = texture(for: Q3MetalRenderer_GetFlareTextureHandle(), device: device) else {
+                return false
+            }
+
+            let flareViewProjection = makeWorldViewProjection(sceneView)
+            var flareUniforms = EntityUniforms(viewProjection: flareViewProjection)
+            flareUniforms.cameraPos = SIMD3<Float>(sceneView.viewOrigin.0,
+                                                   sceneView.viewOrigin.1,
+                                                   sceneView.viewOrigin.2)
+            flareUniforms.suppressDlights = 1
+
+            encoder.setRenderPipelineState(flarePipeline)
+            encoder.setDepthStencilState(flareDepth)
+            encoder.setCullMode(.none)
+            // Flare disc texture (Q3 tr.flareShader image) must clampToEdge
+            // — with .repeat the falloff disc tiles across the framebuffer
+            // and the rings persist through the fog volume into Q3.ui (see
+            // fog-fix comment at encodeMainFlarePass call site). uiSampler
+            // is the existing clampToEdge sampler created at line ~4031.
+            encoder.setFragmentSamplerState(uiSamplerState, index: 0)
+            encoder.setFragmentTexture(flareTexture, index: 0)
+            // q3_entity_fragment declares the dlight block at buffer(2).
+            // It is suppressed for flares, but binding defensively keeps
+            // capture/validation state consistent with other entity draws.
+            Self.bindDlightBlock(snapshot: snapshot, encoder: encoder, device: device, index: 2, extra: currentBakedDlights())
+
+            drawFlarePass(encoder: encoder,
+                          sceneView: sceneView,
+                          uniforms: &flareUniforms,
+                          device: device)
+            return true
+        }
+
+        /* Build and draw camera-facing additive billboards for each BSP flare.
+         * Called inside an already-configured render pass: caller bound
+         * pipeline, depth-stencil, sampler, flare texture, and dlight block.
+         * We allocate a transient per-frame vertex buffer sized to the flare
+         * count × 4 corners. Flare size is fixed at 16 world units — the Q3
+         * behavior of world-space billboards that shrink with distance is
+         * visually acceptable for phase-one. */
+        private func drawFlarePass(encoder: MTLRenderCommandEncoder,
+                                   sceneView: Q3MetalSceneView,
+                                   uniforms: inout EntityUniforms,
+                                   device: MTLDevice?) {
+            guard let device,
+                  let flaresPointer = Q3MetalRenderer_GetFlares() else { return }
+            let flareCount = Int(Q3MetalRenderer_GetFlareCount())
+            guard flareCount > 0 else { return }
+
+            // Q3 axis convention: axis0=forward, axis1=left, axis2=up.
+            // Billboard plane spans (-axis1, axis2) — rotating left into
+            // "right" flips axis1 so +X on the quad is visually rightward.
+            let axis1 = SIMD3<Float>(sceneView.viewAxis.3, sceneView.viewAxis.4, sceneView.viewAxis.5)
+            let axis2 = SIMD3<Float>(sceneView.viewAxis.6, sceneView.viewAxis.7, sceneView.viewAxis.8)
+            let right = -axis1
+            let up = axis2
+            let halfSize: Float = 16.0
+
+            let corners: [(SIMD2<Float>, SIMD2<Float>)] = [
+                (SIMD2(-1, -1), SIMD2(0, 1)),
+                (SIMD2( 1, -1), SIMD2(1, 1)),
+                (SIMD2( 1,  1), SIMD2(1, 0)),
+                (SIMD2(-1,  1), SIMD2(0, 0)),
+            ]
+
+            var vertices = [Q3MetalEntityVertex]()
+            vertices.reserveCapacity(flareCount * 4)
+            var indices = [UInt32]()
+            indices.reserveCapacity(flareCount * 6)
+
+            let flares = UnsafeBufferPointer(start: flaresPointer, count: flareCount)
+            for (i, flare) in flares.enumerated() {
+                let origin = SIMD3<Float>(flare.origin.0, flare.origin.1, flare.origin.2)
+                let color = SIMD3<Float>(flare.color.0, flare.color.1, flare.color.2)
+                let base = UInt32(i * 4)
+                for (corner, uv) in corners {
+                    let p = origin + right * (corner.x * halfSize) + up * (corner.y * halfSize)
+                    var vert = Q3MetalEntityVertex(
+                        position: (p.x, p.y, p.z),
+                        texCoord: (uv.x, uv.y),
+                        color: (color.x, color.y, color.z, 1.0),
+                        normal: (0, 0, 0)
+                    )
+                    vertices.append(vert)
+                }
+                indices.append(contentsOf: [base, base + 1, base + 2, base, base + 2, base + 3])
+            }
+
+            let vertStride = MemoryLayout<Q3MetalEntityVertex>.stride
+            guard let vertexBuffer = device.makeBuffer(
+                bytes: vertices,
+                length: vertices.count * vertStride,
+                options: .storageModeShared
+            ),
+            let indexBuffer = device.makeBuffer(
+                bytes: indices,
+                length: indices.count * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared
+            ) else { return }
+
+            encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
+            encoder.setFragmentBytes(&uniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
+            encoder.drawIndexedPrimitives(
+                type: .triangle,
+                indexCount: indices.count,
+                indexType: .uint32,
+                indexBuffer: indexBuffer,
+                indexBufferOffset: 0
+            )
+        }
+
+        private func makeWorldViewProjection(_ sceneView: Q3MetalSceneView) -> simd_float4x4 {
+            let origin = SIMD3<Float>(sceneView.viewOrigin.0, sceneView.viewOrigin.1, sceneView.viewOrigin.2)
+            let axis0 = SIMD3<Float>(sceneView.viewAxis.0, sceneView.viewAxis.1, sceneView.viewAxis.2)
+            let axis1 = SIMD3<Float>(sceneView.viewAxis.3, sceneView.viewAxis.4, sceneView.viewAxis.5)
+            let axis2 = SIMD3<Float>(sceneView.viewAxis.6, sceneView.viewAxis.7, sceneView.viewAxis.8)
+
+            let viewer = simd_float4x4(columns: (
+                SIMD4<Float>(axis0.x, axis1.x, axis2.x, 0),
+                SIMD4<Float>(axis0.y, axis1.y, axis2.y, 0),
+                SIMD4<Float>(axis0.z, axis1.z, axis2.z, 0),
+                SIMD4<Float>(-simd_dot(origin, axis0), -simd_dot(origin, axis1), -simd_dot(origin, axis2), 1)
+            ))
+
+            let flip = simd_float4x4(columns: (
+                SIMD4<Float>(0, 0, -1, 0),
+                SIMD4<Float>(-1, 0, 0, 0),
+                SIMD4<Float>(0, 1, 0, 0),
+                SIMD4<Float>(0, 0, 0, 1)
+            ))
+
+            let zNear: Float = 4.0
+            let zFar: Float = 8192.0
+            let xScale = 1.0 / tan(sceneView.fovX * .pi / 360.0)
+            let yScale = 1.0 / tan(sceneView.fovY * .pi / 360.0)
+            let depth = zFar - zNear
+            let quakeProjection = simd_float4x4(columns: (
+                SIMD4<Float>(xScale, 0, 0, 0),
+                SIMD4<Float>(0, yScale, 0, 0),
+                SIMD4<Float>(0, 0, -(zFar + zNear) / depth, -1),
+                SIMD4<Float>(0, 0, -(2 * zFar * zNear) / depth, 0)
+            ))
+
+            // Quake's legacy projection targets OpenGL clip space. Metal keeps the
+            // same XY clip rules but uses a 0...1 depth range instead of -1...1.
+            let openGLToMetalClip = simd_float4x4(columns: (
+                SIMD4<Float>(1, 0, 0, 0),
+                SIMD4<Float>(0, 1, 0, 0),
+                SIMD4<Float>(0, 0, 0.5, 0),
+                SIMD4<Float>(0, 0, 0.5, 1)
+            ))
+
+            return openGLToMetalClip * quakeProjection * flip * viewer
+        }
+
+        private func formatVector(_ vector: SIMD3<Float>) -> String {
+            String(format: "(%.3f, %.3f, %.3f)", vector.x, vector.y, vector.z)
+        }
+
+        private func formatMatrix(_ matrix: simd_float4x4) -> String {
+            let c0 = matrix.columns.0
+            let c1 = matrix.columns.1
+            let c2 = matrix.columns.2
+            let c3 = matrix.columns.3
+            return String(
+                format: "[[%.3f, %.3f, %.3f, %.3f], [%.3f, %.3f, %.3f, %.3f], [%.3f, %.3f, %.3f, %.3f], [%.3f, %.3f, %.3f, %.3f]]",
+                c0.x, c0.y, c0.z, c0.w,
+                c1.x, c1.y, c1.z, c1.w,
+                c2.x, c2.y, c2.z, c2.w,
+                c3.x, c3.y, c3.z, c3.w
+            )
+        }
+    }
+}
+
+@MainActor
+final class GameControllerBridge {
+    static let shared = GameControllerBridge()
+
+    private struct State {
+        var leftX: Float = 0
+        var leftY: Float = 0
+        var rightX: Float = 0
+        var rightY: Float = 0
+        var firePressed: Int32 = 0
+        var jumpPressed: Int32 = 0
+        var crouchPressed: Int32 = 0
+        var buttonMask: UInt32 = 0
+    }
+
+    /* Mirror of code/ios/ios_local.h Q3_PAD_* bits. */
+    private struct PadBit {
+        static let a:              UInt32 = 1 << 0
+        static let b:              UInt32 = 1 << 1
+        static let x:              UInt32 = 1 << 2
+        static let y:              UInt32 = 1 << 3
+        static let leftShoulder:   UInt32 = 1 << 4
+        static let rightShoulder:  UInt32 = 1 << 5
+        static let leftTrigger:    UInt32 = 1 << 6
+        static let rightTrigger:   UInt32 = 1 << 7
+        static let dpadUp:         UInt32 = 1 << 8
+        static let dpadDown:       UInt32 = 1 << 9
+        static let dpadLeft:       UInt32 = 1 << 10
+        static let dpadRight:      UInt32 = 1 << 11
+        static let menu:           UInt32 = 1 << 12
+        static let options:        UInt32 = 1 << 13
+        static let leftThumb:      UInt32 = 1 << 14
+        static let rightThumb:     UInt32 = 1 << 15
+    }
+
+    private var started = false
+    private var activeController: GCController?
+    private var activeMouse: GCMouse?
+    private var state = State()
+    private var lastLoggedState: State?
+
+    private init() {}
+
+    func start() {
+        guard !started else { return }
+        started = true
+
+        print("[GCController] start")
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(controllerDidConnect(_:)),
+            name: .GCControllerDidConnect,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(controllerDidDisconnect(_:)),
+            name: .GCControllerDidDisconnect,
+            object: nil
+        )
+        if #available(iOS 14.0, *) {
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(mouseDidConnect(_:)),
+                name: .GCMouseDidConnect,
+                object: nil
+            )
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(mouseDidDisconnect(_:)),
+                name: .GCMouseDidDisconnect,
+                object: nil
+            )
+        }
+
+        print("[GCController] existing controllers: \(GCController.controllers().count)")
+        for controller in GCController.controllers() {
+            print("[GCController] existing \(describe(controller))")
+        }
+
+        GCController.startWirelessControllerDiscovery { [weak self] in
+            print("[GCController] wireless discovery completed")
+            Task { @MainActor in
+                self?.pickActiveController()
+            }
+        }
+        pickActiveController()
+        if #available(iOS 14.0, *) {
+            pickActiveMouse()
+        }
+    }
+
+    @objc private func controllerDidConnect(_ notification: Notification) {
+        if let controller = notification.object as? GCController {
+            print("[GCController] connected \(describe(controller))")
+        } else {
+            print("[GCController] connected unknown controller")
+        }
+        pickActiveController(preferred: notification.object as? GCController)
+    }
+
+    @objc private func controllerDidDisconnect(_ notification: Notification) {
+        let disconnected = notification.object as? GCController
+        if activeController === disconnected {
+            activeController = nil
+            state = State()
+            lastLoggedState = nil
+            pushState()
+        }
+        if let disconnected {
+            print("[GCController] disconnected \(describe(disconnected))")
+        } else {
+            print("[GCController] disconnected unknown controller")
+        }
+        pickActiveController()
+    }
+
+    private func pickActiveController(preferred: GCController? = nil) {
+        let nextController = [preferred, activeController]
+            .compactMap { $0 }
+            .first { $0.extendedGamepad != nil }
+            ?? GCController.controllers().first { $0.extendedGamepad != nil }
+
+        guard activeController !== nextController else {
+            return
+        }
+
+        activeController?.extendedGamepad?.valueChangedHandler = nil
+        activeController = nextController
+        state = State()
+        lastLoggedState = nil
+        pushState()
+
+        guard let controller = nextController, let gamepad = controller.extendedGamepad else {
+            print("[GCController] no extended gamepad controller selected")
+            return
+        }
+
+        controller.playerIndex = .index1
+        controller.handlerQueue = .main
+        gamepad.valueChangedHandler = { [weak self] gamepad, element in
+            self?.ingest(gamepad: gamepad, source: element)
+        }
+        ingest(gamepad: gamepad, source: nil)
+        print("[GCController] using \(describe(controller))")
+    }
+
+    @available(iOS 14.0, *)
+    @objc private func mouseDidConnect(_ notification: Notification) {
+        if let mouse = notification.object as? GCMouse {
+            print("[GCMouse] connected \(mouse.vendorName ?? "unknown")")
+            pickActiveMouse(preferred: mouse)
+        } else {
+            print("[GCMouse] connected unknown mouse")
+            pickActiveMouse()
+        }
+    }
+
+    @available(iOS 14.0, *)
+    @objc private func mouseDidDisconnect(_ notification: Notification) {
+        let mouse = notification.object as? GCMouse
+        if activeMouse === mouse {
+            activeMouse?.mouseInput?.mouseMovedHandler = nil
+            activeMouse?.mouseInput?.leftButton.pressedChangedHandler = nil
+            activeMouse?.mouseInput?.rightButton?.pressedChangedHandler = nil
+            activeMouse?.mouseInput?.middleButton?.pressedChangedHandler = nil
+            activeMouse = nil
+        }
+        if let mouse {
+            print("[GCMouse] disconnected \(mouse.vendorName ?? "unknown")")
+        }
+        pickActiveMouse()
+    }
+
+    @available(iOS 14.0, *)
+    private func pickActiveMouse(preferred: GCMouse? = nil) {
+        let nextMouse = preferred ?? activeMouse ?? GCMouse.mice().first
+        guard activeMouse !== nextMouse else { return }
+
+        activeMouse?.mouseInput?.mouseMovedHandler = nil
+        activeMouse?.mouseInput?.leftButton.pressedChangedHandler = nil
+        activeMouse?.mouseInput?.rightButton?.pressedChangedHandler = nil
+        activeMouse?.mouseInput?.middleButton?.pressedChangedHandler = nil
+        activeMouse = nextMouse
+
+        guard let mouse = nextMouse, let input = mouse.mouseInput else {
+            print("[GCMouse] no mouse/trackpad selected")
+            return
+        
+
+[…truncated 14065 chars — raise BridgeOptions.maxResultChars, or call the tool with a narrower scope (filter, head, pagination)…]
+
+        case .keyboardF10: return 154
+        case .keyboardF11: return 155
+        case .keyboardF12: return 156
+        case .keyboardGraveAccentAndTilde: return 96
+        default:
+            // Fallback: trust the produced character. Some keyboard
+            // layouts route DEL/BS through a keyCode that doesn't
+            // match `.keyboardDeleteOrBackspace` — catch the actual
+            // 0x7F (DEL) or 0x08 (BS) character and route both to
+            // K_BACKSPACE.
+            if let ch = key.charactersIgnoringModifiers.first,
+               let asc = ch.asciiValue {
+                if asc == 0x7F || asc == 0x08 { return 127 }
+                if asc >= 32 && asc < 127 {
+                    // Printable ASCII — Q3 uses lowercase for letter keys.
+                    if let lower = String(ch).lowercased().first?.asciiValue {
+                        return Int32(lower)
+                    }
+                    return Int32(asc)
+                }
+            }
+            return nil
+        }
+    }
+}

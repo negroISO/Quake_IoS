@@ -1,0 +1,357 @@
+$ cat "/Users/targus/Downloads/screenshots/Run Quake3-iOS_2026-06-12T17-01-14.txt"
+[exit 0]
+[Q3-BOOT] App init
+tcp_input [C1:1] flags=[R.] seq=0, ack=111886958, win=0 state=SYN_SENT rcv_nxt=0, snd_una=111886957
+nw_endpoint_flow_failed_with_error [C1 192.168.0.197:8765 in_progress channel-flow (satisfied (Path is satisfied), viable, interface: en0[802.11], ipv4, dns, uses wifi, LQM: good)] already failing, returning
+Linwood eligibility not implemented yet
+Update the Info.plist: 1) `UIRequiresFullScreen` will soon be ignored. 2) Support for all orientations will soon be required.
+Reading from public effective user settings.
+non-launching port is incompatible with service identifier "com.apple.PointerUI.pointeruid.default-service"
+tcp_input [C1:3] flags=[R.] seq=0, ack=3418461018, win=0 state=SYN_SENT rcv_nxt=0, snd_una=3418461017
+nw_endpoint_flow_failed_with_error [C1 192.168.0.197:8765 in_progress channel-flow (satisfied (Path is satisfied), viable, interface: en0[802.11], ipv4, dns, uses wifi, LQM: good)] already failing, returning
+tcp_input [C1:5] flags=[R.] seq=0, ack=682014856, win=0 state=SYN_SENT rcv_nxt=0, snd_una=682014855
+nw_endpoint_flow_failed_with_error [C1 192.168.0.197:8765 in_progress channel-flow (satisfied (Path is satisfied), viable, interface: en0[802.11], ipv4, dns, uses wifi, LQM: good)] already failing, returning
+tcp_input [C1:7] flags=[R.] seq=0, ack=4066859078, win=0 state=SYN_SENT rcv_nxt=0, snd_una=4066859077
+nw_endpoint_flow_failed_with_error [C1 192.168.0.197:8765 in_progress channel-flow (satisfied (Path is satisfied), viable, interface: en0[802.11], ipv4, dns, uses wifi, LQM: good)] already failing, returning
+tcp_input [C1:9] flags=[R.] seq=0, ack=3886014776, win=0 state=SYN_SENT rcv_nxt=0, snd_una=3886014775
+nw_endpoint_flow_failed_with_error [C1 192.168.0.197:8765 in_progress channel-flow (satisfied (Path is satisfied), viable, interface: en0[802.11], ipv4, dns, uses wifi, LQM: good)] already failing, returning
+tcp_input [C1:11] flags=[R.] seq=0, ack=3172261879, win=0 state=SYN_SENT rcv_nxt=0, snd_una=3172261878
+nw_endpoint_flow_failed_with_error [C1 192.168.0.197:8765 in_progress channel-flow (satisfied (Path is satisfied), viable, interface: en0[802.11], ipv4, dns, uses wifi, LQM: good)] already failing, returning
+tcp_input [C1:13] flags=[R.] seq=0, ack=1136563405, win=0 state=SYN_SENT rcv_nxt=0, snd_una=1136563404
+nw_endpoint_flow_failed_with_error [C1 192.168.0.197:8765 in_progress channel-flow (satisfied (Path is satisfied), viable, interface: en0[802.11], ipv4, dns, uses wifi, LQM: good)] already failing, returning
+[Q3-MENU] selected map q3dm1
+[Metal] display config screenMaxFPS=120 preferredFPS=120 lowPower=0 bounds=(0.0, 0.0, 1376.0, 1032.0) nativeBounds=(0.0, 0.0, 2064.0, 2752.0) nativeScale=2.0 outputTarget=(2752.0, 2064.0)
+[Metal] display link range min=60.0 max=120.0 preferred=120.0
+[Metal] layer maximumDrawableCount=3
+[Q3-BOOT] .task entered (engineStarted=0)
+[Q3-BOOT] yielding 200ms for LoadingOverlay paint
+[Metal] Drawable size: (1376.0, 1032.0) (target (2752.0, 2064.0))
+[Metal] Drawable size: (2752.0, 2064.0) (target (2752.0, 2064.0))
+[Metal] Drawable size: (2752.0, 2064.0) (target (2752.0, 2064.0))
+[Metal] Drawable forced to (2752.0, 2064.0) (was (1376.0, 1032.0))
+[Metal] Drawable size: (2752.0, 2064.0) (target (2752.0, 2064.0))
+[Q3-UPSCALE] compute scaler ready: 1376×1032 → 2752×2064 (Medium)
+[MTL_POSTPROC] q3_postprocess pipeline ready
+[MTL_POSTPROC] encode #1 intensity=1.5 gamma=0.95 size=2752x2064
+[libMTLHud] Metric com.apple.hud-stat.frame-interval already exist
+[libMTLHud] Metric com.apple.hud-stat.present-delay already exist
+[libMTLHud] Metric com.apple.hud-stat.fps already exist
+[Q3-BOOT] starting GameControllerBridge
+[GCController] start
+[GCController] existing controllers: 0
+[Q3-BOOT] MetalFX quality=Medium render=1376x1032 (output target 2752x2064 screen)
+[Q3-UPSCALE] render res = 1376x1032
+[Q3-BOOT] RT mix = 1
+[Q3-BOOT] MetalFX frame interpolation = Off
+[Q3-BOOT] dispatching Quake3_Init to background queue
+[Swift] Starting Quake3 engine, basePath: /private/var/containers/Bundle/Application/FC671C7B-B72B-4C6A-8BD1-B080712BE3D8/Q3_RT.app
+[GCMouse] connected Magic Keyboard
+[GCMouse] using Magic Keyboard
+[Q3-AUDIO] session sampleRate=48000
+[Q3-AUDIO] AVAudioEngine started
+[Q3-BOOT] (bg) calling Quake3_Init
+[Q3-INIT] entered Quake3_Init basePath=/private/var/containers/Bundle/Application/FC671C7B-B72B-4C6A-8BD1-B080712BE3D8/Q3_RT.app
+[Q3-INIT] calling Com_Init cmdline='+set com_zoneMegs 64 +set com_hunkMegs 256 +set com_soundMegs 16 +set vm_ui 1 +set vm_game 1 +set vm_cgame 1 +set r_overBrightBits 1 +set r_mapOverBrightBits 2 +set r_intensity 1.0 +set r_gamma 1.0 +set r_picmip 1 +set r_mapGreyScale 0 +set r_ignorehwgamma 1 +set cg_fov 109 +set cg_zoomfov 75 +set r_subdivisions 4 +set r_lodbias 0'
+Q3 1.32e macos-arm64-debug Jun 12 2026
+Q3 1.32e macos-arm64-debug Jun 12 2026
+----- FS_Startup -----
+----- FS_Startup -----
+...found 0 cached paks
+...found 0 cached paks
+...loaded in 21 milliseconds
+...loaded in 21 milliseconds
+----------------------
+----------------------
+6020 files in 15 pk3 files
+6020 files in 15 pk3 files
+execing default.cfg
+execing default.cfg
+execing q3config.cfg
+execing q3config.cfg
+couldn't exec autoexec.cfg
+couldn't exec autoexec.cfg
+Hunk_Clear: reset the hunk ok
+Hunk_Clear: reset the hunk ok
+Sys_Init: iOS platform (arm64)
+Sys_Init: iOS platform (arm64)
+...detecting CPU, found 
+...detecting CPU, found
+arm64
+arm64
+----- Client Initialization -----
+----- Client Initialization -----
+----- Client Initialization Complete -----
+----- Client Initialization Complete -----
+----- Initializing Renderer ----
+----- Initializing Renderer ----
+[Q3-PBR] boot json=/private/var/containers/Bundle/Application/FC671C7B-B72B-4C6A-8BD1-B080712BE3D8/Q3_RT.app/baseq3/pbr/materials.json root=/private/var/containers/Bundle/Application/FC671C7B-B72B-4C6A-8BD1-B080712BE3D8/Q3_RT.app/baseq3/pbr
+[Q3-PBR] boot json=/private/var/containers/Bundle/Application/FC671C7B-B72B-4C6A-8BD1-B080712BE3D8/Q3_RT.app/baseq3/pbr/materials.json root=/private/var/containers/Bundle/Application/FC671C7B-B72B-4C6A-8BD1-B080712BE3D8/Q3_RT.app/baseq3/pbr
+[Q3][metal_pbr_boot] [Q3-PBR] boot json=/private/var/containers/Bundle/Application/FC671C7B-B72B-4C6A-8BD1-B080712BE3D8/Q3_RT.app/baseq3/pbr/materials.json root=/private/var/containers/Bundle/Application/FC671C7B-B72B-4C6A-8BD1-B080712BE3D8/Q3_RT.app/baseq3/pbr
+[Q3-PBR] loaded 943 materials from /private/var/containers/Bundle/Application/FC671C7B-B72B-4C6A-8BD1-B080712BE3D8/Q3_RT.app/baseq3/pbr/materials.json
+[Q3-PBR] loaded 943 materials from /private/var/containers/Bundle/Application/FC671C7B-B72B-4C6A-8BD1-B080712BE3D8/Q3_RT.app/baseq3/pbr/materials.json
+[Q3][metal_pbr_ibl] [Q3-PBR] loaded 943 materials from /private/var/containers/Bundle/Application/FC671C7B-B72B-4C6A-8BD1-B080712BE3D8/Q3_RT.app/baseq3/pbr/materials.json
+[Q3-PBR] assets root: /private/var/containers/Bundle/Application/FC671C7B-B72B-4C6A-8BD1-B080712BE3D8/Q3_RT.app/baseq3/pbr
+[Q3-PBR] assets root: /private/var/containers/Bundle/Application/FC671C7B-B72B-4C6A-8BD1-B080712BE3D8/Q3_RT.app/baseq3/pbr
+[Q3][metal_pbr_ibl] [Q3-PBR] assets root: /private/var/containers/Bundle/Application/FC671C7B-B72B-4C6A-8BD1-B080712BE3D8/Q3_RT.app/baseq3/pbr
+[Q3-PBR] name-indexed materials: 2052 (Path A fallback)
+[Q3-PBR] name-indexed materials: 2052 (Path A fallback)
+[Q3][metal_pbr_ibl] [Q3-PBR] name-indexed materials: 2052 (Path A fallback)
+[Q3-PBR] table_load returned 943 materials (named=2052)
+[Q3-PBR] table_load returned 943 materials (named=2052)
+[Q3][metal_pbr_boot] [Q3-PBR] table_load returned 943 materials (named=2052)
+=== Metal Stub Renderer Initialized ===
+=== Metal Stub Renderer Initialized ===
+-------------------------------
+-------------------------------
+RE_BeginRegistration: Metal stub
+RE_BeginRegistration: Metal stub
+[Q3-FOG] parsed fogparms shader='textures/nvidia/naughtyfog' color=(0.000,0.000,0.000) dist=1024
+[Q3-FOG] parsed fogparms shader='textures/nvidia/naughtyfog' color=(0.000,0.000,0.000) dist=1024
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/nvidia/naughtyfog' color=(0.000,0.000,0.000) dist=1024
+[tcgen-vec] 'textures/vector' v0=(0.0001 0.0001 0.0001) v1=(0 0 0)
+[tcgen-vec] 'textures/vector' v0=(0.0001 0.0001 0.0001) v1=(0 0 0)
+[Q3-FOG] parsed fogparms shader='textures/dont_use/foggentest_shader' color=(0.200,0.100,0.300) dist=0
+[Q3-FOG] parsed fogparms shader='textures/dont_use/foggentest_shader' color=(0.200,0.100,0.300) dist=0
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/dont_use/foggentest_shader' color=(0.200,0.100,0.300) dist=0
+[Q3-FOG] parsed fogparms shader='textures/dont_use/flameshader' color=(0.300,0.100,0.100) dist=0
+[Q3-FOG] parsed fogparms shader='textures/dont_use/flameshader' color=(0.300,0.100,0.100) dist=0
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/dont_use/flameshader' color=(0.300,0.100,0.100) dist=0
+[Q3-FOG] parsed fogparms shader='textures/test/slimeshader' color=(0.200,1.000,0.250) dist=0
+[Q3-FOG] parsed fogparms shader='textures/test/slimeshader' color=(0.200,1.000,0.250) dist=0
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/test/slimeshader' color=(0.200,1.000,0.250) dist=0
+[Q3-FOG] parsed fogparms shader='textures/test/fogtestshader' color=(0.200,0.225,0.250) dist=0
+[Q3-FOG] parsed fogparms shader='textures/test/fogtestshader' color=(0.200,0.225,0.250) dist=0
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/test/fogtestshader' color=(0.200,0.225,0.250) dist=0
+[Q3-FOG] parsed fogparms shader='textures/test/densewaterfog' color=(0.700,0.700,0.700) dist=128
+[Q3-FOG] parsed fogparms shader='textures/test/densewaterfog' color=(0.700,0.700,0.700) dist=128
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/test/densewaterfog' color=(0.700,0.700,0.700) dist=128
+[Q3-FOG] parsed fogparms shader='textures/sfx/mkc_fog_dm1' color=(0.000,0.000,0.000) dist=400
+[Q3-FOG] parsed fogparms shader='textures/sfx/mkc_fog_dm1' color=(0.000,0.000,0.000) dist=400
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/mkc_fog_dm1' color=(0.000,0.000,0.000) dist=400
+[Q3-FOG] parsed fogparms shader='textures/sfx/mkc_fog_dm1a' color=(0.000,0.000,0.000) dist=400
+[Q3-FOG] parsed fogparms shader='textures/sfx/mkc_fog_dm1a' color=(0.000,0.000,0.000) dist=400
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/mkc_fog_dm1a' color=(0.000,0.000,0.000) dist=400
+[Q3-FOG] parsed fogparms shader='textures/sfx/mkc_fog_dm4' color=(64.000,0.000,0.000) dist=256
+[Q3-FOG] parsed fogparms shader='textures/sfx/mkc_fog_dm4' color=(64.000,0.000,0.000) dist=256
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/mkc_fog_dm4' color=(64.000,0.000,0.000) dist=256
+[Q3-FOG] WARN out-of-range fog channel shader='textures/sfx/mkc_fog_dm4' raw=(64.000,0.000,0.000)
+[Q3-FOG] WARN out-of-range fog channel shader='textures/sfx/mkc_fog_dm4' raw=(64.000,0.000,0.000)
+[Q3][metal_fog] [Q3-FOG] WARN out-of-range fog channel shader='textures/sfx/mkc_fog_dm4' raw=(64.000,0.000,0.000)
+[Q3-FOG] parsed fogparms shader='textures/sfx/lightmap' color=(0.700,0.100,0.100) dist=64
+[Q3-FOG] parsed fogparms shader='textures/sfx/lightmap' color=(0.700,0.100,0.100) dist=64
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/lightmap' color=(0.700,0.100,0.100) dist=64
+[Q3-FOG] parsed fogparms shader='textures/sfx/hellfog_pj_dm10' color=(0.500,0.120,0.100) dist=392
+[Q3-FOG] parsed fogparms shader='textures/sfx/hellfog_pj_dm10' color=(0.500,0.120,0.100) dist=392
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/hellfog_pj_dm10' color=(0.500,0.120,0.100) dist=392
+[Q3-FOG] parsed fogparms shader='textures/sfx/hellfog_mini_dm10' color=(0.500,0.120,0.100) dist=16
+[Q3-FOG] parsed fogparms shader='textures/sfx/hellfog_mini_dm10' color=(0.500,0.120,0.100) dist=16
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/hellfog_mini_dm10' color=(0.500,0.120,0.100) dist=16
+[Q3-FOG] parsed fogparms shader='textures/sfx/xblackfog' color=(0.000,0.000,0.000) dist=128
+[Q3-FOG] parsed fogparms shader='textures/sfx/xblackfog' color=(0.000,0.000,0.000) dist=128
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/xblackfog' color=(0.000,0.000,0.000) dist=128
+[Q3-FOG] parsed fogparms shader='textures/sfx/xfinalfog' color=(0.000,0.000,0.000) dist=500
+[Q3-FOG] parsed fogparms shader='textures/sfx/xfinalfog' color=(0.000,0.000,0.000) dist=500
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/xfinalfog' color=(0.000,0.000,0.000) dist=500
+[Q3-FOG] parsed fogparms shader='textures/sfx/xfinalfoginvert' color=(0.000,0.000,0.000) dist=256
+[Q3-FOG] parsed fogparms shader='textures/sfx/xfinalfoginvert' color=(0.000,0.000,0.000) dist=256
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/xfinalfoginvert' color=(0.000,0.000,0.000) dist=256
+[Q3-FOG] parsed fogparms shader='textures/sfx/xbluefog' color=(0.300,0.300,0.900) dist=128
+[Q3-FOG] parsed fogparms shader='textures/sfx/xbluefog' color=(0.300,0.300,0.900) dist=128
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/xbluefog' color=(0.300,0.300,0.900) dist=128
+[Q3-FOG] parsed fogparms shader='textures/sfx/xredfog' color=(0.900,0.300,0.300) dist=128
+[Q3-FOG] parsed fogparms shader='textures/sfx/xredfog' color=(0.900,0.300,0.300) dist=128
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/xredfog' color=(0.900,0.300,0.300) dist=128
+[Q3-FOG] parsed fogparms shader='textures/sfx/xbluefogx128' color=(0.300,0.300,0.900) dist=128
+[Q3-FOG] parsed fogparms shader='textures/sfx/xbluefogx128' color=(0.300,0.300,0.900) dist=128
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/xbluefogx128' color=(0.300,0.300,0.900) dist=128
+[Q3-FOG] parsed fogparms shader='textures/sfx/xdensegreyfog' color=(0.700,0.700,0.700) dist=1700
+[Q3-FOG] parsed fogparms shader='textures/sfx/xdensegreyfog' color=(0.700,0.700,0.700) dist=1700
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/xdensegreyfog' color=(0.700,0.700,0.700) dist=1700
+[Q3-FOG] parsed fogparms shader='textures/sfx/xlightgreyfog' color=(0.700,0.700,0.700) dist=1400
+[Q3-FOG] parsed fogparms shader='textures/sfx/xlightgreyfog' color=(0.700,0.700,0.700) dist=1400
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/xlightgreyfog' color=(0.700,0.700,0.700) dist=1400
+[Q3-FOG] parsed fogparms shader='textures/sfx/xfinalfog' color=(0.700,0.700,0.700) dist=3000
+[Q3-FOG] parsed fogparms shader='textures/sfx/xfinalfog' color=(0.700,0.700,0.700) dist=3000
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/xfinalfog' color=(0.700,0.700,0.700) dist=3000
+[METAL-SHADER] name='textures/sfx/powerupshit' stages=1 deformWaveFunc=0
+[METAL-SHADER] name='textures/sfx/powerupshit' stages=1 deformWaveFunc=0
+[METAL-SHADER]   stage[0] blendMode=5 srcBlend=0x1 dstBlend=0x1 tcGen=ENVIRONMENT tcMods=1 rgbGen=0 alphaGen=0
+[METAL-SHADER]   stage[0] blendMode=5 srcBlend=0x1 dstBlend=0x1 tcGen=ENVIRONMENT tcMods=1 rgbGen=0 alphaGen=0
+[METAL-SHADER]     tcMod[0]={TURB p=(0.250,0.500,0.000,0.000)}
+[METAL-SHADER]     tcMod[0]={TURB p=(0.250,0.500,0.000,0.000)}
+[Q3-FOG] parsed fogparms shader='textures/sfx/fog_timdm1' color=(0.615,0.309,0.000) dist=616
+[Q3-FOG] parsed fogparms shader='textures/sfx/fog_timdm1' color=(0.615,0.309,0.000) dist=616
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/fog_timdm1' color=(0.615,0.309,0.000) dist=616
+[Q3-FOG] parsed fogparms shader='textures/sfx/fog_timdm8' color=(0.211,0.231,0.094) dist=250
+[Q3-FOG] parsed fogparms shader='textures/sfx/fog_timdm8' color=(0.211,0.231,0.094) dist=250
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/fog_timdm8' color=(0.211,0.231,0.094) dist=250
+[Q3-FOG] parsed fogparms shader='textures/sfx/fog_timdm2' color=(0.615,0.309,0.000) dist=356
+[Q3-FOG] parsed fogparms shader='textures/sfx/fog_timdm2' color=(0.615,0.309,0.000) dist=356
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/fog_timdm2' color=(0.615,0.309,0.000) dist=356
+[Q3-FOG] parsed fogparms shader='textures/sfx/fog_timctf1' color=(0.729,0.729,0.780) dist=464
+[Q3-FOG] parsed fogparms shader='textures/sfx/fog_timctf1' color=(0.729,0.729,0.780) dist=464
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/fog_timctf1' color=(0.729,0.729,0.780) dist=464
+[Q3-FOG] parsed fogparms shader='textures/sfx/fog_pjdm1' color=(0.733,0.737,0.620) dist=300
+[Q3-FOG] parsed fogparms shader='textures/sfx/fog_pjdm1' color=(0.733,0.737,0.620) dist=300
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/fog_pjdm1' color=(0.733,0.737,0.620) dist=300
+[Q3-FOG] parsed fogparms shader='textures/sfx/proto_hellfog' color=(0.275,0.012,0.000) dist=500
+[Q3-FOG] parsed fogparms shader='textures/sfx/proto_hellfog' color=(0.275,0.012,0.000) dist=500
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/proto_hellfog' color=(0.275,0.012,0.000) dist=500
+[Q3-FOG] parsed fogparms shader='textures/sfx/fog_intel' color=(0.750,0.380,0.000) dist=800
+[Q3-FOG] parsed fogparms shader='textures/sfx/fog_intel' color=(0.750,0.380,0.000) dist=800
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/fog_intel' color=(0.750,0.380,0.000) dist=800
+[Q3-FOG] parsed fogparms shader='textures/sfx/fog_q3dm10' color=(0.750,0.380,0.000) dist=128
+[Q3-FOG] parsed fogparms shader='textures/sfx/fog_q3dm10' color=(0.750,0.380,0.000) dist=128
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/fog_q3dm10' color=(0.750,0.380,0.000) dist=128
+[Q3-FOG] parsed fogparms shader='textures/sfx/hellfog_tim_dm14' color=(0.550,0.110,0.100) dist=128
+[Q3-FOG] parsed fogparms shader='textures/sfx/hellfog_tim_dm14' color=(0.550,0.110,0.100) dist=128
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/hellfog_tim_dm14' color=(0.550,0.110,0.100) dist=128
+[Q3-FOG] parsed fogparms shader='textures/sfx/kc_hellfog_1k' color=(0.500,0.120,0.100) dist=225
+[Q3-FOG] parsed fogparms shader='textures/sfx/kc_hellfog_1k' color=(0.500,0.120,0.100) dist=225
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/kc_hellfog_1k' color=(0.500,0.120,0.100) dist=225
+[Q3-FOG] parsed fogparms shader='textures/sfx/hellfog_1k' color=(0.500,0.120,0.100) dist=300
+[Q3-FOG] parsed fogparms shader='textures/sfx/hellfog_1k' color=(0.500,0.120,0.100) dist=300
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/hellfog_1k' color=(0.500,0.120,0.100) dist=300
+[Q3-FOG] parsed fogparms shader='textures/sfx/hellfog' color=(0.550,0.110,0.100) dist=300
+[Q3-FOG] parsed fogparms shader='textures/sfx/hellfog' color=(0.550,0.110,0.100) dist=300
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/hellfog' color=(0.550,0.110,0.100) dist=300
+[Q3-FOG] parsed fogparms shader='textures/sfx/constfog' color=(0.800,0.800,0.800) dist=100
+[Q3-FOG] parsed fogparms shader='textures/sfx/constfog' color=(0.800,0.800,0.800) dist=100
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/constfog' color=(0.800,0.800,0.800) dist=100
+[Q3-FOG] parsed fogparms shader='textures/sfx/testconstantfog' color=(0.000,1.000,0.000) dist=300
+[Q3-FOG] parsed fogparms shader='textures/sfx/testconstantfog' color=(0.000,1.000,0.000) dist=300
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/testconstantfog' color=(0.000,1.000,0.000) dist=300
+[Q3-FOG] parsed fogparms shader='textures/sfx/q3tourney3fog' color=(0.550,0.110,0.100) dist=384
+[Q3-FOG] parsed fogparms shader='textures/sfx/q3tourney3fog' color=(0.550,0.110,0.100) dist=384
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/q3tourney3fog' color=(0.550,0.110,0.100) dist=384
+[Q3-FOG] parsed fogparms shader='textures/sfx/q3dm14fog' color=(0.550,0.110,0.100) dist=256
+[Q3-FOG] parsed fogparms shader='textures/sfx/q3dm14fog' color=(0.550,0.110,0.100) dist=256
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/q3dm14fog' color=(0.550,0.110,0.100) dist=256
+[Q3-FOG] parsed fogparms shader='textures/sfx/q3dm9fog' color=(0.550,0.110,0.100) dist=256
+[Q3-FOG] parsed fogparms shader='textures/sfx/q3dm9fog' color=(0.550,0.110,0.100) dist=256
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/q3dm9fog' color=(0.550,0.110,0.100) dist=256
+[Q3-FOG] parsed fogparms shader='textures/sfx/hellfogdense' color=(0.550,0.110,0.100) dist=128
+[Q3-FOG] parsed fogparms shader='textures/sfx/hellfogdense' color=(0.550,0.110,0.100) dist=128
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/hellfogdense' color=(0.550,0.110,0.100) dist=128
+[Q3-FOG] parsed fogparms shader='textures/sfx/pj_a1_fog1' color=(0.500,0.500,0.500) dist=512
+[Q3-FOG] parsed fogparms shader='textures/sfx/pj_a1_fog1' color=(0.500,0.500,0.500) dist=512
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/pj_a1_fog1' color=(0.500,0.500,0.500) dist=512
+[Q3-FOG] parsed fogparms shader='textures/sfx/fog_mkcdm4' color=(0.500,0.000,0.000) dist=96
+[Q3-FOG] parsed fogparms shader='textures/sfx/fog_mkcdm4' color=(0.500,0.000,0.000) dist=96
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/fog_mkcdm4' color=(0.500,0.000,0.000) dist=96
+[Q3-FOG] parsed fogparms shader='textures/sfx/mkc_fog_tdm3' color=(0.300,0.200,0.200) dist=320
+[Q3-FOG] parsed fogparms shader='textures/sfx/mkc_fog_tdm3' color=(0.300,0.200,0.200) dist=320
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/mkc_fog_tdm3' color=(0.300,0.200,0.200) dist=320
+[Q3-FOG] parsed fogparms shader='textures/sfx/mkc_fog_ctfred' color=(0.300,0.200,0.200) dist=320
+[Q3-FOG] parsed fogparms shader='textures/sfx/mkc_fog_ctfred' color=(0.300,0.200,0.200) dist=320
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/mkc_fog_ctfred' color=(0.300,0.200,0.200) dist=320
+[Q3-FOG] parsed fogparms shader='textures/sfx/mkc_fog_ctfblue' color=(0.200,0.200,0.250) dist=320
+[Q3-FOG] parsed fogparms shader='textures/sfx/mkc_fog_ctfblue' color=(0.200,0.200,0.250) dist=320
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/mkc_fog_ctfblue' color=(0.200,0.200,0.250) dist=320
+[Q3-FOG] parsed fogparms shader='textures/sfx/mkc_fog_ctfblue2' color=(0.100,0.100,0.300) dist=320
+[Q3-FOG] parsed fogparms shader='textures/sfx/mkc_fog_ctfblue2' color=(0.100,0.100,0.300) dist=320
+[Q3][metal_fog] [Q3-FOG] parsed fogparms shader='textures/sfx/mkc_fog_ctfblue2' color=(0.100,0.100,0.300) dist=320
+[METAL-SHADER] name='models/powerups/armor/shard2' stages=2 deformWaveFunc=0
+[METAL-SHADER] name='models/powerups/armor/shard2' stages=2 deformWaveFunc=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=ENVIRONMENT tcMods=0 rgbGen=0 alphaGen=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=ENVIRONMENT tcMods=0 rgbGen=0 alphaGen=0
+[METAL-SHADER]   stage[1] blendMode=2 srcBlend=0x302 dstBlend=0x303 tcGen=TEXTURE tcMods=0 rgbGen=2 alphaGen=0
+[METAL-SHADER]   stage[1] blendMode=2 srcBlend=0x302 dstBlend=0x303 tcGen=TEXTURE tcMods=0 rgbGen=2 alphaGen=0
+[METAL-SHADER] name='models/powerups/armor/newred' stages=2 deformWaveFunc=0
+[METAL-SHADER] name='models/powerups/armor/newred' stages=2 deformWaveFunc=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=ENVIRONMENT tcMods=0 rgbGen=0 alphaGen=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=ENVIRONMENT tcMods=0 rgbGen=0 alphaGen=0
+[METAL-SHADER]   stage[1] blendMode=2 srcBlend=0x302 dstBlend=0x303 tcGen=TEXTURE tcMods=0 rgbGen=0 alphaGen=0
+[METAL-SHADER]   stage[1] blendMode=2 srcBlend=0x302 dstBlend=0x303 tcGen=TEXTURE tcMods=0 rgbGen=0 alphaGen=0
+[METAL-SHADER] name='models/powerups/armor/newyellow' stages=2 deformWaveFunc=0
+[METAL-SHADER] name='models/powerups/armor/newyellow' stages=2 deformWaveFunc=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=ENVIRONMENT tcMods=0 rgbGen=0 alphaGen=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=ENVIRONMENT tcMods=0 rgbGen=0 alphaGen=0
+[METAL-SHADER]   stage[1] blendMode=2 srcBlend=0x302 dstBlend=0x303 tcGen=TEXTURE tcMods=0 rgbGen=0 alphaGen=0
+[METAL-SHADER]   stage[1] blendMode=2 srcBlend=0x302 dstBlend=0x303 tcGen=TEXTURE tcMods=0 rgbGen=0 alphaGen=0
+[METAL-SHADER] name='models/powerups/ammo/bfgammo' stages=3 deformWaveFunc=0
+[METAL-SHADER] name='models/powerups/ammo/bfgammo' stages=3 deformWaveFunc=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=TEXTURE tcMods=2 rgbGen=0 alphaGen=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=TEXTURE tcMods=2 rgbGen=0 alphaGen=0
+[METAL-SHADER]     tcMod[0]={ROTATE p=(350.000,0.000,0.000,0.000)}
+[METAL-SHADER]     tcMod[0]={ROTATE p=(350.000,0.000,0.000,0.000)}
+[METAL-SHADER]     tcMod[1]={SCROLL p=(3.000,1.000,0.000,0.000)}
+[METAL-SHADER]     tcMod[1]={SCROLL p=(3.000,1.000,0.000,0.000)}
+[METAL-SHADER]   stage[1] blendMode=5 srcBlend=0x1 dstBlend=0x1 tcGen=ENVIRONMENT tcMods=0 rgbGen=0 alphaGen=0
+[METAL-SHADER]   stage[1] blendMode=5 srcBlend=0x1 dstBlend=0x1 tcGen=ENVIRONMENT tcMods=0 rgbGen=0 alphaGen=0
+[METAL-SHADER]   stage[2] blendMode=2 srcBlend=0x302 dstBlend=0x303 tcGen=TEXTURE tcMods=0 rgbGen=2 alphaGen=0
+[METAL-SHADER]   stage[2] blendMode=2 srcBlend=0x302 dstBlend=0x303 tcGen=TEXTURE tcMods=0 rgbGen=2 alphaGen=0
+[METAL-SHADER] name='models/powerups/ammo/bfgammo1' stages=1 deformWaveFunc=0
+[METAL-SHADER] name='models/powerups/ammo/bfgammo1' stages=1 deformWaveFunc=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=ENVIRONMENT tcMods=0 rgbGen=2 alphaGen=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=ENVIRONMENT tcMods=0 rgbGen=2 alphaGen=0
+[METAL-SHADER] name='models/powerups/ammo/bfgammo2' stages=1 deformWaveFunc=0
+[METAL-SHADER] name='models/powerups/ammo/bfgammo2' stages=1 deformWaveFunc=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=TEXTURE tcMods=0 rgbGen=0 alphaGen=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=TEXTURE tcMods=0 rgbGen=0 alphaGen=0
+[METAL-SHADER] name='models/powerups/ammo/grenammo' stages=2 deformWaveFunc=0
+[METAL-SHADER] name='models/powerups/ammo/grenammo' stages=2 deformWaveFunc=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=ENVIRONMENT tcMods=0 rgbGen=0 alphaGen=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=ENVIRONMENT tcMods=0 rgbGen=0 alphaGen=0
+[METAL-SHADER]   stage[1] blendMode=2 srcBlend=0x302 dstBlend=0x303 tcGen=TEXTURE tcMods=0 rgbGen=2 alphaGen=0
+[METAL-SHADER]   stage[1] blendMode=2 srcBlend=0x302 dstBlend=0x303 tcGen=TEXTURE tcMods=0 rgbGen=2 alphaGen=0
+[METAL-SHADER] name='models/powerups/ammo/grenammo1' stages=1 deformWaveFunc=0
+[METAL-SHADER] name='models/powerups/ammo/grenammo1' stages=1 deformWaveFunc=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=ENVIRONMENT tcMods=0 rgbGen=2 alphaGen=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=ENVIRONMENT tcMods=0 rgbGen=2 alphaGen=0
+[METAL-SHADER] name='models/powerups/ammo/grenammo2' stages=1 deformWaveFunc=0
+[METAL-SHADER] name='models/powerups/ammo/grenammo2' stages=1 deformWaveFunc=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=TEXTURE tcMods=0 rgbGen=0 alphaGen=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=TEXTURE tcMods=0 rgbGen=0 alphaGen=0
+[METAL-SHADER] name='models/powerups/ammo/lighammo' stages=2 deformWaveFunc=0
+[METAL-SHADER] name='models/powerups/ammo/lighammo' stages=2 deformWaveFunc=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=TEXTURE tcMods=2 rgbGen=0 alphaGen=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=TEXTURE tcMods=2 rgbGen=0 alphaGen=0
+[METAL-SHADER]     tcMod[0]={ROTATE p=(350.000,0.000,0.000,0.000)}
+[METAL-SHADER]     tcMod[0]={ROTATE p=(350.000,0.000,0.000,0.000)}
+[METAL-SHADER]     tcMod[1]={SCROLL p=(3.000,1.000,0.000,0.000)}
+[METAL-SHADER]     tcMod[1]={SCROLL p=(3.000,1.000,0.000,0.000)}
+[METAL-SHADER]   stage[1] blendMode=2 srcBlend=0x302 dstBlend=0x303 tcGen=TEXTURE tcMods=0 rgbGen=2 alphaGen=0
+[METAL-SHADER]   stage[1] blendMode=2 srcBlend=0x302 dstBlend=0x303 tcGen=TEXTURE tcMods=0 rgbGen=2 alphaGen=0
+[METAL-SHADER] name='models/powerups/ammo/lighammo1' stages=1 deformWaveFunc=0
+[METAL-SHADER] name='models/powerups/ammo/lighammo1' stages=1 deformWaveFunc=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=ENVIRONMENT tcMods=2 rgbGen=2 alphaGen=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=ENVIRONMENT tcMods=2 rgbGen=2 alphaGen=0
+[METAL-SHADER]     tcMod[0]={ROTATE p=(6.000,0.000,0.000,0.000)}
+[METAL-SHADER]     tcMod[0]={ROTATE p=(6.000,0.000,0.000,0.000)}
+[METAL-SHADER]     tcMod[1]={SCROLL p=(0.090,0.090,0.000,0.000)}
+[METAL-SHADER]     tcMod[1]={SCROLL p=(0.090,0.090,0.000,0.000)}
+[METAL-SHADER] name='models/powerups/ammo/lighammo2' stages=1 deformWaveFunc=0
+[METAL-SHADER] name='models/powerups/ammo/lighammo2' stages=1 deformWaveFunc=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=TEXTURE tcMods=0 rgbGen=0 alphaGen=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=TEXTURE tcMods=0 rgbGen=0 alphaGen=0
+[METAL-SHADER] name='models/powerups/ammo/machammo' stages=2 deformWaveFunc=0
+[METAL-SHADER] name='models/powerups/ammo/machammo' stages=2 deformWaveFunc=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=ENVIRONMENT tcMods=0 rgbGen=0 alphaGen=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=ENVIRONMENT tcMods=0 rgbGen=0 alphaGen=0
+[METAL-SHADER]   stage[1] blendMode=2 srcBlend=0x302 dstBlend=0x303 tcGen=TEXTURE tcMods=0 rgbGen=2 alphaGen=0
+[METAL-SHADER]   stage[1] blendMode=2 srcBlend=0x302 dstBlend=0x303 tcGen=TEXTURE tcMods=0 rgbGen=2 alphaGen=0
+[METAL-SHADER] name='models/powerups/ammo/machammo1' stages=1 deformWaveFunc=0
+[METAL-SHADER] name='models/powerups/ammo/machammo1' stages=1 deformWaveFunc=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=ENVIRONMENT tcMods=0 rgbGen=2 alphaGen=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=ENVIRONMENT tcMods=0 rgbGen=2 alphaGen=0
+[METAL-SHADER] name='models/powerups/ammo/machammo2' stages=1 deformWaveFunc=0
+[METAL-SHADER] name='models/powerups/ammo/machammo2' stages=1 deformWaveFunc=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=TEXTURE tcMods=0 rgbGen=0 alphaGen=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=TEXTURE tcMods=0 rgbGen=0 alphaGen=0
+[METAL-SHADER] name='models/powerups/ammo/plasammo1' stages=1 deformWaveFunc=0
+[METAL-SHADER] name='models/powerups/ammo/plasammo1' stages=1 deformWaveFunc=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=ENVIRONMENT tcMods=0 rgbGen=2 alphaGen=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=ENVIRONMENT tcMods=0 rgbGen=2 alphaGen=0
+[METAL-SHADER] name='models/powerups/ammo/plasammo' stages=2 deformWaveFunc=0
+[METAL-SHADER] name='models/powerups/ammo/plasammo' stages=2 deformWaveFunc=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=TEXTURE tcMods=2 rgbGen=0 alphaGen=0
+[METAL-SHADER]   stage[0] blendMode=0 srcBlend=0x1 dstBlend=0x0 tcGen=TEXTURE tcMods=2 rgbGen=0 alphaGen=0
+[METAL-SHADER]     tcMod[0]={ROTATE p=(350.000,0.000,0.000,0.000)}
+[METAL-SHADER]     tcMod[0]={ROTATE p=(350.000,0.000,0.000,0.000)}
+[METAL-SHADER]     tcMod[1]={SCROLL p=(3.000,1.000,0.000,0.000)}
+[METAL-SHADER]     tcMod[1]={SCROLL p=(3.000,1.000,0.000,0.000)}
+[METAL-SHADER]   stage[1] blendMode=2 srcBlend=0x302 dstBlend=0x303 tcGen=TEXTURE tcMods=0 rgbGen=2 alphaGen=0
+[METAL-SHADER]   stage[1] blendMode=2 srcBlend=0x302 dstBlend=0x303 tcGen=TEXTURE t
+
+[… truncated 223992 chars …]

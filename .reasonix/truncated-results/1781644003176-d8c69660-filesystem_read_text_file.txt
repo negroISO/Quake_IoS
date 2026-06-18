@@ -1,0 +1,846 @@
+/*
+=============================================================================
+
+Metal Renderer Stub - Quake Frontend / Metal Backend
+
+This file implements the translation layer between Quake III's CPU-side
+renderer and Apple's Metal GPU pipeline.
+
+Architecture:
+    Quake frontend:
+        - parse shader scripts
+        - build stage lists
+        - preserve GLS blend/depth/cull semantics
+
+    Metal backend:
+        - translate stage state into Metal draw commands
+        - bind textures and buffers
+        - execute draw calls
+
+Rules:
+    - Do not add shader-name-specific fixes.
+    - Do not add hardcoded visual tweaks.
+    - Do not merge, skip, or reorder stages for convenience.
+    - Cull is shader-level.
+    - Lightmap is a real stage.
+    - Blend must converge on srcBlend/dstBlend passthrough, not compressed modes.
+
+If a visual issue exists, fix the generic mismatch against ioq3/Kenny behavior.
+
+=============================================================================
+*/
+
+#include "../qcommon/q_shared.h"
+#include "../qcommon/qfiles.h"
+#include "../client/client.h"
+#include "../renderercommon/tr_public.h"
+#include "../renderer/tr_common.h"
+#include "../clean_frontend/q3_stage.h"
+#include "metal_renderer_shared.h"
+#include "ios_local.h"
+#include "q3_pbr.h"
+#include <os/log.h>
+#include <stdio.h>
+#include <errno.h>
+#include <sys/stat.h>   /* GetRefAPI PBR bundle-path probe */
+
+/* Append a line to Documents/q3_diag.log inside the app sandbox.
+ * Catalyst launched directly from scripts may expose HOME as the real user
+ * home, which is sandbox-denied. Prefer CFFIXED_USER_HOME when present; it
+ * points at ~/Library/Containers/<bundle>/Data on Catalyst and the app
+ * container on iOS. */
+static void Q3_FileLogf(const char *fmt, ...) {
+    static char path[1024] = {0};
+    if (path[0] == '\0') {
+        char docs[1024];
+        const char *home = getenv("CFFIXED_USER_HOME");
+        if (home == NULL || home[0] == '\0') home = getenv("HOME");
+        if (home == NULL || home[0] == '\0') home = ".";
+        snprintf(docs, sizeof(docs), "%s/Documents", home);
+        mkdir(docs, 0755);
+        snprintf(path, sizeof(path), "%s/q3_diag.log", docs);
+    }
+    FILE *f = fopen(path, "a");
+    if (!f) {
+        /* Direct Catalyst launches can still inherit HOME=/Users/<name>.
+         * Fall back to the known app-group container path used by the runner. */
+        const char *home = getenv("HOME");
+        if (home != NULL && home[0] != '\0') {
+            char docs[1024];
+            snprintf(docs, sizeof(docs), "%s/Library/Containers/com.quake3ios.rt/Data/Documents", home);
+            mkdir(docs, 0755);
+            snprintf(path, sizeof(path), "%s/q3_diag.log", docs);
+            f = fopen(path, "a");
+        }
+    }
+    if (!f) {
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "[Q3-DIAG] q3_diag fopen failed path=%s errno=%d\n", path, errno);
+        }
+        return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
+
+#define Q3_OSLOG(fmt, ...) do { \
+    os_log(OS_LOG_DEFAULT, "[Q3] " fmt, ##__VA_ARGS__); \
+    Q3_FileLogf("[Q3] " fmt, ##__VA_ARGS__); \
+} while (0)
+
+#define LL(x) x=LittleLong(x)
+
+#define Q3_METAL_MAX_VERTICES 65536
+/* Raised 2026-06-09 from 8192 → 32768. q3dm11 emits 15344 world draws,
+ * silently truncated at 8192 caused missing geometry. 32768 covers all
+ * shipped maps with margin; per-cmd cost ≈ static array growth is acceptable
+ * on iPad M4 (cmd struct ~96 bytes → ~3 MB resident). Keep as static to
+ * avoid realloc plumbing touching every accessor; revisit if a future map
+ * exceeds this. */
+#define Q3_METAL_MAX_DRAWS 65536
+#define Q3_METAL_MAX_TEXTURES 1024
+#define Q3_METAL_MAX_MODELS 1024
+#define Q3_METAL_MAX_REFENTITIES 1024
+
+typedef struct {
+    qboolean inUse;
+    qboolean isWhite;
+    qboolean failed;
+    qboolean isLightmap;
+    uint32_t generation;
+    qhandle_t handle;
+    int width;
+    int height;
+    byte *rgbaBytes;
+    char name[MAX_QPATH];
+    int blendMode; /* 0=opaque, 1=alpha-add, 2=alpha, 3=filter,
+                    * 4=subtract, 5=full-add; propagated from the
+                    * shader-map entry that resolved this texture. */
+    int alphaFunc; /* 0=none, 1=GT0, 2=GE128, 3=LT128 */
+    int tcGenEnv;  /* 1 if the resolved shader uses `tcGen environment`
+                    * (chrome/reflective like powerups/quad, shell shaders).
+                    * Entity pipeline reads this to switch UV generation
+                    * from mesh ST to the reflection formula. */
+    int rgbGen;    /* 0=identity, 1=vertex, 2=lightingDiffuse, 3=wave,
+                    * 7=identityLighting.
+                    * Stored per-texture so the entity fragment can skip
+                    * the baked-in Lambert color for chrome shells that
+                    * upstream treats as full-bright (CGEN_IDENTITY). */
+    int rgbGenExplicit; /* true when the shader authored an rgbGen token.
+                         * Distinguishes explicit rgbGen identity from the
+                         * parser's zero-initialized default/no-directive
+                         * path used by ordinary lit MD3 skins. */
+    int alphaGen;  /* 0=identity (force alpha 1.0), 1=vertex, 3=wave.
+                    * Parallels rgbGen and matches upstream AGEN_IDENTITY,
+                    * which overrides vertex alpha with 255 so stages that
+                    * opt into identity alpha stay opaque regardless of
+                    * the entity shaderRGBA alpha channel. */
+    /* Stage 0 rgbGen wave parameters — only meaningful when rgbGen == 3.
+     * Copied from the shader-map so the entity fragment can evaluate the
+     * glow wave per frame. rgbWaveFunc selects the waveform shape
+     * (1=sin, 2=triangle, 3=square, 4=sawtooth, 5=inverse_sawtooth). */
+    int rgbWaveFunc;
+    float rgbWaveBase;
+    float rgbWaveAmp;
+    float rgbWavePhase;
+    float rgbWaveFreq;
+    /* Stage 0 alphaGen wave parameters — mirrors rgbWave* and is
+     * consumed when alphaGen == 3. */
+    int alphaWaveFunc;
+    float alphaWaveBase;
+    float alphaWaveAmp;
+    float alphaWavePhase;
+    float alphaWaveFreq;
+    /* rgbGen const (CGEN_CONST): static RGB tint multiplied against the
+     * texel when rgbGen == 4. Copied from stage[0].rgbConstColor. */
+    float rgbConstColor[3];
+    /* alphaGen const: static alpha multiplier when alphaGen == 4.
+     * Default 1.0 (no-op). */
+    float alphaConst;
+    /* Stage 0 tcMod chain, copied from the resolved shader-map entry at
+     * registration time. Entity pipeline propagates to Swift so the
+     * fragment shader can apply scroll/rotate after tcGen env — matches
+     * ioquake3's RB_CalcScrollTexCoords + RB_CalcRotateTexCoords order. */
+    int tcModCount;
+    Q3TcMod tcMods[Q3_MAX_TCMODS];
+    /* Stage 0 `clampmap` directive: 0=repeat (default `map`), 1=clamp
+     * (`clampmap`). Read by EntityFlagsForTexture; entity draws bind
+     * uiSamplerState (.clampToEdge) when set, worldSamplerState
+     * (.repeat) when clear. Caveat: this is stamped per-texture from
+     * stage 0, so a texture used by both a `map` stage and a `clampmap`
+     * stage in different shaders will reflect whichever shader
+     * registered last. Acceptable for current Q3 content where wrap mode
+     * is texture-content driven (dlight discs always clampmap, scrolling
+     * patterns always map). Full per-stage routing would also write the
+     * flag at entity-emit time from the stage that produced the draw,
+     * but the helper-based path keeps EntityFlagsForTexture self-
+     * contained for now. */
+    int wrapClampMode;
+    /* deformVertexes wave (stage 0) — propagated to entity draws via
+     * Q3MetalRenderer_GetTextureInfo so chrome shell shaders (powerups/
+     * quad, quadWeapon, regen, battlesuit) apply the proper normal-axis
+     * vertex offset. Without this the shell shader renders at the gun
+     * model's exact position and collapses inside the silhouette;
+     * canonical powerups/quadWeapon uses base=0.5 → +0.5 unit halo,
+     * powerups/quad uses base=3.0 → +3 unit halo. func==0 → no deform. */
+    int deformWaveFunc;
+    float deformWaveDiv;
+    float deformWaveBase;
+    float deformWaveAmp;
+    float deformWavePhase;
+    float deformWaveFreq;
+    /* PBR Phase 1: when r_pbrMaterials is on and the loaded pixels'
+     * XXH3_64bits hash matches an entry in the RTX Remix mod's
+     * mod.usda manifest, pbrMaterial points at the resolved material
+     * record. Swift consumes this via Q3MetalRenderer_GetPBRMaterial
+     * to lazy-load DDS textures and bind them to the PBR fragment
+     * shader. NULL when no match. */
+    uint64_t pbrContentHash;
+    const void *pbrMaterial;  /* opaque pointer to q3_pbr_material_t */
+} metalTexture_t;
+
+refimport_t ri;
+
+static void MetalTelemetryPrintf(const char *type, int printLevel, const char *format, ...) {
+    char message[2048];
+    size_t len;
+    va_list args;
+
+    if (format == NULL) {
+        return;
+    }
+
+    va_start(args, format);
+    Q_vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+
+    if (ri.Printf != NULL) {
+        ri.Printf(printLevel, "%s", message);
+    }
+
+    len = strlen(message);
+    while (len > 0 && (message[len - 1] == '\n' || message[len - 1] == '\r')) {
+        message[--len] = '\0';
+    }
+
+    /* Also surface to os_log + sandbox file so host-side tools see us. */
+    if (message[0] != '\0') {
+        if (type != NULL && type[0] != '\0') {
+            os_log(OS_LOG_DEFAULT, "[Q3][%{public}s] %{public}s", type, message);
+            Q3_FileLogf("[Q3][%s] %s", type, message);
+        } else {
+            os_log(OS_LOG_DEFAULT, "[Q3] %{public}s", message);
+            Q3_FileLogf("[Q3] %s", message);
+        }
+    }
+
+    if (type != NULL && type[0] != '\0' && message[0] != '\0') {
+        Q3DebugTelemetry_Log(type, message);
+    }
+}
+
+static void Q3PBRLogf(const char *format, ...) {
+    char message[2048];
+    va_list args;
+    if (format == NULL) return;
+    va_start(args, format);
+    Q_vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+    MetalTelemetryPrintf("metal_pbr_ibl", PRINT_ALL, "%s", message);
+}
+
+/* Swift-callable bridge so the Swift PBR loader can write to q3_diag.log via
+ * the same channel-tagged pipeline as the C-side hits. Without this, NSLog
+ * messages from MetalView.pbrAlbedoTexture(for:) go to Apple System Log only,
+ * and host-side debugging needs a Mac attached to Console.app. */
+void Q3MetalRenderer_SwiftPBRLog(const char *type, const char *message) {
+    if (type == NULL || type[0] == '\0' || message == NULL || message[0] == '\0') {
+        return;
+    }
+    MetalTelemetryPrintf(type, PRINT_ALL, "%s\n", message);
+}
+
+static glconfig_t s_glConfig;
+static Q3MetalFrameSnapshot s_frameSnapshot;
+static Q3MetalSceneView s_sceneView;
+static Q3MetalVertex s_vertices[Q3_METAL_MAX_VERTICES];
+static Q3MetalDrawCmd s_draws[Q3_METAL_MAX_DRAWS];
+static uint32_t s_vertexCount;
+static uint32_t s_drawCount;
+static uint32_t s_sceneLogCounter;
+static float s_currentColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+static metalTexture_t s_textures[Q3_METAL_MAX_TEXTURES];
+static qhandle_t s_nextTextureHandle = 1;
+static qhandle_t s_whiteTextureHandle;
+static qhandle_t s_transparentTextureHandle;
+static qhandle_t s_skyTextureHandle;
+static qhandle_t s_timHellBaseTextureHandle;
+static qhandle_t s_timHellAddTextureHandle;
+static qhandle_t *s_worldLightmapHandles;
+static int s_worldLightmapCount;
+
+static qboolean MetalRenderAuditEnabled(void) {
+    return ri.Cvar_VariableIntegerValue("metal_render_audit") != 0;
+}
+
+/* Per-map fog LUT (cycle F1 of fog rendering). LUMP_FOGS in the BSP
+ * holds one dfog_t per fog volume; each one names a shader whose
+ * fogparms directive we parsed earlier into
+ * metalShaderMap_t.hasFog/fogColor/fogDistance. We resolve the name
+ * once at world-load time and cache the result so per-frame drawing
+ * can index by surface->fogNum without another shader-map walk.
+ * hasColor==qfalse means the referenced shader either wasn't parsed
+ * or didn't declare fogparms — treat as "no fog" for that volume. */
+#define METAL_MAX_WORLD_FOGS 256  /* matches MAX_MAP_FOGS in qfiles.h */
+typedef struct {
+    char  shaderName[MAX_QPATH];
+    qboolean hasColor;
+    float color[3];
+    float distance;
+    float tcScale;
+    qboolean hasSurface;
+    float surface[4];
+    qboolean hasBounds;
+    vec3_t bounds[2];
+} metalWorldFog_t;
+static metalWorldFog_t s_worldFogs[METAL_MAX_WORLD_FOGS];
+/* Parallel array exposed to Swift via Q3MetalRenderer_GetWorldFogs.
+ * Same count as s_worldFogs; each entry's color[3]+distance matches
+ * s_worldFogs[i].color/distance. Entries whose hasColor==qfalse are
+ * zeroed out here so Swift seeing distance==0 reliably means "no
+ * fog for this volume" even if the fogIndex was passed through. */
+static Q3MetalWorldFog s_worldFogsPublic[METAL_MAX_WORLD_FOGS];
+static int s_worldFogCount;
+
+/* Flare points harvested from the BSP's MST_FLARE lump. Populated at world
+ * load, consumed each frame by the Swift renderer to emit camera-facing
+ * additive billboards. Texture handle is set to the resolved 'flareShader'
+ * (gfx/misc/flare.tga) during world load — 0 means no flare texture
+ * available, flares skip rendering. */
+static Q3MetalFlare s_worldFlares[Q3_METAL_MAX_FLARES];
+static int s_worldFlareCount;
+static uint32_t s_flareTextureHandle;
+
+typedef struct {
+    vec3_t mins;
+    vec3_t maxs;
+    int firstSurface;
+    int numSurfaces;
+} metalInlineModel_t;
+
+typedef struct {
+    qboolean inUse;
+    qhandle_t handle;
+    char name[MAX_QPATH];
+    md3Header_t *md3;
+    int inlineModelIndex; /* >0 for BSP inline brush models: "*1", "*2", ... */
+} metalModel_t;
+
+typedef struct {
+    refEntity_t entity;
+    qboolean mirrored;
+} metalSceneEntity_t;
+
+typedef struct {
+    uint32_t firstDraw;
+    uint32_t drawCount;
+} Q3MetalSurfaceDrawRange;
+
+typedef struct {
+    uint32_t drawIndex;
+    uint32_t stageIndex;
+    uint32_t batchIndex;
+} Q3MetalWorldBatchEntry;
+
+typedef struct {
+    qboolean loaded;
+    uint32_t generation;
+    uint32_t vertexCount;
+    uint32_t indexCount;
+    uint32_t drawCount;
+    Q3MetalWorldVertex *vertices;
+    uint32_t *indices;
+    Q3MetalWorldDrawCmd *draws;
+    Q3MetalWorldDrawCmd *visibleDraws;
+    Q3MetalWorldBatchCmd *batches;
+    uint32_t batchCount;
+    uint32_t batchCapacity;
+    uint32_t *batchIndices;
+    uint32_t batchIndexCount;
+    uint32_t batchIndexCapacity;
+    Q3MetalWorldBatchEntry *batchEntries;
+    uint32_t batchEntryCount;
+    uint32_t batchEntryCapacity;
+    uint32_t *batchWriteCursors;
+    uint32_t batchWriteCursorCapacity;
+    uint32_t visibleDrawCount;
+    uint32_t visibleDrawCapacity;
+    qboolean visibleDrawsValid;
+    Q3MetalSurfaceDrawRange *surfaceDrawRanges;
+    int surfaceDrawRangeCount;
+    int lastViewCluster;
+    uint32_t lastAreaMaskHash;
+    qboolean lastAreaMaskValid;
+    uint32_t visibleVisCount;      /* PVS/node stamp; only changes when cluster changes. */
+    uint32_t visibleSurfaceStamp;  /* Per-frame surface dedupe stamp. */
+    /* Parallel table of animated shader slot per draw index.
+     * Slot == -1 means static; >= 0 indexes s_shaderMap for per-frame
+     * retargeting (fire/lava/teleport on world geometry). */
+    int *animShaderSlots;
+    uint32_t animatedDrawCount; /* number of draws with slot >= 0 */
+    /* BSP lightgrid. LUMP_LIGHTGRID is an array of 8-byte cells
+     * (ambient[3] + directed[3] + latLong[2]) sampled at a regular grid
+     * over the map volume. Used by SetupEntityLighting to compute
+     * per-entity ambient+directed+lightDir so MD3 entities pick up
+     * the local room lighting instead of rendering full-white. */
+    const byte *lightGrid;
+    vec3_t lightGridOrigin;
+    vec3_t lightGridSize;     /* cell dims — default (64,64,128) */
+    int    lightGridBounds[3]; /* cell counts per axis */
+    metalInlineModel_t *inlineModels;
+    int inlineModelCount;
+    char name[MAX_QPATH];
+} metalWorld_t;
+
+static metalWorld_t s_world;
+static metalModel_t s_models[Q3_METAL_MAX_MODELS];
+static qhandle_t s_nextModelHandle = 1;
+static metalSceneEntity_t s_sceneEntities[Q3_METAL_MAX_REFENTITIES];
+static uint32_t s_sceneEntityCount;
+static Q3MetalLight s_sceneLights[Q3_METAL_MAX_LIGHTS];
+static uint32_t s_sceneLightCount;
+
+/* Per-frame scene pool. Captured in RE_RenderScene, consumed by Swift's
+ * draw(). sceneCount is reset at frame start in RE_BeginFrame; each
+ * RenderScene call appends one entry. Entity + light ranges index into
+ * the shared per-frame pools populated alongside. */
+static Q3MetalSceneSnapshot s_sceneSnapshots[Q3_METAL_MAX_SCENES];
+static uint32_t s_sceneSnapshotCount;
+
+/* Per-frame light pool. s_sceneLights[] is the intake buffer that
+ * AddLightToScene fills between ClearScene+RenderScene for the CURRENT
+ * scene. At RenderScene time we memcpy those lights to s_frameLights
+ * so each scene gets a stable range for Swift to bind by scene. */
+static Q3MetalLight s_frameLights[Q3_METAL_MAX_LIGHTS * Q3_METAL_MAX_SCENES];
+static uint32_t s_frameLightCount;
+
+/* Scene polys — shadow blobs, bullet marks, blood splats, particle
+ * sprays. Submitted by cgame via RE_AddPolyToScene as world-space
+ * triangle fans (typically 3-4 verts). We copy into a pool and emit
+ * as entity draws at RenderScene time alongside sprites + bolts. */
+#define Q3_METAL_MAX_SCENE_POLYS 256
+#define Q3_METAL_MAX_SCENE_POLY_VERTS 4096
+
+typedef struct {
+    qhandle_t shader;
+    int firstVert;
+    int numVerts;
+    uint32_t fogIndex;
+} metalScenePoly_t;
+
+static metalScenePoly_t s_scenePolys[Q3_METAL_MAX_SCENE_POLYS];
+static polyVert_t s_scenePolyVerts[Q3_METAL_MAX_SCENE_POLY_VERTS];
+static int s_scenePolyCount;
+static int s_scenePolyVertCount;
+
+typedef struct {
+    qboolean valid;
+    vec3_t origin;
+    vec3_t axis[3];
+} metalPortalSurface_t;
+
+static metalPortalSurface_t s_scenePortalSurface;
+
+/* Audit: once-per-session dedup log for missing-feature tracking. Copies
+ * the message string into owned storage so callers can safely pass stack
+ * buffers. Only used for genuinely missing renderer features — do NOT
+ * add hooks for features we implement; stale warnings create false work.
+ * Kept intentionally small (256 slots × 128 chars) to bound memory. */
+#define METAL_AUDIT_MAX 256
+static char s_auditSeen[METAL_AUDIT_MAX][128];
+static int s_auditCount = 0;
+
+static void AuditOnce(const char *msg) {
+    int i;
+    for (i = 0; i < s_auditCount; ++i) {
+        if (strcmp(s_auditSeen[i], msg) == 0) return;
+    }
+    if (s_auditCount < METAL_AUDIT_MAX) {
+        Q_strncpyz(s_auditSeen[s_auditCount], msg, sizeof(s_auditSeen[0]));
+        s_auditCount += 1;
+    }
+    ri.Printf(PRINT_WARNING, "[Q3-AUDIT] %s\n", msg);
+}
+static Q3MetalEntityVertex *s_entityVertices;
+static uint32_t *s_entityIndices;
+static Q3MetalEntityDrawCmd *s_entityDraws;
+static uint32_t s_entityVertexCount;
+static uint32_t s_entityIndexCount;
+static uint32_t s_entityDrawCount;
+static uint32_t s_entityVertexCapacity;
+static uint32_t s_entityIndexCapacity;
+static uint32_t s_entityDrawCapacity;
+static uint32_t s_entityAcceptedThisFrame;
+static uint32_t s_entityRejectedNullThisFrame;
+static uint32_t s_entityRejectedTypeThisFrame;
+static uint32_t s_entityRejectedModelThisFrame;
+
+#define MAX_SHADER_MAP_ENTRIES 4096
+#define METAL_ANIMMAP_MAX_FRAMES 16
+#define Q3_MAX_STAGES 8
+#define METAL_STAGE_AUDIT_MAX 1024
+#define METAL_DRAW_PLAN_AUDIT_MAX 2048
+#define METAL_ENTITY_STAGE_AUDIT_MAX 1024
+#define Q3_GL_ZERO 0x0000u
+#define Q3_GL_ONE 0x0001u
+#define Q3_GL_SRC_COLOR 0x0300u
+#define Q3_GL_ONE_MINUS_SRC_COLOR 0x0301u
+#define Q3_GL_SRC_ALPHA 0x0302u
+#define Q3_GL_ONE_MINUS_SRC_ALPHA 0x0303u
+#define Q3_GL_DST_ALPHA 0x0304u
+#define Q3_GL_ONE_MINUS_DST_ALPHA 0x0305u
+#define Q3_GL_DST_COLOR 0x0306u
+#define Q3_GL_ONE_MINUS_DST_COLOR 0x0307u
+/* Q3_MAX_TCMODS and Q3TcMod live in metal_renderer_shared.h so both the
+ * stub and Swift bindings share the exact same tcMod chain layout. */
+
+typedef struct {
+    char mapPath[MAX_QPATH];
+    int blendMode;
+    uint32_t rawSrcBlend;
+    uint32_t rawDstBlend;
+    uint32_t depthFunc;
+    int rgbGen;
+    int rgbGenExplicit;
+    int alphaGen;
+    int alphaFunc;
+    int tcGen;
+    /* tcGen vector basis: two world-space vectors. Only consulted when
+     * tcGen == 2 (vector). Parsed from `tcGen vector ( x y z ) ( x y z )`.
+     * Stored padded as float[4] (xyz + 0) for Swift bridge stability —
+     * mirrors Q3MetalWorldStage.tcGenVec0/1 layout. */
+    float tcGenVec0[4];
+    float tcGenVec1[4];
+    /* deformVertexes wave: parsed at shader level, stamped onto every
+     * stage on shader close. func=0 means no deform. */
+    int deformWaveFunc;
+    float deformWaveDiv;
+    float deformWaveBase;
+    float deformWaveAmp;
+    float deformWavePhase;
+    float deformWaveFreq;
+    int deformMoveFunc;
+    float deformMoveVector[3];
+    float deformMoveBase;
+    float deformMoveAmp;
+    float deformMovePhase;
+    float deformMoveFreq;
+    /* deformVertexes bulge <bulgeWidth> <bulgeHeight> <bulgeSpeed>.
+     * Mirrors ioq3 RB_DeformTessGeometry DEFORM_BULGE case in
+     * tr_shade_calc.c. Math (per ioq3):
+     *   phase  = st.s * bulgeWidth + time * bulgeSpeed
+     *   scale  = sin(phase) * bulgeHeight
+     *   pos   += normal * scale
+     * Used by q3dm4's organic ceiling tube/vein decorations
+     * (gothic_block / wallhead family). bulgeWidth = 0 means no
+     * bulge (MSL skips the block). */
+    float deformBulgeWidth;
+    float deformBulgeHeight;
+    float deformBulgeSpeed;
+    /* deformVertexes autosprite (1) / autoSprite2 (2). Tag-only for
+     * the moment — pipeline awareness lands here so a follow-up
+     * commit can wire the camera-aligned transform without touching
+     * the parser surface. */
+    int autospriteMode;
+    Q3TcMod tcMods[Q3_MAX_TCMODS];
+    int tcModCount;
+    int rgbWaveFunc;
+    float rgbWaveBase;
+    float rgbWaveAmp;
+    float rgbWavePhase;
+    float rgbWaveFreq;
+    int alphaWaveFunc;
+    float alphaWaveBase;
+    float alphaWaveAmp;
+    float alphaWavePhase;
+    float alphaWaveFreq;
+    /* rgbGen const: fixed RGB tint in [0,1]. Only meaningful when
+     * rgbGen == 4 (CGEN_CONST equivalent). Populated from the
+     * `rgbGen const ( r g b )` directive. */
+    float rgbConstColor[3];
+    /* alphaGen const <v>: fixed alpha in [0,1]. Default 1.0. Only
+     * meaningful when alphaGen == 4. */
+    float alphaConst;
+    int useLightmap;
+    /* Stamped at shader-map register time from the shader-level
+     * METAL_SHADER_CULL_* value. Q3 'cull' is shader-wide so every
+     * stage copies from the same source, but propagating it here
+     * makes AddWorldDrawStage's single pointer carry all the data
+     * Swift needs to pick a pipeline cull state. */
+    int cullMode;
+    /* Explicit `depthwrite` keyword on the stage, OR opaque (no
+     * blendFunc / blendFunc 0). ioq3 sets depthMaskBits=0 for any
+     * blendFunc'd stage UNLESS this bit is set. Without it, blended
+     * water/grate floors that author `depthwrite` to occlude correctly
+     * (e.g. blocks17gwater) leak the chamber below through the surface. */
+    int depthWrite;
+    int animFrameCount;
+    float animFps;
+    char animFrames[METAL_ANIMMAP_MAX_FRAMES][MAX_QPATH];
+    qhandle_t animTextures[METAL_ANIMMAP_MAX_FRAMES];
+    /* Q3 shader script wrap directive: 0 = repeat (default / `map`),
+     * 1 = clamp to edge (`clampmap`). Propagated to Q3MetalWorldStage
+     * so the Swift draw loop binds the matching MTLSamplerState. */
+    int wrapClampMode;
+    float pbrRoughness;
+    float pbrMetallic;
+} Q3MetalStage;
+
+enum {
+    METAL_SHADER_CULL_DISABLE = 0,
+    METAL_SHADER_CULL_BACK = 1,
+    METAL_SHADER_CULL_FRONT = 2
+};
+
+typedef struct {
+    char shaderName[128];
+    char mapPath[MAX_QPATH];
+    /* tcGenEnv is a shader-level flag kept for a STEP 5 follow-up that
+     * will move it onto individual stages. Do not read it for new code;
+     * prefer stages[i].tcGen. */
+    qboolean tcGenEnv;
+    int animFrameCount;
+    float animFps;
+    char animFrames[METAL_ANIMMAP_MAX_FRAMES][MAX_QPATH];
+    qhandle_t animTextures[METAL_ANIMMAP_MAX_FRAMES];
+    char skyBoxBase[MAX_QPATH];
+    qhandle_t skyFaceTextures[6];
+    int cullMode;
+    qboolean isPortal;
+    /* Fog volume parameters, extracted from 'fogparms ( r g b ) distance'.
+     * hasFog=qtrue means this shader marks a fog volume; color + distance
+     * define how much fog accumulates at the far plane. Not yet consumed
+     * by the renderer — stored so per-surface fog assignment + a fog
+     * pass can be added later without another parser commit. */
+    qboolean hasFog;
+    float fogColor[3];
+    float fogDistance;
+    qboolean hasLightmapStage;
+    /* Surface should emit a Q3 flare billboard at its centroid. Set when
+     * the shader script carries a 'flareShader <tex>' directive. The
+     * texture name is ignored — we use the canonical gfx/misc/flare
+     * globally, matching how Q3 ships flares visually. */
+    qboolean hasFlare;
+    /* Shader declares itself as a sky via `surfaceparm sky` or `skyparms`.
+     * Name-prefix matching (textures/skies/, env/) only catches stock
+     * naming conventions; custom maps like nv15 use arbitrary paths but
+     * still tag the shader. Consulting this flag at surface classification
+     * time makes sky detection prefix-independent. */
+    qboolean isSky;
+    /* `surfaceparm nodraw` — utility brushes (caulk, hint, clip family,
+     * areaportal, clusterportal, donotenter, trigger, origin, skip).
+     * Vanilla Q3 silently SKIPS rendering these. Without the skip they
+     * appear as translucent grey cones, opaque utility planes covering
+     * the sky, and gray "carrier rectangles" co-located with torches. */
+    qboolean isNoDraw;
+    Q3MetalStage stages[Q3_MAX_STAGES];
+    int stageCount;
+    q3_pbr_world_mat_t pbrMatClass;
+    float pbrRoughness;
+    float pbrMetallic;
+} metalShaderMap_t;
+
+static metalTexture_t *FindTextureByHandle(qhandle_t handle);
+
+static qboolean s_worldMapAuditActive = qfalse;
+static char s_stageAuditSeen[METAL_STAGE_AUDIT_MAX][MAX_QPATH];
+static int s_stageAuditSeenCount = 0;
+static char s_drawPlanAuditSeen[METAL_DRAW_PLAN_AUDIT_MAX][MAX_QPATH];
+static int s_drawPlanAuditSeenCount = 0;
+static char s_entityStageAuditSeen[METAL_ENTITY_STAGE_AUDIT_MAX][MAX_QPATH];
+static int s_entityStageAuditSeenCount = 0;
+static int s_surfaceProbeEmitted = 0;
+
+static void ResetMetalWorldAudits(void) {
+    s_worldMapAuditActive = qfalse;
+    s_stageAuditSeenCount = 0;
+    s_drawPlanAuditSeenCount = 0;
+    s_entityStageAuditSeenCount = 0;
+    s_surfaceProbeEmitted = 0;
+    Com_Memset(s_stageAuditSeen, 0, sizeof(s_stageAuditSeen));
+    Com_Memset(s_drawPlanAuditSeen, 0, sizeof(s_drawPlanAuditSeen));
+    Com_Memset(s_entityStageAuditSeen, 0, sizeof(s_entityStageAuditSeen));
+}
+
+static qboolean AuditSeen(char seen[][MAX_QPATH], int *count, int maxCount, const char *key) {
+    int i;
+    if (key == NULL || key[0] == '\0') {
+        return qtrue;
+    }
+    for (i = 0; i < *count; ++i) {
+        if (!Q_stricmp(seen[i], key)) {
+            return qtrue;
+        }
+    }
+    if (*count < maxCount) {
+        Q_strncpyz(seen[*count], key, MAX_QPATH);
+        *count += 1;
+    }
+    return qfalse;
+}
+
+static const char *MetalCullName(int cullMode) {
+    switch (cullMode) {
+        case METAL_SHADER_CULL_DISABLE: return "none";
+        case METAL_SHADER_CULL_FRONT: return "front";
+        case METAL_SHADER_CULL_BACK:
+        default: return "back";
+    }
+}
+
+static const char *MetalRgbGenName(int rgbGen) {
+    switch (rgbGen) {
+        case 1: return "vertex";
+        case 2: return "lightingDiffuse";
+        case 3: return "wave";
+        case 4: return "const";
+        case 7: return "identityLighting";
+        case 0:
+        default: return "identity";
+    }
+}
+
+static const char *MetalTcGenName(int tcGen) {
+    switch (tcGen) {
+        case 1: return "environment";
+        case 2: return "vector";
+        case 0:
+        default: return "base";
+    }
+}
+
+static const char *MetalSrcBlendName(int blendMode) {
+    switch (blendMode) {
+        case 1: return "GL_SRC_ALPHA";
+        case 2: return "GL_SRC_ALPHA";
+        case 3: return "GL_DST_COLOR";
+        case 4: return "GL_ZERO";
+        case 5: return "GL_ONE";
+        case 0:
+        default: return "GL_ONE";
+    }
+}
+
+static const char *MetalDstBlendName(int blendMode) {
+    switch (blendMode) {
+        case 1: return "GL_ONE";
+        case 2: return "GL_ONE_MINUS_SRC_ALPHA";
+        case 3: return "GL_ZERO";
+        case 4: return "GL_ONE_MINUS_SRC_COLOR";
+        case 5: return "GL_ONE";
+        case 0:
+        default: return "GL_ZERO";
+    }
+}
+
+static const char *MetalRawBlendName(uint32_t factor) {
+    switch (factor) {
+        case Q3_GL_ZERO: return "GL_ZERO";
+        case Q3_GL_ONE: return "GL_ONE";
+        case Q3_GL_SRC_COLOR: return "GL_SRC_COLOR";
+        case Q3_GL_ONE_MINUS_SRC_COLOR: return "GL_ONE_MINUS_SRC_COLOR";
+        case Q3_GL_SRC_ALPHA: return "GL_SRC_ALPHA";
+        case Q3_GL_ONE_MINUS_SRC_ALPHA: return "GL_ONE_MINUS_SRC_ALPHA";
+        case Q3_GL_DST_ALPHA: return "GL_DST_ALPHA";
+        case Q3_GL_ONE_MINUS_DST_ALPHA: return "GL_ONE_MINUS_DST_ALPHA";
+        case Q3_GL_DST_COLOR: return "GL_DST_COLOR";
+        case Q3_GL_ONE_MINUS_DST_COLOR: return "GL_ONE_MINUS_DST_COLOR";
+        default: return "GL_ONE";
+    }
+}
+
+static int MetalPassForBlendMode(int blendMode) {
+    if (blendMode == 5) return 4;
+    if (blendMode == 1) return 3;
+    if (blendMode == 2) return 2;
+    if (blendMode == 3) return 1;
+    return 0;
+}
+
+static void RawBlendFromMode(int blendMode, uint32_t *src, uint32_t *dst) {
+    uint32_t s = Q3_GL_ONE;
+    uint32_t d = Q3_GL_ZERO;
+    switch (blendMode) {
+        case 1: s = Q3_GL_SRC_ALPHA; d = Q3_GL_ONE; break;
+        case 2: s = Q3_GL_SRC_ALPHA; d = Q3_GL_ONE_MINUS_SRC_ALPHA; break;
+        case 3: s = Q3_GL_DST_COLOR; d = Q3_GL_ZERO; break;
+        case 4: s = Q3_GL_ZERO; d = Q3_GL_ONE_MINUS_SRC_COLOR; break;
+        case 5: s = Q3_GL_ONE; d = Q3_GL_ONE; break;
+        default: break;
+    }
+    if (src != NULL) *src = s;
+    if (dst != NULL) *dst = d;
+}
+
+static qboolean MetalStageBlendIsOpaqueForFog(const Q3MetalStage *stage) {
+    uint32_t src;
+    uint32_t dst;
+    if (stage == NULL) {
+        return qtrue;
+    }
+    src = stage->rawSrcBlend;
+    dst = stage->rawDstBlend;
+    if (src == Q3_GL_ONE && dst == Q3_GL_ZERO) {
+        return qtrue;
+    }
+    /* ioq3 still treats lightmap/filter stages as part of an opaque
+     * surface.  Do not classify GL_DST_COLOR/GL_ZERO or
+     * GL_ZERO/GL_SRC_COLOR as translucent just because they are blended. */
+    if ((src == Q3_GL_DST_COLOR && dst == Q3_GL_ZERO) ||
+        (src == Q3_GL_ZERO && dst == Q3_GL_SRC_COLOR)) {
+        return qtrue;
+    }
+    return qfalse;
+}
+
+static qboolean MetalShaderShouldEmitFogPass(const metalShaderMap_t *entry,
+                                             int emitte
+
+[…truncated 504150 chars — raise BridgeOptions.maxResultChars, or call the tool with a narrower scope (filter, head, pagination)…]
+
+ene;
+    re.AddAdditiveLightToScene = RE_AddAdditiveLightToScene;
+    re.AddLinearLightToScene = RE_AddLinearLightToScene;
+    re.RenderScene = RE_RenderScene;
+    re.SetColor = RE_SetColor;
+    re.DrawStretchPic = RE_StretchPic;
+    re.DrawStretchRaw = RE_StretchRaw;
+    re.UploadCinematic = RE_UploadCinematic;
+    re.RegisterFont = RE_RegisterFont;
+    re.RemapShader = RE_RemapShader;
+    re.GetEntityToken = RE_GetEntityToken;
+    re.inPVS = R_inPVS;
+    re.TakeVideoFrame = RE_TakeVideoFrame;
+    re.SetColorMappings = R_SetColorMappings;
+    re.ThrottleBackend = RE_ThrottleBackend;
+    re.FinishBloom = RE_FinishBloom;
+    re.CanMinimize = RE_CanMinimize;
+    re.GetConfig = RE_GetConfig;
+    re.VertexLighting = RE_VertexLighting;
+    re.SyncRender = RE_SyncRender;
+
+    ri.Printf(PRINT_ALL, "=== Metal Stub Renderer Initialized ===\n");
+    return &re;
+}
+
+/* STANDALONE stub — CD key not used on iOS */
+#ifdef STANDALONE
+#include "../qcommon/q_shared.h"
+qboolean UI_usesUniqueCDKey(void) { return qfalse; }
+#endif

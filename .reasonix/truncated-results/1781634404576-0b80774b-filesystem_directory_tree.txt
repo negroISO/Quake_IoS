@@ -1,0 +1,1225 @@
+[
+  {
+    "name": ".DS_Store",
+    "type": "file"
+  },
+  {
+    "name": ".agents",
+    "type": "directory",
+    "children": [
+      {
+        "name": "skills",
+        "type": "directory",
+        "children": [
+          {
+            "name": "metal-gpu-debug",
+            "type": "directory",
+            "children": [
+              {
+                "name": "SKILL.md",
+                "type": "file"
+              },
+              {
+                "name": "references",
+                "type": "directory",
+                "children": [
+                  {
+                    "name": "debugging-recipes.md",
+                    "type": "file"
+                  },
+                  {
+                    "name": "xctrace-quick-ref.md",
+                    "type": "file"
+                  }
+                ]
+              },
+              {
+                "name": "scripts",
+                "type": "directory",
+                "children": [
+                  {
+                    "name": "capture_frame.swift",
+                    "type": "file"
+                  },
+                  {
+                    "name": "parse_gputrace.py",
+                    "type": "file"
+                  },
+                  {
+                    "name": "parse_trace.py",
+                    "type": "file"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": ".brain",
+    "type": "directory",
+    "children": [
+      {
+        "name": "INDEX.md",
+        "type": "file"
+      },
+      {
+        "name": "fixes",
+        "type": "directory",
+        "children": [
+          {
+            "name": "fixes.md",
+            "type": "file"
+          }
+        ]
+      },
+      {
+        "name": "session",
+        "type": "directory",
+        "children": [
+          {
+            "name": "handoff.md",
+            "type": "file"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": ".claude",
+    "type": "directory",
+    "children": [
+      {
+        "name": "auto-memory",
+        "type": "directory",
+        "children": [
+          {
+            "name": "dirty-files",
+            "type": "file"
+          }
+        ]
+      },
+      {
+        "name": "settings.local.json",
+        "type": "file"
+      },
+      {
+        "name": "skills",
+        "type": "directory",
+        "children": [
+          {
+            "name": "metal-gpu-debug",
+            "type": "directory",
+            "children": [
+              {
+                "name": "SKILL.md",
+                "type": "file"
+              },
+              {
+                "name": "references",
+                "type": "directory",
+                "children": [
+                  {
+                    "name": "debugging-recipes.md",
+                    "type": "file"
+                  },
+                  {
+                    "name": "xctrace-quick-ref.md",
+                    "type": "file"
+                  }
+                ]
+              },
+              {
+                "name": "scripts",
+                "type": "directory",
+                "children": [
+                  {
+                    "name": "capture_frame.swift",
+                    "type": "file"
+                  },
+                  {
+                    "name": "parse_gputrace.py",
+                    "type": "file"
+                  },
+                  {
+                    "name": "parse_trace.py",
+                    "type": "file"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": ".git",
+    "type": "directory",
+    "children": [
+      {
+        "name": "COMMIT_EDITMSG",
+        "type": "file"
+      },
+      {
+        "name": "FETCH_HEAD",
+        "type": "file"
+      },
+      {
+        "name": "HEAD",
+        "type": "file"
+      },
+      {
+        "name": "ORIG_HEAD",
+        "type": "file"
+      },
+      {
+        "name": "config",
+        "type": "file"
+      },
+      {
+        "name": "description",
+        "type": "file"
+      },
+      {
+        "name": "fsmonitor--daemon",
+        "type": "directory",
+        "children": [
+          {
+            "name": "cookies",
+            "type": "directory",
+            "children": []
+          }
+        ]
+      },
+      {
+        "name": "fsmonitor--daemon.ipc",
+        "type": "file"
+      },
+      {
+        "name": "hooks",
+        "type": "directory",
+        "children": [
+          {
+            "name": "applypatch-msg.sample",
+            "type": "file"
+          },
+          {
+            "name": "commit-msg.sample",
+            "type": "file"
+          },
+          {
+            "name": "fsmonitor-watchman.sample",
+            "type": "file"
+          },
+          {
+            "name": "post-commit",
+            "type": "file"
+          },
+          {
+            "name": "post-update.sample",
+            "type": "file"
+          },
+          {
+            "name": "pre-applypatch.sample",
+            "type": "file"
+          },
+          {
+            "name": "pre-commit.sample",
+            "type": "file"
+          },
+          {
+            "name": "pre-merge-commit.sample",
+            "type": "file"
+          },
+          {
+            "name": "pre-push.sample",
+            "type": "file"
+          },
+          {
+            "name": "pre-rebase.sample",
+            "type": "file"
+          },
+          {
+            "name": "pre-receive.sample",
+            "type": "file"
+          },
+          {
+            "name": "prepare-commit-msg.sample",
+            "type": "file"
+          },
+          {
+            "name": "push-to-checkout.sample",
+            "type": "file"
+          },
+          {
+            "name": "sendemail-validate.sample",
+            "type": "file"
+          },
+          {
+            "name": "update.sample",
+            "type": "file"
+          }
+        ]
+      },
+      {
+        "name": "index",
+        "type": "file"
+      },
+      {
+        "name": "info",
+        "type": "directory",
+        "children": [
+          {
+            "name": "exclude",
+            "type": "file"
+          },
+          {
+            "name": "refs",
+            "type": "file"
+          }
+        ]
+      },
+      {
+        "name": "logs",
+        "type": "directory",
+        "children": [
+          {
+            "name": "HEAD",
+            "type": "file"
+          },
+          {
+            "name": "refs",
+            "type": "directory",
+            "children": [
+              {
+                "name": "heads",
+                "type": "directory",
+                "children": [
+                  {
+                    "name": "metal-q3dm4-16_93",
+                    "type": "file"
+                  },
+                  {
+                    "name": "metal-renderer",
+                    "type": "file"
+                  },
+                  {
+                    "name": "metal-renderer-fresh",
+                    "type": "file"
+                  },
+                  {
+                    "name": "metal-renderer-fresh-backup",
+                    "type": "file"
+                  },
+                  {
+                    "name": "metal-renderer-fresh-pre-pk3strip",
+                    "type": "file"
+                  },
+                  {
+                    "name": "metal-renderer-wip-stages",
+                    "type": "file"
+                  }
+                ]
+              },
+              {
+                "name": "remotes",
+                "type": "directory",
+                "children": [
+                  {
+                    "name": "origin",
+                    "type": "directory",
+                    "children": [
+                      {
+                        "name": "HEAD",
+                        "type": "file"
+                      },
+                      {
+                        "name": "metal-q3dm4-16_93",
+                        "type": "file"
+                      },
+                      {
+                        "name": "metal-renderer",
+                        "type": "file"
+                      },
+                      {
+                        "name": "metal-renderer-fresh",
+                        "type": "file"
+                      },
+                      {
+                        "name": "metal-renderer-wip-stages",
+                        "type": "file"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "name": "stash",
+                "type": "file"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "objects",
+        "type": "directory",
+        "children": [
+          {
+            "name": "00",
+            "type": "directory",
+            "children": [
+              {
+                "name": "1e0b7e089d88befe05e061053529efccbeac27",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "01",
+            "type": "directory",
+            "children": [
+              {
+                "name": "5c3362ee87d8805a562df39ba4bfba80e9f5e4",
+                "type": "file"
+              },
+              {
+                "name": "7728cf710d7e7f9016ec3ccbfa23bb16a12d69",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "02",
+            "type": "directory",
+            "children": [
+              {
+                "name": "508690812e62c23a6cb4a8b8b09c402044cad3",
+                "type": "file"
+              },
+              {
+                "name": "6f038506aa47536c0d7aa19420513cf04b207d",
+                "type": "file"
+              },
+              {
+                "name": "8d70bca7a9ac08db97d651679488bb1d965bae",
+                "type": "file"
+              },
+              {
+                "name": "a7b75ff1afba3054637de4e0d9ec6f753239f1",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "03",
+            "type": "directory",
+            "children": [
+              {
+                "name": "3420d63fb3ed66e8874f371d4123c653cd013f",
+                "type": "file"
+              },
+              {
+                "name": "4dc0a6f1c8a7bf4d32e4cca80ad7f7cf4e577e",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "04",
+            "type": "directory",
+            "children": [
+              {
+                "name": "b66c94501821f8d62059a12ac863f14c595927",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "05",
+            "type": "directory",
+            "children": [
+              {
+                "name": "741589173db5c6970a9d6ca686fd9c996f1416",
+                "type": "file"
+              },
+              {
+                "name": "a69f7031c830d1b5f562633329f4115917a187",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "06",
+            "type": "directory",
+            "children": [
+              {
+                "name": "0c62e79a55e4dc72223f08168bbb53592faf93",
+                "type": "file"
+              },
+              {
+                "name": "1a5b4937257fde317346211739a365c67806d7",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "07",
+            "type": "directory",
+            "children": [
+              {
+                "name": "a4bd10b56ebf0bf92b073409c62485b429f990",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "08",
+            "type": "directory",
+            "children": [
+              {
+                "name": "49d297bb1198c874f023a10319d18b16bdbe50",
+                "type": "file"
+              },
+              {
+                "name": "64959cece14125e91ca203f08968bd524fb37a",
+                "type": "file"
+              },
+              {
+                "name": "79a563aba16f419ffb0dc9fb63fd4c127dddd1",
+                "type": "file"
+              },
+              {
+                "name": "d4e0601c41d05eb1a357fda8bf2c0392fbbcc9",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "09",
+            "type": "directory",
+            "children": [
+              {
+                "name": "4ac3fb589af7d9f11399bb7efe9b09d75d9741",
+                "type": "file"
+              },
+              {
+                "name": "55e10a93e01d181951217281371880ebade58e",
+                "type": "file"
+              },
+              {
+                "name": "83eeffbe455439a910cf4cebfc2d390aaac9c0",
+                "type": "file"
+              },
+              {
+                "name": "e87467e966a3686ba9f70fef9dde5062fe7b3d",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "0a",
+            "type": "directory",
+            "children": [
+              {
+                "name": "663cbafb4155374f82d7d8215bc9ff1a0546a7",
+                "type": "file"
+              },
+              {
+                "name": "c5c7159aff594e440c3db05b8cea39bdc2f7bc",
+                "type": "file"
+              },
+              {
+                "name": "cdfd2b22825b76bf85068904d431b8233597dd",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "0b",
+            "type": "directory",
+            "children": [
+              {
+                "name": "7874faf7577cc4589c260623085d8db547dc27",
+                "type": "file"
+              },
+              {
+                "name": "91110f92f9d65e2f02aac9547237f9511ea61f",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "0c",
+            "type": "directory",
+            "children": [
+              {
+                "name": "c693dd9fce15b0a6f28892c7675363afc684df",
+                "type": "file"
+              },
+              {
+                "name": "dd04d3a2723cc7d1989480e973018bf0b0d829",
+                "type": "file"
+              },
+              {
+                "name": "ed82221ffc0f79cc4269b1e2851de82cbe7de0",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "0d",
+            "type": "directory",
+            "children": [
+              {
+                "name": "04c70f31a17d5bb10f755b11c432233dd92af9",
+                "type": "file"
+              },
+              {
+                "name": "4f83cd349f04605dfa574195326a1860670f77",
+                "type": "file"
+              },
+              {
+                "name": "942db22ebdb3c0c047243216ad74513baf9607",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "0e",
+            "type": "directory",
+            "children": [
+              {
+                "name": "29ccc3a24ccc4c26043490f1d9003594cc748a",
+                "type": "file"
+              },
+              {
+                "name": "c4c1dcfbff4e087b6d79dc4655e0e6826aa76c",
+                "type": "file"
+              },
+              {
+                "name": "tmp_obj_haTaoQ",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "0f",
+            "type": "directory",
+            "children": [
+              {
+                "name": "91789deb2d67bcca5ea8e49058c3789c824e9d",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "10",
+            "type": "directory",
+            "children": [
+              {
+                "name": "17e9b4f57d35acc3a812f0aae2c26f8f5d81c2",
+                "type": "file"
+              },
+              {
+                "name": "59dc4b31cfc3cadd1d2772330b8e13213a12b3",
+                "type": "file"
+              },
+              {
+                "name": "99444400903975da285db00688040337787b22",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "11",
+            "type": "directory",
+            "children": [
+              {
+                "name": "40e559ec57a24186122c5a90ec65c0464f52c6",
+                "type": "file"
+              },
+              {
+                "name": "7974188995a1bdc45a39dd9aff07c2445347a7",
+                "type": "file"
+              },
+              {
+                "name": "a4b152bb764a7dc5ee9ee63bd027a3e0bf488a",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "12",
+            "type": "directory",
+            "children": [
+              {
+                "name": "e5b834e0d8f8c43fd413e17789e99264256f6c",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "13",
+            "type": "directory",
+            "children": [
+              {
+                "name": "7a83e65464d508dd4b2c209dd98aab80057a10",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "14",
+            "type": "directory",
+            "children": [
+              {
+                "name": "646db80ae4957f3424a80a1960a5036818afce",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "17",
+            "type": "directory",
+            "children": [
+              {
+                "name": "1940bede695b91bbe8506eeac3df46ad1d2a40",
+                "type": "file"
+              },
+              {
+                "name": "2bc2944358e7cc18e05cd47efd43c78fa9bf0c",
+                "type": "file"
+              },
+              {
+                "name": "33cb83da87b4a4e70527ceaf338d6ebc4f481b",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "18",
+            "type": "directory",
+            "children": [
+              {
+                "name": "4d2c03216538ab8ec99d7c63e149d44f9a9b9e",
+                "type": "file"
+              },
+              {
+                "name": "9ea6c4ca012fd5560c229126d62557fe3d0b78",
+                "type": "file"
+              },
+              {
+                "name": "b41c3f8e726e1411302f5fa9621448f71f9ecf",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "19",
+            "type": "directory",
+            "children": [
+              {
+                "name": "a69d9e186527ed92787bcccf15076408c9f980",
+                "type": "file"
+              },
+              {
+                "name": "acb8ece27a7846b6f0441eb84859f4cb11afe8",
+                "type": "file"
+              },
+              {
+                "name": "ad4f8d7fb1c7fe064600e278f6375688ba56c6",
+                "type": "file"
+              },
+              {
+                "name": "f2fcec2e56d1f3f532d7ef64526ee9f906cddd",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "1a",
+            "type": "directory",
+            "children": [
+              {
+                "name": "066c115fc6092b064c097818461035ce48cb72",
+                "type": "file"
+              },
+              {
+                "name": "6c9d4a1f250169e5b71663313a2fabbf4c205d",
+                "type": "file"
+              },
+              {
+                "name": "c18403f7aab50bd9c501441f6948c489f837ce",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "1b",
+            "type": "directory",
+            "children": [
+              {
+                "name": "00737d28ec9da090f73638855ab63a1f12e998",
+                "type": "file"
+              },
+              {
+                "name": "0276ef4d0591b22f9f825090944ae13af94643",
+                "type": "file"
+              },
+              {
+                "name": "2990d6bc6f00c7a67814a0d572ee0151ad77f3",
+                "type": "file"
+              },
+              {
+                "name": "35dfdf62aa866018ea0fc1f5cf70aa9f1e87c6",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "1c",
+            "type": "directory",
+            "children": [
+              {
+                "name": "7c1324eec67f713130ee5687fe412ea4ca0c4b",
+                "type": "file"
+              },
+              {
+                "name": "bb020ec8775c689959b24e4f2b51f45785bf1a",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "1d",
+            "type": "directory",
+            "children": [
+              {
+                "name": "0c1dba2a95bfe72995112321fcdfd0dfbe3c5f",
+                "type": "file"
+              },
+              {
+                "name": "222f0488fa7a35e6ba338f19dc186d74130749",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "1e",
+            "type": "directory",
+            "children": [
+              {
+                "name": "0162775ae326de5c7842d26ebf76f3f33de546",
+                "type": "file"
+              },
+              {
+                "name": "9b5fdcd8a2de4de50867efcde509df59ad6f2d",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "1f",
+            "type": "directory",
+            "children": [
+              {
+                "name": "a240e80067d830efe126c8c60e312bde702c6d",
+                "type": "file"
+              },
+              {
+                "name": "b2621b2e3374055710edc986f76c55bc240889",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "20",
+            "type": "directory",
+            "children": [
+              {
+                "name": "51e2b3c68673209b9f30b80ef55534b5473e88",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "21",
+            "type": "directory",
+            "children": [
+              {
+                "name": "0ef49572aff2a76a2761d8da8c3a2cf84789eb",
+                "type": "file"
+              },
+              {
+                "name": "32d7390479461a0e5a94335bf7ad126dda4de3",
+                "type": "file"
+              },
+              {
+                "name": "6a28ee1ab78bf80e0bddcc4eb40afb9f93a0b8",
+                "type": "file"
+              },
+              {
+                "name": "a5cb6e7fa8e3b8a6f9f4096f97c777bca290be",
+                "type": "file"
+              },
+              {
+                "name": "a64f8245bebb0a1d06182cdac65163b582b278",
+                "type": "file"
+              },
+              {
+                "name": "db151fb706cf527a7891e13b881f1f92628937",
+                "type": "file"
+              },
+              {
+                "name": "dd39597594fa904129cd2d9ca01bf6c31cdbf0",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "22",
+            "type": "directory",
+            "children": [
+              {
+                "name": "4a29c16b3dbeacdfc000de62d49a8de6ccac06",
+                "type": "file"
+              },
+              {
+                "name": "7d42c5bbb985534b97afb44e5ace2c3fd3601b",
+                "type": "file"
+              },
+              {
+                "name": "951fe0e23c573cc291fa1312a8fb1a2b0ee8f1",
+                "type": "file"
+              },
+              {
+                "name": "fc02875c8f12c41030ad9e68c87eec2275355d",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "23",
+            "type": "directory",
+            "children": [
+              {
+                "name": "27cc2ce578c338aaf2bd215f01cd9b242f926d",
+                "type": "file"
+              },
+              {
+                "name": "bb62ff98b9a19ded56f4a1b1783145e4c1a430",
+                "type": "file"
+              },
+              {
+                "name": "ee5d10c4aa8025a185a85c3acf1fdde76a79bb",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "24",
+            "type": "directory",
+            "children": [
+              {
+                "name": "0172613ae2c03b7a38814ccd758c7a6c491cee",
+                "type": "file"
+              },
+              {
+                "name": "ada2de129e99f48b5b56e75edbfb00cf84c038",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "25",
+            "type": "directory",
+            "children": [
+              {
+                "name": "0c49b696877645a0edc91ecd44d0f0884ec236",
+                "type": "file"
+              },
+              {
+                "name": "c9b8d7f2de9750b03d9aad35ad77ffae1cf600",
+                "type": "file"
+              },
+              {
+                "name": "d2692ec8c157d9e8cba1bb1b0bd88203b73a9e",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "26",
+            "type": "directory",
+            "children": [
+              {
+                "name": "3af633788705249423de68e42835a879848592",
+                "type": "file"
+              },
+              {
+                "name": "768d433f77695befdd6519a26f7d19c39806dd",
+                "type": "file"
+              },
+              {
+                "name": "7a2c41c6501870d4a80d28174371b4f1eb7c2c",
+                "type": "file"
+              },
+              {
+                "name": "c7346a744fd7926faaa52b8f6bff67b7756150",
+                "type": "file"
+              },
+              {
+                "name": "d269939a853fa0999471b36c2bfad8b7f9b901",
+                "type": "file"
+              },
+              {
+                "name": "e8bbebb6b859bcef9241dd7bb293be8d25f07c",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "27",
+            "type": "directory",
+            "children": [
+              {
+                "name": "670b9688439d8242bdc085719e6be480723d65",
+                "type": "file"
+              },
+              {
+                "name": "7742f8cd8dbd88bc2168ef2c53aade50c7f8e5",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "28",
+            "type": "directory",
+            "children": [
+              {
+                "name": "de348f373b1a2eda0bf7c3dc02cd5cb23e581f",
+                "type": "file"
+              },
+              {
+                "name": "f261b3768f72fef2f35fc1f7b9d36e25c3cbe9",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "29",
+            "type": "directory",
+            "children": [
+              {
+                "name": "5ed5ce4ee145eca65018b27ddbffad39bc473a",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "2a",
+            "type": "directory",
+            "children": [
+              {
+                "name": "60dca4611d6a7d41f5f664e4b610f2f58d5e94",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "2b",
+            "type": "directory",
+            "children": [
+              {
+                "name": "1d2794f76199f4bb6e2561d222e38991137721",
+                "type": "file"
+              },
+              {
+                "name": "79cc6ecb359df124143b8a13c0622747ad5785",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "2c",
+            "type": "directory",
+            "children": [
+              {
+                "name": "0a6fe7243b9db1ae901721bd1dc1ae3aa03074",
+                "type": "file"
+              },
+              {
+                "name": "6a6eb3ccafd03a3ea017df4bd072c3246988ab",
+                "type": "file"
+              },
+              {
+                "name": "97baf23904d5e130ecd30e59c55ed465e286da",
+                "type": "file"
+              },
+              {
+                "name": "f8fd3fa8259edf9f7e4096f6c7101cc5c7737b",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "2d",
+            "type": "directory",
+            "children": [
+              {
+                "name": "e76aafb72cfd537c15e40947227ba11d443c41",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "2e",
+            "type": "directory",
+            "children": [
+              {
+                "name": "6643c0ff69484a4a6aaf07209d7eae8abdbbaa",
+                "type": "file"
+              },
+              {
+                "name": "tmp_obj_32YwWt",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "2f",
+            "type": "directory",
+            "children": [
+              {
+                "name": "56dce5e6c505a77380b76b18d77cc9466eaa12",
+                "type": "file"
+              },
+              {
+                "name": "804640ff330bc5d60f4ca65d524a4d7a053ca5",
+                "type": "file"
+              },
+              {
+                "name": "a04f7cbd35ce1c829db4d024c20b641894ed56",
+                "type": "file"
+              },
+              {
+                "name": "b5608279895b77ad6d64936e6150be5af5db21",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "31",
+            "type": "directory",
+            "children": [
+              {
+                "name": "085dee6b672b2c2a8e9f10c9a11a74199494c5",
+                "type": "file"
+              },
+              {
+                "name": "295c0c494a95846ca7c69ddf6af10e057983b6",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "32",
+            "type": "directory",
+            "children": [
+              {
+                "name": "3eb5f33741a6ad9b90dfd2866c85b1e31281d2",
+                "type": "file"
+              },
+              {
+                "name": "d98b06332950457754aa621820d7f0edf98e45",
+                "type": "file"
+              },
+              {
+                "name": "ecf6db675a80cc5849f52f91374b455d368d97",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "33",
+            "type": "directory",
+            "children": [
+              {
+                "name": "bb91097d0d5fad026526b9b33f908665cdd4ad",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "34",
+            "type": "directory",
+            "children": [
+              {
+                "name": "139e5451cd815fc47c2913919b3f43a17d72bd",
+                "type": "file"
+              },
+              {
+                "name": "153f8f7cce072cfd537089465f229239b04915",
+                "type": "file"
+ 
+
+[…truncated 10095913 chars — raise BridgeOptions.maxResultChars, or call the tool with a narrower scope (filter, head, pagination)…]
+
+ "name": "world.air.patched.ll",
+            "type": "file"
+          },
+          {
+            "name": "world.ll",
+            "type": "file"
+          },
+          {
+            "name": "world.metal",
+            "type": "file"
+          },
+          {
+            "name": "world.metallib",
+            "type": "file"
+          },
+          {
+            "name": "world_stats_baseline.json",
+            "type": "file"
+          },
+          {
+            "name": "world_stats_current.json",
+            "type": "file"
+          },
+          {
+            "name": "world_stats_patched.json",
+            "type": "file"
+          }
+        ]
+      },
+      {
+        "name": "shader_register_audit.sh",
+        "type": "file"
+      },
+      {
+        "name": "stage_baseq3.sh",
+        "type": "file"
+      }
+    ]
+  },
+  {
+    "name": "trace_dump.txt",
+    "type": "file"
+  },
+  {
+    "name": "ui",
+    "type": "directory",
+    "children": [
+      {
+        "name": "menudef.h",
+        "type": "file"
+      }
+    ]
+  }
+]

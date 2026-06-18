@@ -1,0 +1,407 @@
+17:             var tcGen: Float
+18:-            var tcModCount: Int32           // 0-4 tcMod entries in the chain
+20:+            var tcMod: Float
+23:-            var tcModType: SIMD4<Float>     // type per chain entry (1=scroll, 2=wave, 3=rotate, 4=scale, 5=turb)
+24:-            var tcModParams0: SIMD4<Float>  // chain[0] params
+25:-            var tcModParams1: SIMD4<Float>  // chain[1] params
+26:-            var tcModParams2: SIMD4<Float>  // chain[2] params
+27:-            var tcModParams3: SIMD4<Float>  // chain[3] params
+28:+            var tcModParams: SIMD4<Float>
+31:             var alphaTestThreshold: Float   // >0: discard if a<thresh; <0: discard if a>=|thresh|; 0: none
+32:-            var blendMode: Int32
+33:-            var alphaGen: Float             // 0=identity, 1=vertex
+38:-            // 0=opaque (red), 1=filter (green), 2=alpha (blue), 3=additive (yellow).
+48:-        // Flip to true to log world-pass stage/drawcall counts each frame.
+52:         // One-shot: logs the first sky draw's stage layout once per launch.
+53:         // Confirms killsky_1 + killsky_2 are both wired through as stages.
+59:-        /// Full tcMod chain pack — matches the `WorldDrawUniforms`
+60:-        /// `tcModCount` + `tcModType` + `tcModParams0..3` layout. MSL
+67:-        /// Flatten the parsed `Q3MetalStage.tcMods[Q3_MAX_TCMODS]` chain
+70:-        private static func fillTcMods(_ stage: Q3MetalWorldStage) -> TcModChainPack {
+76:-            let n = Int(min(stage.tcModCount, 4))
+77:-            // Q3TcMod tcMods[] is a fixed-size C array (tuple in Swift).
+78:-            let chain = [stage.tcMods.0, stage.tcMods.1, stage.tcMods.2, stage.tcMods.3]
+93:+        private static func stageTcModParams(_ stage: Q3MetalWorldStage) -> SIMD4<Float> {
+94:+            SIMD4<Float>(stage.tcModParams.0, stage.tcModParams.1, stage.tcModParams.2, stage.tcModParams.3)
+126:             float tcGen;
+127:-            int   tcModCount;
+128:+            float tcMod;
+131:-            float4 tcModType;
+132:-            float4 tcModParams0;
+133:-            float4 tcModParams1;
+134:-            float4 tcModParams2;
+135:-            float4 tcModParams3;
+136:+            float4 tcModParams;
+139:             float alphaTestThreshold;
+140:-            int blendMode;
+141:-            float alphaGen;
+158:-            // tcMod turb / tcGen environment must see the moved brush in
+165:-            // Iterate the full tcMod chain in declaration order. Up to four
+170:-            for (int i = 0; i < u.tcModCount; ++i) {
+171:-                int t = int(u.tcModType[i] + 0.5);
+172:-                float4 p = (i == 0) ? u.tcModParams0
+173:-                         : (i == 1) ? u.tcModParams1
+174:-                         : (i == 2) ? u.tcModParams2
+175:-                                    : u.tcModParams3;
+214:-            int tcGen = int(u.tcGen + 0.5);
+215:-            if (tcGen == 1) {
+216:-                // tcGen environment — per-fragment facet normal from the
+247:-            // Explicit alphaFunc (from the shader parser) only. Positive
+251:-            // The previous implicit "if blendMode opaque/filter && alpha<0.5
+253:-            // opaque wall had alpha=1, but RGBA textures loaded via
+254:-            // fallback paths (or JPGs with accidental alpha<128) were
+257:-            // implicit alpha discard on opaque/filter stages.
+258:-            float thresh = u.alphaTestThreshold;
+269:-            // Debug pass colorizer — solid replace when alpha >= 0.9.
+283:+        fragment float4 q3_world_fragment(WorldVertexOut in [[stage_in]],
+289:+            int tcMod = int(drawUniforms.tcMod + 0.5);
+291:+            if (tcMod == 1) {
+292:+                texCoord += drawUniforms.tcModParams.xy * drawUniforms.timeSeconds;
+293:+            } else if (tcMod == 2) {
+294:+                float s = sin(drawUniforms.timeSeconds * drawUniforms.tcModParams.w) * drawUniforms.tcModParams.y;
+296:+            } else if (tcMod == 3) {
+297:+                float a = drawUniforms.tcModParams.x * drawUniforms.timeSeconds;
+302:+            } else if (tcMod == 4) {
+303:+                texCoord *= drawUniforms.tcModParams.xy;
+304:+            } else if (tcMod == 5) {
+305:+                // tcMod turb — position-dependent sine UV warp, drives
+311:+                float amp = drawUniforms.tcModParams.x;
+312:+                float freq = drawUniforms.tcModParams.y;
+313:+                float phase = drawUniforms.tcModParams.z;
+345:-            // Tint (alpha < 0.9 but > 0) falls through to normal shading
+353:-        // Apply rgbGen and alphaGen from the stage uniform to the computed
+361:-        //  3. alphaGen VERTEX (1) multiplies color.a by vertex.a.
+362:-        // This function MUST NOT affect shaders that leave rgbGen/alphaGen
+368:-            int alphaGen = int(u.alphaGen + 0.5);
+377:-            if (alphaGen == 1) {
+383:-        fragment float4 q3_world_frag_opaque(WorldVertexOut in [[stage_in]],
+404:-        fragment float4 q3_world_frag_alpha(WorldVertexOut in [[stage_in]],
+426:-        fragment float4 q3_world_frag_add(WorldVertexOut in [[stage_in]],
+447:-        fragment float4 q3_world_frag_filter(WorldVertexOut in [[stage_in]],
+469:-        // BSP-baked stage UV. Stages are intentionally ignored by the
+471:-        // slot 0 is bound. No lightmap, no tcMod, no stage blendMode —
+473:-        fragment float4 q3_portal_fragment(WorldVertexOut in [[stage_in]],
+485:-        fragment float4 q3_entity_portal_fragment(EntityVertexOut in [[stage_in]],
+491:+            // NOTE: No unconditional alpha-test discard here.
+494:+            // emulate GL alphaFunc, but Q3 alpha-test is a PER-SHADER-STAGE opt-in
+495:+            // (the `alphaFunc GT0|GE128|LT128` keyword on a stage), not a
+497:+            // ornamental arches go see-through whenever their stage0 texture
+499:+            // lightmap*vertexColor multiplied alpha below threshold.
+501:+            // Until the per-stage shader driver is in place, world fragments must
+502:+            // always write. Alpha-tested stages will be reintroduced through the
+510:+            // Per-shader alphaFunc: GT0 / GE128 / LT128.
+511:+            // Threshold >0 → discard if alpha < threshold (GT0=0.004, GE128=0.5)
+512:+            // Threshold <0 → discard if alpha >= |threshold| (LT128=-0.5)
+513:+            if (drawUniforms.alphaTestThreshold > 0.0) {
+514:+                if (texel.a < drawUniforms.alphaTestThreshold) discard_fragment();
+515:+            } else if (drawUniforms.alphaTestThreshold < 0.0) {
+516:+                if (texel.a >= -drawUniforms.alphaTestThreshold) discard_fragment();
+539:         fragment float4 q3_entity_fragment(EntityVertexOut in [[stage_in]],
+554:-        fragment float4 q3_entity_additive_fragment(EntityVertexOut in [[stage_in]],
+562:-            float alpha = texel.a * in.color.a;
+563:-            float3 glow = texel.rgb * alpha * in.color.rgb * 0.35;
+564:-            float4 outColor = float4(glow, alpha);
+580:             // Push to max depth so sky always renders behind everything
+588:             // slot: if tcMod==1 use .xy as scroll; if tcMod==4 use
+591:-            // Walk the tcMod chain; sky only applies scroll/scale slots
+594:-            for (int _i = 0; _i < drawUniforms.tcModCount; ++_i) {
+595:-                int tcMod = int(drawUniforms.tcModType[_i] + 0.5);
+596:-                float4 _p = (_i == 0) ? drawUniforms.tcModParams0
+597:-                          : (_i == 1) ? drawUniforms.tcModParams1
+598:-                          : (_i == 2) ? drawUniforms.tcModParams2
+599:-                                      : drawUniforms.tcModParams3;
+600:-                if (tcMod == 1) {
+605:-                } else if (tcMod == 4) {
+610:+            int tcMod = int(drawUniforms.tcMod + 0.5);
+611:+            if (tcMod == 1) {
+612:+                float2 scroll = drawUniforms.tcModParams.xy * drawUniforms.timeSeconds;
+616:+            } else if (tcMod == 4) {
+617:+                uvX *= drawUniforms.tcModParams.xy;
+618:+                uvY *= drawUniforms.tcModParams.xy;
+619:+                uvZ *= drawUniforms.tcModParams.xy;
+629:-        // `blendFunc GL_DST_COLOR GL_*` — without this, they render through
+630:-        // the default alpha pipeline as an opaque red overlay that blocks
+637:-        // Premultiplied-alpha blend (src=ONE, dst=ONE_MINUS_SRC_ALPHA).
+638:-        // For Q3 shaders with `blendFunc GL_ONE GL_ONE_MINUS_SRC_ALPHA` —
+639:-        // their texels are pre-multiplied by alpha, so using the plain
+640:-        // alpha pipeline (SRC_ALPHA / ONE_MINUS_SRC_ALPHA) darkens edges
+648:         private var depthHackDepthStencilState: MTLDepthStencilState?
+674:-            let depthDesc = MTLTextureDescriptor.texture2DDescriptor(
+675:-                pixelFormat: .depth32Float,
+680:-            depthDesc.usage = [.renderTarget]
+681:-            depthDesc.storageMode = .private
+682:-            portalDepthTexture = device.makeTexture(descriptor: depthDesc)
+714:-            // Q3 `cull front` inverts winding — we render back faces.
+726:-            // Per-pass RGB: 0=opaque (red), 1=filter (green), 2=alpha (blue),
+737:-                case 2: return SIMD4<Float>(0, 0, 1, debugAlpha) // alpha
+742:-            func worldPassIndex(blendMode: UInt32) -> Int {
+743:-                switch blendMode {
+745:-                case 2: return 2  // alpha
+747:-                case 4: return 2  // premultiplied-alpha (reuse alpha debug color)
+788:                 alpha: Double(snapshot.clearColor.3)
+794:-            // scope: opaque stage-0 draws only; sky and portal surfaces are
+815:-                // Rate-limited cull probe. Prints once per ~120 frames so
+857:-                    portalPassDescriptor.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+858:-                    portalPassDescriptor.depthAttachment.texture = portalDepth
+859:-                    portalPassDescriptor.depthAttachment.loadAction = .clear
+860:-                    portalPassDescriptor.depthAttachment.storeAction = .dontCare
+861:-                    portalPassDescriptor.depthAttachment.clearDepth = 1.0
+892:-                            for draw in portalWorldDraws where draw.indexCount > 0 && (draw.flags & SKY_FLAG_PORTAL) != 0 {
+893:-                                if (draw.flags & PORTAL_FLAG_PORTAL) != 0 { continue }
+894:-                                let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+895:-                                guard stageCount > 0 else { continue }
+896:-                                for stageIndex in 0..<stageCount {
+897:-                                    let stage = Self.worldStage(draw, stageIndex)
+898:-                                    guard let skyTex = texture(for: stage.textureHandle, device: view.device) else { continue }
+899:-                                    let useAdditiveSky = stage.blendMode == 1 && skyAdditivePipelineState != nil
+904:-                                        tcGen: Float(stage.tcGen),
+905:-                                        tcModCount: Self.fillTcMods(stage).count,
+906:-                                        rgbGen: Float(stage.rgbGen),
+908:-                                        tcModType: Self.fillTcMods(stage).types,
+909:-                                        tcModParams0: Self.fillTcMods(stage).p0,
+910:-                                        tcModParams1: Self.fillTcMods(stage).p1,
+911:-                                        tcModParams2: Self.fillTcMods(stage).p2,
+912:-                                        tcModParams3: Self.fillTcMods(stage).p3,
+915:-                                        alphaTestThreshold: 0,
+916:-                                        blendMode: Int32(stage.blendMode),
+917:-                                        alphaGen: Float(stage.alphaGen),
+932:-                            portalEncoder.setDepthStencilState(depthStencilState)
+936:-                        // ---- WORLD (in portal pass, full stage iteration) ----
+938:-                        // split, per-stage blend/pipeline/depth selection.
+941:-                        for draw in portalWorldDraws where draw.indexCount > 0 && (draw.flags & SKY_FLAG_PORTAL) == 0 {
+942:-                            if (draw.flags & PORTAL_FLAG_PORTAL) != 0 { continue }
+943:-                            let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+944:-                            guard stageCount > 0 else { continue }
+946:-                            portalEncoder.setCullMode((draw.flags & NOCULL_FLAG_PORTAL) != 0 ? .none : .back)
+949:-                                for stageIndex in 0..<stageCount {
+950:-                                    let stage = Self.worldStage(draw, stageIndex)
+951:-                                    let mode = stage.blendMode
+959:-                                    guard let stageTexture = texture(for: stage.textureHandle, device: view.device) else { continue }
+975:-                                        portalEncoder.setDepthStencilState(depthStencilState)
+980:-                                    portalEncoder.setFragmentTexture(stageTexture, index: 0)
+981:-                                    let usesLightmap = stage.useLightmap != 0
+989:-                                        tcGen: Float(stage.tcGen),
+990:-                                        tcModCount: Self.fillTcMods(stage).count,
+991:-                                        rgbGen: Float(stage.rgbGen),
+993:-                                        tcModType: Self.fillTcMods(stage).types,
+994:-                                        tcModParams0: Self.fillTcMods(stage).p0,
+995:-                                        tcModParams1: Self.fillTcMods(stage).p1,
+996:-                                        tcModParams2: Self.fillTcMods(stage).p2,
+997:-                                        tcModParams3: Self.fillTcMods(stage).p3,
+1000:-                                        alphaTestThreshold: Self.alphaTestThreshold(for: stage.alphaFunc),
+1001:-                                        blendMode: Int32(mode),
+1002:-                                        alphaGen: Float(stage.alphaGen),
+1018:-                        // stage metadata; only the model matrix changes per
+1049:-                                        if draw.indexCount == 0 || (draw.flags & SKY_FLAG_PORTAL) != 0 || (draw.flags & PORTAL_FLAG_PORTAL) != 0 {
+1053:-                                        let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+1054:-                                        guard stageCount > 0 else { continue }
+1056:-                                        portalEncoder.setCullMode((draw.flags & NOCULL_FLAG_PORTAL) != 0 ? .none : .back)
+1058:-                                        for stageIndex in 0..<stageCount {
+1059:-                                            let stage = Self.worldStage(draw, stageIndex)
+1060:-                                            let mode = stage.blendMode
+1063:-                                            guard let stageTexture = texture(for: stage.textureHandle, device: view.device) else { continue }
+1078:-                                            portalEncoder.setDepthStencilState(isOpaqueStage ? depthStencilState : additiveDepthStencilState)
+1079:-                                            portalEncoder.setFragmentTexture(stageTexture, index: 0)
+1080:-                                            let usesLightmap = stage.useLightmap != 0
+1087:-                                            let _tc = Self.fillTcMods(stage)
+1089:-                                                tcGen: Float(stage.tcGen),
+1090:-                                                tcModCount: _tc.count,
+1091:-                                                rgbGen: Float(stage.rgbGen),
+1093:-                                                tcModType: _tc.types,
+1094:-                                                tcModParams0: _tc.p0,
+1095:-                                                tcModParams1: _tc.p1,
+1096:-                                                tcModParams2: _tc.p2,
+1097:-                                                tcModParams3: _tc.p3,
+1100:-                                                alphaTestThreshold: Self.alphaTestThreshold(for: stage.alphaFunc),
+1101:-                                                blendMode: Int32(mode),
+1102:-                                                alphaGen: Float(stage.alphaGen),
+1166:-                for draw in worldDraws where draw.indexCount > 0 && (draw.flags & SKY_FLAG) != 0 {
+1167:-                    if noPortalsEnabled && (draw.flags & PORTAL_FLAG) != 0 {
+1170:-                    let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+1171:-                    guard stageCount > 0 else { continue }
+1173:-                    for stageIndex in 0..<stageCount {
+1174:-                        let stage = Self.worldStage(draw, stageIndex)
+1175:-                        guard let skyTexture = texture(for: stage.textureHandle, device: view.device) else {
+1179:-                        let useAdditiveSky = stage.blendMode == 1 && skyAdditivePipelineState != nil
+1185:-                        let _tc = Self.fillTcMods(stage)
+1187:-                            tcGen: Float(stage.tcGen),
+1188:-                            tcModCount: _tc.count,
+1189:-                            rgbGen: Float(stage.rgbGen),
+1191:-                            tcModType: _tc.types,
+1192:-                            tcModParams0: _tc.p0,
+1193:-                            tcModParams1: _tc.p1,
+1194:-                            tcModParams2: _tc.p2,
+1195:-                            tcModParams3: _tc.p3,
+1198:-                            alphaTestThreshold: 0,
+1199:-                            blendMode: Int32(stage.blendMode),
+1200:-                            alphaGen: Float(stage.alphaGen),
+1201:-                            debugPassColor: debugColor(pass: worldPassIndex(blendMode: stage.blendMode))
+1218:-                // Restore depth state for world/entities
+1219:-                encoder.setDepthStencilState(depthStencilState)
+1242:-                // tcMod to 0 on every stage. Used to isolate whether
+1243:-                // "flying texture" artifacts come from the tcMod parameter
+1260:-                encoder.setDepthStencilState(depthStencilState)
+1264:+                encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
+1279:-                // stages across draws emit contiguously, then coalesce runs
+1280:-                // of same-state stages with contiguous index ranges into a
+1297:-                var stagesSeen: Int = 0
+1321:+                    // 0 = opaque, 1 = filter, 2 = alpha, 3 = additive.
+1326:+                        let isSky = (draw.flags & skyFlagBit) != 0
+1332:+                            let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+1333:+                            guard stageCount > 0 else { continue }
+1345:-                    for draw in worldDraws where draw.indexCount > 0 && (draw.flags & SKY_FLAG) == 0 {
+1346:-                        if noPortalsEnabled && (draw.flags & PORTAL_FLAG) != 0 {
+1349:+                            // One-shot diagnostic: log the sky draw's stage
+1350:+                            // layout so we can confirm killsky (stage0=base,
+1351:+                            // stage1=additive cloud overlay) is wired end-to-end.
+1354:+                                print("[Metal] sky draw stageCount=\(stageCount) flags=0x\(String(draw.flags, radix: 16))")
+1355:+                                for i in 0..<stageCount {
+1357:+                                    print("[Metal]   sky stage \(i): tex=\(s.textureHandle) blend=\(s.blendMode) tcMod=\(s.tcMod) tcModParams=(\(s.tcModParams.0),\(s.tcModParams.1),\(s.tcModParams.2),\(s.tcModParams.3))")
+1366:-                        if (draw.flags & PORTAL_FLAG) != 0 {
+1375:+                            // Render each sky stage in order. Stage 0 is the
+1377:+                            // depth-write off). Subsequent stages are overlays
+1378:+                            // — killsky spec sheet stage 1 is GL_ONE/GL_ONE
+1379:+                            // additive. Use the stage's blendMode to decide.
+1380:+                            for stageIndex in 0..<stageCount {
+1381:+                                let stage = Self.worldStage(draw, stageIndex)
+1382:+                                guard let skyStageTexture = texture(for: stage.textureHandle, device: view.device) else {
+1385:+                                let isAdditive = (stageIndex > 0) && (Int(stage.blendMode) == 1)
+1390:+                                    tcGen: Float(stage.tcGen),
+1391:+                                    tcMod: Float(stage.tcMod),
+1392:+                                    rgbGen: Float(stage.rgbGen),
+1394:+                                    tcModParams: Self.stageTcModParams(stage),
+1397:+                                    alphaTestThreshold: 0,
+1420:-                            // normal stage path so the surface still draws.
+1427:                         let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+1428:                         guard stageCount > 0 else { continue }
+1430:-                        // Per-stage cullMode (parsed from shader `cull`
+1434:-                        let stage0CullMode = Self.worldStage(draw, 0).cullMode
+1437:-                            switch stage0CullMode {
+1444:                         for stageIndex in 0..<stageCount {
+1445:                             let stage = Self.worldStage(draw, stageIndex)
+1446:-                            let mode = stage.blendMode
+1450:-                            guard let stageTexture = texture(for: stage.textureHandle, device: view.device) else {
+1451:+                            let blendMode = Int(stage.blendMode)
+1452:+                            let drawPass = (blendMode == 1) ? 3 : ((blendMode == 2) ? 2 : ((blendMode == 3) ? 1 : 0))
+1454:+                            guard let baseTexture = texture(for: stage.textureHandle, device: view.device) else {
+1457:-                            stagesSeen += 1
+1470:-                                isOpaqueStage ? depthStencilState : additiveDepthStencilState
+1472:-                            let usesLightmap = stage.useLightmap != 0
+1490:-                            // DIAGNOSTIC: log chain for multi-tcMod stages.
+1491:-                            // `stage.tcMods` is a Swift tuple (C fixed-size
+1493:-                            if stage.tcModCount > 1 {
+1495:-                                let chain = [stage.tcMods.0, stage.tcMods.1, stage.tcMods.2, stage.tcMods.3]
+1497:-                                for i in 0..<Int(stage.tcModCount) {
+1503:-                                let shaderKey = String(format: "tex=0x%x", stage.textureHandle)
+1504:-                                print("[DRAW] \(shaderKey) tcModCount=\(stage.tcModCount) types=\(typeStr)")
+1506:+                                encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
+1508:-                            let _tc: TcModChainPack = disableTcMod ? Self.kZeroTcModPack : Self.fillTcMods(stage)
+1510:+                            let alphaTest = Self.alphaTestThreshold(for: stage.alphaFunc)
+1512:                                 tcGen: Float(stage.tcGen),
+1513:-                                tcModCount: _tc.count,
+1514:+                                tcMod: Float(stage.tcMod),
+1515:                                 rgbGen: Float(stage.rgbGen),
+1517:-                                tcModType: _tc.types,
+1518:-                                tcModParams0: _tc.p0,
+1519:-                                tcModParams1: _tc.p1,
+1520:-                                tcModParams2: _tc.p2,
+1521:-                                tcModParams3: _tc.p3,
+1523:-                                forceWhiteVertColor: (mode == 1 || stage.rgbGen == 0) ? 1 : 0,
+1524:-                                alphaTestThreshold: Self.alphaTestThreshold(for: stage.alphaFunc),
+1525:-                                blendMode: Int32(stage.blendMode),
+1526:-                                alphaGen: Float(stage.alphaGen),
+1527:-                                debugPassColor: debugColor(pass: worldPassIndex(blendMode: stage.blendMode))
+1528:+                                tcModParams: Self.stageTcModParams(stage),
+1530:+                                forceWhiteVertColor: (blendMode == 1) ? 1.0 : 0.0,
+1531:+                                alphaTestThreshold: alphaTest,
+1545:-                            if targetUniforms.tcModCount > 1 {
+1546:-                                print("[UNIFORM] tcModCount=\(targetUniforms.tcModCount) " +
+1547:-                                      "types=(\(targetUniforms.tcModType.x),\(targetUniforms.tcModType.y)," +
+1548:-                                      "\(targetUniforms.tcModType.z),\(targetUniforms.tcModType.w)) " +
+1549:-                                      "p0=(\(targetUniforms.tcModParams0.x),\(targetUniforms.tcModParams0.y)) " +
+1550:-                                      "p1=(\(targetUniforms.tcModParams1.x),\(targetUniforms.tcModParams1.y))")
+1557:-                                lastTex0 === stageTexture &&
+1588:-                            if lastTex0 !== stageTexture {
+1589:-                                encoder.setFragmentTexture(stageTexture, index: 0)
+1590:-                                lastTex0 = stageTexture
+1615:-                    print("[batch] world stages=\(stagesSeen) drawCalls=\(emittedDrawCalls)")
+1680:-                            if draw.indexCount == 0 || (draw.flags & SKY_FLAG) != 0 {
+1683:-                            if noPortalsEnabled && (draw.flags & PORTAL_FLAG) != 0 {
+1687:-                            if (draw.flags & PORTAL_FLAG) != 0 {
+1706:-                            let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+1707:-                            guard stageCount > 0 else { continue }
+1708:-                            // Per-stage cullMode (parsed from shader `cull`
+1710:-                            let stage0CullMode = Self.worldStage(draw, 0).cullMode
+1713:-                                switch stage0CullMode {
+1721:-                            for stageIndex in 0..<stageCount {
+1722:-                                let stage = Self.worldStage(draw, stageIndex)
+1723:-                                let mode = stage.blendMode
+1726:-                                guard let stageTexture = texture(for: stage.textureHandle, device: view.device) else {
+1743:-                                encoder.setDepthStencilState(isOpaqueStage ? depthStencilState : additiveDepthStencilState)
+1744:-                                encoder.setFragmentTexture(stageTexture, index: 0)
+1745:-                                let usesLightmap = stage.useLightmap != 0
+1753:-                                let _tc: TcModChainPack = disableTcMod ? Self.kZeroTcModPack : Self.fillTcMods(stage)
+1755:-                                    tcGen: Float(stage.tcGen),
+1756:-                                    tcModCount: _tc.count,
+1757:-                                    rgbGen: Float(stage.rgbGen),
+1759:-                                    tcModType: _tc.types,
+1760:-                                    tcModParams0: _tc.p0,
+1761:-                                    tcModParams1: _tc.p1,
+1762:-                                    tcModParams2: _tc.p2,
+1763:-                                    tcModParams3: _tc.p3,
+1765:-                                    forceWhiteVertColor: (mode == 1 || stage.rgbGen == 0) ? 1 : 0,
+1766:-                                    alphaTestThreshold: Self.alphaTestThreshold(for: stage.alphaFunc),
+1767:-                                    blendMode: Int32(stage.blendMode),
+1768:-                                    alphaGen: Float(stage.alphaGen),
+1769:-                                    debugPassColor: debugColor(pass: worldPassIndex(blendMode: stage.blendMode))
+1802:                 encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
+1809:-                let depthHackBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_DEPTHHACK)
+1811:-                let alphaBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ALPHA)
+1813:-                let nocullBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_NOCULL)
+1818:-                // system. Any blendMode on the weapon texture would otherwise
+1819:-                // flip wantsReadOnlyDepth on and lose the depth hack, causing
+1821:-                // + depth-hack stencil + no cull, and skip these draws in the
+1825:-                    guard (draw.flags & firstPersonBit) != 0 else { continue }
+1826:-                    if noPortalsEnabled && (draw.flags & portalBit) != 0 {
+1833:-                    encoder.setDepthStencilState(ensuredDepthStencilState(depthHackDepthStencilState, device: view.device))
+1848:+                    let depthHackBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_DEPTHHACK)
+1850:+                    let alphaBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ALPHA)
+1854:-                // 0 = opaque, 1 = filter, 2 = alpha, 3 = additive.
+1859:+                    // 0 = opaque, 1 = filter, 2 = alpha, 3 = additive.
+1862:-                        if (draw.flags & firstPersonBit) != 0 { continue }
+1863:-                        if noPortalsEnabled && (draw.flags & portalBit) != 0 {
+1873:-                        // MD3 UVs. Routed through the alpha pass only.
+1874:-                        if (draw.flags & portalBit) != 0,
+1906:-                        // Portal-flagged entities on non-alpha passes are
+1908:-                        if (draw.flags & portalBit) != 0 { continue }
+1910:                         let isEntityAdditive = (draw.flags & additiveBit) != 0
+1911:                         let isEntityAlpha = (draw.flags & alphaBit) != 0
+1912:                         let isEntityFilter = (draw.flags & filterBit) != 0
+1918:                         let wantsDepthHack = (draw.flags & depthHackBit) != 0
+1919:-                        let wantsNoCull = (draw.flags & nocullBit) != 0
+1939:+                            let state = wantsDepthHack ? depthHackDepthStencilState : depthStencilState
+1944:-                            : (wantsDepthHack ? depthHackDepthStencilState : depthStencilState)
+1987:-                        // Per-draw pipeline switch: blendMode==3 uses the
+1989:-                        // else uses the default alpha-blend UI pipeline.
+1991:-                            (draw.blendMode == 3) ? uiFilterPipelineState : uiPipelineState
+2048:-            uiFilterPipelineDescriptor.depthAttachmentPixelFormat = view.depthStencilPixelFormat
+2053:-            uiFilterPipelineDescriptor.colorAttachments[0].alphaBlendOperation = .add
+2067:             worldPipelineDescriptor.depthAttachmentPixelFormat = view.depthStencilPixelFormat
+2081:             worldFilterPipelineDescr
+
+[…truncated 38334 chars — raise BridgeOptions.maxResultChars, or call the tool with a narrower scope (filter, head, pagination)…]
+
+TY_DRAWFLAG_ALPHA | Q3_METAL_ENTITY_DRAWFLAG_FILTER))
+5051:-     * texture's parsed blendMode routes the draw to opaque/alpha/
+5054:-    if (fd->rdflags == 0 && s_scenePolyCount > 0) {
+5099:-                if (tex->blendMode == 1)      drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+5100:-                else if (tex->blendMode == 2) drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_ALPHA;
+5101:-                else if (tex->blendMode == 3) drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_FILTER;
+5107:-            s_entityDraws[entityDrawCursor].flags = drawFlags;
+5129:-    /* Plumb the shader's blendMode to the UI draw so the Swift side can
+5130:-     * pick a matching pipeline. Filter-mode (blendMode==3) is the one
+5132:-     * `blendFunc GL_DST_COLOR GL_SRC_ALPHA`, which we map to filter in
+5136:-    if (tex != NULL && tex->blendMode == 3) {
+5144:-    draw->blendMode = drawBlendMode;
+5267:-        s_cvarNoCull = ri.Cvar_Get("r_nocull", "0", CVAR_CHEAT);
+5296:-         * texture motion artifacts come from the tcMod uniform path.

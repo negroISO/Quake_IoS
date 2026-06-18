@@ -185,7 +185,7 @@ typedef struct {
     float pbrRoughness;
     float pbrMetallic;
     /* Optional owner material texture handle for multi-stage shaders whose
-     * visible FX/base stage is authored in Q3 as textures/sfx/* but the RTX
+     * visible FX/base stage is authored in Q3 as textures/sfx/ but the RTX
      * Remix PBR material is keyed to a later concrete world texture stage.
      * 0/default = use textureHandle. */
     uint32_t pbrMaterialHandle;
@@ -193,7 +193,7 @@ typedef struct {
 
 #define Q3_METAL_MAX_STAGES 8
 
-#define Q3_METAL_MAX_LIGHTS 128
+#define Q3_METAL_MAX_LIGHTS 512
 #define Q3_METAL_TEXTURE_FLAG_LIGHTMAP 0x00000001u
 
 /* Dynamic light (point). Emitted by cgame for muzzle flashes, rocket/plasma

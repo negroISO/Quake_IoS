@@ -1,0 +1,1264 @@
+[
+  {
+    "name": ".DS_Store",
+    "type": "file"
+  },
+  {
+    "name": ".agents",
+    "type": "directory",
+    "children": [
+      {
+        "name": "skills",
+        "type": "directory",
+        "children": [
+          {
+            "name": "metal-gpu-debug",
+            "type": "directory",
+            "children": [
+              {
+                "name": "SKILL.md",
+                "type": "file"
+              },
+              {
+                "name": "references",
+                "type": "directory",
+                "children": [
+                  {
+                    "name": "debugging-recipes.md",
+                    "type": "file"
+                  },
+                  {
+                    "name": "xctrace-quick-ref.md",
+                    "type": "file"
+                  }
+                ]
+              },
+              {
+                "name": "scripts",
+                "type": "directory",
+                "children": [
+                  {
+                    "name": "capture_frame.swift",
+                    "type": "file"
+                  },
+                  {
+                    "name": "parse_gputrace.py",
+                    "type": "file"
+                  },
+                  {
+                    "name": "parse_trace.py",
+                    "type": "file"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": ".brain",
+    "type": "directory",
+    "children": [
+      {
+        "name": "INDEX.md",
+        "type": "file"
+      },
+      {
+        "name": "fixes",
+        "type": "directory",
+        "children": [
+          {
+            "name": "fixes.md",
+            "type": "file"
+          }
+        ]
+      },
+      {
+        "name": "session",
+        "type": "directory",
+        "children": [
+          {
+            "name": "handoff.md",
+            "type": "file"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": ".claude",
+    "type": "directory",
+    "children": [
+      {
+        "name": "auto-memory",
+        "type": "directory",
+        "children": [
+          {
+            "name": "dirty-files",
+            "type": "file"
+          }
+        ]
+      },
+      {
+        "name": "settings.local.json",
+        "type": "file"
+      },
+      {
+        "name": "skills",
+        "type": "directory",
+        "children": [
+          {
+            "name": "metal-gpu-debug",
+            "type": "directory",
+            "children": [
+              {
+                "name": "SKILL.md",
+                "type": "file"
+              },
+              {
+                "name": "references",
+                "type": "directory",
+                "children": [
+                  {
+                    "name": "debugging-recipes.md",
+                    "type": "file"
+                  },
+                  {
+                    "name": "xctrace-quick-ref.md",
+                    "type": "file"
+                  }
+                ]
+              },
+              {
+                "name": "scripts",
+                "type": "directory",
+                "children": [
+                  {
+                    "name": "capture_frame.swift",
+                    "type": "file"
+                  },
+                  {
+                    "name": "parse_gputrace.py",
+                    "type": "file"
+                  },
+                  {
+                    "name": "parse_trace.py",
+                    "type": "file"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": ".git",
+    "type": "directory",
+    "children": [
+      {
+        "name": "COMMIT_EDITMSG",
+        "type": "file"
+      },
+      {
+        "name": "FETCH_HEAD",
+        "type": "file"
+      },
+      {
+        "name": "HEAD",
+        "type": "file"
+      },
+      {
+        "name": "ORIG_HEAD",
+        "type": "file"
+      },
+      {
+        "name": "config",
+        "type": "file"
+      },
+      {
+        "name": "description",
+        "type": "file"
+      },
+      {
+        "name": "fsmonitor--daemon",
+        "type": "directory",
+        "children": [
+          {
+            "name": "cookies",
+            "type": "directory",
+            "children": []
+          }
+        ]
+      },
+      {
+        "name": "fsmonitor--daemon.ipc",
+        "type": "file"
+      },
+      {
+        "name": "hooks",
+        "type": "directory",
+        "children": [
+          {
+            "name": "applypatch-msg.sample",
+            "type": "file"
+          },
+          {
+            "name": "commit-msg.sample",
+            "type": "file"
+          },
+          {
+            "name": "fsmonitor-watchman.sample",
+            "type": "file"
+          },
+          {
+            "name": "post-commit",
+            "type": "file"
+          },
+          {
+            "name": "post-update.sample",
+            "type": "file"
+          },
+          {
+            "name": "pre-applypatch.sample",
+            "type": "file"
+          },
+          {
+            "name": "pre-commit.sample",
+            "type": "file"
+          },
+          {
+            "name": "pre-merge-commit.sample",
+            "type": "file"
+          },
+          {
+            "name": "pre-push.sample",
+            "type": "file"
+          },
+          {
+            "name": "pre-rebase.sample",
+            "type": "file"
+          },
+          {
+            "name": "pre-receive.sample",
+            "type": "file"
+          },
+          {
+            "name": "prepare-commit-msg.sample",
+            "type": "file"
+          },
+          {
+            "name": "push-to-checkout.sample",
+            "type": "file"
+          },
+          {
+            "name": "sendemail-validate.sample",
+            "type": "file"
+          },
+          {
+            "name": "update.sample",
+            "type": "file"
+          }
+        ]
+      },
+      {
+        "name": "index",
+        "type": "file"
+      },
+      {
+        "name": "info",
+        "type": "directory",
+        "children": [
+          {
+            "name": "exclude",
+            "type": "file"
+          },
+          {
+            "name": "refs",
+            "type": "file"
+          }
+        ]
+      },
+      {
+        "name": "logs",
+        "type": "directory",
+        "children": [
+          {
+            "name": "HEAD",
+            "type": "file"
+          },
+          {
+            "name": "refs",
+            "type": "directory",
+            "children": [
+              {
+                "name": "heads",
+                "type": "directory",
+                "children": [
+                  {
+                    "name": "metal-q3dm4-16_93",
+                    "type": "file"
+                  },
+                  {
+                    "name": "metal-renderer",
+                    "type": "file"
+                  },
+                  {
+                    "name": "metal-renderer-fresh",
+                    "type": "file"
+                  },
+                  {
+                    "name": "metal-renderer-fresh-backup",
+                    "type": "file"
+                  },
+                  {
+                    "name": "metal-renderer-fresh-pre-pk3strip",
+                    "type": "file"
+                  },
+                  {
+                    "name": "metal-renderer-wip-stages",
+                    "type": "file"
+                  }
+                ]
+              },
+              {
+                "name": "remotes",
+                "type": "directory",
+                "children": [
+                  {
+                    "name": "origin",
+                    "type": "directory",
+                    "children": [
+                      {
+                        "name": "HEAD",
+                        "type": "file"
+                      },
+                      {
+                        "name": "metal-q3dm4-16_93",
+                        "type": "file"
+                      },
+                      {
+                        "name": "metal-renderer",
+                        "type": "file"
+                      },
+                      {
+                        "name": "metal-renderer-fresh",
+                        "type": "file"
+                      },
+                      {
+                        "name": "metal-renderer-wip-stages",
+                        "type": "file"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "name": "stash",
+                "type": "file"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "objects",
+        "type": "directory",
+        "children": [
+          {
+            "name": "07",
+            "type": "directory",
+            "children": [
+              {
+                "name": "a4bd10b56ebf0bf92b073409c62485b429f990",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "0e",
+            "type": "directory",
+            "children": [
+              {
+                "name": "c4c1dcfbff4e087b6d79dc4655e0e6826aa76c",
+                "type": "file"
+              },
+              {
+                "name": "tmp_obj_haTaoQ",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "1a",
+            "type": "directory",
+            "children": [
+              {
+                "name": "6c9d4a1f250169e5b71663313a2fabbf4c205d",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "1d",
+            "type": "directory",
+            "children": [
+              {
+                "name": "0c1dba2a95bfe72995112321fcdfd0dfbe3c5f",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "22",
+            "type": "directory",
+            "children": [
+              {
+                "name": "951fe0e23c573cc291fa1312a8fb1a2b0ee8f1",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "2e",
+            "type": "directory",
+            "children": [
+              {
+                "name": "tmp_obj_32YwWt",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "33",
+            "type": "directory",
+            "children": [
+              {
+                "name": "bb91097d0d5fad026526b9b33f908665cdd4ad",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "5e",
+            "type": "directory",
+            "children": [
+              {
+                "name": "cf635489c095ff83b4354623a981d3f314f76b",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "61",
+            "type": "directory",
+            "children": [
+              {
+                "name": "1a3dfa95425fab821ce411047c7067a4a00212",
+                "type": "file"
+              },
+              {
+                "name": "ec99d4e3766916cf810e73cb1207b507fb2fbc",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "72",
+            "type": "directory",
+            "children": [
+              {
+                "name": "b07363437e7ad47da59846ca41c752a4812bbd",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "77",
+            "type": "directory",
+            "children": [
+              {
+                "name": "ca57ef257f6175a819c910608c31b35550862f",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "95",
+            "type": "directory",
+            "children": [
+              {
+                "name": "1dc1b313920badd68750746fe77e66fe5f86f5",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "99",
+            "type": "directory",
+            "children": [
+              {
+                "name": "20e7d30babd9797c74ab2de25bdd13253fc02f",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "9b",
+            "type": "directory",
+            "children": [
+              {
+                "name": "c707c99ed517325e6eb60ff2ae41948d732e2d",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "a6",
+            "type": "directory",
+            "children": [
+              {
+                "name": "f558681ae91a1450d700e3e56b9f6e8c6a0f25",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "c9",
+            "type": "directory",
+            "children": [
+              {
+                "name": "d3a480cfc15f2fee5ed7f9b4f6742bec7a6241",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "d4",
+            "type": "directory",
+            "children": [
+              {
+                "name": "55c97402b6245234cd054ea1e66b0e2ff3ef62",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "e1",
+            "type": "directory",
+            "children": [
+              {
+                "name": "dcbb78371ba099f59166d26ad17c235c7172dc",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "info",
+            "type": "directory",
+            "children": [
+              {
+                "name": "commit-graph",
+                "type": "file"
+              },
+              {
+                "name": "packs",
+                "type": "file"
+              }
+            ]
+          },
+          {
+            "name": "pack",
+            "type": "directory",
+            "children": [
+              {
+                "name": "multi-pack-index",
+                "type": "file"
+              },
+              {
+                "name": "pack-68007e6ae7a5e8129ac017c4358754c44b412c4b.idx",
+                "type": "file"
+              },
+              {
+                "name": "pack-68007e6ae7a5e8129ac017c4358754c44b412c4b.mtimes",
+                "type": "file"
+              },
+              {
+                "name": "pack-68007e6ae7a5e8129ac017c4358754c44b412c4b.pack",
+                "type": "file"
+              },
+              {
+                "name": "pack-68007e6ae7a5e8129ac017c4358754c44b412c4b.rev",
+                "type": "file"
+              },
+              {
+                "name": "pack-e375cadd7f2f629b391cc9b7e18e04bbf2fcb1ca.idx",
+                "type": "file"
+              },
+              {
+                "name": "pack-e375cadd7f2f629b391cc9b7e18e04bbf2fcb1ca.pack",
+                "type": "file"
+              },
+              {
+                "name": "pack-e375cadd7f2f629b391cc9b7e18e04bbf2fcb1ca.rev",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_0A7BAl",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_0C0if2",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_0Fjmii",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_0eMRib",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_0nICJM",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_1SUEGk",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_1rqxYE",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_1trUBp",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_1vfg8z",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_2jUtnP",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_2tW3xG",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_2u7vb2",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_3jPpu8",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_47Nbab",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_48EbnN",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_4Nk6vj",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_4X3OhN",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_4XRGj3",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_4ZtgFa",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_4oCxZh",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_4sQkWf",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_51x0mW",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_5MqYM6",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_62RKf6",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_6NYJJ1",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_6RscXH",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_6hWYvk",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_6o3IL3",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_7BdnZg",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_7fUFrO",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_7gK4LJ",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_834OhM",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_94wkPD",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_9W8Y83",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_A7fnKj",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_AmQKb9",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_AxFYW9",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_BvnsXB",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_CXddmp",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_CqLDMc",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_DFwjgp",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_DIQaJ0",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_DMoDYp",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_DpFTBt",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_DuKCyW",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_E67Um2",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_EMksud",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_ENKvfu",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_Elm0tz",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_EwYfwD",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_FWaQgu",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_Ft5OaB",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_GCe491",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_GKFxpu",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_GXWe11",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_HUqkA7",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_IFHlyf",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_J5ZTqm",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_JHLyl9",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_JMjlwk",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_JrSCkj",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_JxWWqO",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_KRNczV",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_KSUpXy",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_KwLJI9",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_LR6jsm",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_LZwJ3y",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_LbDoRY",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_LdlZeB",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_LiBJNu",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_MiQMZU",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_Mpg9j2",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_MrR3Cz",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_N3EWSM",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_NN62aY",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_NQvu2X",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_NYHbxa",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_NkQqAS",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_P9Bb7b",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_PDDibR",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_PVAXVZ",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_PcZL5r",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_PrOOLX",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_SCvS93",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_SExOLp",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_SSpxpD",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_Sf7aIy",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_SmPxbD",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_TJ3pJ2",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_Tf8jcZ",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_TjoPvW",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_TlEkOc",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_TlO1yg",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_UBWb8t",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_UEHx3y",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_UN6dF9",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_Ur8E7q",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_VHJpMP",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_Vit0B7",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_XFcEug",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_Xvaa7c",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_Y32l9C",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_aSlHr1",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_bbuInK",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_bdsIi6",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_bhH7pk",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_bkRH8m",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_bloOoz",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_d5Cyoc",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_dovxn6",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_du51V0",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_eGttPo",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_eMdUCY",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_eX2WfP",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_epqZiA",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_exBQkX",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_f3Prgy",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_fJIjXQ",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_fpF2kP",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_gJVJM7",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_hhCHEe",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_hhlzeR",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_j7DHcS",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_jBHAIl",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_jNUDXj",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_jtbuBr",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_k1JzN5",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_kVWf31",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_lG8cam",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_lGX7zV",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_lYNOys",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_lyZaDx",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_m4El28",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_mTQvI9",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_mX4PRb",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_mi5YzA",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_nk0aca",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_ocGX5n",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_ogkrju",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_ognnNw",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_p46nHi",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_pGEIDx",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_pLm7UL",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_pneNLz",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_qClWvU",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_qWVSe1",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_r0oiVr",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_rbfD7U",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_rgj33M",
+                "type": "file"
+              },
+              {
+                "name": "tmp_pack_rgmvKD",
+                "
+
+[…truncated 9912236 chars — raise BridgeOptions.maxResultChars, or call the tool with a narrower scope (filter, head, pagination)…]
+
+ "name": "world.air.patched.ll",
+            "type": "file"
+          },
+          {
+            "name": "world.ll",
+            "type": "file"
+          },
+          {
+            "name": "world.metal",
+            "type": "file"
+          },
+          {
+            "name": "world.metallib",
+            "type": "file"
+          },
+          {
+            "name": "world_stats_baseline.json",
+            "type": "file"
+          },
+          {
+            "name": "world_stats_current.json",
+            "type": "file"
+          },
+          {
+            "name": "world_stats_patched.json",
+            "type": "file"
+          }
+        ]
+      },
+      {
+        "name": "shader_register_audit.sh",
+        "type": "file"
+      },
+      {
+        "name": "stage_baseq3.sh",
+        "type": "file"
+      }
+    ]
+  },
+  {
+    "name": "trace_dump.txt",
+    "type": "file"
+  },
+  {
+    "name": "ui",
+    "type": "directory",
+    "children": [
+      {
+        "name": "menudef.h",
+        "type": "file"
+      }
+    ]
+  }
+]

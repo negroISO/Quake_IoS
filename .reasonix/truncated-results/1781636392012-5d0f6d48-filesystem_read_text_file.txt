@@ -1,0 +1,587 @@
+entityAdditiveFullDesc.depthAttachmentPixelFormat = view.depthStencilPixelFormat
+            entityAdditiveFullDesc.vertexFunction = library.makeFunction(name: "q3_entity_vertex")
+            entityAdditiveFullDesc.fragmentFunction = library.makeFunction(name: "q3_entity_fragment")
+            entityAdditiveFullDesc.label = "Q3.entity.additiveFull"
+            do {
+                entityAdditiveFullPipelineState = try device.makeRenderPipelineState(descriptor: entityAdditiveFullDesc)
+            } catch {
+                print("[Metal] Failed to create additive-full entity pipeline: \\(error)")
+            }
+
+            let entityAlphaDesc = MTLRenderPipelineDescriptor()
+            entityAlphaDesc.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            entityAlphaDesc.colorAttachments[0].isBlendingEnabled = true
+            entityAlphaDesc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+            entityAlphaDesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+            entityAlphaDesc.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+            entityAlphaDesc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            entityAlphaDesc.depthAttachmentPixelFormat = view.depthStencilPixelFormat
+            entityAlphaDesc.vertexFunction = library.makeFunction(name: "q3_entity_vertex")
+            entityAlphaDesc.fragmentFunction = library.makeFunction(name: "q3_entity_fragment")
+            entityAlphaDesc.label = "Q3.entity.alpha"
+            do {
+                entityAlphaPipelineState = try device.makeRenderPipelineState(descriptor: entityAlphaDesc)
+            } catch {
+                print("[Metal] Failed to create alpha entity pipeline: \\(error)")
+            }
+
+            let entityFilterDesc = MTLRenderPipelineDescriptor()
+            entityFilterDesc.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            entityFilterDesc.colorAttachments[0].isBlendingEnabled = true
+            entityFilterDesc.colorAttachments[0].writeMask = .all
+            entityFilterDesc.colorAttachments[0].rgbBlendOperation = .add
+            entityFilterDesc.colorAttachments[0].alphaBlendOperation = .add
+            entityFilterDesc.colorAttachments[0].sourceRGBBlendFactor = .destinationColor
+            entityFilterDesc.colorAttachments[0].destinationRGBBlendFactor = .zero
+            entityFilterDesc.colorAttachments[0].sourceAlphaBlendFactor = .one
+            entityFilterDesc.colorAttachments[0].destinationAlphaBlendFactor = .zero
+            entityFilterDesc.depthAttachmentPixelFormat = view.depthStencilPixelFormat
+            entityFilterDesc.vertexFunction = library.makeFunction(name: "q3_entity_vertex")
+            entityFilterDesc.fragmentFunction = library.makeFunction(name: "q3_entity_fragment")
+            entityFilterDesc.label = "Q3.entity.filter"
+            do {
+                entityFilterPipelineState = try device.makeRenderPipelineState(descriptor: entityFilterDesc)
+            } catch {
+                print("[Metal] Failed to create filter entity pipeline: \\(error)")
+            }
+
+            // Subtract (GL_ZERO / GL_ONE_MINUS_SRC_COLOR) — out = dst * (1 - src).
+            // Used by blood marks, bullet marks, burn marks, markShadow.
+            // Dark-valued source bytes darken the destination without
+            // replacing it. Without this pipeline, those decals were
+            // falling through to additive which made them invisible
+            // against lit stone/metal surfaces.
+            let entitySubtractDesc = MTLRenderPipelineDescriptor()
+            entitySubtractDesc.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            entitySubtractDesc.colorAttachments[0].isBlendingEnabled = true
+            entitySubtractDesc.colorAttachments[0].writeMask = .all
+            entitySubtractDesc.colorAttachments[0].rgbBlendOperation = .add
+            entitySubtractDesc.colorAttachments[0].alphaBlendOperation = .add
+            entitySubtractDesc.colorAttachments[0].sourceRGBBlendFactor = .zero
+            entitySubtractDesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceColor
+            /* Alpha: write source alpha straight through (one/zero).
+             * Previously used oneMinusSourceAlpha which is a
+             * premultiplied-alpha idiom — inappropriate here. */
+            entitySubtractDesc.colorAttachments[0].sourceAlphaBlendFactor = .one
+            entitySubtractDesc.colorAttachments[0].destinationAlphaBlendFactor = .zero
+            entitySubtractDesc.depthAttachmentPixelFormat = view.depthStencilPixelFormat
+            entitySubtractDesc.vertexFunction = library.makeFunction(name: "q3_entity_vertex")
+            entitySubtractDesc.fragmentFunction = library.makeFunction(name: "q3_entity_fragment")
+            entitySubtractDesc.label = "Q3.entity.subtract"
+            do {
+                entitySubtractPipelineState = try device.makeRenderPipelineState(descriptor: entitySubtractDesc)
+            } catch {
+                print("[Metal] Failed to create subtract entity pipeline: \\(error)")
+            }
+
+            // Depth state for additive entities — read but no write
+            let additiveEntityDepthDesc = MTLDepthStencilDescriptor()
+            additiveEntityDepthDesc.depthCompareFunction = .lessEqual
+            additiveEntityDepthDesc.isDepthWriteEnabled = false
+            additiveEntityDepthStencilState = device.makeDepthStencilState(descriptor: additiveEntityDepthDesc)
+
+            // Always-pass depth for multi-scene HUD sub-scenes
+            let alwaysPassDesc = MTLDepthStencilDescriptor()
+            alwaysPassDesc.depthCompareFunction = .always
+            alwaysPassDesc.isDepthWriteEnabled = false
+            alwaysPassDepthStencilState = device.makeDepthStencilState(descriptor: alwaysPassDesc)
+
+            let uiSamplerDescriptor = MTLSamplerDescriptor()
+            uiSamplerDescriptor.minFilter = .linear
+            uiSamplerDescriptor.magFilter = .linear
+            uiSamplerDescriptor.sAddressMode = .clampToEdge
+            uiSamplerDescriptor.tAddressMode = .clampToEdge
+            uiSamplerState = device.makeSamplerState(descriptor: uiSamplerDescriptor)
+
+            let worldSamplerDescriptor = MTLSamplerDescriptor()
+            worldSamplerDescriptor.minFilter = .linear
+            worldSamplerDescriptor.magFilter = .linear
+            worldSamplerDescriptor.sAddressMode = .repeat
+            worldSamplerDescriptor.tAddressMode = .repeat
+            worldSamplerState = device.makeSamplerState(descriptor: worldSamplerDescriptor)
+
+            let depthDescriptor = MTLDepthStencilDescriptor()
+            depthDescriptor.isDepthWriteEnabled = true
+            depthDescriptor.depthCompareFunction = .lessEqual
+            depthStencilState = device.makeDepthStencilState(descriptor: depthDescriptor)
+
+            let sunShadowDepthDescriptor = MTLDepthStencilDescriptor()
+            sunShadowDepthDescriptor.isDepthWriteEnabled = true
+            sunShadowDepthDescriptor.depthCompareFunction = .lessEqual
+            sunShadowDepthStencilState = device.makeDepthStencilState(descriptor: sunShadowDepthDescriptor)
+
+            let additiveDepthDescriptor = MTLDepthStencilDescriptor()
+            additiveDepthDescriptor.isDepthWriteEnabled = false
+            additiveDepthDescriptor.depthCompareFunction = .lessEqual
+            additiveDepthStencilState = device.makeDepthStencilState(descriptor: additiveDepthDescriptor)
+
+            let fogEqualDepthDescriptor = MTLDepthStencilDescriptor()
+            fogEqualDepthDescriptor.isDepthWriteEnabled = false
+            fogEqualDepthDescriptor.depthCompareFunction = .equal
+            fogEqualDepthStencilState = device.makeDepthStencilState(descriptor: fogEqualDepthDescriptor)
+
+            let additiveLessDepthDescriptor = MTLDepthStencilDescriptor()
+            additiveLessDepthDescriptor.isDepthWriteEnabled = false
+            /* WAS .less — caused the powerups/quadWeapon chrome shell (and
+             * all other shell-shader entities: powerups/quad, regen,
+             * battlesuit, battleWeapon) to fail the depth test against
+             * the underlying model. Sequence: (1) gun renders with depth
+             * write → writes depth Z at gun surface; (2) chrome shell
+             * renders with deformWave +0.5 unit offset → vertex shader
+             * pushes shell verts toward camera; (3) under RF_DEPTHHACK
+             * (which compresses the viewmodel's depth range to a tiny
+             * near-z slice via viewport zRange / depth bias), the
+             * 0.5-world-unit deform offset projects to *the same NDC
+             * depth* as the gun surface; (4) `.less` requires strictly
+             * less → equal-z FAILS → chrome rejected, invisible.
+             * PC Q3 uses GL_LEQUAL for blend passes (ioq3 default
+             * GLS_DEPTHFUNC_LEQUAL) so equal-z passes through. Matching
+             * that fixes the chrome-shell invisibility while still
+             * preventing additive effects from drawing through closer
+             * solid geometry. Diff confirmed via /tmp/metalshader.log
+             * QUAD-EMIT trace: chrome shell IS emitted every frame with
+             * blendMode=5 ADDITIVE_FULL, tcGenEnv=1, deformWaveFunc=1
+             * — all flags correct, only depth compare was rejecting it. */
+            additiveLessDepthDescriptor.depthCompareFunction = .lessEqual
+            additiveLessDepthStencilState = device.makeDepthStencilState(descriptor: additiveLessDepthDescriptor)
+
+            // Depth-hack state for first-person viewmodel (STEP 8).
+            // Q3's depth-hack trick compresses the weapon's depth range so
+            // the gun isn't clipped by walls. Depth TEST still runs with
+            // .lessEqual so the model's OWN parts occlude each other
+            // correctly; the previous .always disabled the test entirely,
+            // which broke self-occlusion inside the weapon mesh (e.g.
+            // barrel showing through the gun body).
+            let depthHackDescriptor = MTLDepthStencilDescriptor()
+            depthHackDescriptor.isDepthWriteEnabled = true
+            depthHackDescriptor.depthCompareFunction = .lessEqual
+            depthHackDepthStencilState = device.makeDepthStencilState(descriptor: depthHackDescriptor)
+        }
+
+        private func uploadVertices(_ vertices: UnsafeBufferPointer<Q3MetalVertex>, device: MTLDevice?) -> MTLBuffer? {
+            guard let device else { return nil }
+
+            let requiredLength = vertices.count * MemoryLayout<GPUVertex>.stride
+            if requiredLength == 0 {
+                return nil
+            }
+
+            if vertexBuffer == nil || requiredLength > vertexBufferCapacity {
+                let nextCapacity = max(requiredLength, max(vertexBufferCapacity * 2, 4096))
+                vertexBuffer = device.makeBuffer(length: nextCapacity, options: .storageModeShared)
+                vertexBuffer?.label = "Q3.vb.ui"
+                vertexBufferCapacity = nextCapacity
+            }
+
+            guard let vertexBuffer, let rawPointer = vertexBuffer.contents().bindMemory(to: GPUVertex.self, capacity: vertices.count) as UnsafeMutablePointer<GPUVertex>? else {
+                return nil
+            }
+
+            for i in 0..<vertices.count {
+                let vertex = vertices[i]
+                rawPointer[i] = GPUVertex(
+                    position: SIMD2<Float>(vertex.position.0, vertex.position.1),
+                    texCoord: SIMD2<Float>(vertex.texCoord.0, vertex.texCoord.1),
+                    color: SIMD4<Float>(vertex.color.0, vertex.color.1, vertex.color.2, vertex.color.3)
+                )
+            }
+
+            return vertexBuffer
+        }
+
+        private func uploadWorldBuffers(device: MTLDevice?, generation: UInt32) -> MTLBuffer? {
+            guard let device,
+                  let verticesPointer = Q3MetalRenderer_GetWorldVertices(),
+                  let indicesPointer = Q3MetalRenderer_GetWorldIndices(),
+                  let snapshot = Q3MetalRenderer_GetFrameSnapshot()?.pointee
+            else { return nil }
+
+            if cachedWorldGeneration == generation, let worldVertexBuffer {
+                let neededIndexBytes = Int(snapshot.worldIndexCount) * MemoryLayout<UInt32>.stride
+                if worldIndexBuffer?.length ?? 0 >= neededIndexBytes {
+                    return worldVertexBuffer
+                }
+                // Buffer too small for current map (e.g. nv15 needs 3MB, q3dm1 only 200KB).
+                // Fall through to re-allocate.
+            }
+
+            let vertexCount = Int(snapshot.worldVertexCount)
+            let indexCount = Int(snapshot.worldIndexCount)
+            guard vertexCount > 0, indexCount > 0 else { return nil }
+
+            let sourceVertices = UnsafeBufferPointer(start: verticesPointer, count: vertexCount)
+            var gpuVertices = [GPUWorldVertex]()
+            gpuVertices.reserveCapacity(vertexCount)
+            for vertex in sourceVertices {
+                    gpuVertices.append(
+                        GPUWorldVertex(
+                            position: SIMD3<Float>(vertex.position.0, vertex.position.1, vertex.position.2),
+                            texCoord: SIMD2<Float>(vertex.texCoord.0, vertex.texCoord.1),
+                            lightmapTexCoord: SIMD2<Float>(vertex.lightmapTexCoord.0, vertex.lightmapTexCoord.1),
+                            normal: SIMD3<Float>(vertex.normal.0, vertex.normal.1, vertex.normal.2),
+                            color: SIMD4<Float>(vertex.color.0, vertex.color.1, vertex.color.2, vertex.color.3),
+                            autospriteCenter: SIMD4<Float>(
+                                vertex.autospriteCenter.0,
+                                vertex.autospriteCenter.1,
+                                vertex.autospriteCenter.2,
+                                vertex.autospriteCenter.3),
+                            autospriteLongAxis: SIMD4<Float>(
+                                vertex.autospriteLongAxis.0,
+                                vertex.autospriteLongAxis.1,
+                                vertex.autospriteLongAxis.2,
+                                vertex.autospriteLongAxis.3),
+                            lightingDiffuse: SIMD3<Float>(
+                                vertex.lightingDiffuse.0,
+                                vertex.lightingDiffuse.1,
+                                vertex.lightingDiffuse.2)
+                        )
+                    )
+                }
+
+            let sourceIndices = UnsafeBufferPointer(start: indicesPointer, count: indexCount)
+            guard let sourceIndexBase = sourceIndices.baseAddress else {
+                return nil
+            }
+            worldVertexBuffer = device.makeBuffer(
+                bytes: gpuVertices,
+                length: gpuVertices.count * MemoryLayout<GPUWorldVertex>.stride,
+                options: .storageModeShared
+            )
+            worldVertexBuffer?.label = "Q3.vb.world"
+            worldIndexBuffer = device.makeBuffer(
+                bytes: sourceIndexBase,
+                length: sourceIndices.count * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared
+            )
+            worldIndexBuffer?.label = "Q3.ib.world"
+            cachedWorldGeneration = generation
+            worldAccelerationStructure = nil
+            worldASBuilt = false
+            worldASGeneration = 0
+            // Purge PBR texture caches on map change — the previous map's
+            // 3840x3840 PBR textures consume ~2.2 GB alone; without this,
+            // switching maps accumulates textures until iOS kills the app
+            // at its ~3.3 GB memory limit (EXC_RESOURCE MEMORY).
+            pbrAlbedoCache.removeAll(keepingCapacity: false)
+            pbrNormalCache.removeAll(keepingCapacity: false)
+            pbrRoughnessCache.removeAll(keepingCapacity: false)
+            pbrMetallicCache.removeAll(keepingCapacity: false)
+            pbrEmissiveCache.removeAll(keepingCapacity: false)
+            pbrHeightCache.removeAll(keepingCapacity: false)
+            pbrTriedAndMissed.removeAll(keepingCapacity: false)
+            entityAtlasAlbedoCache.removeAll(keepingCapacity: false)
+            entityAtlasIsCaptureCache.removeAll(keepingCapacity: false)
+            entityAtlasAlbedoMissed.removeAll(keepingCapacity: false)
+            pbrEmissiveTried.removeAll(keepingCapacity: false)
+            pbrHeightTried.removeAll(keepingCapacity: false)
+            loggedParallaxHandles.removeAll(keepingCapacity: false)
+            textureCache.removeAll(keepingCapacity: false)
+            rtASVertexBuffer = nil
+            rtASIndexBuffer = nil
+            return worldVertexBuffer
+        }
+
+        private func uploadEntityBuffers(device: MTLDevice?) -> MTLBuffer? {
+            guard let device,
+                  let snapshot = Q3MetalRenderer_GetFrameSnapshot()?.pointee,
+                  let verticesPointer = Q3MetalRenderer_GetEntityVertices(),
+                  let indicesPointer = Q3MetalRenderer_GetEntityIndices()
+            else { return nil }
+
+            let vertexCount = Int(snapshot.entityVertexCount)
+            let indexCount = Int(snapshot.entityIndexCount)
+            guard vertexCount > 0, indexCount > 0 else { return nil }
+
+            let vertexLength = vertexCount * MemoryLayout<GPUEntityVertex>.stride
+            if entityVertexBuffer == nil || vertexLength > entityVertexBufferCapacity {
+                let nextCapacity = max(vertexLength, max(entityVertexBufferCapacity * 2, 4096))
+                entityVertexBuffer = device.makeBuffer(length: nextCapacity, options: .storageModeShared)
+                entityVertexBuffer?.label = "Q3.vb.entity"
+                entityVertexBufferCapacity = nextCapacity
+            }
+
+            guard let entityVertexBuffer,
+                  let rawVertexPointer = entityVertexBuffer.contents().bindMemory(to: GPUEntityVertex.self, capacity: vertexCount) as UnsafeMutablePointer<GPUEntityVertex>?
+            else {
+                return nil
+            }
+
+            let sourceVertices = UnsafeBufferPointer(start: verticesPointer, count: vertexCount)
+            for i in 0..<vertexCount {
+                let vertex = sourceVertices[i]
+                rawVertexPointer[i] = GPUEntityVertex(
+                    position: SIMD3<Float>(vertex.position.0, vertex.position.1, vertex.position.2),
+                    texCoord: SIMD2<Float>(vertex.texCoord.0, vertex.texCoord.1),
+                    color: SIMD4<Float>(vertex.color.0, vertex.color.1, vertex.color.2, vertex.color.3),
+                    normal: SIMD3<Float>(vertex.normal.0, vertex.normal.1, vertex.normal.2)
+                )
+            }
+
+            let indexLength = indexCount * MemoryLayout<UInt32>.stride
+            if entityIndexBuffer == nil || indexLength > entityIndexBufferCapacity {
+                let nextCapacity = max(indexLength, max(entityIndexBufferCapacity * 2, 4096))
+                entityIndexBuffer = device.makeBuffer(length: nextCapacity, options: .storageModeShared)
+                entityIndexBuffer?.label = "Q3.ib.entity"
+                entityIndexBufferCapacity = nextCapacity
+            }
+
+            guard let entityIndexBuffer,
+                  let rawIndexPointer = entityIndexBuffer.contents().bindMemory(to: UInt32.self, capacity: indexCount) as UnsafeMutablePointer<UInt32>?
+            else {
+                return nil
+            }
+
+            let sourceIndices = UnsafeBufferPointer(start: indicesPointer, count: indexCount)
+            for i in 0..<indexCount {
+                rawIndexPointer[i] = sourceIndices[i]
+            }
+
+            return entityVertexBuffer
+        }
+
+        private func texture(for handle: UInt32, device: MTLDevice?) -> MTLTexture? {
+            guard let device else { return nil }
+
+            var info = Q3MetalTextureInfo()
+            guard Q3MetalRenderer_GetTextureInfo(handle, &info) != 0,
+                  let rgbaBytes = info.rgbaBytes
+            else {
+                return nil
+            }
+
+            guard info.width > 0, info.height > 0 else {
+                return nil
+            }
+
+            if let cached = textureCache[handle], cached.generation == info.generation {
+                return cached.texture
+            }
+
+            let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .rgba8Unorm,
+                width: Int(info.width),
+                height: Int(info.height),
+                mipmapped: false
+            )
+            descriptor.usage = .shaderRead
+
+            guard let texture = device.makeTexture(descriptor: descriptor) else {
+                return nil
+            }
+            if let namePtr = Q3MetalRenderer_GetTextureName(handle) {
+                let name = String(cString: namePtr)
+                texture.label = name.isEmpty ? "Q3.tex.\(handle)" : "Q3.tex.\(handle):\(name)"
+            } else {
+                texture.label = "Q3.tex.\(handle)"
+            }
+
+            let bytesPerRow = Int(info.width) * 4
+            texture.replace(
+                region: MTLRegionMake2D(0, 0, Int(info.width), Int(info.height)),
+                mipmapLevel: 0,
+                withBytes: rgbaBytes,
+                bytesPerRow: bytesPerRow
+            )
+
+            textureCache[handle] = (generation: info.generation, texture: texture)
+            return texture
+        }
+
+        private func makeOrthoProjection(width: Float, height: Float) -> simd_float4x4 {
+            simd_float4x4(columns: (
+                SIMD4<Float>(2.0 / width, 0, 0, 0),
+                SIMD4<Float>(0, -2.0 / height, 0, 0),
+                SIMD4<Float>(0, 0, 1, 0),
+                SIMD4<Float>(-1, 1, 0, 1)
+            ))
+        }
+
+        private func makeSunShadowOrtho(width: Float, height: Float, near: Float, far: Float) -> simd_float4x4 {
+            let depth = max(far - near, 1.0)
+            return simd_float4x4(columns: (
+                SIMD4<Float>(2.0 / max(width, 1.0), 0, 0, 0),
+                SIMD4<Float>(0, 2.0 / max(height, 1.0), 0, 0),
+                SIMD4<Float>(0, 0, 1.0 / depth, 0),
+                SIMD4<Float>(0, 0, -near / depth, 1)
+            ))
+        }
+
+        private func makeSunShadowViewProjection(center: SIMD3<Float>, sunDir rawSunDir: SIMD3<Float>) -> simd_float4x4 {
+            let sunDirLen = simd_length(rawSunDir)
+            let sunDir = sunDirLen > 1e-4 ? rawSunDir / sunDirLen : SIMD3<Float>(0.3, 0.5, 0.7)
+            let forward = -sunDir
+            let upHint: SIMD3<Float> = abs(simd_dot(forward, SIMD3<Float>(0, 0, 1))) > 0.92
+                ? SIMD3<Float>(0, 1, 0)
+                : SIMD3<Float>(0, 0, 1)
+            let right = simd_normalize(simd_cross(upHint, forward))
+            let up = simd_normalize(simd_cross(forward, right))
+            let span: Float = 4096.0
+            let depth: Float = 8192.0
+            let eye = center + sunDir * (depth * 0.5)
+            let view = simd_float4x4(columns: (
+                SIMD4<Float>(right.x, up.x, forward.x, 0),
+                SIMD4<Float>(right.y, up.y, forward.y, 0),
+                SIMD4<Float>(right.z, up.z, forward.z, 0),
+                SIMD4<Float>(-simd_dot(eye, right), -simd_dot(eye, up), -simd_dot(eye, forward), 1)
+            ))
+            return makeSunShadowOrtho(width: span, height: span, near: 1.0, far: depth) * view
+        }
+
+        private func ensureSunShadowTexture(device: MTLDevice, size: Int = 512) -> MTLTexture? {
+            if let tex = sunShadowTexture,
+               sunShadowTextureSize.width == size,
+               sunShadowTextureSize.height == size {
+                return tex
+            }
+            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float,
+                                                                width: size,
+                                                                height: size,
+                                                                mipmapped: false)
+            desc.usage = [.renderTarget, .shaderRead]
+            desc.storageMode = .private
+            guard let tex = device.makeTexture(descriptor: desc) else { return nil }
+            tex.label = "Q3.sun.shadow.depth"
+            sunShadowTexture = tex
+            sunShadowTextureSize = MTLSize(width: size, height: size, depth: 1)
+            return tex
+        }
+
+        private func ensureSunShadowDummyTexture(device: MTLDevice) -> MTLTexture? {
+            if let tex = sunShadowDummyTexture { return tex }
+            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float,
+                                                                width: 1,
+                                                                height: 1,
+                                                                mipmapped: false)
+            desc.usage = .shaderRead
+            desc.storageMode = .shared
+            guard let tex = device.makeTexture(descriptor: desc) else { return nil }
+            var one: Float = 1.0
+            withUnsafeBytes(of: &one) { bytes in
+                tex.replace(region: MTLRegionMake2D(0, 0, 1, 1),
+                            mipmapLevel: 0,
+                            withBytes: bytes.baseAddress!,
+                            bytesPerRow: 4)
+            }
+            tex.label = "Q3.sun.shadow.depth.dummy"
+            sunShadowDummyTexture = tex
+            return tex
+        }
+
+        private func encodeSunShadowMap(commandBuffer: MTLCommandBuffer,
+                                        device: MTLDevice,
+                                        snapshot: Q3MetalFrameSnapshot,
+                                        sceneView: Q3MetalSceneView) -> (texture: MTLTexture, matrix: simd_float4x4)? {
+            guard Q3_PBRSunShadows() != 0,
+                  Q3_RTMix() <= 0.001,
+                  snapshot.worldCommandCount > 0,
+                  let pipeline = sunShadowPipelineState,
+                  let depthState = sunShadowDepthStencilState,
+                  let shadowTexture = ensureSunShadowTexture(device: device),
+                  let worldVertexBuffer = uploadWorldBuffers(device: device, generation: snapshot.worldGeneration),
+                  let worldIndexBuffer,
+                  let drawsPtr = Q3MetalRenderer_GetWorldDrawCommands() else {
+                return nil
+            }
+            _ = ensureRTLightBuffer(device: device)
+            guard rtLightCount > 0,
+                  let sun = rtLightsCPU.first,
+                  sun.dirType.w == 0 else {
+                return nil
+            }
+            let center = SIMD3<Float>(sceneView.viewOrigin.0, sceneView.viewOrigin.1, sceneView.viewOrigin.2)
+            let sunDir = SIMD3<Float>(sun.dirType.x, sun.dirType.y, sun.dirType.z)
+            let shadowMatrix = makeSunShadowViewProjection(center: center, sunDir: sunDir)
+            let pass = MTLRenderPassDescriptor()
+            pass.depthAttachment.texture = shadowTexture
+            pass.depthAttachment.loadAction = .clear
+            pass.depthAttachment.storeAction = .store
+            pass.depthAttachment.clearDepth = 1.0
+            guard let enc = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else { return nil }
+            enc.label = "Q3.sun.shadow"
+            enc.setViewport(MTLViewport(originX: 0, originY: 0,
+                                        width: Double(shadowTexture.width),
+                                        height: Double(shadowTexture.height),
+                                        znear: 0, zfar: 1))
+            enc.setRenderPipelineState(pipeline)
+            enc.setDepthStencilState(depthState)
+            enc.setFrontFacing(.clockwise)
+            enc.setVertexBuffer(worldVertexBuffer, offset: 0, index: 0)
+            var shadowUniforms = WorldUniforms(viewProjection: shadowMatrix,
+                                               cameraPos: center,
+                                               cameraRight: SIMD3<Float>(1, 0, 0),
+                                               cameraUp: SIMD3<Float>(0, 0, 1))
+            shadowUniforms.sunDir = sunDir
+            shadowUniforms.sunIntensity = sun.colorIntensity.w
+            shadowUniforms.sunColor = SIMD4<Float>(sun.colorIntensity.x, sun.colorIntensity.y, sun.colorIntensity.z, 1)
+            enc.setVertexBytes(&shadowUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
+
+            let draws = UnsafeBufferPointer(start: drawsPtr, count: Int(snapshot.worldCommandCount))
+            let skyFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
+            let fogOnlyBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY)
+            var castDraws = 0
+            for draw in draws {
+                if draw.indexCount == 0 || (draw.flags & skyFlagBit) != 0 || (draw.flags & fogOnlyBit) != 0 { continue }
+                let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+                if stageCount <= 0 { continue }
+                var castStage: Q3MetalWorldStage? = nil
+                for i in 0..<stageCount {
+                    let st = Self.worldStage(draw, i)
+                    if st.useLightmap == 0 && Self.worldRenderPass(for: st) == 0 {
+                        castStage = st
+                        break
+                    }
+                }
+                guard let stage = castStage else { continue }
+                let (tv0, tv1) = Self.tcGenVectors(stage)
+                var drawUniforms = WorldDrawUniforms(
+                    tcGen: Float(stage.tcGen),
+                    tcModCount: 0,
+                    rgbGen: Float(stage.rgbGen),
+                    alphaGen: Float(stage.alphaGen),
+                    blendMode: 0,
+                    timeSeconds: snapshot.shaderTime,
+                    rgbWaveFunc: stage.rgbWaveFunc,
+                    alphaWaveFunc: stage.alphaWaveFunc,
+                    tcModType: SIMD4<Float>(0, 0, 0, 0),
+                    tcModParams0: SIMD4<Float>(0, 0, 0, 0),
+                    tcModParams1: SIMD4<Float>(0, 0, 0, 0),
+                    tcModParams2: SIMD4<Float>(0, 0, 0, 0),
+                    tcModParams3: SIMD4<Float>(0, 0, 0, 0),
+                    rgbWaveParams: SIMD4(stage.rgbWaveBase, stage.rgbWaveAmp, stage.rgbWavePhase, stage.rgbWaveFreq),
+                    alphaWaveParams: SIMD4(stage.alphaWaveBase, stage.alphaWaveAmp, stage.alphaWavePhase, stage.alphaWaveFreq),
+                    rgbConstColor: SIMD4(stage.rgbConstColor.0, stage.rgbConstColor.1, stage.rgbConstColor.2, stage.alphaConst),
+                    entityColor: SIMD4(1, 1, 1, 1),
+                    fogColorDistance: SIMD4<Float>(0, 0, 0, 0),
+                    tcGenVec0: tv0,
+                    tcGenVec1: tv1,
+                    deformWaveFunc: stage.deformWaveFunc,
+                    deformWaveDiv: stage.deformWaveDiv != 0 ? stage.deformWaveDiv : 1.0,
+           
+
+[…truncated 32942 chars — raise BridgeOptions.maxResultChars, or call the tool with a narrower scope (filter, head, pagination)…]
+
+        case .keyboardF10: return 154
+        case .keyboardF11: return 155
+        case .keyboardF12: return 156
+        case .keyboardGraveAccentAndTilde: return 96
+        default:
+            // Fallback: trust the produced character. Some keyboard
+            // layouts route DEL/BS through a keyCode that doesn't
+            // match `.keyboardDeleteOrBackspace` — catch the actual
+            // 0x7F (DEL) or 0x08 (BS) character and route both to
+            // K_BACKSPACE.
+            if let ch = key.charactersIgnoringModifiers.first,
+               let asc = ch.asciiValue {
+                if asc == 0x7F || asc == 0x08 { return 127 }
+                if asc >= 32 && asc < 127 {
+                    // Printable ASCII — Q3 uses lowercase for letter keys.
+                    if let lower = String(ch).lowercased().first?.asciiValue {
+                        return Int32(lower)
+                    }
+                    return Int32(asc)
+                }
+            }
+            return nil
+        }
+    }
+}

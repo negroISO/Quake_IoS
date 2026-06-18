@@ -1,0 +1,265 @@
+$ cat "/Users/targus/Downloads/screenshots/Build Quake3-iOS_2026-06-12T19-49-23.txt"
+[exit 0]
+
+Showing Recent Messages
+
+Prepare build
+
+ComputePackagePrebuildTargetDependencyGraph
+
+CreateBuildRequest
+
+SendProjectDescription
+
+CreateBuildOperation
+
+ComputeTargetDependencyGraph
+
+note: Building targets in dependency order
+note: Target dependency graph (1 target)
+    Target 'Quake3-iOS' in project 'Quake3-iOS' (no dependencies)
+
+Building targets in dependency order
+
+Target dependency graph (1 target)
+
+GatherProvisioningInputs
+
+ClangStatCache /Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang-stat-cache /Applications/Xcode-beta.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS27.0.sdk /Users/targus/Library/Developer/Xcode/DerivedData/SDKStatCaches.noindex/iphoneos27.0-24A5355p-802b3160ec225d8f0f354b513c6f7a32ab8728d0c5b464cc751fe8b4b02b9db3.sdkstatcache
+    cd /Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS.xcodeproj
+    /Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang-stat-cache /Applications/Xcode-beta.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS27.0.sdk -o /Users/targus/Library/Developer/Xcode/DerivedData/SDKStatCaches.noindex/iphoneos27.0-24A5355p-802b3160ec225d8f0f354b513c6f7a32ab8728d0c5b464cc751fe8b4b02b9db3.sdkstatcache
+
+PruneExplicitPrecompiledModules /Users/targus/Library/Developer/Xcode/DerivedData/Quake3-iOS-cckzitrudgsrphcnxezacbpdcsfh/Build/Intermediates.noindex/ExplicitPrecompiledModules
+
+PruneExplicitPrecompiledModules /Users/targus/Library/Developer/Xcode/DerivedData/Quake3-iOS-cckzitrudgsrphcnxezacbpdcsfh/Build/Intermediates.noindex/SwiftExplicitPrecompiledModules
+
+
+Build target Quake3-iOS of project Quake3-iOS with configuration Debug
+
+SwiftDriver Quake3-iOS normal arm64 com.apple.xcode.tools.swift.compiler (in target 'Quake3-iOS' from project 'Quake3-iOS')
+    cd /Users/targus/Documents/Quake_IoS_Phase9_Fork
+    builtin-SwiftDriver -- /Applications/Xcode-beta.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc -module-name Q3_RT -Onone @/Users/targus/Library/Developer/Xcode/DerivedData/Quake3-iOS-cckzitrudgsrphcnxezacbpdcsfh/Build/Intermediates.noindex/Quake3-iOS.build/Debug-iphoneos/Quake3-iOS.build/Objects-normal/arm64/Q3_RT.SwiftFileList -DDEBUG -enable-experimental-feature DebugDescriptionMacro -sdk /Applications/Xcode-beta.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS27.0.sdk -target arm64-apple-ios26.0 -g -module-cache-path /Users/targus/Library/Developer/Xcode/DerivedData/ModuleCache.noindex -Xfrontend -serialize-debugging-options -enable-testing -index-store-path /Users/targus/Library/Developer/Xcode/DerivedData/Quake3-iOS-cckzitrudgsrphcnxezacbpdcsfh/Index.noindex/DataStore -Xcc -D_LIBCPP_HARDENING_MODE\=_LIBCPP_HARDENING_MODE_DEBUG -swift-version 6 -I /Users/targus/Library/Developer/Xcode/DerivedData/Quake3-iOS-cckzitrudgsrphcnxezacbpdcsfh/Build/Products/Debug-iphoneos -F /Users/targus/Library/Developer/Xcode/DerivedData/Quake3-iOS-cckzitrudgsrphcnxezacbpdcsfh/Build/Products/Debug-iphoneos -c -j10 -enable-batch-mode -incremental -Xcc -ivfsstatcache -Xcc /Users/targus/Library/Developer/Xcode/DerivedData/SDKStatCaches.noindex/iphoneos27.0-24A5355p-802b3160ec225d8f0f354b513c6f7a32ab8728d0c5b464cc751fe8b4b02b9db3.sdkstatcache -output-file-map /Users/targus/Library/Developer/Xcode/DerivedData/Quake3-iOS-cckzitrudgsrphcnxezacbpdcsfh/Build/Intermediates.noindex/Quake3-iOS.build/Debug-iphoneos/Quake3-iOS.build/Objects-normal/arm64/Quake3-iOS-OutputFileMap.json -save-temps -no-color-diagnostics -explicit-module-build -module-cache-path /Users/targus/Library/Developer/Xcode/DerivedData/Quake3-iOS-cckzitrudgsrphcnxezacbpdcsfh/Build/Intermediates.noindex/SwiftExplicitPrecompiledModules -clang-scanner-module-cache-path /Users/targus/Library/Developer/Xcode/DerivedData/ModuleCache.noindex -sdk-module-cache-path /Users/targus/Library/Developer/Xcode/DerivedData/ModuleCache.noindex -emit-dependencies -emit-module -emit-module-path /Users/targus/Library/Developer/Xcode/DerivedData/Quake3-iOS-cckzitrudgsrphcnxezacbpdcsfh/Build/Intermediates.noindex/Quake3-iOS.build/Debug-iphoneos/Quake3-iOS.build/Objects-normal/arm64/Q3_RT.swiftmodule -serialize-diagnostics -dependency-scan-serialize-diagnostics-path /Users/targus/Library/Developer/Xcode/DerivedData/Quake3-iOS-cckzitrudgsrphcnxezacbpdcsfh/Build/Intermediates.noindex/Quake3-iOS.build/Debug-iphoneos/Quake3-iOS.build/Objects-normal/arm64/Q3_RT-dependency-scan.dia -validate-clang-modules-once -clang-build-session-file /Users/targus/Library/Developer/Xcode/DerivedData/ModuleCache.noindex/Session.modulevalidation -Xcc -fmodules-prune-interval\=86400 -Xcc -fmodules-prune-after\=345600 -emit-const-values -const-gather-protocols-list /Users/targus/Library/Developer/Xcode/DerivedData/Quake3-iOS-cckzitrudgsrphcnxezacbpdcsfh/Build/Intermediates.noindex/Quake3-iOS.build/Debug-iphoneos/Quake3-iOS.build/Objects-normal/arm64/Quake3-iOS_const_extract_protocols.json -Xcc -iquote -Xcc /Users/targus/Library/Developer/Xcode/DerivedData/Quake3-iOS-cckzitrudgsrphcnxezacbpdcsfh/Build/Intermediates.noindex/Quake3-iOS.build/Debug-iphoneos/Quake3-iOS.build/Q3_RT-generated-files.hmap -Xcc -I/Users/targus/Library/Developer/Xcode/DerivedData/Quake3-iOS-cckzitrudgsrphcnxezacbpdcsfh/Build/Intermediates.noindex/Quake3-iOS.build/Debug-iphoneos/Quake3-iOS.build/Q3_RT-own-target-headers.hmap -Xcc -I/Users/targus/Library/Developer/Xcode/DerivedData/Quake3-iOS-cckzitrudgsrphcnxezacbpdcsfh/Build/Intermediates.noindex/Quake3-iOS.build/Debug-iphoneos/Quake3-iOS.build/Q3_RT-all-target-headers.hmap -Xcc -iquote -Xcc /Users/targus/Library/Developer/Xcode/DerivedData/Quake3-iOS-cckzitrudgsrphcnxezacbpdcsfh/Build/Intermediates.noindex/Quake3-iOS.build/Debug-iphoneos/Quake3-iOS.build/Q3_RT-project-headers.hmap -Xcc -I/Users/targus/Library/Developer/Xcode/DerivedData/Quake3-iOS-cckzitrudgsrphcnxezacbpdcsfh/Build/Products/Debug-iphoneos/include -Xcc -I/Users/targus/Documents/Quake_IoS_Phase9_Fork/code -Xcc -I/Users/targus/Documents/Quake_IoS_Phase9_Fork/code/renderercommon -Xcc -I/Users/targus/Documents/Quake_IoS_Phase9_Fork/code/renderervk -Xcc -I/Users/targus/Documents/Quake_IoS_Phase9_Fork/code/qcommon -Xcc -I/Users/targus/Documents/Quake_IoS_Phase9_Fork/code/client -Xcc -I/Users/targus/Documents/Quake_IoS_Phase9_Fork/code/server -Xcc -I/Users/targus/Documents/Quake_IoS_Phase9_Fork/code/botlib -Xcc -I/Users/targus/Documents/Quake_IoS_Phase9_Fork/code/libjpeg -Xcc -I/Users/targus/Documents/Quake_IoS_Phase9_Fork/code/libogg/include -Xcc -I/Users/targus/Documents/Quake_IoS_Phase9_Fork/code/libvorbis/include -Xcc -I/Users/targus/Documents/Quake_IoS_Phase9_Fork/code/libvorbis/lib -Xcc -I/Users/targus/Library/Developer/Xcode/DerivedData/Quake3-iOS-cckzitrudgsrphcnxezacbpdcsfh/Build/Intermediates.noindex/Quake3-iOS.build/Debug-iphoneos/Quake3-iOS.build/DerivedSources-normal/arm64 -Xcc -I/Users/targus/Library/Developer/Xcode/DerivedData/Quake3-iOS-cckzitrudgsrphcnxezacbpdcsfh/Build/Intermediates.noindex/Quake3-iOS.build/Debug-iphoneos/Quake3-iOS.build/DerivedSources/arm64 -Xcc -I/Users/targus/Library/Developer/Xcode/DerivedData/Quake3-iOS-cckzitrudgsrphcnxezacbpdcsfh/Build/Intermediates.noindex/Quake3-iOS.build/Debug-iphoneos/Quake3-iOS.build/DerivedSources -Xcc -DDEBUG\=1 -Xcc -DBOTLIB -Xcc -DUSE_ICON -Xcc -DUSE_VULKAN -Xcc -DUSE_VBO -Xcc -DUSE_CODEC_VORBIS -Xcc -DHAVE_VM_COMPILED -Xcc -DIOS_BUILD\=1 -Xcc -DMACOS_X\=1 -Xcc -DUSE_LOCAL_HEADERS\=1 -Xcc -DARCH_STRING\=\"arm64\" -Xcc -DDLL_EXT\=\".dylib\" -emit-objc-header -emit-objc-header-path /Users/targus/Library/Developer/Xcode/DerivedData/Quake3-iOS-cckzitrudgsrphcnxezacbpdcsfh/Build/Intermediates.noindex/Quake3-iOS.build/Debug-iphoneos/Quake3-iOS.build/Objects-normal/arm64/Q3_RT-Swift.h -import-objc-header /Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/Quake3-iOS-Bridging-Header.h -working-directory /Users/targus/Documents/Quake_IoS_Phase9_Fork -experimental-emit-module-separately -disable-cmo
+
+SwiftGeneratePch normal arm64 Compiling\ bridging\ header (in target 'Quake3-iOS' from project 'Quake3-iOS')
+
+SwiftDriverJobDiscovery normal arm64 Compiling bridging header (in target 'Quake3-iOS' from project 'Quake3-iOS')
+
+SwiftEmitModule normal arm64 Emitting\ module\ for\ Q3_RT (in target 'Quake3-iOS' from project 'Quake3-iOS')
+
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift:18:58: warning: 'main' was deprecated in iOS 26.0: Use a UIScreen instance found through context instead (i.e, view.window.windowScene.screen), or for properties like UIScreen.scale with trait equivalents, use a traitCollection found through context. [#DeprecatedDeclaration]
+   16 | /// actual UIKit screen and is normalized to landscape.
+   17 | @MainActor
+   18 | func Q3MetalOutputTargetSize(screen: UIScreen = UIScreen.main) -> CGSize {
+      |                                                          `- warning: 'main' was deprecated in iOS 26.0: Use a UIScreen instance found through context instead (i.e, view.window.windowScene.screen), or for properties like UIScreen.scale with trait equivalents, use a traitCollection found through context. [#DeprecatedDeclaration]
+   19 |     let scale = screen.nativeScale > 0 ? screen.nativeScale : screen.scale
+   20 |     let px = CGSize(width: screen.bounds.width * scale,
+
+[#DeprecatedDeclaration]: <https://docs.swift.org/compiler/documentation/diagnostics/deprecated-declaration>
+
+SwiftCompile normal arm64 (in target 'Quake3-iOS' from project 'Quake3-iOS')
+    cd /Users/targus/Documents/Quake_IoS_Phase9_Fork
+    
+
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift:18:58: 'main' was deprecated in iOS 26.0: Use a UIScreen instance found through context instead (i.e, view.window.windowScene.screen), or for properties like UIScreen.scale with trait equivalents, use a traitCollection found through context.
+
+SwiftCompile normal arm64 Compiling\ MetalView.swift /Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift (in target 'Quake3-iOS' from project 'Quake3-iOS')
+
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift:18:58: warning: 'main' was deprecated in iOS 26.0: Use a UIScreen instance found through context instead (i.e, view.window.windowScene.screen), or for properties like UIScreen.scale with trait equivalents, use a traitCollection found through context. [#DeprecatedDeclaration]
+   16 | /// actual UIKit screen and is normalized to landscape.
+   17 | @MainActor
+   18 | func Q3MetalOutputTargetSize(screen: UIScreen = UIScreen.main) -> CGSize {
+      |                                                          `- warning: 'main' was deprecated in iOS 26.0: Use a UIScreen instance found through context instead (i.e, view.window.windowScene.screen), or for properties like UIScreen.scale with trait equivalents, use a traitCollection found through context. [#DeprecatedDeclaration]
+   19 |     let scale = screen.nativeScale > 0 ? screen.nativeScale : screen.scale
+   20 |     let px = CGSize(width: screen.bounds.width * scale,
+
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift:209:35: warning: 'main' was deprecated in iOS 26.0: Use a UIScreen instance found through context instead (i.e, view.window.windowScene.screen), or for properties like UIScreen.scale with trait equivalents, use a traitCollection found through context. [#DeprecatedDeclaration]
+  207 |          * 120Hz range is harmless there and lets real iPhone Pro/Max
+  208 |          * hardware run past 60 when the renderer has headroom. */
+  209 |         let maxFPS = max(UIScreen.main.maximumFramesPerSecond, 120)
+      |                                   `- warning: 'main' was deprecated in iOS 26.0: Use a UIScreen instance found through context instead (i.e, view.window.windowScene.screen), or for properties like UIScreen.scale with trait equivalents, use a traitCollection found through context. [#DeprecatedDeclaration]
+  210 |         #endif
+  211 |         view.preferredFramesPerSecond = maxFPS
+
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift:212:63: warning: 'main' was deprecated in iOS 26.0: Use a UIScreen instance found through context instead (i.e, view.window.windowScene.screen), or for properties like UIScreen.scale with trait equivalents, use a traitCollection found through context. [#DeprecatedDeclaration]
+  210 |         #endif
+  211 |         view.preferredFramesPerSecond = maxFPS
+  212 |         print("[Metal] display config screenMaxFPS=\(UIScreen.main.maximumFramesPerSecond) preferredFPS=\(view.preferredFramesPerSecond) lowPower=\(ProcessInfo.processInfo.isLowPowerModeEnabled ? 1 : 0) bounds=\(UIScreen.main.bounds) nativeBounds=\(UIScreen.main.nativeBounds) nativeScale=\(UIScreen.main.nativeScale) outputTarget=\(Q3MetalOutputTargetSize())")
+      |                                                               `- warning: 'main' was deprecated in iOS 26.0: Use a UIScreen instance found through context instead (i.e, view.window.windowScene.screen), or for properties like UIScreen.scale with trait equivalents, use a traitCollection found through context. [#DeprecatedDeclaration]
+  213 |         view.enableSetNeedsDisplay = false
+  214 |         view.isPaused = true
+
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift:212:222: warning: 'main' was deprecated in iOS 26.0: Use a UIScreen instance found through context instead (i.e, view.window.windowScene.screen), or for properties like UIScreen.scale with trait equivalents, use a traitCollection found through context. [#DeprecatedDeclaration]
+  210 |         #endif
+  211 |         view.preferredFramesPerSecond = maxFPS
+  212 |         print("[Metal] display config screenMaxFPS=\(UIScreen.main.maximumFramesPerSecond) preferredFPS=\(view.preferredFramesPerSecond) lowPower=\(ProcessInfo.processInfo.isLowPowerModeEnabled ? 1 : 0) bounds=\(UIScreen.main.bounds) nativeBounds=\(UIScreen.main.nativeBounds) nativeScale=\(UIScreen.main.nativeScale) outputTarget=\(Q3MetalOutputTargetSize())")
+      |                                                                                                                                                                                                                              `- warning: 'main' was deprecated in iOS 26.0: Use a UIScreen instance found through context instead (i.e, view.window.windowScene.screen), or for properties like UIScreen.scale with trait equivalents, use a traitCollection found through context. [#DeprecatedDeclaration]
+  213 |         view.enableSetNeedsDisplay = false
+  214 |         view.isPaused = true
+
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift:212:259: warning: 'main' was deprecated in iOS 26.0: Use a UIScreen instance found through context instead (i.e, view.window.windowScene.screen), or for properties like UIScreen.scale with trait equivalents, use a traitCollection found through context. [#DeprecatedDeclaration]
+  210 |         #endif
+  211 |         view.preferredFramesPerSecond = maxFPS
+  212 |         print("[Metal] display config screenMaxFPS=\(UIScreen.main.maximumFramesPerSecond) preferredFPS=\(view.preferredFramesPerSecond) lowPower=\(ProcessInfo.processInfo.isLowPowerModeEnabled ? 1 : 0) bounds=\(UIScreen.main.bounds) nativeBounds=\(UIScreen.main.nativeBounds) nativeScale=\(UIScreen.main.nativeScale) outputTarget=\(Q3MetalOutputTargetSize())")
+      |                                                                                                                                                                                                                                                                   `- warning: 'main' was deprecated in iOS 26.0: Use a UIScreen instance found through context instead (i.e, view.window.windowScene.screen), or for properties like UIScreen.scale with trait equivalents, use a traitCollection found through context. [#DeprecatedDeclaration]
+  213 |         view.enableSetNeedsDisplay = false
+  214 |         view.isPaused = true
+
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift:212:301: warning: 'main' was deprecated in iOS 26.0: Use a UIScreen instance found through context instead (i.e, view.window.windowScene.screen), or for properties like UIScreen.scale with trait equivalents, use a traitCollection found through context. [#DeprecatedDeclaration]
+  210 |         #endif
+  211 |         view.preferredFramesPerSecond = maxFPS
+  212 |         print("[Metal] display config screenMaxFPS=\(UIScreen.main.maximumFramesPerSecond) preferredFPS=\(view.preferredFramesPerSecond) lowPower=\(ProcessInfo.processInfo.isLowPowerModeEnabled ? 1 : 0) bounds=\(UIScreen.main.bounds) nativeBounds=\(UIScreen.main.nativeBounds) nativeScale=\(UIScreen.main.nativeScale) outputTarget=\(Q3MetalOutputTargetSize())")
+      |                                                                                                                                                                                                                                                                                                             `- warning: 'main' was deprecated in iOS 26.0: Use a UIScreen instance found through context instead (i.e, view.window.windowScene.screen), or for properties like UIScreen.scale with trait equivalents, use a traitCollection found through context. [#DeprecatedDeclaration]
+  213 |         view.enableSetNeedsDisplay = false
+  214 |         view.isPaused = true
+
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift:288:24: warning: call to main actor-isolated instance method 'draw()' in a synchronous nonisolated context [#ActorIsolatedCall]
+  285 |         }
+  286 | 
+  287 |         @objc private func displayLinkDidFire(_ link: CADisplayLink) {
+      |                            `- note: add '@MainActor' to make instance method 'displayLinkDidFire' part of global actor 'MainActor'
+  288 |             pacedView?.draw()
+      |                        `- warning: call to main actor-isolated instance method 'draw()' in a synchronous nonisolated context [#ActorIsolatedCall]
+  289 |         }
+  290 | 
+
+/Applications/Xcode-beta.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS27.0.sdk/System/Library/Frameworks/MetalKit.framework/Headers/MTKView.h:235:1: note: calls to instance method 'draw()' from outside of its actor context are implicitly asynchronous
+233 |  @discussion Manually ask the view to draw new contents. This causes the view to call either the drawInMTKView (delegate) or drawRect (subclass) method. This should be used when the view's paused proprety is set to true and enableSetNeedsDisplay is set to false.
+234 |  */
+235 | - (void)draw;
+    | `- note: calls to instance method 'draw()' from outside of its actor context are implicitly asynchronous
+236 | 
+237 | /*!
+
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift:1318:27: warning: result of call to 'withUnsafeBytes' is unused [#NoUsage]
+ 1316 |                 }
+ 1317 |                 if extraCount > 0 {
+ 1318 |                     extra.withUnsafeBytes { ex in
+      |                           `- warning: result of call to 'withUnsafeBytes' is unused [#NoUsage]
+ 1319 |                         memcpy(base.advanced(by: dlightHeaderSize + engineCount * MemoryLayout<Q3MetalLight>.stride),
+ 1320 |                                ex.baseAddress!, extraCount * MemoryLayout<Q3MetalLight>.stride)
+
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift:4776:17: warning: variable 'pixel' was never mutated; consider changing to 'let' constant
+ 4774 |             desc.storageMode = .shared
+ 4775 |             guard let tex = device.makeTexture(descriptor: desc) else { return nil }
+ 4776 |             var pixel: [UInt8] = [255, 0, 255, 255] // magenta = missing PBR
+      |                 `- warning: variable 'pixel' was never mutated; consider changing to 'let' constant
+ 4777 |             pixel.withUnsafeBytes { bytes in
+ 4778 |                 tex.replace(region: MTLRegionMake2D(0, 0, 1, 1),
+
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift:6182:24: warning: 'init(cString:)' is deprecated: Use String(decoding: array, as: UTF8.self) instead, after truncating the null termination. [#DeprecatedDeclaration]
+ 6180 |             }
+ 6181 |             guard gotName != 0 else { return nil }
+ 6182 |             let stem = String(cString: nameBuf)
+      |                        `- warning: 'init(cString:)' is deprecated: Use String(decoding: array, as: UTF8.self) instead, after truncating the null termination. [#DeprecatedDeclaration]
+ 6183 |             guard !stem.isEmpty else { return nil }
+ 6184 | 
+
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift:6282:24: warning: 'init(cString:)' is deprecated: Use String(decoding: array, as: UTF8.self) instead, after truncating the null termination. [#DeprecatedDeclaration]
+ 6280 |             }
+ 6281 |             guard ok != 0 else { return nil }
+ 6282 |             let stem = String(cString: nameBuf)
+      |                        `- warning: 'init(cString:)' is deprecated: Use String(decoding: array, as: UTF8.self) instead, after truncating the null termination. [#DeprecatedDeclaration]
+ 6283 |             return stem.isEmpty ? nil : stem
+ 6284 |         }
+
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift:6499:17: warning: variable 'pixel' was never mutated; consider changing to 'let' constant
+ 6497 |             guard let tex = device.makeTexture(descriptor: desc) else { return nil }
+ 6498 |             tex.label = "Q3.pbr.normal.flat_default"
+ 6499 |             var pixel: [UInt8] = [128, 128, 255, 255]
+      |                 `- warning: variable 'pixel' was never mutated; consider changing to 'let' constant
+ 6500 |             pixel.withUnsafeBytes { bytes in
+ 6501 |                 tex.replace(region: MTLRegionMake2D(0, 0, 1, 1),
+
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift:6686:17: warning: variable 'pixel' was never mutated; consider changing to 'let' constant
+ 6684 |             guard let tex = device.makeTexture(descriptor: desc) else { return nil }
+ 6685 |             tex.label = "Q3.pbr.emissive.default_zero"
+ 6686 |             var pixel: [UInt8] = [0, 0, 0, 255]
+      |                 `- warning: variable 'pixel' was never mutated; consider changing to 'let' constant
+ 6687 |             pixel.withUnsafeBytes { bytes in
+ 6688 |                 tex.replace(region: MTLRegionMake2D(0, 0, 1, 1),
+
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift:6902:43: warning: 'main' was deprecated in iOS 26.0: Use a UIScreen instance found through context instead (i.e, view.window.windowScene.screen), or for properties like UIScreen.scale with trait equivalents, use a traitCollection found through context. [#DeprecatedDeclaration]
+ 6900 |             let target: CGSize
+ 6901 |             if profile == "native_ipad_25" {
+ 6902 |                 let nativeSize = UIScreen.main.nativeBounds.size
+      |                                           `- warning: 'main' was deprecated in iOS 26.0: Use a UIScreen instance found through context instead (i.e, view.window.windowScene.screen), or for properties like UIScreen.scale with trait equivalents, use a traitCollection found through context. [#DeprecatedDeclaration]
+ 6903 |                 target = CGSize(width: max(nativeSize.width, nativeSize.height),
+ 6904 |                                 height: min(nativeSize.width, nativeSize.height))
+
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift:6915:90: warning: 'main' was deprecated in iOS 26.0: Use a UIScreen instance found through context instead (i.e, view.window.windowScene.screen), or for properties like UIScreen.scale with trait equivalents, use a traitCollection found through context. [#DeprecatedDeclaration]
+ 6913 |                 // MTKView callback aspect makes Q3's 2D UI projection and the
+ 6914 |                 // drawable disagree, which crops the iPad/OLED menu.
+ 6915 |                 target = Q3MetalOutputTargetSize(screen: view.window?.screen ?? UIScreen.main)
+      |                                                                                          `- warning: 'main' was deprecated in iOS 26.0: Use a UIScreen instance found through context instead (i.e, view.window.windowScene.screen), or for properties like UIScreen.scale with trait equivalents, use a traitCollection found through context. [#DeprecatedDeclaration]
+ 6916 |             }
+ 6917 |             print("[Metal] Drawable size: \(size) (target \(target))")
+
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift:7611:60: warning: result of call to 'withUnsafeBytes' is unused [#NoUsage]
+ 7609 |                                 let byteCount = totalBatchIndexCount * MemoryLayout<UInt32>.stride
+ 7610 |                                 if byteCount > 0 {
+ 7611 |                                     worldBatchIndexScratch.withUnsafeBytes { src in
+      |                                                            `- warning: result of call to 'withUnsafeBytes' is unused [#NoUsage]
+ 7612 |                                         memcpy(batchedIndexBuffer.contents(), src.baseAddress!, byteCount)
+ 7613 |                                     }
+
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift:7063:17: warning: variable 'rtCompositeForUpscale' was never mutated; consider changing to 'let' constant
+ 7061 |             }
+ 7062 |             encoder.label = "Q3.render"
+ 7063 |             var rtCompositeForUpscale: MTLTexture? = nil
+      |                 `- warning: variable 'rtCompositeForUpscale' was never mutated; consider changing to 'let' constant
+ 7064 | 
+ 7065 |             // Viewport matches the actual render-target size (RT when
+
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift:8927:21: warning: initialization of immutable value 'vertices' was never used; consider replacing with assignment to '_' or removing it [#NoUsage]
+ 8925 |             if vertexCount > 0, let verticesPointer = Q3MetalRenderer_GetVertices(),
+ 8926 |                let vertexBuffer = uploadVertices(UnsafeBufferPointer(start: verticesPointer, count: vertexCount), device: view.device) {
+ 8927 |                 let vertices = UnsafeBufferPointer(start: verticesPointer, count: vertexCount)
+      |                     `- warning: initialization of immutable value 'vertices' was never used; consider replacing with assignment to '_' or removing it [#NoUsage]
+ 8928 |                 let projection = makeOrthoProjection(width: max(Float(snapshot.drawableWidth), 1.0), height: max(Float(snapshot.drawableHeight), 1.0))
+ 8929 |                 var uniforms = Uniforms(projection: projection)
+
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift:9040:101: warning: 'main' was deprecated in iOS 26.0: Use a UIScreen instance found through context instead (i.e, view.window.windowScene.screen), or for properties like UIScreen.scale with trait equivalents, use a traitCollection found through context. [#DeprecatedDeclaration]
+ 9038 |             view.contentScaleFactor = 1.0
+ 9039 |             if ProcessInfo.processInfo.environment["Q3_MATCH_PROFILE"] == "native_ipad_25" {
+ 9040 |                 view.drawableSize = Q3MetalOutputTargetSize(screen: view.window?.screen ?? UIScreen.main)
+      |                                                                                                     `- warning: 'main' was deprecated in iOS 26.0: Use a UIScreen instance found through context instead (i.e, view.window.windowScene.screen), or for properties like UIScreen.scale with trait equivalents, use a traitCollection found through context. [#DeprecatedDeclaration]
+ 9041 |             } else {
+ 9042 |                 view.drawableSize = Q3MetalOutputTargetSize(screen: view.window?.screen ?? UIScreen.main)
+
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift:9042:101: warning: 'main' was deprecated in iOS 26.0: Use a UIScreen instance found through context instead (i.e, view.window.windowScene.screen), or for properties like UIScreen.scale with trait equivalents, use a traitCollection found through context. [#DeprecatedDeclaration]
+ 9040 |                 view.drawableSize = Q3MetalOutputTargetSize(screen: view.window?.screen ?? UIScreen.main)
+ 9041 |             } else {
+ 9042 |                 view.drawableSize = Q3MetalOutputTargetSize(screen: view.window?.screen ?? UIScreen.main)
+      |                                                                                                     `- warning: 'main' was deprecated in iOS 26.0: Use a UIScreen instance found through context instead (i.e, view.window.windowScene.screen), or for properties like UIScreen.scale with trait equivalents, use a traitCollection found through context. [#DeprecatedDeclaration]
+ 9043 |             }
+ 9044 |             // Allow CPU readback of the drawable texture for the `video`
+
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift:9811:25: warning: variable 'vert' was never mutated; consider changing to 'let' constant
+ 9809 |                 for (corner, uv) in corners {
+ 9810 |                     let p = origin + right * (corner.x * halfSize) + up * (corner.y * halfSize)
+ 9811 |                     var vert = Q3MetalEntityVertex(
+      |                         `- warning: variable 'vert' was never mutated; consider changing to 'let' constant
+ 9812 |                         position: (p.x, p.y, p.z),
+ 9813 |                         texCoord: (uv.x, uv.y),
+
+[#ActorIsolatedCall]: <https://docs.swift.org/compiler/documentation/diagnostics/actor-isolated-call>
+[#DeprecatedDeclaration]: <https://docs.swift.org/compiler/documentation/diagnostics/deprecated-declaration>
+[#NoUsage]: <https://docs.swift.org/compiler/documentation/diagnostics/no-usage>
+
+SwiftCompile normal arm64 /Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift (in target 'Quake3-iOS' from project 'Quake3-iOS')
+    cd /Users/targus/Documents/Quake_IoS_Phase9_Fork
+    builtin-SwiftPerFileCompile MetalView.swift
+
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift:18:58: 'main' was deprecated in iOS 26.0: Use a UIScreen instance found through context instead (i.e, view.window.windowScene.screen), or for properties like UIScreen.scale with trait equivalents, use a traitCollection found through context.
+
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift:209:35: 'main' was deprecated in iOS 26.0: Use a UIScreen instance found through context instead (i.e, view.window.windowScene.screen), or for properties like UIScreen.scale with trait equivalents, use a traitCollection found through context.
+
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift:212:63: 'main' was deprecated in iOS 26.0: Use a UIScreen instance found through context instead (i.e, view.window.windowScene.screen), or for properties like UIScreen.scale with trait equivalents, use a traitCollection found through context.
+
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift:212:222: 'main' was deprecated in iOS 26.0: Use a UIScreen instance found through context instead (i.e, view.window.windowScene.screen), or for properties like UIScreen.scale with trait equivalents, use a traitCollection found through context.
+
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/Quake3-iOS/MetalView.swift:212:259: 'main' was deprecated in iOS 26.0: Use a UIScreen instance found through context instead (i.e, view.window.windowScene.screen), or for properties like UIScreen.scale with trait equivalents, use a traitCollection found through context.
+
+/Users/targus/Documents/Quake_IoS
+
+[… truncated 31877 chars …]

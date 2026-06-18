@@ -1,0 +1,543 @@
+// MTKView callback aspect makes Q3's 2D UI projection and the
+                // drawable disagree, which crops the iPad/OLED menu.
+                target = Q3MetalOutputTargetSize(screen: view.window?.screen ?? UIScreen.main)
+            }
+            print("[Metal] Drawable size: \(size) (target \(target))")
+            if size.width.isFinite && size.height.isFinite
+                && size.width > 0 && size.height > 0
+                && (Int(size.width) != Int(target.width) ||
+                    Int(size.height) != Int(target.height)) {
+                view.drawableSize = target
+                print("[Metal] Drawable forced to \(target) (was \(size))")
+                Q3MetalRenderer_UpdateDrawableSize(Int32(target.width), Int32(target.height))
+                return
+            }
+            Q3MetalRenderer_UpdateDrawableSize(Int32(size.width), Int32(size.height))
+        }
+
+        func draw(in view: MTKView) {
+            let drawFrameStart = CACurrentMediaTime()
+            if commandQueue == nil {
+                configureRenderer(for: view)
+            }
+
+            /* MetalFX upscale path: when upscaleQuality != .native, we
+             * render the frame at a lower resolution (renderW × renderH)
+             * into upscaleColorTarget and then MetalFX spatially upscales
+             * to the drawable. The Q3 renderer needs to know its
+             * "effective drawable" is the RT size so projection / viewport
+             * / scissor math is consistent with what we'll actually feed
+             * to MetalFX. Native quality keeps the existing direct path. */
+            let outputW = Int(view.drawableSize.width)
+            let outputH = Int(view.drawableSize.height)
+            // Keep "Native" literal even with RT enabled. The old safety
+            // override silently forced Native+RT through the 0.75 MetalFX
+            // path; on current iOS/Xcode that path can assert inside
+            // MetalFX with "Motion texture must not be nil" even though
+            // frame interpolation is off. RT already has its own
+            // r_rt_resolution_scale knob, so do not require MetalFX here.
+            let effectiveUpscaleQuality: Q3UpscaleQuality = upscaleQuality
+            let upscaleActive: Bool
+            let renderW: Int
+            let renderH: Int
+            if effectiveUpscaleQuality != .native, let device = view.device, outputW > 0, outputH > 0 {
+                let rs = effectiveUpscaleQuality.renderSize(forOutput: view.drawableSize)
+                let rW = max(1, Int(rs.width))
+                let rH = max(1, Int(rs.height))
+                if ensureSpatialUpscaleTargets(device: device, inputW: rW, inputH: rH, outputW: outputW, outputH: outputH) {
+                    upscaleActive = true
+                    renderW = rW
+                    renderH = rH
+                } else {
+                    // MetalFX unavailable on this device — fall back.
+                    upscaleActive = false
+                    renderW = outputW
+                    renderH = outputH
+                }
+            } else {
+                upscaleActive = false
+                renderW = outputW
+                renderH = outputH
+            }
+            Q3MetalRenderer_UpdateDrawableSize(Int32(renderW), Int32(renderH))
+
+            /* Acquire the CAMetalLayer drawable before running the Q3
+             * simulation/render build. On ProMotion hardware, waiting until
+             * after a 3-5ms Quake3_Frame() can miss the layer's current
+             * acquisition window, turning otherwise-fast maps (nv15) into
+             * every-other-vblank 60Hz despite low GPU time. Holding the
+             * drawable while Q3 builds command lists is short in steady
+             * state and lets us commit before the next 120Hz deadline. */
+            let drawableAcquireStart = CACurrentMediaTime()
+            guard let drawable = view.currentDrawable,
+                  let descriptor = view.currentRenderPassDescriptor,
+                  let commandQueue,
+                  let uiSamplerState,
+                  let worldSamplerState,
+                  let commandBuffer = commandQueue.makeCommandBuffer()
+            else { return }
+            let drawableAcquireMs = (CACurrentMediaTime() - drawableAcquireStart) * 1000.0
+            commandBuffer.label = "Q3.frame"
+
+            let q3FrameStart = CACurrentMediaTime()
+            Quake3_Frame()
+            let q3FrameMs = (CACurrentMediaTime() - q3FrameStart) * 1000.0
+
+            guard let snapshot = Q3MetalRenderer_GetFrameSnapshot()?.pointee else { return }
+
+            descriptor.colorAttachments[0].clearColor = MTLClearColor(
+                red: Double(snapshot.clearColor.0),
+                green: Double(snapshot.clearColor.1),
+                blue: Double(snapshot.clearColor.2),
+                alpha: Double(snapshot.clearColor.3)
+            )
+            /* Start every frame from Q3's requested clear colour. A
+             * CAMetalLayer drawable's previous contents are undefined, and
+             * transparent/additive passes (sky overlays, flares, UI, filter
+             * decals) can expose pixels the opaque world did not overwrite.
+             *
+             * GL_DST_COLOR/GL_ZERO and other read-modify-write stages still
+             * see valid destinationColor because they execute later in the
+             * same encoder, after the world/sky passes have populated the
+             * framebuffer. Keeping .load here leaked stale drawable pixels
+             * into sky/additive/UI captures as intermittent "light" patches. */
+            descriptor.colorAttachments[0].loadAction = .clear
+            descriptor.colorAttachments[0].storeAction = .store
+
+            /* MetalFX path: redirect the main color attachment to our
+             * offscreen RT. The descriptor's drawable.texture is left
+             * untouched (we'll fill it via spatial upscale after
+             * encoder.endEncoding). Depth attachment is ALSO swapped to
+             * match the RT's dimensions — Metal rejects a render pass
+             * where color/depth dims disagree. */
+            if upscaleActive, let colorRT = upscaleColorTarget, let depthRT = upscaleDepthTarget {
+                descriptor.colorAttachments[0].texture = colorRT
+                descriptor.depthAttachment.texture = depthRT
+                descriptor.depthAttachment.loadAction = .clear
+                descriptor.depthAttachment.storeAction = .store
+                descriptor.depthAttachment.clearDepth = 1.0
+            }
+
+            /* Sanity: the drawable texture MUST NOT be memoryless — filter
+             * blending needs a real framebuffer to sample destinationColor
+             * from. MTKView with framebufferOnly=false (set in
+             * configureRenderer) guarantees .private storage, not
+             * .memoryless. Log once if this invariant is ever violated. */
+            if let drawableTexture = descriptor.colorAttachments[0].texture,
+               drawableTexture.storageMode == .memoryless {
+                print("[Metal] FATAL: drawable is memoryless — destinationColor will be undefined. Filter/subtract blends will not work.")
+            }
+
+            let wantsFogRayBox = hasRenderableFogVolume()
+            let wantsRasterSSR = (Q3_PBRSSREnabled() != 0 && Q3_RTMix() <= 0.001)
+            frameHasRasterSSRMask = false
+            let sceneDepth = (wantsFogRayBox || wantsRasterSSR) ? view.device.flatMap { device in
+                ensureSceneDepthTexture(device: device,
+                                        width: renderW,
+                                        height: renderH)
+            } : nil
+            if let sceneDepth, (!upscaleActive || wantsRasterSSR) {
+                // Drive the descriptor from a shader-readable scene depth
+                // whenever SSR/fog needs to sample it after the world pass.
+                descriptor.depthAttachment.texture = sceneDepth
+                descriptor.depthAttachment.loadAction = .clear
+                descriptor.depthAttachment.storeAction = .store
+                descriptor.depthAttachment.clearDepth = 1.0
+            }
+
+            let rasterMix = Q3_RTMix()
+            let rasterSunShadowsOnly = rasterMix <= 0.001
+            // P0 (hard): raster-only gate for sun-shadow depth. When RT is
+            // active, we keep pass disabled and skip depth-caster work.
+            let rasterShadowCvarEnabled = (Q3_PBRSunShadows() != 0)
+            let shouldSubmitRasterShadows: Bool
+            var hasAuthorSunLight = false
+            if rasterSunShadowsOnly,
+               let device = view.device {
+                _ = ensureRTLightBuffer(device: device)
+                hasAuthorSunLight = rtLightCount > 0 && !rtLightsCPU.isEmpty && rtLightsCPU[0].dirType.w == 0
+            }
+            shouldSubmitRasterShadows = rasterSunShadowsOnly && rasterShadowCvarEnabled && hasAuthorSunLight
+            var currentSunShadowTexture: MTLTexture? = nil
+            var currentSunShadowMatrix = matrix_identity_float4x4
+            if shouldSubmitRasterShadows,
+               let device = view.device,
+               let sceneViewForShadow = Q3MetalRenderer_GetSceneView()?.pointee,
+               let shadow = encodeSunShadowMap(commandBuffer: commandBuffer,
+                                               device: device,
+                                               snapshot: snapshot,
+                                               sceneView: sceneViewForShadow) {
+                currentSunShadowTexture = shadow.texture
+                currentSunShadowMatrix = shadow.matrix
+            }
+            if currentSunShadowTexture == nil,
+               let device = view.device,
+               let dummy = ensureSunShadowDummyTexture(device: device) {
+                currentSunShadowTexture = dummy
+            }
+            if !sunShadowModeDebugLogged {
+                if shouldSubmitRasterShadows {
+                    pbrLog("[Q3-SUNSHADOW] raster shadow pass active mix=\(rasterMix) sun=\(hasAuthorSunLight)")
+                } else if rasterSunShadowsOnly {
+                    pbrLog("[Q3-SUNSHADOW] raster shadow pass skipped mix=\(rasterMix) cvar=\(rasterShadowCvarEnabled) hasSun=\(hasAuthorSunLight)")
+                } else {
+                    pbrLog("[Q3-SUNSHADOW] shadow pass skipped in RT/mixed mode mix=\(rasterMix)")
+                }
+                sunShadowModeDebugLogged = true
+            }
+
+            guard var encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
+                return
+            }
+            encoder.label = "Q3.render"
+            var rtCompositeForUpscale: MTLTexture? = nil
+
+            // Viewport matches the actual render-target size (RT when
+            // upscaling, drawable when native).
+            encoder.setViewport(MTLViewport(
+                originX: 0,
+                originY: 0,
+                width: Double(renderW),
+                height: Double(renderH),
+                znear: 0.0,
+                zfar: 1.0
+            ))
+
+            if snapshot.worldCommandCount > 0,
+               let worldPipelineState,
+               let sceneView = Q3MetalRenderer_GetSceneView()?.pointee,
+               let worldVertexBuffer = uploadWorldBuffers(device: view.device, generation: snapshot.worldGeneration),
+               let worldIndexBuffer {
+                let viewProjection = makeWorldViewProjection(sceneView)
+                let cameraPos = SIMD3<Float>(sceneView.viewOrigin.0, sceneView.viewOrigin.1, sceneView.viewOrigin.2)
+                /* sceneView.viewAxis is a row-major 3x3 in Q3 axis
+                 * convention: axis[0]=forward, axis[1]=left,
+                 * axis[2]=up. For a screen-right billboard basis we
+                 * negate axis[1] to get camera-right. */
+                let camRight = SIMD3<Float>(
+                    -sceneView.viewAxis.3,
+                    -sceneView.viewAxis.4,
+                    -sceneView.viewAxis.5)
+                let camUp = SIMD3<Float>(
+                    sceneView.viewAxis.6,
+                    sceneView.viewAxis.7,
+                    sceneView.viewAxis.8)
+                var worldUniforms = WorldUniforms(
+                    viewProjection: viewProjection,
+                    cameraPos: cameraPos,
+                    cameraRight: camRight,
+                    cameraUp: camUp)
+                // USD sun pull. ensureRTLightBuffer is cached per-map; this
+                // is the raster-path callsite (RT path makes its own call at
+                // line ~5004) — needed so r_rt_mix=0 also gets USD sun.
+                // rtLightsCPU[0] is sorted to the slot-0 DistantLight when
+                // present (kernel contract). When map has no sun the array
+                // is empty or slot 0's dirType.w != 0 — we leave sunColor.w
+                // at the struct default 0 so MSL falls back to hardcoded dir.
+                if rasterSunShadowsOnly,
+                   let device = view.device {
+                    _ = ensureRTLightBuffer(device: device)
+                    if rtLightCount > 0,
+                       let sun = rtLightsCPU.first,
+                       sun.dirType.w == 0 {
+                        worldUniforms.sunDir = SIMD3<Float>(sun.dirType.x, sun.dirType.y, sun.dirType.z)
+                        worldUniforms.sunIntensity = sun.colorIntensity.w
+                        worldUniforms.sunColor = SIMD4<Float>(sun.colorIntensity.x,
+                                                              sun.colorIntensity.y,
+                                                              sun.colorIntensity.z,
+                                                              1.0)
+                    }
+                }
+                let doRasterSunShadows = shouldSubmitRasterShadows
+                if doRasterSunShadows,
+                   let shadowTexture = currentSunShadowTexture,
+                   worldUniforms.sunColor.w > 0.5 {
+                    worldUniforms.sunShadowMatrix = currentSunShadowMatrix
+                    worldUniforms.sunShadowParams = SIMD4<Float>(0.0025, 0.32, 1.0 / Float(max(shadowTexture.width, 1)), Q3_PBRShadowPCFRadius())
+                } else {
+                    worldUniforms.sunShadowParams = SIMD4<Float>(0, 0, 0, 0)
+                }
+                encoder.setRenderPipelineState(worldPipelineState)
+                encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
+                encoder.setFrontFacing(.clockwise)
+                // Default: backface cull. Per-stage overrides below.
+                encoder.setCullMode(.back)
+                encoder.setVertexBuffer(worldVertexBuffer, offset: 0, index: 0)
+                encoder.setVertexBytes(&worldUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
+                // Also bind WorldUniforms at fragment index 1. The sky
+                // fragment shader reads `constant WorldUniforms &uniforms
+                // [[buffer(1)]]` for cameraPos; without this bind, the
+                // read hits undefined memory and produces vertical
+                // smear bands across the sky.
+                encoder.setFragmentBytes(&worldUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
+                encoder.setFragmentSamplerState(worldSamplerState, index: 0)
+                // Slot 8 is always bound to a defined texture; raster-only
+                // mode may use a real shadow depth texture, RT skips to the
+                // local dummy.
+                encoder.setFragmentTexture(currentSunShadowTexture, index: 8)
+
+                // Bind dlight block at fragment buffer(2). Shared across all
+                // world draws in this scene — scene-constant, not per-draw.
+                Self.bindDlightBlock(snapshot: snapshot, encoder: encoder, device: view.device, index: 2, extra: currentBakedDlights())
+
+                var worldPassEntryCount = 0
+                var worldEncodedDrawCalls = 0
+                var worldPassEntryCounts = [Int](repeating: 0, count: 6)
+                var worldEncodedDrawCallsByPass = [Int](repeating: 0, count: 6)
+                var worldBatchGroupCounts = [Int](repeating: 0, count: 6)
+                var worldBatchBuildMs: Double = 0
+                var worldBatchCopyMs: Double = 0
+                var worldEncodeMs: Double = 0
+                if let worldDrawsPointer = Q3MetalRenderer_GetWorldDrawCommands(),
+                   let indicesPointer = Q3MetalRenderer_GetWorldIndices() {
+                    let _ = indicesPointer
+                    let worldDraws = UnsafeBufferPointer(start: worldDrawsPointer, count: Int(snapshot.worldCommandCount))
+                    let timeSeconds = snapshot.shaderTime
+                    // Atlas animation must keep running even when demo/game shaderTime stalls
+                    // or snaps during warmup. Keep UV alignment unchanged; only the frame clock
+                    // comes from a monotonic renderer timer and is packed in spriteAtlasParams.w.
+                    let atlasTimeSeconds = Float(CACurrentMediaTime() - frameTimeOrigin)
+
+                    let skyFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
+                    let fogOverlayBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY)
+                    let fogOnlyBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY)
+                    let combinedLightmapBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_COMBINED_LIGHTMAP)
+
+                    // Ordered world passes:
+                    // 0 = opaque, 1 = filter, 2 = alpha,
+                    // 3 = additive (GL_SRC_ALPHA/GL_ONE — alpha-modulated),
+                    // 4 = additive-full (GL_ONE/GL_ONE — explosion/glow cores),
+                    // 5 = fog overlay pass (post-stage alpha fog).
+                    // Sky draws are handled in pass 0 through the sky pipeline
+                    // (view-direction spherical projection, no lightmap).
+                    var worldPassEntriesByPass = Array(repeating: [WorldPassEntry](), count: 6)
+                    if !worldDraws.isEmpty {
+                        worldPassEntriesByPass[0].reserveCapacity(worldDraws.count)
+                        worldPassEntriesByPass[1].reserveCapacity(worldDraws.count)
+                        for pass in 2..<6 {
+                            worldPassEntriesByPass[pass].reserveCapacity(max(16, worldDraws.count / 8))
+                        }
+                    }
+
+                    for drawIndex in 0..<worldDraws.count {
+                        let draw = worldDraws[drawIndex]
+                        guard draw.indexCount > 0 else { continue }
+
+                        if (draw.flags & fogOnlyBit) != 0 {
+                            worldPassEntriesByPass[5].append(WorldPassEntry(drawIndex: drawIndex, stageIndex: -2))
+                            continue
+                        }
+
+                        if (draw.flags & skyFlagBit) != 0 {
+                            worldPassEntriesByPass[0].append(WorldPassEntry(drawIndex: drawIndex, stageIndex: -1))
+                            continue
+                        }
+
+                        let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+                        guard stageCount > 0 else { continue }
+
+                        for stageIndex in 0..<stageCount {
+                            let stage = Self.worldStage(draw, stageIndex)
+                            let drawPass = Self.worldRenderPass(for: stage)
+                            worldPassEntriesByPass[drawPass].append(WorldPassEntry(drawIndex: drawIndex, stageIndex: stageIndex))
+                        }
+                    }
+                    worldPassEntryCount = worldPassEntriesByPass.reduce(0) { $0 + $1.count }
+                    for pass in 0..<6 {
+                        worldPassEntryCounts[pass] = worldPassEntriesByPass[pass].count
+                    }
+                    let shouldSampleWorldBatchGroups = ((debugFrameCounter &+ 1) % 60) == 0
+                    if shouldSampleWorldBatchGroups {
+                        for pass in 0...1 {
+                            var hashes = Set<UInt64>()
+                            hashes.reserveCapacity(min(worldPassEntriesByPass[pass].count, 256))
+                            for entry in worldPassEntriesByPass[pass] where entry.stageIndex >= 0 {
+                                let d = worldDraws[entry.drawIndex]
+                                let s = Self.worldStage(d, entry.stageIndex)
+                                hashes.insert(Self.worldBatchHash(draw: d, stage: s, pass: pass))
+                            }
+                            worldBatchGroupCounts[pass] = hashes.count
+                        }
+                    }
+
+                    var cWorldBatches = UnsafeBufferPointer<Q3MetalWorldBatchCmd>(start: nil, count: 0)
+                    var cWorldBatchIndexBuffer: MTLBuffer?
+                    let batchBuildStart = CACurrentMediaTime()
+                    let cBatchCount = Int(Q3MetalRenderer_BuildWorldBatches((1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4)))
+                    worldBatchBuildMs = (CACurrentMediaTime() - batchBuildStart) * 1000.0
+                    let cBatchIndexCount = Int(Q3MetalRenderer_GetWorldBatchIndexCount())
+                    if cBatchCount > 0,
+                       cBatchIndexCount > 0,
+                       let cBatchPointer = Q3MetalRenderer_GetWorldBatches(),
+                       let cBatchIndexPointer = Q3MetalRenderer_GetWorldBatchIndices(),
+                       let device = view.device,
+                       let batchBuffer = ensureWorldBatchIndexBuffer(device: device,
+                                                                      indexCount: cBatchIndexCount,
+                                                                      slot: Int(debugFrameCounter % 3)) {
+                        let byteCount = cBatchIndexCount * MemoryLayout<UInt32>.stride
+                        let batchCopyStart = CACurrentMediaTime()
+                        memcpy(batchBuffer.contents(), cBatchIndexPointer, byteCount)
+                        worldBatchCopyMs = (CACurrentMediaTime() - batchCopyStart) * 1000.0
+                        cWorldBatches = UnsafeBufferPointer(start: cBatchPointer, count: cBatchCount)
+                        cWorldBatchIndexBuffer = batchBuffer
+                    }
+
+                    var lastWorldPipelineState: MTLRenderPipelineState?
+                    var lastWorldDepthStencilState: MTLDepthStencilState?
+                    var lastWorldCullMode: MTLCullMode?
+                    var lastWorldFragmentTexture0: MTLTexture?
+                    var lastWorldFragmentTexture1: MTLTexture?
+
+                    func invalidateWorldStateCache() {
+                        lastWorldPipelineState = nil
+                        lastWorldDepthStencilState = nil
+                        lastWorldCullMode = nil
+                        lastWorldFragmentTexture0 = nil
+                        lastWorldFragmentTexture1 = nil
+                    }
+
+                    func setWorldPipelineStateCached(_ state: MTLRenderPipelineState) {
+                        if lastWorldPipelineState !== state {
+                            encoder.setRenderPipelineState(state)
+                            lastWorldPipelineState = state
+                        }
+                    }
+
+                    func setWorldDepthStencilStateCached(_ state: MTLDepthStencilState?) {
+                        if lastWorldDepthStencilState !== state {
+                            encoder.setDepthStencilState(state)
+                            lastWorldDepthStencilState = state
+                        }
+                    }
+
+                    func setWorldCullModeCached(_ mode: MTLCullMode) {
+                        if lastWorldCullMode != mode {
+                            encoder.setCullMode(mode)
+                            lastWorldCullMode = mode
+                        }
+                    }
+
+                    func setWorldFragmentTextureCached(_ texture: MTLTexture?, index: Int) {
+                        if index == 0 {
+                            if lastWorldFragmentTexture0 !== texture {
+                                encoder.setFragmentTexture(texture, index: index)
+                                lastWorldFragmentTexture0 = texture
+                            }
+                        } else if index == 1 {
+                            if lastWorldFragmentTexture1 !== texture {
+                                encoder.setFragmentTexture(texture, index: index)
+                                lastWorldFragmentTexture1 = texture
+                            }
+                        } else {
+                            encoder.setFragmentTexture(texture, index: index)
+                        }
+                    }
+
+                    func encodeNormalWorldDraw(_ draw: Q3MetalWorldDrawCmd,
+                                               _ stage: Q3MetalWorldStage,
+                                               _ stageIndex: Int,
+                                               _ worldPass: Int,
+                                               _ activeIndexBuffer: MTLBuffer,
+                                               _ activeIndexOffset: Int,
+                                               _ activeIndexCount: Int) -> Bool {
+                        guard let lightmapTexture = texture(for: draw.lightmapTextureHandle, device: view.device),
+                              let baseTexture = texture(for: stage.textureHandle, device: view.device) else {
+                            return false
+                        }
+                        let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+                        let drawHasLightmapStage = Self.worldDrawHasLightmapStage(draw)
+                        let noFog = UInt32(Q3_METAL_NO_FOG)
+                        var fogCD = SIMD4<Float>(0, 0, 0, 0)
+                        var fogParams = SIMD4<Float>(0, 0, 0, 0)
+                        var fogSurface = SIMD4<Float>(0, 0, 0, 0)
+                        if draw.fogIndex != noFog {
+                            let count = Q3MetalRenderer_GetWorldFogCount()
+                            if Int(draw.fogIndex) < count,
+                               let fogs = Q3MetalRenderer_GetWorldFogs() {
+                                let f = fogs.advanced(by: Int(draw.fogIndex)).pointee
+                                fogCD = SIMD4(f.color.0, f.color.1, f.color.2, f.distance)
+                                fogParams = SIMD4(f.tcScale, f.hasSurface != 0 ? 1.0 : 0.0, 0, 0)
+                                fogSurface = SIMD4(f.surface.0, f.surface.1, f.surface.2, f.surface.3)
+                                /* DIAG: log first time each distinct (fogIndex, color)
+                                 * pair shows up so we can determine whether q3dm4's
+                                 * "fog changes between visits" is multiple BSP-authored
+                                 * fog volumes (expected) or a single volume returning
+                                 * varying state (bug). Grep q3_diag.log for FOG-DIAG. */
+                                if Coordinator.fogSeen.insert(Int(draw.fogIndex)).inserted {
+                                    NSLog("[FOG-DIAG] fogIndex=%d color=(%.3f, %.3f, %.3f) distance=%.1f tcScale=%.3f",
+                                          Int(draw.fogIndex), f.color.0, f.color.1, f.color.2, f.distance, f.tcScale)
+                                }
+                            }
+                        }
+
+                        let blendMode = Self.worldBlendClass(for: stage)
+                        let drawPass = Self.worldRenderPass(for: stage)
+                        guard drawPass == worldPass, stageCount > 0 else { return false }
+                        let blendedDepthState = (stage.useLightmap == 0 && stage.depthWrite != 0)
+                            ? depthStencilState
+                            : additiveDepthStencilState
+                        if drawPass == 4, let worldAdditiveFullPipelineState {
+                            encoder.setRenderPipelineState(worldAdditiveFullPipelineState)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
+                        } else if drawPass == 3, let worldAdditivePipelineState {
+                            encoder.setRenderPipelineState(worldAdditivePipelineState)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: view.device))
+                        } else if drawPass == 2, let worldAlphaPipelineState {
+                            encoder.setRenderPipelineState(worldAlphaPipelineState)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(blendedDepthState, device: view.device))
+                        } else if drawPass == 1, let worldFilterPipelineState {
+                            encoder.setRenderPipelineState(worldFilterPipelineState)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(blendedDepthState, device: view.device))
+                        } else {
+                            encoder.setRenderPipelineState(worldPipelineState)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
+                        }
+                        encoder.setCullMode(Self.metalCullMode(for: stage.cullMode))
+                        let alphaTest = Self.alphaTestThreshold(for: stage.alphaFunc)
+                        // RING-DIAG (non-cached path): one-shot per
+                        // (handle, drawPass) for any stage whose texture name
+                        // contains "center2trn". Confirms the draw actually
+                        // reaches the encoder, and whether the alpha pipeline
+                        // got chosen vs the opaque fallback (when
+                        // worldAlphaPipelineState is nil).
+                        do {
+                            let h = stage.textureHandle
+                            let key = (UInt64(h) << 8) | UInt64(drawPass & 0xFF)
+                            if !loggedRingDiagKeys.contains(key),
+                               let cName = Q3MetalRenderer_GetTextureName(h) {
+                                let name = String(cString: cName)
+                                if name.contains("center2trn") {
+                                    loggedRingDiagKeys.insert(key)
+                                    let pipeChosen: String
+                                    if drawPass == 2 && worldAlphaPipelineState != nil { pipeChosen = "alpha" }
+                                    else if drawPass == 2 { pipeChosen = "OPAQUE-FALLBACK(alphaNil)" }
+                                    else if drawPass == 1 && worldFilterPipelineState != nil { pipeChosen = "filter" }
+        
+
+[…truncated 214102 chars — raise BridgeOptions.maxResultChars, or call the tool with a narrower scope (filter, head, pagination)…]
+
+        case .keyboardF10: return 154
+        case .keyboardF11: return 155
+        case .keyboardF12: return 156
+        case .keyboardGraveAccentAndTilde: return 96
+        default:
+            // Fallback: trust the produced character. Some keyboard
+            // layouts route DEL/BS through a keyCode that doesn't
+            // match `.keyboardDeleteOrBackspace` — catch the actual
+            // 0x7F (DEL) or 0x08 (BS) character and route both to
+            // K_BACKSPACE.
+            if let ch = key.charactersIgnoringModifiers.first,
+               let asc = ch.asciiValue {
+                if asc == 0x7F || asc == 0x08 { return 127 }
+                if asc >= 32 && asc < 127 {
+                    // Printable ASCII — Q3 uses lowercase for letter keys.
+                    if let lower = String(ch).lowercased().first?.asciiValue {
+                        return Int32(lower)
+                    }
+                    return Int32(asc)
+                }
+            }
+            return nil
+        }
+    }
+}

@@ -1,0 +1,711 @@
+var castDraws = 0
+            for draw in draws {
+                if draw.indexCount == 0 || (draw.flags & skyFlagBit) != 0 || (draw.flags & fogOnlyBit) != 0 { continue }
+                let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+                if stageCount <= 0 { continue }
+                var castStage: Q3MetalWorldStage? = nil
+                for i in 0..<stageCount {
+                    let st = Self.worldStage(draw, i)
+                    if st.useLightmap == 0 && Self.worldRenderPass(for: st) == 0 {
+                        castStage = st
+                        break
+                    }
+                }
+                guard let stage = castStage else { continue }
+                let (tv0, tv1) = Self.tcGenVectors(stage)
+                var drawUniforms = WorldDrawUniforms(
+                    tcGen: Float(stage.tcGen),
+                    tcModCount: 0,
+                    rgbGen: Float(stage.rgbGen),
+                    alphaGen: Float(stage.alphaGen),
+                    blendMode: 0,
+                    timeSeconds: snapshot.shaderTime,
+                    rgbWaveFunc: stage.rgbWaveFunc,
+                    alphaWaveFunc: stage.alphaWaveFunc,
+                    tcModType: SIMD4<Float>(0, 0, 0, 0),
+                    tcModParams0: SIMD4<Float>(0, 0, 0, 0),
+                    tcModParams1: SIMD4<Float>(0, 0, 0, 0),
+                    tcModParams2: SIMD4<Float>(0, 0, 0, 0),
+                    tcModParams3: SIMD4<Float>(0, 0, 0, 0),
+                    rgbWaveParams: SIMD4(stage.rgbWaveBase, stage.rgbWaveAmp, stage.rgbWavePhase, stage.rgbWaveFreq),
+                    alphaWaveParams: SIMD4(stage.alphaWaveBase, stage.alphaWaveAmp, stage.alphaWavePhase, stage.alphaWaveFreq),
+                    rgbConstColor: SIMD4(stage.rgbConstColor.0, stage.rgbConstColor.1, stage.rgbConstColor.2, stage.alphaConst),
+                    entityColor: SIMD4(1, 1, 1, 1),
+                    fogColorDistance: SIMD4<Float>(0, 0, 0, 0),
+                    tcGenVec0: tv0,
+                    tcGenVec1: tv1,
+                    deformWaveFunc: stage.deformWaveFunc,
+                    deformWaveDiv: stage.deformWaveDiv != 0 ? stage.deformWaveDiv : 1.0,
+                    deformWaveBase: stage.deformWaveBase,
+                    deformWaveAmp: stage.deformWaveAmp,
+                    deformWavePhase: stage.deformWavePhase,
+                    deformWaveFreq: stage.deformWaveFreq,
+                    deformMoveFunc: stage.deformMoveFunc,
+                    deformMoveVector: SIMD3(stage.deformMoveVector.0, stage.deformMoveVector.1, stage.deformMoveVector.2),
+                    deformMoveBase: stage.deformMoveBase,
+                    deformMoveAmp: stage.deformMoveAmp,
+                    deformMovePhase: stage.deformMovePhase,
+                    deformMoveFreq: stage.deformMoveFreq,
+                    deformBulgeWidth: stage.deformBulgeWidth,
+                    deformBulgeHeight: stage.deformBulgeHeight,
+                    deformBulgeSpeed: stage.deformBulgeSpeed,
+                    autospriteMode: 0,
+                    debugMode: 0,
+                    forceWhiteVertColor: 0,
+                    alphaTestThreshold: 0,
+                    fogOnly: 0,
+                    stageUsesLightmap: 0,
+                    drawHasLightmapStage: 0,
+                    pbrRoughness: stage.pbrRoughness,
+                    pbrMetallic: stage.pbrMetallic,
+                    _pad0: 0)
+                enc.setCullMode(Self.metalCullMode(for: stage.cullMode))
+                enc.setVertexBytes(&drawUniforms, length: MemoryLayout<WorldDrawUniforms>.stride, index: 2)
+                enc.drawIndexedPrimitives(type: .triangle,
+                                          indexCount: Int(draw.indexCount),
+                                          indexType: .uint32,
+                                          indexBuffer: worldIndexBuffer,
+                                          indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride)
+                castDraws += 1
+            }
+            enc.endEncoding()
+            let mapKey = rtLightMapName.isEmpty ? "<unknown>" : rtLightMapName
+            if sunShadowLoggedMaps.insert(mapKey).inserted {
+                pbrLog("[Q3-SUNSHADOW] map='\(mapKey)' size=\(shadowTexture.width)x\(shadowTexture.height) casters=\(castDraws) pcf=\(Q3_PBRShadowPCFRadius()) sunDir=(\(sunDir.x),\(sunDir.y),\(sunDir.z))")
+            }
+            return (shadowTexture, shadowMatrix)
+        }
+
+        /* Encodes the main scene's camera-facing additive flare billboards.
+         * Returns true only when a flare draw was actually encoded. When the
+         * depth-limited fog ray-box is active this must run before that fog
+         * pass so the fog attenuates light sprites instead of letting them
+         * punch bright Q3.entity.additive artifacts through the final Q3.ui
+         * framebuffer state. */
+        @discardableResult
+        private func encodeMainFlarePass(encoder: MTLRenderCommandEncoder,
+                                         sceneView: Q3MetalSceneView,
+                                         snapshot: Q3MetalFrameSnapshot,
+                                         device: MTLDevice?) -> Bool {
+            guard Q3MetalRenderer_GetFlareCount() > 0,
+                  Q3MetalRenderer_GetFlareTextureHandle() != 0,
+                  let flarePipeline = entityAdditivePipelineState,
+                  let flareDepth = additiveLessDepthStencilState ?? additiveEntityDepthStencilState,
+                  let flareTexture = texture(for: Q3MetalRenderer_GetFlareTextureHandle(), device: device) else {
+                return false
+            }
+
+            let flareViewProjection = makeWorldViewProjection(sceneView)
+            var flareUniforms = EntityUniforms(viewProjection: flareViewProjection)
+            flareUniforms.cameraPos = SIMD3<Float>(sceneView.viewOrigin.0,
+                                                   sceneView.viewOrigin.1,
+                                                   sceneView.viewOrigin.2)
+            flareUniforms.suppressDlights = 1
+
+            encoder.setRenderPipelineState(flarePipeline)
+            encoder.setDepthStencilState(flareDepth)
+            encoder.setCullMode(.none)
+            // Flare disc texture (Q3 tr.flareShader image) must clampToEdge
+            // — with .repeat the falloff disc tiles across the framebuffer
+            // and the rings persist through the fog volume into Q3.ui (see
+            // fog-fix comment at encodeMainFlarePass call site). uiSampler
+            // is the existing clampToEdge sampler created at line ~4031.
+            encoder.setFragmentSamplerState(uiSamplerState, index: 0)
+            encoder.setFragmentTexture(flareTexture, index: 0)
+            // q3_entity_fragment declares the dlight block at buffer(2).
+            // It is suppressed for flares, but binding defensively keeps
+            // capture/validation state consistent with other entity draws.
+            Self.bindDlightBlock(snapshot: snapshot, encoder: encoder, device: device, index: 2, extra: currentBakedDlights())
+
+            drawFlarePass(encoder: encoder,
+                          sceneView: sceneView,
+                          uniforms: &flareUniforms,
+                          device: device)
+            return true
+        }
+
+        /* Build and draw camera-facing additive billboards for each BSP flare.
+         * Called inside an already-configured render pass: caller bound
+         * pipeline, depth-stencil, sampler, flare texture, and dlight block.
+         * We allocate a transient per-frame vertex buffer sized to the flare
+         * count × 4 corners. Flare size is fixed at 16 world units — the Q3
+         * behavior of world-space billboards that shrink with distance is
+         * visually acceptable for phase-one. */
+        private func drawFlarePass(encoder: MTLRenderCommandEncoder,
+                                   sceneView: Q3MetalSceneView,
+                                   uniforms: inout EntityUniforms,
+                                   device: MTLDevice?) {
+            guard let device,
+                  let flaresPointer = Q3MetalRenderer_GetFlares() else { return }
+            let flareCount = Int(Q3MetalRenderer_GetFlareCount())
+            guard flareCount > 0 else { return }
+
+            // Q3 axis convention: axis0=forward, axis1=left, axis2=up.
+            // Billboard plane spans (-axis1, axis2) — rotating left into
+            // "right" flips axis1 so +X on the quad is visually rightward.
+            let axis1 = SIMD3<Float>(sceneView.viewAxis.3, sceneView.viewAxis.4, sceneView.viewAxis.5)
+            let axis2 = SIMD3<Float>(sceneView.viewAxis.6, sceneView.viewAxis.7, sceneView.viewAxis.8)
+            let right = -axis1
+            let up = axis2
+            let halfSize: Float = 16.0
+
+            let corners: [(SIMD2<Float>, SIMD2<Float>)] = [
+                (SIMD2(-1, -1), SIMD2(0, 1)),
+                (SIMD2( 1, -1), SIMD2(1, 1)),
+                (SIMD2( 1,  1), SIMD2(1, 0)),
+                (SIMD2(-1,  1), SIMD2(0, 0)),
+            ]
+
+            var vertices = [Q3MetalEntityVertex]()
+            vertices.reserveCapacity(flareCount * 4)
+            var indices = [UInt32]()
+            indices.reserveCapacity(flareCount * 6)
+
+            let flares = UnsafeBufferPointer(start: flaresPointer, count: flareCount)
+            for (i, flare) in flares.enumerated() {
+                let origin = SIMD3<Float>(flare.origin.0, flare.origin.1, flare.origin.2)
+                let color = SIMD3<Float>(flare.color.0, flare.color.1, flare.color.2)
+                let base = UInt32(i * 4)
+                for (corner, uv) in corners {
+                    let p = origin + right * (corner.x * halfSize) + up * (corner.y * halfSize)
+                    var vert = Q3MetalEntityVertex(
+                        position: (p.x, p.y, p.z),
+                        texCoord: (uv.x, uv.y),
+                        color: (color.x, color.y, color.z, 1.0),
+                        normal: (0, 0, 0)
+                    )
+                    vertices.append(vert)
+                }
+                indices.append(contentsOf: [base, base + 1, base + 2, base, base + 2, base + 3])
+            }
+
+            let vertStride = MemoryLayout<Q3MetalEntityVertex>.stride
+            guard let vertexBuffer = device.makeBuffer(
+                bytes: vertices,
+                length: vertices.count * vertStride,
+                options: .storageModeShared
+            ),
+            let indexBuffer = device.makeBuffer(
+                bytes: indices,
+                length: indices.count * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared
+            ) else { return }
+
+            encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
+            encoder.setFragmentBytes(&uniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
+            encoder.drawIndexedPrimitives(
+                type: .triangle,
+                indexCount: indices.count,
+                indexType: .uint32,
+                indexBuffer: indexBuffer,
+                indexBufferOffset: 0
+            )
+        }
+
+        private func makeWorldViewProjection(_ sceneView: Q3MetalSceneView) -> simd_float4x4 {
+            let origin = SIMD3<Float>(sceneView.viewOrigin.0, sceneView.viewOrigin.1, sceneView.viewOrigin.2)
+            let axis0 = SIMD3<Float>(sceneView.viewAxis.0, sceneView.viewAxis.1, sceneView.viewAxis.2)
+            let axis1 = SIMD3<Float>(sceneView.viewAxis.3, sceneView.viewAxis.4, sceneView.viewAxis.5)
+            let axis2 = SIMD3<Float>(sceneView.viewAxis.6, sceneView.viewAxis.7, sceneView.viewAxis.8)
+
+            let viewer = simd_float4x4(columns: (
+                SIMD4<Float>(axis0.x, axis1.x, axis2.x, 0),
+                SIMD4<Float>(axis0.y, axis1.y, axis2.y, 0),
+                SIMD4<Float>(axis0.z, axis1.z, axis2.z, 0),
+                SIMD4<Float>(-simd_dot(origin, axis0), -simd_dot(origin, axis1), -simd_dot(origin, axis2), 1)
+            ))
+
+            let flip = simd_float4x4(columns: (
+                SIMD4<Float>(0, 0, -1, 0),
+                SIMD4<Float>(-1, 0, 0, 0),
+                SIMD4<Float>(0, 1, 0, 0),
+                SIMD4<Float>(0, 0, 0, 1)
+            ))
+
+            let zNear: Float = 4.0
+            let zFar: Float = 8192.0
+            let xScale = 1.0 / tan(sceneView.fovX * .pi / 360.0)
+            let yScale = 1.0 / tan(sceneView.fovY * .pi / 360.0)
+            let depth = zFar - zNear
+            let quakeProjection = simd_float4x4(columns: (
+                SIMD4<Float>(xScale, 0, 0, 0),
+                SIMD4<Float>(0, yScale, 0, 0),
+                SIMD4<Float>(0, 0, -(zFar + zNear) / depth, -1),
+                SIMD4<Float>(0, 0, -(2 * zFar * zNear) / depth, 0)
+            ))
+
+            // Quake's legacy projection targets OpenGL clip space. Metal keeps the
+            // same XY clip rules but uses a 0...1 depth range instead of -1...1.
+            let openGLToMetalClip = simd_float4x4(columns: (
+                SIMD4<Float>(1, 0, 0, 0),
+                SIMD4<Float>(0, 1, 0, 0),
+                SIMD4<Float>(0, 0, 0.5, 0),
+                SIMD4<Float>(0, 0, 0.5, 1)
+            ))
+
+            return openGLToMetalClip * quakeProjection * flip * viewer
+        }
+
+        private func formatVector(_ vector: SIMD3<Float>) -> String {
+            String(format: "(%.3f, %.3f, %.3f)", vector.x, vector.y, vector.z)
+        }
+
+        private func formatMatrix(_ matrix: simd_float4x4) -> String {
+            let c0 = matrix.columns.0
+            let c1 = matrix.columns.1
+            let c2 = matrix.columns.2
+            let c3 = matrix.columns.3
+            return String(
+                format: "[[%.3f, %.3f, %.3f, %.3f], [%.3f, %.3f, %.3f, %.3f], [%.3f, %.3f, %.3f, %.3f], [%.3f, %.3f, %.3f, %.3f]]",
+                c0.x, c0.y, c0.z, c0.w,
+                c1.x, c1.y, c1.z, c1.w,
+                c2.x, c2.y, c2.z, c2.w,
+                c3.x, c3.y, c3.z, c3.w
+            )
+        }
+    }
+}
+
+@MainActor
+final class GameControllerBridge {
+    static let shared = GameControllerBridge()
+
+    private struct State {
+        var leftX: Float = 0
+        var leftY: Float = 0
+        var rightX: Float = 0
+        var rightY: Float = 0
+        var firePressed: Int32 = 0
+        var jumpPressed: Int32 = 0
+        var crouchPressed: Int32 = 0
+        var buttonMask: UInt32 = 0
+    }
+
+    /* Mirror of code/ios/ios_local.h Q3_PAD_* bits. */
+    private struct PadBit {
+        static let a:              UInt32 = 1 << 0
+        static let b:              UInt32 = 1 << 1
+        static let x:              UInt32 = 1 << 2
+        static let y:              UInt32 = 1 << 3
+        static let leftShoulder:   UInt32 = 1 << 4
+        static let rightShoulder:  UInt32 = 1 << 5
+        static let leftTrigger:    UInt32 = 1 << 6
+        static let rightTrigger:   UInt32 = 1 << 7
+        static let dpadUp:         UInt32 = 1 << 8
+        static let dpadDown:       UInt32 = 1 << 9
+        static let dpadLeft:       UInt32 = 1 << 10
+        static let dpadRight:      UInt32 = 1 << 11
+        static let menu:           UInt32 = 1 << 12
+        static let options:        UInt32 = 1 << 13
+        static let leftThumb:      UInt32 = 1 << 14
+        static let rightThumb:     UInt32 = 1 << 15
+    }
+
+    private var started = false
+    private var activeController: GCController?
+    private var activeMouse: GCMouse?
+    private var state = State()
+    private var lastLoggedState: State?
+
+    private init() {}
+
+    func start() {
+        guard !started else { return }
+        started = true
+
+        print("[GCController] start")
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(controllerDidConnect(_:)),
+            name: .GCControllerDidConnect,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(controllerDidDisconnect(_:)),
+            name: .GCControllerDidDisconnect,
+            object: nil
+        )
+        if #available(iOS 14.0, *) {
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(mouseDidConnect(_:)),
+                name: .GCMouseDidConnect,
+                object: nil
+            )
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(mouseDidDisconnect(_:)),
+                name: .GCMouseDidDisconnect,
+                object: nil
+            )
+        }
+
+        print("[GCController] existing controllers: \(GCController.controllers().count)")
+        for controller in GCController.controllers() {
+            print("[GCController] existing \(describe(controller))")
+        }
+
+        GCController.startWirelessControllerDiscovery { [weak self] in
+            print("[GCController] wireless discovery completed")
+            Task { @MainActor in
+                self?.pickActiveController()
+            }
+        }
+        pickActiveController()
+        if #available(iOS 14.0, *) {
+            pickActiveMouse()
+        }
+    }
+
+    @objc private func controllerDidConnect(_ notification: Notification) {
+        if let controller = notification.object as? GCController {
+            print("[GCController] connected \(describe(controller))")
+        } else {
+            print("[GCController] connected unknown controller")
+        }
+        pickActiveController(preferred: notification.object as? GCController)
+    }
+
+    @objc private func controllerDidDisconnect(_ notification: Notification) {
+        let disconnected = notification.object as? GCController
+        if activeController === disconnected {
+            activeController = nil
+            state = State()
+            lastLoggedState = nil
+            pushState()
+        }
+        if let disconnected {
+            print("[GCController] disconnected \(describe(disconnected))")
+        } else {
+            print("[GCController] disconnected unknown controller")
+        }
+        pickActiveController()
+    }
+
+    private func pickActiveController(preferred: GCController? = nil) {
+        let nextController = [preferred, activeController]
+            .compactMap { $0 }
+            .first { $0.extendedGamepad != nil }
+            ?? GCController.controllers().first { $0.extendedGamepad != nil }
+
+        guard activeController !== nextController else {
+            return
+        }
+
+        activeController?.extendedGamepad?.valueChangedHandler = nil
+        activeController = nextController
+        state = State()
+        lastLoggedState = nil
+        pushState()
+
+        guard let controller = nextController, let gamepad = controller.extendedGamepad else {
+            print("[GCController] no extended gamepad controller selected")
+            return
+        }
+
+        controller.playerIndex = .index1
+        controller.handlerQueue = .main
+        gamepad.valueChangedHandler = { [weak self] gamepad, element in
+            self?.ingest(gamepad: gamepad, source: element)
+        }
+        ingest(gamepad: gamepad, source: nil)
+        print("[GCController] using \(describe(controller))")
+    }
+
+    @available(iOS 14.0, *)
+    @objc private func mouseDidConnect(_ notification: Notification) {
+        if let mouse = notification.object as? GCMouse {
+            print("[GCMouse] connected \(mouse.vendorName ?? "unknown")")
+            pickActiveMouse(preferred: mouse)
+        } else {
+            print("[GCMouse] connected unknown mouse")
+            pickActiveMouse()
+        }
+    }
+
+    @available(iOS 14.0, *)
+    @objc private func mouseDidDisconnect(_ notification: Notification) {
+        let mouse = notification.object as? GCMouse
+        if activeMouse === mouse {
+            activeMouse?.mouseInput?.mouseMovedHandler = nil
+            activeMouse?.mouseInput?.leftButton.pressedChangedHandler = nil
+            activeMouse?.mouseInput?.rightButton?.pressedChangedHandler = nil
+            activeMouse?.mouseInput?.middleButton?.pressedChangedHandler = nil
+            activeMouse = nil
+        }
+        if let mouse {
+            print("[GCMouse] disconnected \(mouse.vendorName ?? "unknown")")
+        }
+        pickActiveMouse()
+    }
+
+    @available(iOS 14.0, *)
+    private func pickActiveMouse(preferred: GCMouse? = nil) {
+        let nextMouse = preferred ?? activeMouse ?? GCMouse.mice().first
+        guard activeMouse !== nextMouse else { return }
+
+        activeMouse?.mouseInput?.mouseMovedHandler = nil
+        activeMouse?.mouseInput?.leftButton.pressedChangedHandler = nil
+        activeMouse?.mouseInput?.rightButton?.pressedChangedHandler = nil
+        activeMouse?.mouseInput?.middleButton?.pressedChangedHandler = nil
+        activeMouse = nextMouse
+
+        guard let mouse = nextMouse, let input = mouse.mouseInput else {
+            print("[GCMouse] no mouse/trackpad selected")
+            return
+        }
+
+        input.mouseMovedHandler = { _, deltaX, deltaY in
+            let scale: Float = 1.35
+            let dx = Int32((deltaX * scale).rounded())
+            let dy = Int32((-deltaY * scale).rounded())
+            if dx != 0 || dy != 0 {
+                Q3Sys_MouseMove(dx, dy)
+            }
+        }
+        input.leftButton.pressedChangedHandler = { _, _, pressed in
+            Q3Sys_KeyEvent(178, pressed ? 1 : 0) // K_MOUSE1
+        }
+        input.rightButton?.pressedChangedHandler = { _, _, pressed in
+            Q3Sys_KeyEvent(179, pressed ? 1 : 0) // K_MOUSE2
+        }
+        input.middleButton?.pressedChangedHandler = { _, _, pressed in
+            Q3Sys_KeyEvent(180, pressed ? 1 : 0) // K_MOUSE3
+        }
+        print("[GCMouse] using \(mouse.vendorName ?? "unknown")")
+    }
+
+    private func ingest(gamepad: GCExtendedGamepad, source: GCControllerElement?) {
+        state.leftX = gamepad.leftThumbstick.xAxis.value
+        state.leftY = gamepad.leftThumbstick.yAxis.value
+        state.rightX = gamepad.rightThumbstick.xAxis.value
+        state.rightY = gamepad.rightThumbstick.yAxis.value
+        state.firePressed = gamepad.rightTrigger.isPressed ? 1 : 0
+        state.jumpPressed = gamepad.buttonA.isPressed ? 1 : 0
+        state.crouchPressed = gamepad.buttonB.isPressed ? 1 : 0
+
+        var mask: UInt32 = 0
+        if gamepad.buttonA.isPressed             { mask |= PadBit.a }
+        if gamepad.buttonB.isPressed             { mask |= PadBit.b }
+        if gamepad.buttonX.isPressed             { mask |= PadBit.x }
+        if gamepad.buttonY.isPressed             { mask |= PadBit.y }
+        if gamepad.leftShoulder.isPressed        { mask |= PadBit.leftShoulder }
+        if gamepad.rightShoulder.isPressed       { mask |= PadBit.rightShoulder }
+        if gamepad.leftTrigger.isPressed         { mask |= PadBit.leftTrigger }
+        if gamepad.rightTrigger.isPressed        { mask |= PadBit.rightTrigger }
+        if gamepad.dpad.up.isPressed             { mask |= PadBit.dpadUp }
+        if gamepad.dpad.down.isPressed           { mask |= PadBit.dpadDown }
+        if gamepad.dpad.left.isPressed           { mask |= PadBit.dpadLeft }
+        if gamepad.dpad.right.isPressed          { mask |= PadBit.dpadRight }
+        if gamepad.buttonMenu.isPressed          { mask |= PadBit.menu }
+        if gamepad.buttonOptions?.isPressed == true { mask |= PadBit.options }
+        if gamepad.leftThumbstickButton?.isPressed == true  { mask |= PadBit.leftThumb }
+        if gamepad.rightThumbstickButton?.isPressed == true { mask |= PadBit.rightThumb }
+        state.buttonMask = mask
+
+        logStateChange(source: source)
+        pushState()
+    }
+
+    private func pushState() {
+        // Feed the engine continuously from the latest controller sample.
+        Q3Gamepad_SetState(
+            state.leftX,
+            state.leftY,
+            state.rightX,
+            state.rightY,
+            state.firePressed,
+            state.jumpPressed,
+            state.crouchPressed
+        )
+        Q3Gamepad_SetButtons(state.buttonMask)
+    }
+
+    private func logStateChange(source: GCControllerElement?) {
+        let shouldLog: Bool
+        if let lastLoggedState {
+            shouldLog =
+                abs(state.leftX - lastLoggedState.leftX) >= 0.05 ||
+                abs(state.leftY - lastLoggedState.leftY) >= 0.05 ||
+                abs(state.rightX - lastLoggedState.rightX) >= 0.05 ||
+                abs(state.rightY - lastLoggedState.rightY) >= 0.05 ||
+                state.firePressed != lastLoggedState.firePressed ||
+                state.jumpPressed != lastLoggedState.jumpPressed ||
+                state.crouchPressed != lastLoggedState.crouchPressed ||
+                state.buttonMask != lastLoggedState.buttonMask
+        } else {
+            shouldLog = true
+        }
+
+        guard shouldLog else { return }
+        lastLoggedState = state
+
+        let sourceName = source.map { String(describing: type(of: $0)) } ?? "initial"
+        let maskHex = String(format: "0x%04X", state.buttonMask)
+        var btns: [String] = []
+        if state.buttonMask & PadBit.a != 0             { btns.append("A") }
+        if state.buttonMask & PadBit.b != 0             { btns.append("B") }
+        if state.buttonMask & PadBit.x != 0             { btns.append("X") }
+        if state.buttonMask & PadBit.y != 0             { btns.append("Y") }
+        if state.buttonMask & PadBit.leftShoulder != 0  { btns.append("LB") }
+        if state.buttonMask & PadBit.rightShoulder != 0 { btns.append("RB") }
+        if state.buttonMask & PadBit.leftTrigger != 0   { btns.append("LT") }
+        if state.buttonMask & PadBit.rightTrigger != 0  { btns.append("RT") }
+        if state.buttonMask & PadBit.dpadUp != 0        { btns.append("dU") }
+        if state.buttonMask & PadBit.dpadDown != 0      { btns.append("dD") }
+        if state.buttonMask & PadBit.dpadLeft != 0      { btns.append("dL") }
+        if state.buttonMask & PadBit.dpadRight != 0     { btns.append("dR") }
+        if state.buttonMask & PadBit.menu != 0          { btns.append("MENU") }
+        if state.buttonMask & PadBit.options != 0       { btns.append("OPT") }
+        if state.buttonMask & PadBit.leftThumb != 0     { btns.append("L3") }
+        if state.buttonMask & PadBit.rightThumb != 0    { btns.append("R3") }
+        let btnStr = btns.isEmpty ? "-" : btns.joined(separator: "+")
+        print(
+            String(
+                format: "[GCController] input %@ left=(%.2f, %.2f) right=(%.2f, %.2f) fire=%d jump=%d crouch=%d buttons=%@ mask=%@",
+                sourceName,
+                state.leftX,
+                state.leftY,
+                state.rightX,
+                state.rightY,
+                state.firePressed,
+                state.jumpPressed,
+                state.crouchPressed,
+                btnStr,
+                maskHex
+            )
+        )
+    }
+
+    private func describe(_ controller: GCController) -> String {
+        let name = controller.vendorName ?? "Unknown"
+        let profile = controller.extendedGamepad != nil ? "extended" : "non-extended"
+        return "\(name) profile=\(profile)"
+    }
+}
+
+/// MTKView subclass that adds hardware-keyboard + trackpad input on
+/// iPad's Magic Keyboard (and any BT keyboard/mouse on iPhone). Bridges
+/// to Q3 via Q3Sys_KeyEvent / Q3Sys_MouseMove (declared in the bridging
+/// header).
+///
+/// - Keyboard: `pressesBegan/Ended` → maps `UIKey.keyCode` to Q3 keycodes
+///   (defined in code/client/keycodes.h: ASCII for letters/digits, K_*
+///   constants for arrows/modifiers/F-keys).
+/// - Trackpad: `UIPanGestureRecognizer` with `.allowedScrollTypesMask =
+///   .all` captures both two-finger trackpad pan AND mouse drag deltas.
+///   Translation is fed as raw mouse delta (drag-to-look).
+/// - Trackpad click: `UITapGestureRecognizer` with `allowedTouchTypes =
+///   [.indirectPointer]` fires K_MOUSE1 (a standard click — bound by
+///   default.cfg to `+attack`). Direct touch is excluded so on-screen
+///   touches (HUD/joystick zones) don't double-fire.
+///
+/// Coexists cleanly with `GameControllerBridge`: both push events into
+/// the same Q3 event queue (Sys_QueEvent), and Q3's bind system dispatches
+/// based on the keycode regardless of source device. Whichever input
+/// the user prefers (controller, keyboard, trackpad) just works.
+final class Q3InputView: MTKView {
+    override var canBecomeFirstResponder: Bool { true }
+
+    override init(frame frameRect: CGRect, device: MTLDevice?) {
+        super.init(frame: frameRect, device: device)
+        setupInput()
+    }
+
+    required init(coder: NSCoder) {
+        super.init(coder: coder)
+        setupInput()
+    }
+
+    private func setupInput() {
+        isUserInteractionEnabled = true
+
+        let pan = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
+        if #available(iOS 13.4, *) {
+            pan.allowedScrollTypesMask = .all
+        }
+        addGestureRecognizer(pan)
+
+        let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
+        if #available(iOS 13.4, *) {
+            tap.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
+        }
+        addGestureRecognizer(tap)
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        _ = becomeFirstResponder()
+        super.touchesBegan(touches, with: event)
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        // Become first responder once SwiftUI has finished mounting.
+        // Direct call during view installation is sometimes ignored
+        // mid-layout; deferring one runloop tick is reliable.
+        if window != nil {
+            DispatchQueue.main.async { [weak self] in
+                _ = self?.becomeFirstResponder()
+            }
+        }
+    }
+
+    @objc private func handlePan(_ g: UIPanGestureRecognizer) {
+        switch g.state {
+        case .began, .changed:
+            let t = g.translation(in: self)
+            let dx = Int32(t.x.rounded())
+            let dy = Int32(t.y.rounded())
+            if dx != 0 || dy != 0 {
+                Q3Sys_MouseMove(dx, dy)
+                // Reset translation so each call is a fresh delta
+                // rather than cumulative.
+                g.setTranslation(.zero, in: self)
+            }
+        default:
+            break
+        }
+    }
+
+    @objc private func handleTap(_ g: UITapGestureRecognizer) {
+        guard g.state == .recognized else { return }
+        // K_MOUSE1 = 178 (code/client/keycodes.h). Q3 binds run on
+        // key-down; pulse down→up so the bind fires once per click.
+        Q3Sys_KeyEvent(178, 1)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            Q3Sys_KeyEvent(178, 0)
+        }
+    }
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPress
+
+[…truncated 4186 chars — raise BridgeOptions.maxResultChars, or call the tool with a narrower scope (filter, head, pagination)…]
+
+        case .keyboardF10: return 154
+        case .keyboardF11: return 155
+        case .keyboardF12: return 156
+        case .keyboardGraveAccentAndTilde: return 96
+        default:
+            // Fallback: trust the produced character. Some keyboard
+            // layouts route DEL/BS through a keyCode that doesn't
+            // match `.keyboardDeleteOrBackspace` — catch the actual
+            // 0x7F (DEL) or 0x08 (BS) character and route both to
+            // K_BACKSPACE.
+            if let ch = key.charactersIgnoringModifiers.first,
+               let asc = ch.asciiValue {
+                if asc == 0x7F || asc == 0x08 { return 127 }
+                if asc >= 32 && asc < 127 {
+                    // Printable ASCII — Q3 uses lowercase for letter keys.
+                    if let lower = String(ch).lowercased().first?.asciiValue {
+                        return Int32(lower)
+                    }
+                    return Int32(asc)
+                }
+            }
+            return nil
+        }
+    }
+}

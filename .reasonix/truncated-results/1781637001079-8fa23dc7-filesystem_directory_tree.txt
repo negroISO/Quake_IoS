@@ -1,0 +1,980 @@
+[
+  {
+    "name": ".DS_Store",
+    "type": "file"
+  },
+  {
+    "name": "Build",
+    "type": "directory",
+    "children": [
+      {
+        "name": "Intermediates.noindex",
+        "type": "directory",
+        "children": [
+          {
+            "name": "EagerLinkingTBDs",
+            "type": "directory",
+            "children": [
+              {
+                "name": "Debug-iphoneos",
+                "type": "directory",
+                "children": []
+              }
+            ]
+          },
+          {
+            "name": "ExplicitPrecompiledModules",
+            "type": "directory",
+            "children": [
+              {
+                "name": "CFNetwork-3PND7TWVV4RPXYKRYHPBKDW3C.d",
+                "type": "file"
+              },
+              {
+                "name": "CFNetwork-3PND7TWVV4RPXYKRYHPBKDW3C.dia",
+                "type": "file"
+              },
+              {
+                "name": "CFNetwork-3PND7TWVV4RPXYKRYHPBKDW3C.pcm",
+                "type": "file"
+              },
+              {
+                "name": "CFNetwork-3PND7TWVV4RPXYKRYHPBKDW3C.scan",
+                "type": "file"
+              },
+              {
+                "name": "CoreFoundation-B5KWAJE8KDBF4KC28B99PXDM5.d",
+                "type": "file"
+              },
+              {
+                "name": "CoreFoundation-B5KWAJE8KDBF4KC28B99PXDM5.dia",
+                "type": "file"
+              },
+              {
+                "name": "CoreFoundation-B5KWAJE8KDBF4KC28B99PXDM5.pcm",
+                "type": "file"
+              },
+              {
+                "name": "CoreFoundation-B5KWAJE8KDBF4KC28B99PXDM5.scan",
+                "type": "file"
+              },
+              {
+                "name": "CoreGraphics-EASOE3ELF8K3ZOB3SWBPCG5KH.d",
+                "type": "file"
+              },
+              {
+                "name": "CoreGraphics-EASOE3ELF8K3ZOB3SWBPCG5KH.dia",
+                "type": "file"
+              },
+              {
+                "name": "CoreGraphics-EASOE3ELF8K3ZOB3SWBPCG5KH.pcm",
+                "type": "file"
+              },
+              {
+                "name": "CoreGraphics-EASOE3ELF8K3ZOB3SWBPCG5KH.scan",
+                "type": "file"
+              },
+              {
+                "name": "CoreImage-4ABLK8A6Y33YM77LV8SB1GATZ.d",
+                "type": "file"
+              },
+              {
+                "name": "CoreImage-4ABLK8A6Y33YM77LV8SB1GATZ.dia",
+                "type": "file"
+              },
+              {
+                "name": "CoreImage-4ABLK8A6Y33YM77LV8SB1GATZ.pcm",
+                "type": "file"
+              },
+              {
+                "name": "CoreImage-4ABLK8A6Y33YM77LV8SB1GATZ.scan",
+                "type": "file"
+              },
+              {
+                "name": "CoreText-745PXJKFREIRQRTBMI0ZL8QGE.d",
+                "type": "file"
+              },
+              {
+                "name": "CoreText-745PXJKFREIRQRTBMI0ZL8QGE.dia",
+                "type": "file"
+              },
+              {
+                "name": "CoreText-745PXJKFREIRQRTBMI0ZL8QGE.pcm",
+                "type": "file"
+              },
+              {
+                "name": "CoreText-745PXJKFREIRQRTBMI0ZL8QGE.scan",
+                "type": "file"
+              },
+              {
+                "name": "CoreVideo-8A3S84FG7AN97OROAHKH8FQVP.d",
+                "type": "file"
+              },
+              {
+                "name": "CoreVideo-8A3S84FG7AN97OROAHKH8FQVP.dia",
+                "type": "file"
+              },
+              {
+                "name": "CoreVideo-8A3S84FG7AN97OROAHKH8FQVP.pcm",
+                "type": "file"
+              },
+              {
+                "name": "CoreVideo-8A3S84FG7AN97OROAHKH8FQVP.scan",
+                "type": "file"
+              },
+              {
+                "name": "Darwin-31Y19EOLTTYRFKX3KJIQ2IEL3.d",
+                "type": "file"
+              },
+              {
+                "name": "Darwin-31Y19EOLTTYRFKX3KJIQ2IEL3.dia",
+                "type": "file"
+              },
+              {
+                "name": "Darwin-31Y19EOLTTYRFKX3KJIQ2IEL3.pcm",
+                "type": "file"
+              },
+              {
+                "name": "Darwin-31Y19EOLTTYRFKX3KJIQ2IEL3.scan",
+                "type": "file"
+              },
+              {
+                "name": "Darwin-7D24TAG454CZ5F34FZZLY8XA2.d",
+                "type": "file"
+              },
+              {
+                "name": "Darwin-7D24TAG454CZ5F34FZZLY8XA2.dia",
+                "type": "file"
+              },
+              {
+                "name": "Darwin-7D24TAG454CZ5F34FZZLY8XA2.pcm",
+                "type": "file"
+              },
+              {
+                "name": "Darwin-7D24TAG454CZ5F34FZZLY8XA2.scan",
+                "type": "file"
+              },
+              {
+                "name": "Dispatch-3W5S9XCR959YNK5WDNJAPD37K.d",
+                "type": "file"
+              },
+              {
+                "name": "Dispatch-3W5S9XCR959YNK5WDNJAPD37K.dia",
+                "type": "file"
+              },
+              {
+                "name": "Dispatch-3W5S9XCR959YNK5WDNJAPD37K.pcm",
+                "type": "file"
+              },
+              {
+                "name": "Dispatch-3W5S9XCR959YNK5WDNJAPD37K.scan",
+                "type": "file"
+              },
+              {
+                "name": "Dispatch-A6T30PR6JJMHRGV33663O8K1H.d",
+                "type": "file"
+              },
+              {
+                "name": "Dispatch-A6T30PR6JJMHRGV33663O8K1H.dia",
+                "type": "file"
+              },
+              {
+                "name": "Dispatch-A6T30PR6JJMHRGV33663O8K1H.pcm",
+                "type": "file"
+              },
+              {
+                "name": "Dispatch-A6T30PR6JJMHRGV33663O8K1H.scan",
+                "type": "file"
+              },
+              {
+                "name": "FileProvider-447BAPYZDI8RBPVWYG05LHWWD.d",
+                "type": "file"
+              },
+              {
+                "name": "FileProvider-447BAPYZDI8RBPVWYG05LHWWD.dia",
+                "type": "file"
+              },
+              {
+                "name": "FileProvider-447BAPYZDI8RBPVWYG05LHWWD.pcm",
+                "type": "file"
+              },
+              {
+                "name": "FileProvider-447BAPYZDI8RBPVWYG05LHWWD.scan",
+                "type": "file"
+              },
+              {
+                "name": "Foundation-5UEXOEYZFGJXFB4N39Y2WZOL4.d",
+                "type": "file"
+              },
+              {
+                "name": "Foundation-5UEXOEYZFGJXFB4N39Y2WZOL4.dia",
+                "type": "file"
+              },
+              {
+                "name": "Foundation-5UEXOEYZFGJXFB4N39Y2WZOL4.pcm",
+                "type": "file"
+              },
+              {
+                "name": "Foundation-5UEXOEYZFGJXFB4N39Y2WZOL4.scan",
+                "type": "file"
+              },
+              {
+                "name": "IOSurface-2CLR7VEB1AB6UTZVYEO4GLH6X.d",
+                "type": "file"
+              },
+              {
+                "name": "IOSurface-2CLR7VEB1AB6UTZVYEO4GLH6X.dia",
+                "type": "file"
+              },
+              {
+                "name": "IOSurface-2CLR7VEB1AB6UTZVYEO4GLH6X.pcm",
+                "type": "file"
+              },
+              {
+                "name": "IOSurface-2CLR7VEB1AB6UTZVYEO4GLH6X.scan",
+                "type": "file"
+              },
+              {
+                "name": "ImageIO-8ITHB3OIT88HC9INGFPL4LOU8.d",
+                "type": "file"
+              },
+              {
+                "name": "ImageIO-8ITHB3OIT88HC9INGFPL4LOU8.dia",
+                "type": "file"
+              },
+              {
+                "name": "ImageIO-8ITHB3OIT88HC9INGFPL4LOU8.pcm",
+                "type": "file"
+              },
+              {
+                "name": "ImageIO-8ITHB3OIT88HC9INGFPL4LOU8.scan",
+                "type": "file"
+              },
+              {
+                "name": "MachO-6LUYA8YSCIHYUIINASH318MB7.d",
+                "type": "file"
+              },
+              {
+                "name": "MachO-6LUYA8YSCIHYUIINASH318MB7.dia",
+                "type": "file"
+              },
+              {
+                "name": "MachO-6LUYA8YSCIHYUIINASH318MB7.pcm",
+                "type": "file"
+              },
+              {
+                "name": "MachO-6LUYA8YSCIHYUIINASH318MB7.scan",
+                "type": "file"
+              },
+              {
+                "name": "Metal-L7AWNMEV6E45S39RXNP50LPF.d",
+                "type": "file"
+              },
+              {
+                "name": "Metal-L7AWNMEV6E45S39RXNP50LPF.dia",
+                "type": "file"
+              },
+              {
+                "name": "Metal-L7AWNMEV6E45S39RXNP50LPF.pcm",
+                "type": "file"
+              },
+              {
+                "name": "Metal-L7AWNMEV6E45S39RXNP50LPF.scan",
+                "type": "file"
+              },
+              {
+                "name": "ObjectiveC-A9GKH5TES63G20K8L3PVZTXWX.d",
+                "type": "file"
+              },
+              {
+                "name": "ObjectiveC-A9GKH5TES63G20K8L3PVZTXWX.dia",
+                "type": "file"
+              },
+              {
+                "name": "ObjectiveC-A9GKH5TES63G20K8L3PVZTXWX.pcm",
+                "type": "file"
+              },
+              {
+                "name": "ObjectiveC-A9GKH5TES63G20K8L3PVZTXWX.scan",
+                "type": "file"
+              },
+              {
+                "name": "OpenGLES-54DIMOUM48RAQIXW7071HPCMZ.d",
+                "type": "file"
+              },
+              {
+                "name": "OpenGLES-54DIMOUM48RAQIXW7071HPCMZ.dia",
+                "type": "file"
+              },
+              {
+                "name": "OpenGLES-54DIMOUM48RAQIXW7071HPCMZ.pcm",
+                "type": "file"
+              },
+              {
+                "name": "OpenGLES-54DIMOUM48RAQIXW7071HPCMZ.scan",
+                "type": "file"
+              },
+              {
+                "name": "QuartzCore-1DHWW5J0ZNNBYMMY6WMTXM1ZC.d",
+                "type": "file"
+              },
+              {
+                "name": "QuartzCore-1DHWW5J0ZNNBYMMY6WMTXM1ZC.dia",
+                "type": "file"
+              },
+              {
+                "name": "QuartzCore-1DHWW5J0ZNNBYMMY6WMTXM1ZC.pcm",
+                "type": "file"
+              },
+              {
+                "name": "QuartzCore-1DHWW5J0ZNNBYMMY6WMTXM1ZC.scan",
+                "type": "file"
+              },
+              {
+                "name": "Security-6XKVKIAWPG5JTZ8F4J4RNUD3C.d",
+                "type": "file"
+              },
+              {
+                "name": "Security-6XKVKIAWPG5JTZ8F4J4RNUD3C.dia",
+                "type": "file"
+              },
+              {
+                "name": "Security-6XKVKIAWPG5JTZ8F4J4RNUD3C.pcm",
+                "type": "file"
+              },
+              {
+                "name": "Security-6XKVKIAWPG5JTZ8F4J4RNUD3C.scan",
+                "type": "file"
+              },
+              {
+                "name": "Symbols-BB4L3YPJRAV5NJLBS9H7T5WKS.d",
+                "type": "file"
+              },
+              {
+                "name": "Symbols-BB4L3YPJRAV5NJLBS9H7T5WKS.dia",
+                "type": "file"
+              },
+              {
+                "name": "Symbols-BB4L3YPJRAV5NJLBS9H7T5WKS.pcm",
+                "type": "file"
+              },
+              {
+                "name": "Symbols-BB4L3YPJRAV5NJLBS9H7T5WKS.scan",
+                "type": "file"
+              },
+              {
+                "name": "UIKit-6EB2ZQZ7AXG0HSJTG44B6PYYX.d",
+                "type": "file"
+              },
+              {
+                "name": "UIKit-6EB2ZQZ7AXG0HSJTG44B6PYYX.dia",
+                "type": "file"
+              },
+              {
+                "name": "UIKit-6EB2ZQZ7AXG0HSJTG44B6PYYX.pcm",
+                "type": "file"
+              },
+              {
+                "name": "UIKit-6EB2ZQZ7AXG0HSJTG44B6PYYX.scan",
+                "type": "file"
+              },
+              {
+                "name": "UIUtilities-4PHWY8VNSBR3XR23FK7PS30CK.d",
+                "type": "file"
+              },
+              {
+                "name": "UIUtilities-4PHWY8VNSBR3XR23FK7PS30CK.dia",
+                "type": "file"
+              },
+              {
+                "name": "UIUtilities-4PHWY8VNSBR3XR23FK7PS30CK.pcm",
+                "type": "file"
+              },
+              {
+                "name": "UIUtilities-4PHWY8VNSBR3XR23FK7PS30CK.scan",
+                "type": "file"
+              },
+              {
+                "name": "UserNotifications-2GAGC6K25K564JC03RF18LGQL.d",
+                "type": "file"
+              },
+              {
+                "name": "UserNotifications-2GAGC6K25K564JC03RF18LGQL.dia",
+                "type": "file"
+              },
+              {
+                "name": "UserNotifications-2GAGC6K25K564JC03RF18LGQL.pcm",
+                "type": "file"
+              },
+              {
+                "name": "UserNotifications-2GAGC6K25K564JC03RF18LGQL.scan",
+                "type": "file"
+              },
+              {
+                "name": "XPC-501BCHGAX4R5GBEGPN7XS2NM9.d",
+                "type": "file"
+              },
+              {
+                "name": "XPC-501BCHGAX4R5GBEGPN7XS2NM9.dia",
+                "type": "file"
+              },
+              {
+                "name": "XPC-501BCHGAX4R5GBEGPN7XS2NM9.pcm",
+                "type": "file"
+              },
+              {
+                "name": "XPC-501BCHGAX4R5GBEGPN7XS2NM9.scan",
+                "type": "file"
+              },
+              {
+                "name": "XPC-80PNO9GWK8SC7HQQHJ5WOA34L.d",
+                "type": "file"
+              },
+              {
+                "name": "XPC-80PNO9GWK8SC7HQQHJ5WOA34L.dia",
+                "type": "file"
+              },
+              {
+                "name": "XPC-80PNO9GWK8SC7HQQHJ5WOA34L.pcm",
+                "type": "file"
+              },
+              {
+                "name": "XPC-80PNO9GWK8SC7HQQHJ5WOA34L.scan",
+                "type": "file"
+              },
+              {
+                "name": "_AvailabilityInternal-1AJEQL86GC82VR6JQCKRRQPK4.d",
+                "type": "file"
+              },
+              {
+                "name": "_AvailabilityInternal-1AJEQL86GC82VR6JQCKRRQPK4.dia",
+                "type": "file"
+              },
+              {
+                "name": "_AvailabilityInternal-1AJEQL86GC82VR6JQCKRRQPK4.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_AvailabilityInternal-1AJEQL86GC82VR6JQCKRRQPK4.scan",
+                "type": "file"
+              },
+              {
+                "name": "_AvailabilityInternal-1U9HPYJ062BMYCMUVEFUDIMA3.d",
+                "type": "file"
+              },
+              {
+                "name": "_AvailabilityInternal-1U9HPYJ062BMYCMUVEFUDIMA3.dia",
+                "type": "file"
+              },
+              {
+                "name": "_AvailabilityInternal-1U9HPYJ062BMYCMUVEFUDIMA3.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_AvailabilityInternal-1U9HPYJ062BMYCMUVEFUDIMA3.scan",
+                "type": "file"
+              },
+              {
+                "name": "_AvailabilityInternal-A5VBP684Q2IWNL2I890WLIL0I.d",
+                "type": "file"
+              },
+              {
+                "name": "_AvailabilityInternal-A5VBP684Q2IWNL2I890WLIL0I.dia",
+                "type": "file"
+              },
+              {
+                "name": "_AvailabilityInternal-A5VBP684Q2IWNL2I890WLIL0I.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_AvailabilityInternal-A5VBP684Q2IWNL2I890WLIL0I.scan",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_float-2M7A68Q16TFGMP5OZTAS335V7.d",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_float-2M7A68Q16TFGMP5OZTAS335V7.dia",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_float-2M7A68Q16TFGMP5OZTAS335V7.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_float-2M7A68Q16TFGMP5OZTAS335V7.scan",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_inttypes-7ZU01RMTRVNOFXHUCW1YK8982.d",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_inttypes-7ZU01RMTRVNOFXHUCW1YK8982.dia",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_inttypes-7ZU01RMTRVNOFXHUCW1YK8982.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_inttypes-7ZU01RMTRVNOFXHUCW1YK8982.scan",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_inttypes-CJTXIORQHSTB64266VGISWFER.d",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_inttypes-CJTXIORQHSTB64266VGISWFER.dia",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_inttypes-CJTXIORQHSTB64266VGISWFER.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_inttypes-CJTXIORQHSTB64266VGISWFER.scan",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_limits-9RVBSHJV8MYH7JE08P7584PX6.d",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_limits-9RVBSHJV8MYH7JE08P7584PX6.dia",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_limits-9RVBSHJV8MYH7JE08P7584PX6.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_limits-9RVBSHJV8MYH7JE08P7584PX6.scan",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_limits-AV939UIF9RGBHA85ZEEFJNAGQ.d",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_limits-AV939UIF9RGBHA85ZEEFJNAGQ.dia",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_limits-AV939UIF9RGBHA85ZEEFJNAGQ.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_limits-AV939UIF9RGBHA85ZEEFJNAGQ.scan",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_limits-D63TFE21FSNWJ5ENKF072TCYS.d",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_limits-D63TFE21FSNWJ5ENKF072TCYS.dia",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_limits-D63TFE21FSNWJ5ENKF072TCYS.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_limits-D63TFE21FSNWJ5ENKF072TCYS.scan",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdarg-2AL7FFKERNADUYN0MH249Z0ND.d",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdarg-2AL7FFKERNADUYN0MH249Z0ND.dia",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdarg-2AL7FFKERNADUYN0MH249Z0ND.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdarg-2AL7FFKERNADUYN0MH249Z0ND.scan",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdarg-8WI0QIO5KSSBQJOP7YWP24S93.d",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdarg-8WI0QIO5KSSBQJOP7YWP24S93.dia",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdarg-8WI0QIO5KSSBQJOP7YWP24S93.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdarg-8WI0QIO5KSSBQJOP7YWP24S93.scan",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdarg-CP97QX429UW4MHVWVFPQ68VJV.d",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdarg-CP97QX429UW4MHVWVFPQ68VJV.dia",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdarg-CP97QX429UW4MHVWVFPQ68VJV.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdarg-CP97QX429UW4MHVWVFPQ68VJV.scan",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdatomic-D74PIKNMLZQAFSRYFUDJFGGD1.d",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdatomic-D74PIKNMLZQAFSRYFUDJFGGD1.dia",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdatomic-D74PIKNMLZQAFSRYFUDJFGGD1.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdatomic-D74PIKNMLZQAFSRYFUDJFGGD1.scan",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdbool-1H3J83KN6ZKWPQI0B8YQYFCPN.d",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdbool-1H3J83KN6ZKWPQI0B8YQYFCPN.dia",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdbool-1H3J83KN6ZKWPQI0B8YQYFCPN.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdbool-1H3J83KN6ZKWPQI0B8YQYFCPN.scan",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdbool-3Z7X17M9T6NXEHXOL5T36M2N0.d",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdbool-3Z7X17M9T6NXEHXOL5T36M2N0.dia",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdbool-3Z7X17M9T6NXEHXOL5T36M2N0.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdbool-3Z7X17M9T6NXEHXOL5T36M2N0.scan",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stddef-1YH9450H4E00PC2JX71ZX5AL7.d",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stddef-1YH9450H4E00PC2JX71ZX5AL7.dia",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stddef-1YH9450H4E00PC2JX71ZX5AL7.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stddef-1YH9450H4E00PC2JX71ZX5AL7.scan",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stddef-27O9XUKTD99V1LO28SCP4B77B.d",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stddef-27O9XUKTD99V1LO28SCP4B77B.dia",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stddef-27O9XUKTD99V1LO28SCP4B77B.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stddef-27O9XUKTD99V1LO28SCP4B77B.scan",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stddef-2KA5VKIVH0ND5PMYDYV5GPXOU.d",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stddef-2KA5VKIVH0ND5PMYDYV5GPXOU.dia",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stddef-2KA5VKIVH0ND5PMYDYV5GPXOU.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stddef-2KA5VKIVH0ND5PMYDYV5GPXOU.scan",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdint-4DHIN353VIS510VWFQPAAGGSQ.d",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdint-4DHIN353VIS510VWFQPAAGGSQ.dia",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdint-4DHIN353VIS510VWFQPAAGGSQ.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdint-4DHIN353VIS510VWFQPAAGGSQ.scan",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdint-CA6IBJK05P0K6FJ1KQUTNAWQN.d",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdint-CA6IBJK05P0K6FJ1KQUTNAWQN.dia",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdint-CA6IBJK05P0K6FJ1KQUTNAWQN.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdint-CA6IBJK05P0K6FJ1KQUTNAWQN.scan",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdint-F1264CZ7YFC8R1NYHGQW39C31.d",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdint-F1264CZ7YFC8R1NYHGQW39C31.dia",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdint-F1264CZ7YFC8R1NYHGQW39C31.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_Builtin_stdint-F1264CZ7YFC8R1NYHGQW39C31.scan",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation1-6C5WNW59ECCV23I13U8340T2B.d",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation1-6C5WNW59ECCV23I13U8340T2B.dia",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation1-6C5WNW59ECCV23I13U8340T2B.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation1-6C5WNW59ECCV23I13U8340T2B.scan",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation1-75J851KYCS8IGKORYNM5D5XSH.d",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation1-75J851KYCS8IGKORYNM5D5XSH.dia",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation1-75J851KYCS8IGKORYNM5D5XSH.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation1-75J851KYCS8IGKORYNM5D5XSH.scan",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation1-DE9FHXIZXUOLZYA17PV2JYK8P.d",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation1-DE9FHXIZXUOLZYA17PV2JYK8P.dia",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation1-DE9FHXIZXUOLZYA17PV2JYK8P.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation1-DE9FHXIZXUOLZYA17PV2JYK8P.scan",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation2-22NUIXWI3H43MJPHTGTLAKE8P.d",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation2-22NUIXWI3H43MJPHTGTLAKE8P.dia",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation2-22NUIXWI3H43MJPHTGTLAKE8P.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation2-22NUIXWI3H43MJPHTGTLAKE8P.scan",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation2-6KTIPLZP4RMDJ1HKJ0ESHB37T.d",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation2-6KTIPLZP4RMDJ1HKJ0ESHB37T.dia",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation2-6KTIPLZP4RMDJ1HKJ0ESHB37T.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation2-6KTIPLZP4RMDJ1HKJ0ESHB37T.scan",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation2-6YPOCNTS5YTUS9RQ314UHC8BV.d",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation2-6YPOCNTS5YTUS9RQ314UHC8BV.dia",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation2-6YPOCNTS5YTUS9RQ314UHC8BV.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation2-6YPOCNTS5YTUS9RQ314UHC8BV.scan",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation3-4U3BDPKJ9Z0T76HL5HAPPDXA3.d",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation3-4U3BDPKJ9Z0T76HL5HAPPDXA3.dia",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation3-4U3BDPKJ9Z0T76HL5HAPPDXA3.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation3-4U3BDPKJ9Z0T76HL5HAPPDXA3.scan",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation3-7RKG4YK1ZNO983Z83JVKHT826.d",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation3-7RKG4YK1ZNO983Z83JVKHT826.dia",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation3-7RKG4YK1ZNO983Z83JVKHT826.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation3-7RKG4YK1ZNO983Z83JVKHT826.scan",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation3-8BA4ZBB0BS8RZLZWHY9A5CQVP.d",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation3-8BA4ZBB0BS8RZLZWHY9A5CQVP.dia",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation3-8BA4ZBB0BS8RZLZWHY9A5CQVP.pcm",
+                "type": "file"
+              },
+              {
+                "name": "_DarwinFoundation3-8BA4ZBB0BS8RZLZWHY9A5CQVP.scan",
+                "type": "file"
+              },
+              {
+                "name": "libkern-8P6JW5YQI2592C9C7U1U3A7EJ.d",
+                "type": "file"
+              },
+              {
+                "name": "libkern-8P6JW5YQI2592C9C7U1U
+
+[…truncated 762095 chars — raise BridgeOptions.maxResultChars, or call the tool with a narrower scope (filter, head, pagination)…]
+
+      "type": "file"
+      },
+      {
+        "name": "os-97JAXT63QN5WIHFZGG9ZNZSOJ.pcm",
+        "type": "file"
+      },
+      {
+        "name": "os_object-F1CSLAAW2C3N5SPC5BZSENFN.pcm",
+        "type": "file"
+      },
+      {
+        "name": "os_workgroup-8YM4M46ZELNLQWB0VDG39P4Y1.pcm",
+        "type": "file"
+      },
+      {
+        "name": "ptrauth-880HME4HAEJP83D3CJR2PX7K5.pcm",
+        "type": "file"
+      },
+      {
+        "name": "ptrcheck-ENQ31VUUJICYY4ZK6756IUQYZ.pcm",
+        "type": "file"
+      },
+      {
+        "name": "simd-3KNVA3AA0KRN95AJU4JYHY9J8.pcm",
+        "type": "file"
+      },
+      {
+        "name": "sys_types-1K9O1J1G7F32F06H8QUTD2AMX.pcm",
+        "type": "file"
+      }
+    ]
+  },
+  {
+    "name": "SDKStatCaches.noindex",
+    "type": "directory",
+    "children": [
+      {
+        "name": "iphoneos26.5-23F73-688ef53f1462e2c8f657fdc38a81448f32daed1954a7d5dd0789fcaf2a9bb78b.sdkstatcache",
+        "type": "file"
+      }
+    ]
+  },
+  {
+    "name": "info.plist",
+    "type": "file"
+  }
+]

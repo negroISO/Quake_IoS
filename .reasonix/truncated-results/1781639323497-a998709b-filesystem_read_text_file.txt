@@ -1,0 +1,600 @@
+* above q3dm4's low fog volume as inside, so the real
+                 * pit fog is no longer clipped away. */
+                float4 surface = drawUniforms.fogSurface;
+                t = dot(worldPos, surface.xyz) - surface.w;
+                float eyeT = dot(float3(uniforms.cameraPos), surface.xyz) - surface.w;
+                if (eyeT < 0.0) {
+                    if (t < 1.0) {
+                        t = 1.0 / 32.0;
+                    } else {
+                        t = 1.0 / 32.0 + (30.0 / 32.0 * t) / (t - eyeT);
+                    }
+                } else {
+                    t = (t < 0.0) ? (1.0 / 32.0) : (31.0 / 32.0);
+                }
+            }
+            out.s = s;
+            out.t = t;
+            return out;
+        }
+        float q3FogFactor(float3 worldPos,
+                          constant WorldUniforms &uniforms,
+                          constant WorldDrawUniforms &drawUniforms) {
+            Q3FogTexCoord st = q3FogTexCoords(worldPos, uniforms, drawUniforms);
+            if (st.s < 0.0 || st.t < (1.0 / 32.0)) {
+                return 0.0;
+            }
+            return saturate(q3FogImageFactor(st.s, st.t));
+        }
+
+        struct EntityVertexIn {
+            float3 position;
+            float2 texCoord;
+            float4 color;
+            float3 normal;
+        };
+        // NOTE 2026-06-01: tried packed_float3 swap here to match the
+        // tightly-packed C Q3MetalEntityVertex (48 bytes vs MSL float3-
+        // padded 56). The Geometry tab on a flare draw clearly showed
+        // negative-w vertices producing radial bursts, so the misalignment
+        // hypothesis seemed right. But the packed_float3 build turned fog
+        // green and killed rocket-explosion brightness — so something
+        // upstream is already compensating for the stride mismatch (the
+        // CPU upload path probably re-lays the vertices to MSL-aligned
+        // 56 bytes before binding, or there's a hidden vertex descriptor).
+        // The diagonal "light ray" turned out to be a real BSP lens flare
+        // (light_flare entity), not a geometry bug. If we ever DO need
+        // to revisit struct alignment, audit how Q3MetalRenderer_Get*
+        // buffers are uploaded first.
+
+        struct EntityUniforms {
+            float4x4 viewProjection;
+            /* Mirrors Swift-side struct — MSL packs float3 on 16-byte
+             * boundaries, so the explicit pads keep offsets aligned with
+             * the Swift layout. Read by q3_entity_fragment for tcGen env. */
+            float3 cameraPos;
+            float3 cameraForward;
+            float  tcGen;
+            float  timeSeconds;
+            int    tcModCount;
+            float  alphaTestThreshold;
+            float4 tcModType;
+            float4 tcModParams0;
+            float4 tcModParams1;
+            float4 tcModParams2;
+            float4 tcModParams3;
+            uint rgbGenMode;
+            uint alphaGenMode;
+            uint rgbWaveFunc;
+            uint alphaWaveFunc;
+            float4 rgbGenWaveParams;
+            float4 alphaGenWaveParams;
+            float4 rgbConstColor;
+            float4 entityColor;
+            float4 fogColorDistance;
+            float4 fogParams;
+            float4 fogSurface;
+            uint suppressDlights;
+            uint forceLuminanceAlpha;
+            /* deformVertexes wave (shader-level). Applied in
+             * q3_entity_vertex when deformWaveFunc != 0. Matches the
+             * world pipeline's deform formula exactly. */
+            uint  deformWaveFunc;
+            float deformWaveDiv;
+            float deformWaveBase;
+            float deformWaveAmp;
+            float deformWavePhase;
+            float deformWaveFreq;
+            // RTX Remix sprite-sheet atlas. .x=cols (0=no atlas), .y=rows,
+            // .z=fps, .w=pad. Entity fragment remaps UV when cols>0.
+            float4 spriteAtlasParams;
+            // Emissive contribution. .xyz = sRGB tint, .w = intensity.
+            // Same semantics as WorldDrawUniforms.emissiveParams.
+            float4 emissiveParams;
+            // 2026-06-10: viewmodel-only PBR base-color floor.
+            // .x = floor strength (r_pbr_viewmodel_floor, default 0.35)
+            // .y = viewmodel gate (1.0 for RF_DEPTHHACK, 0.0 otherwise)
+            // .z, .w = pad. Fragment applies `base.rgb = max(base.rgb,
+            // texel.rgb * .x)` only when `.y > 0.5`. Layout MUST match
+            // Swift `EntityUniforms.viewmodelParams` (placed AFTER
+            // emissiveParams) — moving this above emissiveParams scrambles
+            // the GPU read offsets.
+            float4 viewmodelParams;
+            // USD-authored sun for entity/viewmodel normal/specular path.
+            // sunColor.w = 0: use legacy hardcoded entity sun.
+            packed_float3 sunDir;
+            float sunIntensity;
+            float4 sunColor;
+        };
+
+        float q3EntityFogFactor(float3 worldPos,
+                                constant EntityUniforms &uniforms) {
+            if (uniforms.fogColorDistance.w <= 0.0 ||
+                uniforms.fogParams.x <= 0.0) {
+                return 0.0;
+            }
+
+            float s = dot(worldPos - uniforms.cameraPos,
+                          normalize(uniforms.cameraForward)) *
+                      uniforms.fogParams.x + (1.0 / 512.0);
+            float t = 31.0 / 32.0;
+
+            if (uniforms.fogParams.y > 0.5) {
+                float4 surface = uniforms.fogSurface;
+                t = dot(worldPos, surface.xyz) - surface.w;
+                float eyeT = dot(uniforms.cameraPos, surface.xyz) - surface.w;
+                if (eyeT < 0.0) {
+                    if (t < 1.0) {
+                        t = 1.0 / 32.0;
+                    } else {
+                        t = 1.0 / 32.0 + (30.0 / 32.0 * t) / (t - eyeT);
+                    }
+                } else {
+                    t = (t < 0.0) ? (1.0 / 32.0) : (31.0 / 32.0);
+                }
+            }
+
+            if (s < 0.0 || t < (1.0 / 32.0)) {
+                return 0.0;
+            }
+            return saturate(q3FogImageFactor(s, t));
+        }
+
+        struct EntityVertexOut {
+            float4 position [[position]];
+            float2 texCoord;
+            float4 color;
+            // World-space position — entity verts are pre-transformed to
+            // world space C-side so this is a direct pass-through.
+            float3 worldPos;
+            // World-space normal. Zero vector means "no normal supplied"
+            // (sprite / beam / synthetic overlay); the fragment falls
+            // back to a flat face normal via dfdx/dfdy of worldPos.
+            float3 normal;
+        };
+
+        vertex WorldVertexOut q3_world_vertex(const device WorldVertexIn *vertices [[buffer(0)]],
+                                              constant WorldUniforms &uniforms [[buffer(1)]],
+                                              constant WorldDrawUniforms &drawUniforms [[buffer(2)]],
+                                              uint vertexID [[vertex_id]]) {
+            WorldVertexOut out;
+            WorldVertexIn inVertex = vertices[vertexID];
+            float3 worldPos = inVertex.position;
+            /* deformVertexes wave: shader-level position deform.
+             *   spread = 1 / div
+             *   off    = (xyz.x + xyz.y + xyz.z) * spread
+             *   scale  = wave(func, base, amp, phase + off, freq, time)
+             *   pos   += normal * scale
+             * Mirrors ioq3 DeformVertex_Wave (tr_shade_calc.c). func == 0
+             * means no deform — common path branchless on most vertices
+             * because the uniform value is constant per draw.
+             *
+             * Skip when length(normal) is near zero (legacy verts that
+             * didn't fill the normal slot) to avoid a NaN axis. */
+            if (drawUniforms.deformWaveFunc != 0u) {
+                float3 n = inVertex.normal;
+                float nLen = length(n);
+                if (nLen > 1e-4) {
+                    n /= nLen;
+                    float spread = 1.0 / drawUniforms.deformWaveDiv;
+                    float off = (worldPos.x + worldPos.y + worldPos.z) * spread;
+                    float scale = evalWave(drawUniforms.deformWaveFunc,
+                                           drawUniforms.deformWaveBase,
+                                           drawUniforms.deformWaveAmp,
+                                           drawUniforms.deformWavePhase + off,
+                                           drawUniforms.deformWaveFreq,
+                                           drawUniforms.timeSeconds);
+                    worldPos += n * scale;
+                }
+            }
+            /* deformVertexes bulge — per-vertex ST-coord-driven sine
+             * displacement along normal. Closes the q3dm4 gothic_block /
+             * wallhead organic tube/vein decoration gap (PC has them
+             * undulating; iOS rendered them static because bulge was
+             * silently unimplemented). Mirrors ioq3 RB_DeformTessGeometry
+             * DEFORM_BULGE case from tr_shade_calc.c:
+             *   phase = st.s * bulgeWidth + time * bulgeSpeed
+             *   scale = sin(phase) * bulgeHeight
+             *   pos  += normal * scale
+             * Gated on bulgeWidth > 0 because canonical Q3 shaders only
+             * specify bulge when actively using it (no default == 0
+             * sentinel needed for the func bit). Uses the same per-vertex
+             * normal as the wave deform above; same length-check guard
+             * for sprite/beam vertices that didn't fill the normal slot. */
+            if (drawUniforms.deformBulgeWidth != 0.0 ||
+                drawUniforms.deformBulgeHeight != 0.0) {
+                float3 nb = inVertex.normal;
+                float nbLen = length(nb);
+                if (nbLen > 1e-4) {
+                    nb /= nbLen;
+                    float bulgePhase = inVertex.texCoord.x * drawUniforms.deformBulgeWidth +
+                                       drawUniforms.timeSeconds * drawUniforms.deformBulgeSpeed;
+                    float bulgeScale = sin(bulgePhase) * drawUniforms.deformBulgeHeight;
+                    worldPos += nb * bulgeScale;
+                }
+            }
+            if (drawUniforms.deformMoveFunc != 0u) {
+                float scale = evalWave(drawUniforms.deformMoveFunc,
+                                       drawUniforms.deformMoveBase,
+                                       drawUniforms.deformMoveAmp,
+                                       drawUniforms.deformMovePhase,
+                                       drawUniforms.deformMoveFreq,
+                                       drawUniforms.timeSeconds);
+                worldPos += drawUniforms.deformMoveVector * scale;
+            }
+            /* deformVertexes autosprite (mode 1): camera-aligned
+             * billboard. Replaces the authored corner position with
+             *   newPos = center + cameraRight * radius * sign(dot(offset, R))
+             *                   + cameraUp    * radius * sign(dot(offset, U))
+             * where offset = position - center and radius =
+             * length(offset) * sqrt(2)/2. Matches ioq3 RB_AddQuadStampExt
+             * substituted into RB_AutospriteDeform's per-quad emit step.
+             *
+             * Skip when autospriteCenter is zero (vertex is not part of
+             * an autosprite quad — center bake at BSP load left it 0). */
+            if (drawUniforms.autospriteMode == 1u
+                && length(inVertex.autospriteCenter.xyz) > 1e-4) {
+                float3 center = inVertex.autospriteCenter.xyz;
+                float3 offset = worldPos - center;
+                float  radius = length(offset) * 0.7071068;
+                float  lProj  = dot(offset, float3(uniforms.cameraRight));
+                float  uProj  = dot(offset, float3(uniforms.cameraUp));
+                float  lSign  = lProj >= 0.0 ?  1.0 : -1.0;
+                float  uSign  = uProj >= 0.0 ?  1.0 : -1.0;
+                worldPos = center
+                         + float3(uniforms.cameraRight) * (lSign * radius)
+                         + float3(uniforms.cameraUp)    * (uSign * radius);
+            }
+            /* deformVertexes autoSprite2 (mode 2): elongated billboard.
+             * Preserves the quad's authored long axis; only the
+             * perpendicular short axis is camera-aligned. Used by lamp
+             * wires, chains, exhaust trails, jets — geometry whose
+             * long-axis orientation is meaningful and must not collapse.
+             * Mirrors ioq3 RB_Autosprite2Deform (tr_shade_calc.c).
+             *
+             *   along       = dot(offset, longAxis)
+             *   perpOffset  = offset − longAxis * along
+             *   perpAxis    = normalize(cameraRight − longAxis * dot(R, L))
+             *               (or cameraUp if R is nearly parallel to L)
+             *   perpSign    = sign(dot(perpOffset, perpAxis))
+             *   newPos      = center + longAxis * along
+             *                        + perpAxis * (perpSign * |perpOffset|)
+             *
+             * Skip when long axis is zero (vertex not part of an
+             * autoSprite2 quad). */
+            if (drawUniforms.autospriteMode == 2u
+                && length(inVertex.autospriteCenter.xyz) > 1e-4
+                && length(inVertex.autospriteLongAxis.xyz) > 1e-4) {
+                float3 center   = inVertex.autospriteCenter.xyz;
+                float3 longAxis = inVertex.autospriteLongAxis.xyz;
+                float3 offset   = worldPos - center;
+                float  along    = dot(offset, longAxis);
+                float3 perpOffset = offset - longAxis * along;
+                float  perpLen  = length(perpOffset);
+                float3 cR = float3(uniforms.cameraRight);
+                float3 perpFromR = cR - longAxis * dot(cR, longAxis);
+                float  perpFromR_len = length(perpFromR);
+                float3 perpAxis;
+                if (perpFromR_len > 1e-3) {
+                    perpAxis = perpFromR / perpFromR_len;
+                } else {
+                    float3 cU = float3(uniforms.cameraUp);
+                    float3 perpFromU = cU - longAxis * dot(cU, longAxis);
+                    float perpFromU_len = length(perpFromU);
+                    perpAxis = perpFromU_len > 1e-3
+                             ? perpFromU / perpFromU_len
+                             : float3(0.0, 0.0, 1.0);
+                }
+                float perpSign = dot(perpOffset, perpAxis) >= 0.0 ? 1.0 : -1.0;
+                worldPos = center
+                         + longAxis * along
+                         + perpAxis * (perpSign * perpLen);
+            }
+            out.position = uniforms.viewProjection * float4(worldPos, 1.0);
+            out.texCoord = inVertex.texCoord;
+            out.lightmapTexCoord = inVertex.lightmapTexCoord;
+            out.color = inVertex.color;
+            // Pass through world-space position for the fog distance
+            // calculation in the fragment. Cheap; perspective-correct
+            // interpolation is what we want for linear fog.
+            out.worldPos = worldPos;
+            // Smooth per-vertex normal. Pre-normalized at parse time
+            // (drawVert_t.normal); after rasterizer interpolation the
+            // fragment renormalizes before reflection math.
+            out.worldNormal = inVertex.normal;
+            // Pre-baked CGEN_LIGHTING_DIFFUSE: ambient + directed*Lambert
+            // sampled C-side from the BSP lightgrid against the vertex
+            // normal. Smooth-interpolated by the rasterizer; consumed by
+            // ComputeRGBGen mode 2 in the fragment.
+            out.lightingDiffuse = inVertex.lightingDiffuse;
+            return out;
+        }
+
+
+        float q3SunShadowVisibility(float3 worldPos,
+                                    float3 worldNormal,
+                                    constant WorldUniforms &uniforms,
+                                    depth2d<float> sunShadowMap) {
+            if (uniforms.sunShadowParams.w <= 0.5 || is_null_texture(sunShadowMap)) {
+                return 1.0;
+            }
+            float3 n = worldNormal;
+            if (length(n) < 1e-4) {
+                n = float3(0.0, 0.0, 1.0);
+            } else {
+                n = normalize(n);
+            }
+            float4 sh = uniforms.sunShadowMatrix * float4(worldPos + n * 1.5, 1.0);
+            if (abs(sh.w) < 1e-6) { return 1.0; }
+            float3 ndc = sh.xyz / sh.w;
+            if (ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0 ||
+                ndc.z < 0.0 || ndc.z > 1.0) {
+                return 1.0;
+            }
+            float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+            float texel = uniforms.sunShadowParams.z;
+            float bias = uniforms.sunShadowParams.x;
+            int radius = int(clamp(round(uniforms.sunShadowParams.w), 1.0, 4.0));
+            constexpr sampler shadowSampler(coord::normalized, address::clamp_to_edge, filter::linear);
+            float receiver = ndc.z - bias;
+            float visible = 0.0;
+            float taps = 0.0;
+            for (int y = -4; y <= 4; ++y) {
+                for (int x = -4; x <= 4; ++x) {
+                    if (abs(x) > radius || abs(y) > radius) { continue; }
+                    float d = sunShadowMap.sample(shadowSampler, uv + float2(x, y) * texel);
+                    visible += (receiver <= d) ? 1.0 : 0.0;
+                    taps += 1.0;
+                }
+            }
+            return visible / max(taps, 1.0);
+        }
+
+        fragment float4 q3_world_fragment(WorldVertexOut in [[stage_in]],
+                                          constant WorldDrawUniforms &drawUniforms [[buffer(0)]],
+                                          constant WorldUniforms &uniforms [[buffer(1)]],
+                                          constant DLightBlock &dlights [[buffer(2)]],
+                                          constant float4 &pbrWorldParams [[buffer(3)]],
+                                          texture2d<float> colorTexture [[texture(0)]],
+                                          texture2d<float> lightmapTexture [[texture(1)]],
+                                          texture2d<float> worldNormalMap [[texture(2)]],
+                                          texturecube<float> envCube [[texture(3)]],
+                                          texture2d<float> roughnessMap [[texture(4)]],
+                                          texture2d<float> metallicMap [[texture(5)]],
+                                          texture2d<float> emissiveTexture [[texture(6)]],
+                                          texture2d<float> heightMap [[texture(7)]],
+                                          depth2d<float> sunShadowMap [[texture(8)]],
+                                          sampler textureSampler [[sampler(0)]],
+                                          sampler envSampler [[sampler(1)]]) {
+            float2 texCoord = in.texCoord;
+            int rgbGen = int(drawUniforms.rgbGen + 0.5);
+            int alphaGen = int(drawUniforms.alphaGen + 0.5);
+            int blendMode = int(drawUniforms.blendMode + 0.5);
+            bool additiveStage = (blendMode == 1 || blendMode == 5);
+            /* tcGen modes:
+             *   0 (default) — base UVs, mesh ST as authored.
+             *   1 (environment) — chrome/reflective surfaces. Compute
+             *       reflection vector and project per RB_CalcEnvironmentTexCoords
+             *       (s = 0.5 + refl.y*0.5, t = 0.5 - refl.z*0.5). Prefer the
+             *       smooth per-vertex normal (drawVert_t.normal interpolated
+             *       by the rasterizer); fall back to dfdx/dfdy face normal of
+             *       worldPos when the vertex normal is zero. Smooth path makes
+             *       bezier-patch chrome stop looking faceted.
+             *   2 (vector) — basis-projection. Per RB_CalcTexCoords TCGEN_VECTOR:
+             *       s = dot(worldPos, tcGenVec0.xyz)
+             *       t = dot(worldPos, tcGenVec1.xyz)
+             *       Used by lava/water surfaces and a handful of parametric
+             *       shaders. tcMod chain still applies AFTER. */
+            int tcGenMode = int(drawUniforms.tcGen + 0.5);
+            if (tcGenMode == 1) {
+                float3 n;
+                float nLen = length(in.worldNormal);
+                if (nLen > 1e-4) {
+                    n = in.worldNormal / nLen;
+                } else {
+                    float3 dx = dfdx(in.worldPos);
+                    float3 dy = dfdy(in.worldPos);
+                    n = normalize(cross(dx, dy));
+                }
+                float3 viewer = normalize(uniforms.cameraPos - in.worldPos);
+                float d = 2.0 * dot(viewer, n);
+                float3 refl = n * d - viewer;
+                texCoord = float2(0.5 + refl.y * 0.5, 0.5 - refl.z * 0.5);
+            } else if (tcGenMode == 2) {
+                texCoord = float2(
+                    dot(in.worldPos, drawUniforms.tcGenVec0.xyz),
+                    dot(in.worldPos, drawUniforms.tcGenVec1.xyz)
+                );
+            } else if (tcGenMode == 4) {
+                /* TCGEN_LIGHTMAP. Mirrors ioq3. The Swift draw loop sets
+                 * tcGen=4 when stage.useLightmap != 0; the bound
+                 * colorTexture for that stage IS the lightmap. */
+                texCoord = in.lightmapTexCoord;
+            }
+            // tcMod chain — apply in order. Q3 shaders stack mods (e.g. scale
+            // then scroll); order matters and cannot be reduced to one slot.
+            int modCount = drawUniforms.tcModCount;
+            int4 tcModTypes = int4(drawUniforms.tcModType + 0.5);
+            if (modCount > 0) texCoord = applyTcMod(texCoord, in.worldPos, tcModTypes.x, drawUniforms.tcModParams0, drawUniforms.timeSeconds);
+            if (modCount > 1) texCoord = applyTcMod(texCoord, in.worldPos, tcModTypes.y, drawUniforms.tcModParams1, drawUniforms.timeSeconds);
+            if (modCount > 2) texCoord = applyTcMod(texCoord, in.worldPos, tcModTypes.z, drawUniforms.tcModParams2, drawUniforms.timeSeconds);
+            if (modCount > 3) texCoord = applyTcMod(texCoord, in.worldPos, tcModTypes.w, drawUniforms.tcModParams3, drawUniforms.timeSeconds);
+
+            /* RTX Remix sprite-sheet atlas sub-rect sampling. When the
+             * bound PBR albedo is a `*_animation` DDS, the texture is a
+             * cols×rows grid of frames. Pick the current frame by
+             * (time * fps), then remap UV from full [0,1]² to the
+             * frame's sub-rect [(col/cols), ((col+1)/cols)] ×
+             * [(row/rows), ((row+1)/rows)]. Applies to albedo +
+             * roughness + metallic since they share the atlas grid via
+             * materials.json remixConstants.sprite_sheet_*. */
+            if (drawUniforms.spriteAtlasParams.x > 0.5) {
+                float aCols  = drawUniforms.spriteAtlasParams.x;
+                float aRows  = drawUniforms.spriteAtlasParams.y;
+                float aFps   = drawUniforms.spriteAtlasParams.z;
+                float aTotal = aCols * aRows;
+                float atlasTime = (drawUniforms.spriteAtlasParams.w > 0.0) ? drawUniforms.spriteAtlasParams.w : drawUniforms.timeSeconds;
+                float frame  = floor(atlasTime * aFps);
+                float idx    = fmod(frame, aTotal);
+                if (idx < 0.0) { idx += aTotal; }
+                float col = fmod(idx, aCols);
+                float row = floor(idx / aCols);
+                // fract() so upstream tcMod scrolls past [0,1] still
+                // tile within the frame's sub-rect.
+                float2 localUV = fract(texCoord);
+                texCoord = float2((localUV.x + col) / aCols,
+                                  (localUV.y + row) / aRows);
+            }
+            /* Parallax (height-map) offset. The old derivative frame built
+             * T/B from perpendicular vectors without solving the UV
+             * Jacobian, so many planar Q3 surfaces produced a near-zero
+             * tangent-space view direction and scale=0 vs scale=2 frames
+             * were visually identical. Solve the screen-space UV Jacobian
+             * explicitly, then apply a bounded view-dependent offset before
+             * albedo/normal/roughness/metallic/emissive sampling. */
+            bool parallaxDebugTint = false;
+            if (drawUniforms.parallaxParams.x > 0.0001 && tcGenMode == 0 &&
+                !is_null_texture(heightMap)) {
+                parallaxDebugTint = drawUniforms.parallaxParams.w > 0.5;
+                float3 pdx = dfdx(in.worldPos);
+                float3 pdy = dfdy(in.worldPos);
+                float2 duvDx = dfdx(texCoord);
+                float2 duvDy = dfdy(texCoord);
+                float det = duvDx.x * duvDy.y - duvDx.y * duvDy.x;
+                float3 Np = normalize(cross(pdx, pdy));
+                float3 V = normalize(uniforms.cameraPos - in.worldPos);
+                if (dot(Np, V) < 0.0) { Np = -Np; }
+                if (abs(det) > 1.0e-7 && all(isfinite(Np)) && all(isfinite(V))) {
+                    float invDet = 1.0 / det;
+                    float3 T = normalize((pdx * duvDy.y - pdy * duvDx.y) * invDet);
+                    float3 B = normalize((pdy * duvDx.x - pdx * duvDy.x) * invDet);
+                    float vz = max(dot(V, Np), 0.08);
+                    float2 viewTS = float2(dot(V, T), dot(V, B)) / vz;
+                    viewTS = clamp(viewTS, float2(-4.0), float2(4.0));
+                    // Remix height maps are authored as scalar relief. Keep
+                    // normal gameplay default subtle (0.02), but make the
+                    // diagnostic scale=2 sweep visibly move texels.
+                    float h = heightMap.sample(textureSampler, texCoord).r;
+                    float height = (h - 0.5) * drawUniforms.parallaxParams.x * 0.15;
+                    float2 offset = viewTS * height;
+                    if (all(isfinite(offset))) {
+                        texCoord -= offset;
+                    }
+                }
+            }
+            /* Always sample the per-stage colorTexture using the tcGen-
+             * resolved texCoord. For lightmap stages tcGenMode==4 above
+             * routed texCoord to lightmapTexCoord and colorTexture *is*
+             * the lightmap. Stage-driven via tcGen, no flag branch. */
+            float4 texel = colorTexture.sample(textureSampler, texCoord);
+            int mode = int(drawUniforms.debugMode + 0.5);
+            if (mode == 1) {
+                return float4(texel.rgb, 1.0);
+            }
+            if (mode == 2) {
+                /* Debug mode 2 still samples the global lightmap binding
+                 * for a "lightmap only" overlay. Localized so the read
+                 * doesn't fire on the normal path. */
+                float4 lightmap = lightmapTexture.sample(textureSampler, in.lightmapTexCoord);
+                return float4(lightmap.rgb, 1.0);
+            }
+            if (mode == 3) {
+                return float4(fract(in.lightmapTexCoord.x), fract(in.lightmapTexCoord.y), 0.0, 1.0);
+            }
+            if (mode == 4) {
+                return float4(in.color.rgb, 1.0);
+            }
+            if (drawUniforms.fogOnly > 0.5) {
+                if (drawUniforms.fogColorDistance.w <= 0.0) {
+                    return float4(0.0);
+                }
+                float f = q3FogFactor(in.worldPos, uniforms, drawUniforms);
+                if (drawUniforms._pad0 > 0.5) {
+                    /* Explicit fog-volume boundary sheets (xdensegreyfog in
+                     * q3dm4) are authored as the visible fog cap, not as an
+                     * opaque box. Only keep a low floor on faces whose normal
+                     * is parallel to the fog surface plane. Side faces keep
+                     * the stock fog-image value so the volume does not read as
+                     * a hard rectangular wall when the camera moves inside or
+                     * below the pit. */
+                    float capFloor = 0.0;
+                    if (drawUniforms.fogParams.y > 0.5) {
+                        float3 fogN = drawUniforms.fogSurface.xyz;
+                        float fogNLen = length(fogN);
+                        if (fogNLen > 1e-4) {
+                            fogN /= fogNLen;
+                            float3 n = in.worldNormal;
+                            float nLen = length(n);
+                            if (nLen > 1e-4) {
+                                n /= nLen;
+                            } else {
+                                float3 dx = dfdx(in.worldPos);
+                                float3 dy = dfdy(in.worldPos);
+                                n = normalize(cross(dx, dy));
+                            }
+                            float capAlign = abs(dot(n, fogN));
+                            if (capAlign <= 0.70) {
+                                /* Side walls of fog brushes are not visible
+                                 * fog surfaces in stock Q3. Letting the fog
+                                 * image alpha through here produces the hard
+                                 * rectangular grey slab seen in q3dm4. */
+                                f = 0.0;
+                            }
+                            capFloor = (capAlign > 0.70) ? 0.24 : 0.0;
+                        }
+                    } else {
+                        capFloor = 0.18;
+                    }
+                    f = max(f, capFloor);
+                }
+                return float4(q3ResolvedFogColor(drawUniforms.fogColorDistance.xyz), saturate(f));
+            }
+
+            // NOTE: No unconditional alpha-test discard here.
+            //
+            // ef21f24 introduced `if (result.a < 0.01) discard_fragment();` to
+            // emulate GL alphaFunc, but Q3 alpha-test is a PER-SHADER-STAGE opt-in
+            // (the `alphaFunc GT0|GE128|LT128` keyword on a stage), not a
+            // world-wide rule. Forcing it on every fragment made q3dm1's two
+            // ornamental arches go see-through whenever their stage0 texture
+            // failed to resolve (see HUD "falling back to white" errors) or when
+            // lightmap*vertexColor multiplied alpha below threshold.
+            //
+            // Until the per-stage shader driver is in place, world fragments must
+            // always write. Alpha-tested stages will be reintroduced through the
+            // Q3 shader parser, not as a global discard.
+            //
+            // Overbright: Q3 lightmaps are authored expecting a 2x boost (stock
+            // r_overBrightBits default = 1, i.e. multiply by 2^1). Without the
+            // boost the whole world renders at half brightness — user reported
+            // the game was 'awfully dark even with phone brightness all the way
+            // up'. saturate() clamps to [0,1] so bright spots don't wrap.
+            // P
+
+[…truncated 564601 chars — raise BridgeOptions.maxResultChars, or call the tool with a narrower scope (filter, head, pagination)…]
+
+        case .keyboardF10: return 154
+        case .keyboardF11: return 155
+        case .keyboardF12: return 156
+        case .keyboardGraveAccentAndTilde: return 96
+        default:
+            // Fallback: trust the produced character. Some keyboard
+            // layouts route DEL/BS through a keyCode that doesn't
+            // match `.keyboardDeleteOrBackspace` — catch the actual
+            // 0x7F (DEL) or 0x08 (BS) character and route both to
+            // K_BACKSPACE.
+            if let ch = key.charactersIgnoringModifiers.first,
+               let asc = ch.asciiValue {
+                if asc == 0x7F || asc == 0x08 { return 127 }
+                if asc >= 32 && asc < 127 {
+                    // Printable ASCII — Q3 uses lowercase for letter keys.
+                    if let lower = String(ch).lowercased().first?.asciiValue {
+                        return Int32(lower)
+                    }
+                    return Int32(asc)
+                }
+            }
+            return nil
+        }
+    }
+}

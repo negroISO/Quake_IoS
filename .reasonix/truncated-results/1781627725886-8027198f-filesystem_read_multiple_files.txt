@@ -1,0 +1,1033 @@
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/code/renderer/iqm.h:
+/*
+===========================================================================
+This file is part of Quake III Arena source code.
+
+Quake III Arena source code is free software; you can redistribute it
+and/or modify it under the terms of the GNU General Public License as
+published by the Free Software Foundation; either version 2 of the License,
+or (at your option) any later version.
+
+Quake III Arena source code is distributed in the hope that it will be
+useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with Quake III Arena source code; if not, write to the Free Software
+Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+===========================================================================
+*/
+
+#ifndef __IQM_H__
+#define __IQM_H__
+
+#define IQM_MAGIC "INTERQUAKEMODEL"
+#define IQM_VERSION 2
+
+#define	IQM_MAX_JOINTS		128
+
+typedef struct iqmheader
+{
+    char magic[16];
+    unsigned int version;
+    unsigned int filesize;
+    unsigned int flags;
+    unsigned int num_text, ofs_text;
+    unsigned int num_meshes, ofs_meshes;
+    unsigned int num_vertexarrays, num_vertexes, ofs_vertexarrays;
+    unsigned int num_triangles, ofs_triangles, ofs_adjacency;
+    unsigned int num_joints, ofs_joints;
+    unsigned int num_poses, ofs_poses;
+    unsigned int num_anims, ofs_anims;
+    unsigned int num_frames, num_framechannels, ofs_frames, ofs_bounds;
+    unsigned int num_comment, ofs_comment;
+    unsigned int num_extensions, ofs_extensions;
+} iqmHeader_t;
+
+typedef struct iqmmesh
+{
+    unsigned int name;
+    unsigned int material;
+    unsigned int first_vertex, num_vertexes;
+    unsigned int first_triangle, num_triangles;
+} iqmMesh_t;
+
+enum
+{
+    IQM_POSITION     = 0,
+    IQM_TEXCOORD     = 1,
+    IQM_NORMAL       = 2,
+    IQM_TANGENT      = 3,
+    IQM_BLENDINDEXES = 4,
+    IQM_BLENDWEIGHTS = 5,
+    IQM_COLOR        = 6,
+    IQM_CUSTOM       = 0x10
+};
+
+enum
+{
+    IQM_BYTE   = 0,
+    IQM_UBYTE  = 1,
+    IQM_SHORT  = 2,
+    IQM_USHORT = 3,
+    IQM_INT    = 4,
+    IQM_UINT   = 5,
+    IQM_HALF   = 6,
+    IQM_FLOAT  = 7,
+    IQM_DOUBLE = 8,
+};
+
+typedef struct iqmtriangle
+{
+    unsigned int vertex[3];
+} iqmTriangle_t;
+
+typedef struct iqmjoint
+{
+    unsigned int name;
+    int parent;
+    float translate[3], rotate[4], scale[3];
+} iqmJoint_t;
+
+typedef struct iqmpose
+{
+    int parent;
+    unsigned int mask;
+    float channeloffset[10];
+    float channelscale[10];
+} iqmPose_t;
+
+typedef struct iqmanim
+{
+    unsigned int name;
+    unsigned int first_frame, num_frames;
+    float framerate;
+    unsigned int flags;
+} iqmAnim_t;
+
+enum
+{
+    IQM_LOOP = 1<<0
+};
+
+typedef struct iqmvertexarray
+{
+    unsigned int type;
+    unsigned int flags;
+    unsigned int format;
+    unsigned int size;
+    unsigned int offset;
+} iqmVertexArray_t;
+
+typedef struct iqmbounds
+{
+    float bbmin[3], bbmax[3];
+    float xyradius, radius;
+} iqmBounds_t;
+
+#endif
+
+
+
+---
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/code/renderer/qgl.h:
+/*
+===========================================================================
+Copyright (C) 1999-2005 Id Software, Inc.
+
+This file is part of Quake III Arena source code.
+
+Quake III Arena source code is free software; you can redistribute it
+and/or modify it under the terms of the GNU General Public License as
+published by the Free Software Foundation; either version 2 of the License,
+or (at your option) any later version.
+
+Quake III Arena source code is distributed in the hope that it will be
+useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with Quake III Arena source code; if not, write to the Free Software
+Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+===========================================================================
+*/
+/*
+** QGL.H
+*/
+
+#ifndef __QGL_H__
+#define __QGL_H__
+
+#if defined( _WIN32 )
+#if _MSC_VER
+#pragma warning (disable: 4201)
+#pragma warning (disable: 4214)
+#pragma warning (disable: 4514)
+#pragma warning (disable: 4032)
+#pragma warning (disable: 4201)
+#pragma warning (disable: 4214)
+#endif
+#include <windows.h>
+#include <GL/gl.h>
+#elif defined( __linux__ ) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined( __sun )
+#include <GL/gl.h>
+#include <GL/glx.h>
+#elif defined(__APPLE__)
+#include <OpenGL/gl.h>
+#endif
+
+#ifndef APIENTRY
+#define APIENTRY
+#endif
+
+//===========================================================================
+// <Timbo> I hate this section so much
+
+/*
+** multitexture extension definitions
+*/
+#if !defined(__sun)
+
+#define GL_ACTIVE_TEXTURE_ARB               0x84E0
+#define GL_CLIENT_ACTIVE_TEXTURE_ARB        0x84E1
+#define GL_MAX_ACTIVE_TEXTURES_ARB          0x84E2
+
+#define GL_TEXTURE0_ARB                     0x84C0
+#define GL_TEXTURE1_ARB                     0x84C1
+
+#else
+
+#define GL_MAX_ACTIVE_TEXTURES_ARB          0x84E2
+
+#endif /* defined(__sun) */
+
+// anisotropic filtering constants
+#define GL_TEXTURE_MAX_ANISOTROPY_EXT       0x84FE
+#define GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT   0x84FF
+
+#ifndef GL_CLAMP_TO_BORDER
+#define GL_CLAMP_TO_BORDER                  0x812D
+#endif
+
+// define for skyboxes without black seams
+#ifndef GL_CLAMP_TO_EDGE
+#define GL_CLAMP_TO_EDGE                    0x812F
+#endif
+
+/*
+** extension constants
+*/
+// S3TC compression constants
+#define GL_RGB_S3TC                         0x83A0
+#define GL_RGB4_S3TC                        0x83A1
+
+#define GL_COMPRESSED_RGB_S3TC_DXT1_EXT     0x83F0
+#define GL_COMPRESSED_RGBA_S3TC_DXT1_EXT    0x83F1
+#define GL_COMPRESSED_RGBA_S3TC_DXT3_EXT    0x83F2
+#define GL_COMPRESSED_RGBA_S3TC_DXT5_EXT    0x83F3
+
+#ifndef GL_VERSION_1_2
+#define GL_VERSION_1_2 1
+#define GL_UNSIGNED_SHORT_4_4_4_4           0x8033
+#define GL_UNSIGNED_INT_8_8_8_8             0x8035
+#define GL_UNSIGNED_INT_10_10_10_2          0x8036
+#define GL_UNSIGNED_SHORT_4_4_4_4_REV       0x8365
+#define GL_UNSIGNED_INT_8_8_8_8_REV         0x8367
+#define GL_UNSIGNED_INT_2_10_10_10_REV      0x8368
+#define GL_BGR                              0x80E0
+#define GL_BGRA                             0x80E1
+#endif
+
+#ifndef GL_DEPTH_COMPONENT32
+#define GL_DEPTH_COMPONENT32                0x81A7
+#endif
+
+#ifndef GL_ARB_vertex_buffer_object
+#define GL_ARB_vertex_buffer_object 1
+typedef ptrdiff_t GLsizeiptrARB;
+typedef ptrdiff_t GLintptrARB;
+#define GL_ARRAY_BUFFER_ARB                 0x8892
+#define GL_ELEMENT_ARRAY_BUFFER_ARB         0x8893
+#define GL_STATIC_DRAW_ARB                  0x88E4
+#endif
+
+#ifndef GL_ARB_vertex_program
+#define GL_ARB_vertex_program 1
+#define GL_VERTEX_PROGRAM_ARB               0x8620
+#endif
+
+#ifndef GL_ARB_fragment_program
+#define GL_ARB_fragment_program 1
+#define GL_FRAGMENT_PROGRAM_ARB             0x8804
+#define GL_PROGRAM_FORMAT_ASCII_ARB         0x8875
+#define GL_PROGRAM_STRING_ARB               0x8628
+#define GL_PROGRAM_ERROR_POSITION_ARB       0x864B
+#define GL_PROGRAM_ERROR_STRING_ARB         0x8874
+#endif
+
+#ifndef GL_VERSION_2_0
+#define GL_VERSION_2_0 1
+typedef char GLchar;
+#define GL_MAX_TEXTURE_IMAGE_UNITS          0x8872
+#define GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS 0x8B4D
+#endif
+
+#ifndef GL_VERSION_3_0
+#define GL_VERSION_3_0 1
+#define GL_R11F_G11F_B10F                   0x8C3A
+#define GL_DEPTH_STENCIL_ATTACHMENT         0x821A
+#define GL_DEPTH24_STENCIL8                 0x88F0
+#define GL_DEPTH_STENCIL                    0x84F9
+#define GL_UNSIGNED_INT_24_8                0x84FA
+#define GL_UNSIGNED_NORMALIZED              0x8C17
+#define GL_READ_FRAMEBUFFER                 0x8CA8
+#define GL_DRAW_FRAMEBUFFER                 0x8CA9
+#define GL_FRAMEBUFFER_COMPLETE             0x8CD5
+#define GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT 0x8CD6
+#define GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT 0x8CD7
+#define GL_FRAMEBUFFER_INCOMPLETE_DRAW_BUFFER 0x8CDB
+#define GL_FRAMEBUFFER_INCOMPLETE_READ_BUFFER 0x8CDC
+#define GL_FRAMEBUFFER_UNSUPPORTED          0x8CDD
+#define GL_MAX_COLOR_ATTACHMENTS            0x8CDF
+#define GL_COLOR_ATTACHMENT0                0x8CE0
+#define GL_DEPTH_ATTACHMENT                 0x8D00
+#define GL_STENCIL_ATTACHMENT               0x8D20
+#define GL_FRAMEBUFFER                      0x8D40
+#define GL_RENDERBUFFER                     0x8D41
+#endif
+
+//===========================================================================
+
+#define QGL_Core_PROCS \
+	GLE( void, glAlphaFunc, GLenum func, GLclampf ref ) \
+	GLE( void, glBindTexture, GLenum target, GLuint texture ) \
+	GLE( void, glBlendFunc, GLenum sfactor, GLenum dfactor ) \
+	GLE( void, glClear, GLbitfield mask ) \
+	GLE( void, glClearColor, GLclampf red, GLclampf green, GLclampf blue, GLclampf alpha ) \
+	GLE( void, glClearDepth, GLclampd depth ) \
+	GLE( void, glColor4f, GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha ) \
+	GLE( void, glColorMask, GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha ) \
+	GLE( void, glColorPointer, GLint size, GLenum type, GLsizei stride, const GLvoid *pointer ) \
+	GLE( void, glCullFace, GLenum mode ) \
+	GLE( void, glDeleteTextures, GLsizei n, const GLuint *textures ) \
+	GLE( void, glDepthFunc, GLenum func ) \
+	GLE( void, glDepthMask, GLboolean flag ) \
+	GLE( void, glDepthRange, GLclampd zNear, GLclampd zFar ) \
+	GLE( void, glDisable, GLenum cap ) \
+	GLE( void, glDisableClientState, GLenum array ) \
+	GLE( void, glDrawArrays, GLenum mode, GLint first, GLsizei count ) \
+	GLE( void, glDrawBuffer, GLenum mode ) \
+	GLE( void, glDrawElements, GLenum mode, GLsizei count, GLenum type, const GLvoid *indices ) \
+	GLE( void, glEnable, GLenum cap ) \
+	GLE( void, glEnableClientState, GLenum array ) \
+	GLE( void, glFinish, void ) \
+	GLE( void, glGenTextures, GLsizei n, GLuint *textures ) \
+	GLE( void, glGetBooleanv, GLenum pname, GLboolean *params ) \
+	GLE( GLenum, glGetError, void ) \
+	GLE( void, glGetIntegerv, GLenum pname, GLint *params ) \
+	GLE( const GLubyte*, glGetString, GLenum name ) \
+	GLE( void, glLineWidth, GLfloat width ) \
+	GLE( void, glLoadIdentity, void ) \
+	GLE( void, glLoadMatrixf, const GLfloat *m ) \
+	GLE( void, glMatrixMode, GLenum mode ) \
+	GLE( void, glNormalPointer, GLenum type, GLsizei stride, const GLvoid *pointer ) \
+	GLE( void, glPolygonMode, GLenum face, GLenum mode ) \
+	GLE( void, glPolygonOffset, GLfloat factor, GLfloat units ) \
+	GLE( void, glPopMatrix, void ) \
+	GLE( void, glPushMatrix, void ) \
+	GLE( void, glReadPixels, GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, GLvoid *pixels ) \
+	GLE( void, glScissor, GLint x, GLint y, GLsizei width, GLsizei height ) \
+	GLE( void, glShadeModel, GLenum mode ) \
+	GLE( void, glStencilFunc, GLenum func, GLint ref, GLuint mask ) \
+	GLE( void, glStencilOp, GLenum fail, GLenum zfail, GLenum zpass ) \
+	GLE( void, glTexCoordPointer, GLint size, GLenum type, GLsizei stride, const GLvoid *pointer ) \
+	GLE( void, glTexEnvi, GLenum target, GLenum pname, GLint param ) \
+	GLE( void, glTexImage2D, GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const GLvoid *pixels ) \
+	GLE( void, glTexParameteri, GLenum target, GLenum pname, GLint param ) \
+	GLE( void, glTexSubImage2D, GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const GLvoid *pixels ) \
+	GLE( void, glVertexPointer, GLint size, GLenum type, GLsizei stride, const GLvoid *pointer ) \
+	GLE( void, glViewport, GLint x, GLint y, GLsizei width, GLsizei height )
+
+#define QGL_Ext_PROCS \
+	GLE( void, glMultiTexCoord2fARB, GLenum texture, GLfloat s, GLfloat t ) \
+	GLE( void, glActiveTextureARB, GLenum texture ) \
+	GLE( void, glClientActiveTextureARB, GLenum texture ) \
+	GLE( void, glLockArraysEXT, GLint, GLint) \
+	GLE( void, glUnlockArraysEXT, void )
+
+#define QGL_ARB_PROGRAM_PROCS \
+	GLE( void, glGenProgramsARB, GLsizei n, GLuint *programs ) \
+	GLE( void, glDeleteProgramsARB, GLsizei n, const GLuint *programs ) \
+	GLE( void, glProgramStringARB, GLenum target, GLenum format, GLsizei len, const GLvoid *string ) \
+	GLE( void, glBindProgramARB, GLenum target, GLuint program ) \
+	GLE( void, glProgramLocalParameter4fARB, GLenum target, GLuint index, GLfloat x, GLfloat y, GLfloat z, GLfloat w ) \
+	GLE( void, glProgramLocalParameter4fvARB, GLenum target, GLuint index, const GLfloat *params )
+
+#define QGL_VBO_PROCS \
+	GLE( void, glGenBuffersARB, GLsizei n, GLuint *buffers ) \
+	GLE( void, glDeleteBuffersARB, GLsizei n, const GLuint *buffers ) \
+	GLE( void, glBindBufferARB, GLenum target, GLuint buffer ) \
+	GLE( void, glBufferDataARB, GLenum target, GLsizeiptrARB size, const GLvoid *data, GLenum usage )
+
+#define QGL_FBO_PROCS \
+	GLE( void, glBindRenderbuffer, GLenum target, GLuint renderbuffer ) \
+	GLE( void, glDeleteFramebuffers, GLsizei n, const GLuint *framebuffers ) \
+	GLE( void, glDeleteRenderbuffers, GLsizei n, const GLuint *renderbuffers ) \
+	GLE( void, glGenRenderbuffers, GLsizei n, GLuint *renderbuffers ) \
+	GLE( void, glRenderbufferStorage, GLenum target, GLenum internalformat, GLsizei width, GLsizei height ) \
+	GLE( void, glGetRenderbufferParameteriv, GLenum target, GLenum pname, GLint *params ) \
+	GLE( GLboolean, glIsFramebuffer, GLuint framebuffer ) \
+	GLE( void, glBindFramebuffer, GLenum target, GLuint framebuffer ) \
+	GLE( void, glGenFramebuffers, GLsizei n, GLuint *framebuffers ) \
+	GLE( GLenum, glCheckFramebufferStatus, GLenum target ) \
+	GLE( void, glFramebufferTexture2D, GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level ) \
+	GLE( void, glFramebufferRenderbuffer, GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer ) \
+	GLE( void, glGetFramebufferAttachmentParameteriv, GLenum target, GLenum attachment, GLenum pname, GLint *params ) \
+	GLE( void, glBlitFramebuffer, GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter )
+
+#define QGL_FBO_OPT_PROCS \
+	GLE( void, glRenderbufferStorageMultisample, GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height ) \
+	GLE( void, glGetInternalformativ, GLenum target, GLenum internalformat, GLenum pname, GLsizei bufSize, GLint *params )
+
+#define QGL_Win32_PROCS \
+	GLE( HGLRC, wglCreateContext, HDC ) \
+	GLE( BOOL,  wglDeleteContext ,HGLRC ) \
+	GLE( HGLRC, wglGetCurrentContext, VOID ) \
+	GLE( PROC,  wglGetProcAddress, LPCSTR ) \
+	GLE( BOOL,  wglMakeCurrent, HDC, HGLRC )
+
+#ifdef _WIN32
+#define QGL_Swp_PROCS \
+	GLE( BOOL,	wglSwapIntervalEXT, int interval )
+#else
+#define QGL_Swp_PROCS \
+	GLE( void,	glXSwapIntervalEXT, Display *dpy, GLXDrawable drawable, int interval ) \
+	GLE( int,	glXSwapIntervalMESA, unsigned interval ) \
+	GLE( int,	glXSwapIntervalSGI, int interval )
+#endif
+
+#define QGL_LinX11_PROCS \
+	GLE( XVisualInfo*, glXChooseVisual, Display *dpy, int screen, int *attribList ) \
+	GLE( GLXContext, glXCreateContext, Display *dpy, XVisualInfo *vis, GLXContext shareList, Bool direct ) \
+	GLE( void, glXDestroyContext, Display *dpy, GLXContext ctx ) \
+	GLE( Bool, glXMakeCurrent, Display *dpy, GLXDrawable drawable, GLXContext ctx) \
+	GLE( void, glXCopyContext, Display *dpy, GLXContext src, GLXContext dst, GLuint mask ) \
+	GLE( void, glXSwapBuffers, Display *dpy, GLXDrawable drawable )
+
+#ifndef __APPLE__
+
+#define GLE( ret, name, ... ) extern ret ( APIENTRY * q##name )( __VA_ARGS__ );
+	QGL_Swp_PROCS;
+#ifdef _WIN32
+	QGL_Win32_PROCS;
+#else // assume in opposition to win32
+	QGL_LinX11_PROCS;
+#endif
+#undef GLE
+
+#endif // !__APPLE__
+
+#endif // __QGL_H__
+
+
+---
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/code/renderer/tr_common.h:
+/*
+===========================================================================
+Copyright (C) 1999-2005 Id Software, Inc.
+
+This file is part of Quake III Arena source code.
+
+Quake III Arena source code is free software; you can redistribute it
+and/or modify it under the terms of the GNU General Public License as
+published by the Free Software Foundation; either version 2 of the License,
+or (at your option) any later version.
+
+Quake III Arena source code is distributed in the hope that it will be
+useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with Quake III Arena source code; if not, write to the Free Software
+Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+===========================================================================
+*/
+#ifndef TR_COMMON_H
+#define TR_COMMON_H
+
+#include "../qcommon/q_shared.h"
+#include "../renderercommon/tr_public.h"
+
+#define MAX_TEXTURE_UNITS 8
+
+typedef enum
+{
+	IMGFLAG_NONE           = 0x0000,
+	IMGFLAG_MIPMAP         = 0x0001,
+	IMGFLAG_PICMIP         = 0x0002,
+	IMGFLAG_CLAMPTOEDGE    = 0x0004,
+	IMGFLAG_CLAMPTOBORDER  = 0x0008,
+	IMGFLAG_NO_COMPRESSION = 0x0010,
+	IMGFLAG_NOLIGHTSCALE   = 0x0020,
+	IMGFLAG_LIGHTMAP       = 0x0040,
+	IMGFLAG_NOSCALE        = 0x0080,
+	IMGFLAG_RGB            = 0x0100,
+	IMGFLAG_COLORSHIFT     = 0x0200,
+} imgFlags_t;
+
+typedef enum {
+	CT_FRONT_SIDED = 0,
+	CT_BACK_SIDED,
+	CT_TWO_SIDED
+} cullType_t;
+
+typedef struct image_s image_t;
+
+// any change in the LIGHTMAP_* defines here MUST be reflected in
+// R_FindShader() in tr_bsp.c
+#define LIGHTMAP_2D         -4	// shader is for 2D rendering
+#define LIGHTMAP_BY_VERTEX  -3	// pre-lit triangle models
+#define LIGHTMAP_WHITEIMAGE -2
+#define LIGHTMAP_NONE       -1
+
+extern glconfig_t	glConfig;		// outside of TR since it shouldn't be cleared during ref re-init
+
+// These variables should live inside glConfig but can't because of
+// compatibility issues to the original ID vms.  If you release a stand-alone
+// game and your mod uses tr_types.h from this build you can safely move them
+// to the glconfig_t struct.
+extern qboolean  nonPowerOfTwoTextures;
+extern qboolean  textureBorderClampAvailable;
+extern qboolean  textureFilterAnisotropic;
+extern int       maxAnisotropy;
+extern int       gl_version;
+//
+// cvars
+//
+//extern cvar_t *r_stencilbits;			// number of desired stencil bits
+extern cvar_t *r_texturebits;			// number of desired texture bits
+										// 0 = use framebuffer depth
+										// 16 = use 16-bit textures
+										// 32 = use 32-bit textures
+										// all else = error
+#ifdef USE_FBO
+extern cvar_t *r_ext_multisample;
+extern cvar_t *r_ext_supersample;
+#endif
+
+extern cvar_t *r_drawBuffer;
+
+extern cvar_t *r_allowExtensions;				// global enable/disable of OpenGL extensions
+extern cvar_t *r_ext_compressed_textures;		// these control use of specific extensions
+extern cvar_t *r_ext_multitexture;
+extern cvar_t *r_ext_compiled_vertex_array;
+extern cvar_t *r_ext_texture_env_add;
+
+extern cvar_t *r_ext_texture_filter_anisotropic;
+extern cvar_t *r_ext_max_anisotropy;
+
+extern	cvar_t	*r_saveFontData;
+
+float R_NoiseGet4f( float x, float y, float z, double t );
+void  R_NoiseInit( void );
+
+image_t *R_FindImageFile( const char *name, imgFlags_t flags );
+image_t *R_CreateImage( const char *name, const char *name2, byte *pic, int width, int height, imgFlags_t flags );
+void R_UploadSubImage( byte *data, int x, int y, int width, int height, image_t *image );
+
+void R_IssuePendingRenderCommands( void );
+qhandle_t RE_RegisterShaderLightMap( const char *name, int lightmapIndex );
+qhandle_t RE_RegisterShader( const char *name );
+qhandle_t RE_RegisterShaderNoMip( const char *name );
+qhandle_t RE_RegisterShaderFromImage(const char *name, int lightmapIndex, image_t *image, qboolean mipRawImage);
+
+// font stuff
+void R_InitFreeType( void );
+void R_DoneFreeType( void );
+void RE_RegisterFont(const char *fontName, int pointSize, fontInfo_t *font);
+
+/*
+=============================================================
+
+IMAGE LOADERS
+
+=============================================================
+*/
+
+void R_LoadBMP( const char *name, byte **pic, int *width, int *height );
+void R_LoadJPG( const char *name, byte **pic, int *width, int *height );
+void R_LoadPCX( const char *name, byte **pic, int *width, int *height );
+void R_LoadPNG( const char *name, byte **pic, int *width, int *height );
+void R_LoadTGA( const char *name, byte **pic, int *width, int *height );
+
+/*
+====================================================================
+
+IMPLEMENTATION SPECIFIC FUNCTIONS
+
+====================================================================
+*/
+
+int R_GetDlightMode( void );
+
+#endif
+
+
+---
+/Users/targus/Documents/Quake_IoS_Phase9_Fork/code/renderer/tr_local.h:
+/*
+===========================================================================
+Copyright (C) 1999-2005 Id Software, Inc.
+
+This file is part of Quake III Arena source code.
+
+Quake III Arena source code is free software; you can redistribute it
+and/or modify it under the terms of the GNU General Public License as
+published by the Free Software Foundation; either version 2 of the License,
+or (at your option) any later version.
+
+Quake III Arena source code is distributed in the hope that it will be
+useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with Quake III Arena source code; if not, write to the Free Software
+Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+===========================================================================
+*/
+
+#ifndef TR_LOCAL_H
+#define TR_LOCAL_H
+
+#define USE_LEGACY_DLIGHTS	// vq3 dynamic lights
+#define USE_PMLIGHT			// promode dynamic lights via \r_dlightMode 1|2
+#define MAX_REAL_DLIGHTS	(MAX_DLIGHTS*2)
+#define MAX_LITSURFS		(MAX_DRAWSURFS)
+
+#define MAX_TEXTURE_SIZE	2048 // must be less or equal to 32768
+
+#define USE_VBO
+#define USE_TESS_NEEDS_NORMAL
+//#define USE_TESS_NEEDS_ST2
+#define USE_FBO
+
+#ifdef USE_VBO
+#define USE_VBO_GRID		/* put SF_GRID to VBO */
+#endif
+
+#include "../qcommon/q_shared.h"
+#include "../qcommon/qfiles.h"
+#include "../qcommon/qcommon.h"
+#include "../renderercommon/tr_public.h"
+#include "tr_common.h"
+#include "iqm.h"
+#include "qgl.h"
+
+#define GL_INDEX_TYPE		GL_UNSIGNED_INT
+
+typedef uint32_t glIndex_t;
+
+#define	REFENTITYNUM_BITS	12	// as we actually using only 1 bit for dlight mask in opengl1 renderer
+#define	REFENTITYNUM_MASK	((1<<REFENTITYNUM_BITS) - 1)
+// the last N-bit number (2^REFENTITYNUM_BITS - 1) is reserved for the special world refentity,
+//  and this is reflected by the value of MAX_REFENTITIES (which therefore is not a power-of-2)
+#define	MAX_REFENTITIES		((1<<REFENTITYNUM_BITS) - 1)
+#define	REFENTITYNUM_WORLD	((1<<REFENTITYNUM_BITS) - 1)
+// 14 bits
+// can't be increased without changing bit packing for drawsurfs
+// see QSORT_SHADERNUM_SHIFT
+#define SHADERNUM_BITS	14
+#define MAX_SHADERS		(1<<SHADERNUM_BITS)
+#define SHADERNUM_MASK	(MAX_SHADERS-1)
+
+typedef struct dlight_s {
+	vec3_t	origin;
+	vec3_t	origin2;
+	vec3_t	dir;		// origin2 - origin
+
+	vec3_t	color;				// range from 0.0 to 1.0, should be color normalized
+	float	radius;
+
+	vec3_t	transformed;		// origin in local coordinate system
+	vec3_t	transformed2;		// origin2 in local coordinate system
+	int		additive;			// texture detail is lost tho when the lightmap is dark
+	qboolean linear;
+#ifdef USE_PMLIGHT
+	struct litSurf_s	*head;
+	struct litSurf_s	*tail;
+#endif
+} dlight_t;
+
+
+// a trRefEntity_t has all the information passed in by
+// the client game, as well as some locally derived info
+typedef struct {
+	refEntity_t	e;
+
+	float		axisLength;		// compensate for non-normalized axis
+#ifdef USE_LEGACY_DLIGHTS
+	int			needDlights;	// 1 for bmodels that touch a dlight
+#endif
+	qboolean	lightingCalculated;
+	vec3_t		lightDir;		// normalized direction towards light
+	vec3_t		ambientLight;	// color normalized to 0-255
+	int			ambientLightInt;	// 32 bit rgba packed
+	vec3_t		directedLight;
+#ifdef USE_PMLIGHT
+	vec3_t		shadowLightDir;	// normalized direction towards light
+#endif
+	qboolean	intShaderTime;
+} trRefEntity_t;
+
+
+typedef struct {
+	vec3_t		origin;			// in world coordinates
+	vec3_t		axis[3];		// orientation in world
+	vec3_t		viewOrigin;		// viewParms->or.origin in local coordinates
+	float		modelMatrix[16];
+} orientationr_t;
+
+//===============================================================================
+
+typedef enum {
+	SS_BAD,
+	SS_PORTAL,			// mirrors, portals, viewscreens
+	SS_ENVIRONMENT,		// sky box
+	SS_OPAQUE,			// opaque
+
+	SS_DECAL,			// scorch marks, etc.
+	SS_SEE_THROUGH,		// ladders, grates, grills that may have small blended edges
+						// in addition to alpha test
+	SS_BANNER,
+
+	SS_FOG,
+
+	SS_UNDERWATER,		// for items that should be drawn in front of the water plane
+
+	SS_BLEND0,			// regular transparency and filters
+	SS_BLEND1,			// generally only used for additive type effects
+	SS_BLEND2,
+	SS_BLEND3,
+
+	SS_BLEND6,
+	SS_STENCIL_SHADOW,
+	SS_ALMOST_NEAREST,	// gun smoke puffs
+
+	SS_NEAREST			// blood blobs
+} shaderSort_t;
+
+
+#define MAX_SHADER_STAGES 8
+
+typedef enum {
+	GF_NONE,
+
+	GF_SIN,
+	GF_SQUARE,
+	GF_TRIANGLE,
+	GF_SAWTOOTH, 
+	GF_INVERSE_SAWTOOTH, 
+
+	GF_NOISE
+
+} genFunc_t;
+
+
+typedef enum {
+	DEFORM_NONE,
+	DEFORM_WAVE,
+	DEFORM_NORMALS,
+	DEFORM_BULGE,
+	DEFORM_MOVE,
+	DEFORM_PROJECTION_SHADOW,
+	DEFORM_AUTOSPRITE,
+	DEFORM_AUTOSPRITE2,
+	DEFORM_TEXT0,
+	DEFORM_TEXT1,
+	DEFORM_TEXT2,
+	DEFORM_TEXT3,
+	DEFORM_TEXT4,
+	DEFORM_TEXT5,
+	DEFORM_TEXT6,
+	DEFORM_TEXT7
+} deform_t;
+
+typedef enum {
+	AGEN_IDENTITY,
+	AGEN_SKIP,
+	AGEN_ENTITY,
+	AGEN_ONE_MINUS_ENTITY,
+	AGEN_VERTEX,
+	AGEN_ONE_MINUS_VERTEX,
+	AGEN_LIGHTING_SPECULAR,
+	AGEN_WAVEFORM,
+	AGEN_PORTAL,
+	AGEN_CONST
+} alphaGen_t;
+
+typedef enum {
+	CGEN_BAD,
+	CGEN_IDENTITY_LIGHTING,	// tr.identityLight
+	CGEN_IDENTITY,			// always (1,1,1,1)
+	CGEN_ENTITY,			// grabbed from entity's modulate field
+	CGEN_ONE_MINUS_ENTITY,	// grabbed from 1 - entity.modulate
+	CGEN_EXACT_VERTEX,		// tess.vertexColors
+	CGEN_VERTEX,			// tess.vertexColors * tr.identityLight
+	CGEN_ONE_MINUS_VERTEX,
+	CGEN_WAVEFORM,			// programmatically generated
+	CGEN_LIGHTING_DIFFUSE,
+	CGEN_FOG,				// standard fog
+	CGEN_CONST				// fixed color
+} colorGen_t;
+
+typedef enum {
+	TCGEN_BAD,
+	TCGEN_IDENTITY,			// clear to 0,0
+	TCGEN_LIGHTMAP,
+	TCGEN_TEXTURE,
+	TCGEN_ENVIRONMENT_MAPPED,
+	TCGEN_ENVIRONMENT_MAPPED_FP, // with correct first-person mapping
+	TCGEN_FOG,
+	TCGEN_VECTOR			// S and T from world coordinates
+} texCoordGen_t;
+
+typedef enum {
+	ACFF_NONE,
+	ACFF_MODULATE_RGB,
+	ACFF_MODULATE_RGBA,
+	ACFF_MODULATE_ALPHA
+} acff_t;
+
+typedef struct {
+	float base;
+	float amplitude;
+	float phase;
+	float frequency;
+
+	genFunc_t	func;
+} waveForm_t;
+
+#define TR_MAX_TEXMODS 4
+
+typedef enum {
+	TMOD_NONE,
+	TMOD_TRANSFORM,
+	TMOD_TURBULENT,
+	TMOD_SCROLL,
+	TMOD_SCALE,
+	TMOD_STRETCH,
+	TMOD_ROTATE,
+	TMOD_ENTITY_TRANSLATE,
+	TMOD_OFFSET,
+	TMOD_SCALE_OFFSET,
+	TMOD_OFFSET_SCALE,
+} texMod_t;
+
+#define	MAX_SHADER_DEFORMS	3
+typedef struct {
+	deform_t	deformation;			// vertex coordinate modification type
+
+	vec3_t		moveVector;
+	waveForm_t	deformationWave;
+	float		deformationSpread;
+
+	float		bulgeWidth;
+	float		bulgeHeight;
+	float		bulgeSpeed;
+} deformStage_t;
+
+
+typedef struct {
+	texMod_t		type;
+
+	union {
+
+		// used for TMOD_TURBULENT and TMOD_STRETCH
+		waveForm_t		wave;
+
+		// used for TMOD_TRANSFORM
+		struct {
+			float		matrix[2][2];	// s' = s * m[0][0] + t * m[1][0] + trans[0]
+			float		translate[2];	// t' = s * m[0][1] + t * m[0][1] + trans[1]
+		};
+
+		// used for TMOD_SCALE, TMOD_OFFSET, TMOD_SCALE_OFFSET
+		struct {
+			float		scale[2];		// s' = s * scale[0] + offset[0]
+			float		offset[2];		// t' = t * scale[1] + offset[1]
+		};
+
+		// used for TMOD_SCROLL
+		float			scroll[2];		// s' = s + scroll[0] * time
+										// t' = t + scroll[1] * time
+		// used for TMOD_ROTATE
+		// + = clockwise
+		// - = counterclockwise
+		float			rotateSpeed;
+
+	};
+
+} texModInfo_t;
+
+
+#define MAX_IMAGE_ANIMATIONS		24
+#define MAX_IMAGE_ANIMATIONS_VQ3	8
+
+#define LIGHTMAP_INDEX_NONE			0
+#define LIGHTMAP_INDEX_SHADER		1
+#define LIGHTMAP_INDEX_OFFSET		2
+
+typedef struct {
+	image_t			*image[MAX_IMAGE_ANIMATIONS];
+	int				numImageAnimations;
+	double			imageAnimationSpeed;	// -EC- set to double
+
+	texCoordGen_t	tcGen;
+	vec3_t			tcGenVectors[2];
+
+	int				numTexMods;
+	texModInfo_t	*texMods;
+
+	int				videoMapHandle;
+	int				lightmap;				// LIGHTMAP_INDEX_NONE, LIGHTMAP_INDEX_SHADER, LIGHTMAP_INDEX_OFFSET
+	qboolean		isVideoMap;
+	unsigned int 	isScreenMap : 1;
+	unsigned int 	dlight : 1;
+} textureBundle_t;
+
+#define NUM_TEXTURE_BUNDLES 2
+
+#define TESS_ST0	1<<0
+#define TESS_ST1	1<<1
+#define TESS_ENV0	1<<2
+#define TESS_ENV1	1<<3
+
+typedef struct {
+	qboolean		active;
+	
+	textureBundle_t	bundle[NUM_TEXTURE_BUNDLES];
+
+	waveForm_t		rgbWave;
+	colorGen_t		rgbGen;
+
+	waveForm_t		alphaWave;
+	alphaGen_t		alphaGen;
+
+	color4ub_t		constantColor;				// for CGEN_CONST and AGEN_CONST
+
+	unsigned		stateBits;					// GLS_xxxx mask
+	GLint			mtEnv;						// 0, GL_MODULATE, GL_ADD, GL_DECAL
+
+	acff_t			adjustColorsForFog;
+
+	qboolean		isDetail;
+	qboolean		depthFragment;
+
+	short			vboVPindex[3];		// normal, eye-in, eye-out
+	short			vboFPindex[2];		// normal, fog-blend
+	
+	uint32_t		color_offset;		// within current shader
+	uint32_t		tex_offset[2];		// within current shader
+
+	uint32_t		tessFlags;
+
+} shaderStage_t;
+
+struct shaderCommands_s;
+
+typedef enum {
+	FP_NONE,		// surface is translucent and will just be adjusted properly
+	FP_EQUAL,		// surface is opaque but possibly alpha tested
+	FP_LE			// surface is translucent, but still needs a fog pass (fog surface)
+} fogPass_t;
+
+typedef struct {
+	float		cloudHeight;
+	image_t		*outerbox[6], *innerbox[6];
+} skyParms_t;
+
+typedef struct {
+	vec3_t	color;
+	float	depthForOpaque;
+} fogParms_t;
+
+typedef struct shader_s {
+	char		name[MAX_QPATH];		// game path, including extension
+	int			lightmapSearchIndex;	// for a shader to match, both name and lightmapIndex must match
+	int			lightmapIndex;			// for rendering
+
+	int			index;					// this shader == tr.shaders[index]
+	int			sortedIndex;			// this shader == tr.sortedShaders[sortedIndex]
+
+	float		sort;					// lower numbered shaders draw before higher numbered
+
+	qboolean	defaultShader;			// we want to return index 0 if the shader failed to
+										// load for some reason, but R_FindShader should
+										// still keep a name allocated for it, so if
+										// something calls RE_RegisterShader again with
+										// the same name, we don't try looking for it again
+
+	qboolean	explicitlyDefined;		// found in a .shader file
+
+	int			surfaceFlags;			// if explicitlyDefined, this will have SURF_* flags
+	int			contentFlags;
+
+	qboolean	entityMergable;			// merge across entites optimizable (smoke, blood)
+
+	qboolean	isSky;
+	skyParms_t	sky;
+	fogParms_t	f
+
+[…truncated 433290 chars — raise BridgeOptions.maxResultChars, or call the tool with a narrower scope (filter, head, pagination)…]
+
+R_SetupProjectionZ( &tr.viewParms );
+
+	R_AddEntitySurfaces();
+}
+
+
+/*
+================
+R_RenderView
+
+A view may be either the actual camera view,
+or a mirror / remote location
+================
+*/
+void R_RenderView( const viewParms_t *parms ) {
+	int		firstDrawSurf;
+	int		numDrawSurfs;
+
+	if ( parms->viewportWidth <= 0 || parms->viewportHeight <= 0 ) {
+		return;
+	}
+
+	tr.viewCount++;
+
+	tr.viewParms = *parms;
+	tr.viewParms.frameSceneNum = tr.frameSceneNum;
+	tr.viewParms.frameCount = tr.frameCount;
+
+	firstDrawSurf = tr.refdef.numDrawSurfs;
+
+	// set viewParms.world
+	R_RotateForViewer();
+
+	R_SetupProjection( &tr.viewParms, r_zproj->value, qtrue );
+
+	R_GenerateDrawSurfs();
+
+	// if we overflowed MAX_DRAWSURFS, the drawsurfs
+	// wrapped around in the buffer and we will be missing
+	// the first surfaces, not the last ones
+	numDrawSurfs = tr.refdef.numDrawSurfs;
+	if ( numDrawSurfs > MAX_DRAWSURFS ) {
+		numDrawSurfs = MAX_DRAWSURFS;
+	}
+
+	R_SortDrawSurfs( tr.refdef.drawSurfs + firstDrawSurf, numDrawSurfs - firstDrawSurf );
+}

@@ -1,0 +1,695 @@
+}
+
+/* If the shader referenced by `name` is animated, return the current frame's
+ * registered texture handle (lazily registering the frame on first hit).
+ * Returns 0 for non-animated shaders so the caller falls through to the
+ * normal lookup path.
+ *
+ * IMPORTANT: exact-name match only. Extension-stripped fallback would
+ * recurse: a frame path like 'textures/sfx/flame1.tga' could strip to
+ * 'textures/sfx/flame1', match a shader whose animMap lists flame1.tga
+ * as a frame, and re-enter RegisterTexture for the same file until the
+ * iOS watchdog SIGKILLs. */
+static qhandle_t ShaderMap_ResolveCurrentFrame(const char *name) {
+    int i;
+    int slot = -1;
+    const metalShaderMap_t *entry = NULL;
+    float fps;
+    int frameIdx;
+    static qboolean s_resolving = qfalse;
+
+    if (name == NULL || name[0] == '\0') return 0;
+    /* Re-entry guard: if a frame's own registration somehow ends up in
+     * this function, break the cycle. Belt-and-suspenders with the
+     * exact-name-only policy above. */
+    if (s_resolving) return 0;
+
+    for (i = 0; i < s_shaderMapCount; ++i) {
+        if (!Q_stricmp(s_shaderMap[i].shaderName, name)) {
+            entry = &s_shaderMap[i];
+            slot = i;
+            break;
+        }
+    }
+    if (entry == NULL || entry->animFrameCount <= 0) {
+        return 0;
+    }
+    fps = (entry->animFps > 0.0f) ? entry->animFps : 8.0f;
+    frameIdx = (int)((float)cls.realtime * 0.001f * fps) % entry->animFrameCount;
+    if (frameIdx < 0) frameIdx = 0;
+    if (s_shaderMap[slot].animTextures[frameIdx] == 0) {
+        s_resolving = qtrue;
+        s_shaderMap[slot].animTextures[frameIdx] =
+            RegisterTexture(s_shaderMap[slot].animFrames[frameIdx]);
+        s_resolving = qfalse;
+    }
+    return s_shaderMap[slot].animTextures[frameIdx];
+}
+
+/* Exact-match slot lookup used when tagging world draws at map-load
+ * for per-frame retargeting. Returns -1 if not animated. */
+static int ShaderMap_FindAnimatedSlot(const char *name) {
+    int i, s;
+    if (name == NULL || name[0] == '\0') return -1;
+    for (i = 0; i < s_shaderMapCount; ++i) {
+        if (!Q_stricmp(s_shaderMap[i].shaderName, name)) {
+            if (s_shaderMap[i].animFrameCount > 0) return i;
+            for (s = 0; s < s_shaderMap[i].stageCount; ++s) {
+                if (s_shaderMap[i].stages[s].animFrameCount > 0) return i;
+            }
+        }
+    }
+    return -1;
+}
+
+/* Returns the tcMod scroll (s, t) values parsed from the first stage
+ * of the named shader, or (0, 0) if unknown / absent. */
+/* Q3 skybox support. Resolves one of six face textures for a sky
+ * shader based on the surface's dominant normal direction. Returns 0
+ * if the named shader has no skyparms directive; caller falls back
+ * to the legacy fake sky. Lazily registers each face texture. */
+static qhandle_t GetSkyFaceTextureForSurface(const char *shaderName,
+                                             float nx, float ny, float nz) {
+    static const char *kSuffixes[6] = { "_up", "_dn", "_ft", "_bk", "_lf", "_rt" };
+    metalShaderMap_t *entry = NULL;
+    int i, faceIdx;
+    float ax, ay, az;
+    char path[MAX_QPATH];
+    if (shaderName == NULL || shaderName[0] == '\0') return 0;
+
+    for (i = 0; i < s_shaderMapCount; ++i) {
+        if (!Q_stricmp(s_shaderMap[i].shaderName, shaderName) &&
+            s_shaderMap[i].skyBoxBase[0] != '\0') {
+            entry = &s_shaderMap[i];
+            break;
+        }
+    }
+    if (entry == NULL) {
+        static int s_skyMissReported = 0;
+        if (!s_skyMissReported) {
+            s_skyMissReported = 1;
+            MetalTelemetryPrintf("metal_pbr_ibl", PRINT_ALL,
+                "[Q3-PBR-IBL] sky-face lookup MISS shader='%s' (no entry or empty skyBoxBase)\n",
+                shaderName);
+        }
+        return 0;
+    }
+
+    /* PBR Phase 6 v3 — auto-publish active map's sky stem to r_pbr_ibl_skybox.
+     *
+     * Every visible sky surface hits this fn each frame with its parent shader
+     * name; the matched entry's skyBoxBase IS the map's authored sky stem
+     * (parsed at .shader load time, line ~6336). Copying to the cvar lets the
+     * Swift IBL builder source from the right env path on every map load
+     * with zero engine plumbing — and Swift's per-frame cvar-string compare picks
+     * the change up within one frame and invalidates the cached cubemap.
+     *
+     * Compare-then-set so we don't spam Cvar_Set every frame; only fires the
+     * write when the active sky genuinely changes (i.e. once per map load
+     * unless the user manually overrides the cvar). */
+    if (entry->skyBoxBase[0] != '\0' &&
+        ri.Cvar_Set != NULL && ri.Cvar_VariableString != NULL) {
+        const char *cur = ri.Cvar_VariableString("r_pbr_ibl_skybox");
+        if (cur == NULL || Q_stricmp(cur, entry->skyBoxBase) != 0) {
+            MetalTelemetryPrintf("metal_pbr_ibl", PRINT_ALL,
+                "[Q3-PBR-IBL] auto-detect: shader='%s' sky stem='%s' (was '%s')\n",
+                shaderName, entry->skyBoxBase, cur ? cur : "<null>");
+            ri.Cvar_Set("r_pbr_ibl_skybox", entry->skyBoxBase);
+        }
+    }
+
+    ax = fabsf(nx); ay = fabsf(ny); az = fabsf(nz);
+    if (az >= ax && az >= ay) {
+        faceIdx = (nz >= 0.0f) ? 0 /*up*/ : 1 /*dn*/;
+    } else if (ax >= ay) {
+        faceIdx = (nx >= 0.0f) ? 2 /*ft*/ : 3 /*bk*/;
+    } else {
+        faceIdx = (ny >= 0.0f) ? 4 /*lf*/ : 5 /*rt*/;
+    }
+
+    if (entry->skyFaceTextures[faceIdx] != 0) {
+        return entry->skyFaceTextures[faceIdx];
+    }
+    Com_sprintf(path, sizeof(path), "%s%s", entry->skyBoxBase, kSuffixes[faceIdx]);
+    entry->skyFaceTextures[faceIdx] = RegisterTexture(path);
+    return entry->skyFaceTextures[faceIdx];
+}
+
+static int ShaderMap_GetBlendMode(const char *name) {
+    const metalShaderMap_t *entry;
+    if (name == NULL || name[0] == '\0') return 0;
+    /* Read stage[0].blendMode as the shader's primary blend. The old
+     * shader-level entry->blendMode field was a cached copy of the
+     * same value; STEP 4 removed that cache so stages[] is the single
+     * source of truth. */
+    entry = ShaderMap_LookupEntry(name);
+    if (entry == NULL || entry->stageCount <= 0) return 0;
+    return entry->stages[0].blendMode;
+}
+
+/* blendMode enum used throughout the stub and the Q3MetalWorldStage:
+ *   0 = opaque     (no blend)
+ *   1 = additive   (GL_SRC_ALPHA/GL_ONE — alpha-modulated additive)
+ *   2 = alpha      (GL_SRC_ALPHA/GL_ONE_MINUS_SRC_ALPHA)
+ *   3 = filter     (GL_DST_COLOR/GL_ZERO and commutative form GL_ZERO/GL_SRC_COLOR)
+ *   4 = subtract   (GL_ZERO/GL_ONE_MINUS_SRC_COLOR — blood/bullet/shadow decals)
+ *   5 = additive-full (GL_ONE/GL_ONE — full-intensity, ignores alpha)
+ * CRITICAL: 1 and 5 MUST stay distinct. Merging them leaks full-intensity
+ * explosion/glow shaders through an alpha-modulated pipeline (or vice versa),
+ * producing scene-wide yellow/gold blowout when the alpha channel is close
+ * to 1 across the full quad.
+ */
+static int BlendModeFromTokens(const char *src, const char *dst) {
+    if (src == NULL || src[0] == '\0') return 0;
+
+    /* Short Q3 aliases — these are dst-independent. "add" is the
+     * Q3 shorthand for GL_ONE/GL_ONE (full-intensity additive). */
+    if (!Q_stricmp(src, "add"))    return 5;
+    if (!Q_stricmp(src, "blend"))  return 2;
+    if (!Q_stricmp(src, "filter")) return 3;
+
+    if (dst == NULL || dst[0] == '\0') return 0;
+
+    /* Full-intensity additive (GL_ONE/GL_ONE) — explosion cores, muzzle
+     * flash, rail core. Distinct from mode 1 (alpha-modulated). */
+    if (!Q_stricmp(src, "GL_ONE") && !Q_stricmp(dst, "GL_ONE")) return 5;
+    /* Alpha-modulated additive (GL_SRC_ALPHA/GL_ONE) — flame, glow,
+     * particles. Source alpha attenuates the added colour. */
+    if (!Q_stricmp(src, "GL_SRC_ALPHA") && !Q_stricmp(dst, "GL_ONE")) return 1;
+    /* Alpha blend (transparent decals, glass). */
+    if (!Q_stricmp(src, "GL_SRC_ALPHA") && !Q_stricmp(dst, "GL_ONE_MINUS_SRC_ALPHA")) return 2;
+    /* Filter / modulate (lightmap pass, dark overlay). */
+    if (!Q_stricmp(src, "GL_DST_COLOR") && !Q_stricmp(dst, "GL_ZERO")) return 3;
+    /* Q3 floor/portal shaders commonly use this for their final lightmap
+     * modulation stage. The default framebuffer alpha is effectively 1, so
+     * the RGB result is the same read-modify-write filter path, not an
+     * opaque depth-writing pass. */
+    if (!Q_stricmp(src, "GL_DST_COLOR") && !Q_stricmp(dst, "GL_ONE_MINUS_DST_ALPHA")) return 3;
+    /* Filter (commutative factor ordering — some shaders author this form). */
+    if (!Q_stricmp(src, "GL_ZERO") && !Q_stricmp(dst, "GL_SRC_COLOR")) return 3;
+    /* Subtractive darkening for decals (blood marks, bullet marks,
+     * burn marks, markShadow). out = dst * (1 - src). */
+    if (!Q_stricmp(src, "GL_ZERO") && !Q_stricmp(dst, "GL_ONE_MINUS_SRC_COLOR")) return 4;
+    /* Opaque explicit (no-op blend). */
+    if (!Q_stricmp(src, "GL_ONE") && !Q_stricmp(dst, "GL_ZERO")) return 0;
+    /* Skip stage — GL_ZERO/GL_ZERO writes black. We render opaque-black
+     * rather than dropping so the stage still consumes its slot; if a
+     * shader relies on this being a no-op, promote to a dedicated drop
+     * path later. */
+    if (!Q_stricmp(src, "GL_ZERO") && !Q_stricmp(dst, "GL_ZERO")) return 0;
+
+    /* Less-common combos caught by the STEP 3 warn path. These don't
+     * map cleanly to our 4-mode pipeline (opaque/add/alpha/filter);
+     * pick the closest semantic approximation. */
+
+    /* src.a * src + src.a * dst = src.a * (src + dst). Alpha-scaled
+     * sum — closest to alpha-blend in feel. */
+    if (!Q_stricmp(src, "GL_SRC_ALPHA") && !Q_stricmp(dst, "GL_SRC_ALPHA")) return 2;
+    /* (1-src.a) * (src + dst). Inverse-alpha fade — alpha-blend. */
+    if (!Q_stricmp(src, "GL_ONE_MINUS_SRC_ALPHA") && !Q_stricmp(dst, "GL_ONE_MINUS_SRC_ALPHA")) return 2;
+    /* (1-dst.a) * (src + dst). Used for "fade by destination alpha"
+     * overlays; alpha-blend is the closest match. */
+    if (!Q_stricmp(src, "GL_ONE_MINUS_DST_ALPHA") && !Q_stricmp(dst, "GL_ONE_MINUS_DST_ALPHA")) return 2;
+    /* src * (src + dst). Color modulates itself onto the frame —
+     * behaves like a filter/modulate pass (result is darker). */
+    if (!Q_stricmp(src, "GL_SRC_COLOR") && !Q_stricmp(dst, "GL_SRC_COLOR")) return 3;
+    /* (1-src) * (src + dst). Inverse-color filter, still modulative. */
+    if (!Q_stricmp(src, "GL_ONE_MINUS_SRC_COLOR") && !Q_stricmp(dst, "GL_ONE_MINUS_SRC_COLOR")) return 3;
+
+    /* GL_DST_COLOR / X family — all read the framebuffer as a multiplier
+     * (read-modify-write). Q3 uses these for floor / portal / lightmap
+     * stages. ALL must route to filter so depth-write stays off; otherwise
+     * the stage corrupts the depth buffer and surfaces behind it leak
+     * through (q3dm6 floor → lit-walls / lava bleed-through, demo four
+     * 0:33–0:35). Mirrors ioq3 `depthMaskBits = 0` rule for any blend. */
+    if (!Q_stricmp(src, "GL_DST_COLOR") && !Q_stricmp(dst, "GL_ONE_MINUS_SRC_ALPHA")) return 3;
+    if (!Q_stricmp(src, "GL_DST_COLOR") && !Q_stricmp(dst, "GL_ONE_MINUS_SRC_COLOR")) return 3;
+    if (!Q_stricmp(src, "GL_DST_COLOR") && !Q_stricmp(dst, "GL_ONE"))                  return 3;
+    if (!Q_stricmp(src, "GL_DST_COLOR") && !Q_stricmp(dst, "GL_SRC_ALPHA"))            return 3;
+    if (!Q_stricmp(src, "GL_DST_COLOR") && !Q_stricmp(dst, "GL_SRC_COLOR"))            return 3;
+    /* (1-dst.color)*src — invert-multiply. Filter-class (depth-read-only). */
+    if (!Q_stricmp(src, "GL_ONE_MINUS_DST_COLOR") && !Q_stricmp(dst, "GL_ZERO"))               return 3;
+    if (!Q_stricmp(src, "GL_ONE_MINUS_DST_COLOR") && !Q_stricmp(dst, "GL_ONE_MINUS_SRC_ALPHA")) return 2;
+    /* GL_ZERO / X family — source contributes nothing; result is purely a
+     * destination scale. Pass-through / dst-alpha-multiply / etc. All
+     * filter-class. */
+    if (!Q_stricmp(src, "GL_ZERO") && !Q_stricmp(dst, "GL_ONE"))       return 3;
+    if (!Q_stricmp(src, "GL_ZERO") && !Q_stricmp(dst, "GL_SRC_ALPHA")) return 3;
+    /* GL_ONE / X additive variants. Premultiplied alpha + alpha-modulated
+     * additive — closest to alpha (mode 2, depth-read-only).  */
+    if (!Q_stricmp(src, "GL_ONE") && !Q_stricmp(dst, "GL_ONE_MINUS_SRC_ALPHA")) return 2;
+    if (!Q_stricmp(src, "GL_ONE") && !Q_stricmp(dst, "GL_ONE_MINUS_SRC_COLOR")) return 2;
+    if (!Q_stricmp(src, "GL_ONE") && !Q_stricmp(dst, "GL_SRC_ALPHA"))            return 2;
+    if (!Q_stricmp(src, "GL_ONE") && !Q_stricmp(dst, "GL_SRC_COLOR"))            return 3;
+    /* (1-src.a)*src + dst*src.a — inverted alpha (decal trick). Alpha-class. */
+    if (!Q_stricmp(src, "GL_ONE_MINUS_SRC_ALPHA") && !Q_stricmp(dst, "GL_SRC_ALPHA")) return 2;
+
+    /* Unknown combo: warn once and fall back to filter (depth-read-only).
+     * Routing the unclassified default to filter instead of opaque
+     * mirrors ioq3 tr_shader.c's `depthMaskBits = 0 if blendFunc set`
+     * invariant — losing precise blend math is far less visible than the
+     * depth-corruption that comes from running with depth-write ON. */
+    {
+        static char s_unknownSeen[64][64];
+        static int s_unknownCount = 0;
+        char combo[64];
+        int u;
+        qboolean seen = qfalse;
+        Com_sprintf(combo, sizeof(combo), "%s|%s", src, dst);
+        for (u = 0; u < s_unknownCount; ++u) {
+            if (!Q_stricmp(s_unknownSeen[u], combo)) { seen = qtrue; break; }
+        }
+        if (!seen && s_unknownCount < (int)(sizeof(s_unknownSeen) / sizeof(s_unknownSeen[0]))) {
+            Q_strncpyz(s_unknownSeen[s_unknownCount++], combo, sizeof(s_unknownSeen[0]));
+            ri.Printf(PRINT_WARNING, "Metal shader: unrecognized blendFunc '%s %s' → filter (depth-write off)\n", src, dst);
+        }
+    }
+    return 3;
+}
+
+static uint32_t GLBlendFactorFromToken(const char *token) {
+    if (token == NULL || token[0] == '\0') return Q3_GL_ONE;
+    if (!Q_stricmp(token, "GL_ZERO")) return Q3_GL_ZERO;
+    if (!Q_stricmp(token, "GL_ONE")) return Q3_GL_ONE;
+    if (!Q_stricmp(token, "GL_SRC_COLOR")) return Q3_GL_SRC_COLOR;
+    if (!Q_stricmp(token, "GL_ONE_MINUS_SRC_COLOR")) return Q3_GL_ONE_MINUS_SRC_COLOR;
+    if (!Q_stricmp(token, "GL_SRC_ALPHA")) return Q3_GL_SRC_ALPHA;
+    if (!Q_stricmp(token, "GL_ONE_MINUS_SRC_ALPHA")) return Q3_GL_ONE_MINUS_SRC_ALPHA;
+    if (!Q_stricmp(token, "GL_DST_ALPHA")) return Q3_GL_DST_ALPHA;
+    if (!Q_stricmp(token, "GL_ONE_MINUS_DST_ALPHA")) return Q3_GL_ONE_MINUS_DST_ALPHA;
+    if (!Q_stricmp(token, "GL_DST_COLOR")) return Q3_GL_DST_COLOR;
+    if (!Q_stricmp(token, "GL_ONE_MINUS_DST_COLOR")) return Q3_GL_ONE_MINUS_DST_COLOR;
+    if (!Q_stricmp(token, "add")) return Q3_GL_ONE;
+    if (!Q_stricmp(token, "blend")) return Q3_GL_SRC_ALPHA;
+    if (!Q_stricmp(token, "filter")) return Q3_GL_DST_COLOR;
+    return Q3_GL_ONE;
+}
+
+static uint32_t GLBlendDstFromTokens(const char *src, const char *dst) {
+    if (src != NULL && !Q_stricmp(src, "add")) return Q3_GL_ONE;
+    if (src != NULL && !Q_stricmp(src, "blend")) return Q3_GL_ONE_MINUS_SRC_ALPHA;
+    if (src != NULL && !Q_stricmp(src, "filter")) return Q3_GL_ZERO;
+    return GLBlendFactorFromToken(dst);
+}
+
+static Q3cTcGen CleanTcGenFromMetal(int tcGen, int useLightmap) {
+    if (useLightmap) return Q3C_TCGEN_LIGHTMAP;
+    if (tcGen == 1) return Q3C_TCGEN_ENVIRONMENT_MAPPED;
+    if (tcGen == 2) return Q3C_TCGEN_VECTOR;
+    return Q3C_TCGEN_BASE;
+}
+
+static void ApplyCleanStageToMetalStage(const Q3cShaderStage *clean,
+                                        Q3MetalStage *stage) {
+    int i;
+    if (clean == NULL || stage == NULL) return;
+    if (clean->image[0]) Q_strncpyz(stage->mapPath, clean->image, sizeof(stage->mapPath));
+    stage->useLightmap = clean->isLightmap ? 1 : 0;
+    if (clean->animFrameCount > 0) {
+        int count = (int)clean->animFrameCount;
+        if (count > METAL_ANIMMAP_MAX_FRAMES) count = METAL_ANIMMAP_MAX_FRAMES;
+        stage->animFrameCount = count;
+        stage->animFps = clean->animFrequency;
+        for (i = 0; i < count; ++i) {
+            Q_strncpyz(stage->animFrames[i], clean->animFrames[i], MAX_QPATH);
+        }
+        Q_strncpyz(stage->mapPath, stage->animFrames[0], sizeof(stage->mapPath));
+    }
+    stage->tcGen = (clean->tcGen == Q3C_TCGEN_ENVIRONMENT_MAPPED) ? 1 :
+                   (clean->tcGen == Q3C_TCGEN_VECTOR) ? 2 : 0;
+    stage->tcGenVec0[0] = clean->tcGenVectors[0][0];
+    stage->tcGenVec0[1] = clean->tcGenVectors[0][1];
+    stage->tcGenVec0[2] = clean->tcGenVectors[0][2];
+    stage->tcGenVec0[3] = 0.0f;
+    stage->tcGenVec1[0] = clean->tcGenVectors[1][0];
+    stage->tcGenVec1[1] = clean->tcGenVectors[1][1];
+    stage->tcGenVec1[2] = clean->tcGenVectors[1][2];
+    stage->tcGenVec1[3] = 0.0f;
+    stage->rawSrcBlend = clean->srcBlend ? clean->srcBlend : Q3_GL_ONE;
+    stage->rawDstBlend = clean->dstBlend;
+    stage->depthFunc = clean->depthFunc;
+    stage->depthWrite = clean->depthWrite ? 1 : stage->depthWrite;
+    stage->alphaFunc = (int)clean->alphaFunc;
+    stage->wrapClampMode = (int)clean->wrapClampMode;
+}
+
+static int ShaderMap_GetAlphaFunc(const char *name) {
+    const metalShaderMap_t *entry;
+    if (name == NULL || name[0] == '\0') return 0;
+    entry = ShaderMap_LookupEntry(name);
+    if (entry == NULL || entry->stageCount <= 0) return 0;
+    return entry->stages[0].alphaFunc;
+}
+
+static int ShaderMap_GetTcGenEnv(const char *name) {
+    const metalShaderMap_t *entry;
+    if (name == NULL || name[0] == '\0') return 0;
+    entry = ShaderMap_LookupEntry(name);
+    return (entry && entry->tcGenEnv) ? 1 : 0;
+}
+
+/* Stage 0 rgbGen for a shader name. Entity pipeline uses this so
+ * chrome shells (rgbGen identity) bypass the per-vertex Lambert
+ * color that would otherwise dim their full-bright reflection. */
+static int ShaderMap_GetRgbGen(const char *name) {
+    const metalShaderMap_t *entry;
+    if (name == NULL || name[0] == '\0') return 0;
+    entry = ShaderMap_LookupEntry(name);
+    if (entry == NULL || entry->stageCount <= 0) return 0;
+    return entry->stages[0].rgbGen;
+}
+
+static int ShaderMap_GetRgbGenExplicit(const char *name) {
+    const metalShaderMap_t *entry;
+    if (name == NULL || name[0] == '\0') return 0;
+    entry = ShaderMap_LookupEntry(name);
+    if (entry == NULL || entry->stageCount <= 0) return 0;
+    return entry->stages[0].rgbGenExplicit ? 1 : 0;
+}
+
+/* Stage 0 alphaGen. Entity fragment honors identity by forcing alpha
+ * to 1.0 regardless of per-vertex alpha, matching upstream
+ * AGEN_IDENTITY semantics. */
+static int ShaderMap_GetAlphaGen(const char *name) {
+    const metalShaderMap_t *entry;
+    if (name == NULL || name[0] == '\0') return 0;
+    entry = ShaderMap_LookupEntry(name);
+    if (entry == NULL || entry->stageCount <= 0) return 0;
+    return entry->stages[0].alphaGen;
+}
+
+/* Copy stage 0's rgbGen wave parameters (base, amp, phase, freq) so
+ * the entity fragment can evaluate the glow wave per frame when its
+ * stage uses rgbGen wave. Zeroed when the shader doesn't specify a
+ * wave. */
+static void ShaderMap_GetRgbWave(const char *name, int *func, float *base, float *amp,
+                                 float *phase, float *freq) {
+    const metalShaderMap_t *entry;
+    if (func) *func = 1; /* default to sin */
+    if (base) *base = 0.0f;
+    if (amp) *amp = 0.0f;
+    if (phase) *phase = 0.0f;
+    if (freq) *freq = 0.0f;
+    if (name == NULL || name[0] == '\0') return;
+    entry = ShaderMap_LookupEntry(name);
+    if (entry == NULL || entry->stageCount <= 0) return;
+    if (func)  *func  = entry->stages[0].rgbWaveFunc;
+    if (base)  *base  = entry->stages[0].rgbWaveBase;
+    if (amp)   *amp   = entry->stages[0].rgbWaveAmp;
+    if (phase) *phase = entry->stages[0].rgbWavePhase;
+    if (freq)  *freq  = entry->stages[0].rgbWaveFreq;
+}
+
+/* Fetch the shader-level deformVertexes wave parameters from stage 0
+ * of the resolved shader-map entry. The legacy parser at the registration
+ * site stamps these onto every stage (line ~6865) after Q3cShaderGraph_
+ * AddDeform captures them at depth==1, so stage 0 is always representative.
+ * RegisterTexture calls this so the texture (which is what cgame's
+ * customShader resolves to) carries the deform info to the entity uniforms
+ * — without this hop, ApplyCleanStageToMetalStage's narrower copy drops
+ * the deform fields and the quad shell collapses into the gun silhouette. */
+static void ShaderMap_GetDeformWave(const char *name, int *func, float *div, float *base,
+                                    float *amp, float *phase, float *freq) {
+    const metalShaderMap_t *entry;
+    if (func)  *func  = 0;
+    if (div)   *div   = 1.0f;
+    if (base)  *base  = 0.0f;
+    if (amp)   *amp   = 0.0f;
+    if (phase) *phase = 0.0f;
+    if (freq)  *freq  = 0.0f;
+    if (name == NULL || name[0] == '\0') return;
+    entry = ShaderMap_LookupEntry(name);
+    if (entry == NULL || entry->stageCount <= 0) return;
+    if (func)  *func  = (int)entry->stages[0].deformWaveFunc;
+    if (div)   *div   = entry->stages[0].deformWaveDiv;
+    if (base)  *base  = entry->stages[0].deformWaveBase;
+    if (amp)   *amp   = entry->stages[0].deformWaveAmp;
+    if (phase) *phase = entry->stages[0].deformWavePhase;
+    if (freq)  *freq  = entry->stages[0].deformWaveFreq;
+}
+
+static void ShaderMap_GetAlphaWave(const char *name, int *func, float *base, float *amp,
+                                   float *phase, float *freq) {
+    const metalShaderMap_t *entry;
+    if (func) *func = 1;
+    if (base) *base = 0.0f;
+    if (amp) *amp = 0.0f;
+    if (phase) *phase = 0.0f;
+    if (freq) *freq = 0.0f;
+    if (name == NULL || name[0] == '\0') return;
+    entry = ShaderMap_LookupEntry(name);
+    if (entry == NULL || entry->stageCount <= 0) return;
+    if (func)  *func  = entry->stages[0].alphaWaveFunc;
+    if (base)  *base  = entry->stages[0].alphaWaveBase;
+    if (amp)   *amp   = entry->stages[0].alphaWaveAmp;
+    if (phase) *phase = entry->stages[0].alphaWavePhase;
+    if (freq)  *freq  = entry->stages[0].alphaWaveFreq;
+}
+
+/* Copy stage 0's rgbGen const tint. Zeroed when shader doesn't use
+ * `rgbGen const` — the entity fragment multiplies texel by this
+ * value only when rgbGenMode == 4. */
+static void ShaderMap_GetRgbConst(const char *name, float outRgb[3]) {
+    const metalShaderMap_t *entry;
+    outRgb[0] = outRgb[1] = outRgb[2] = 1.0f;
+    if (name == NULL || name[0] == '\0') return;
+    entry = ShaderMap_LookupEntry(name);
+    if (entry == NULL || entry->stageCount <= 0) return;
+    outRgb[0] = entry->stages[0].rgbConstColor[0];
+    outRgb[1] = entry->stages[0].rgbConstColor[1];
+    outRgb[2] = entry->stages[0].rgbConstColor[2];
+}
+
+static float ShaderMap_GetAlphaConst(const char *name) {
+    const metalShaderMap_t *entry;
+    if (name == NULL || name[0] == '\0') return 1.0f;
+    entry = ShaderMap_LookupEntry(name);
+    if (entry == NULL || entry->stageCount <= 0) return 1.0f;
+    return entry->stages[0].alphaConst;
+}
+
+/* Stage 0's tcMod chain for a shader name. Entity pipeline consumes
+ * this through metalTexture_t so the fragment can run scroll/rotate
+ * after tcGen env. Returns count=0 when the shader has no tcMods or
+ * the name fails to resolve. */
+static void ShaderMap_GetTcMods(const char *name, int *outCount, Q3TcMod *outMods) {
+    const metalShaderMap_t *entry;
+    int i;
+    if (outCount) *outCount = 0;
+    if (name == NULL || name[0] == '\0' || outMods == NULL || outCount == NULL) return;
+    for (i = 0; i < Q3_MAX_TCMODS; ++i) {
+        outMods[i].type = 0;
+        outMods[i].params[0] = 0.0f;
+        outMods[i].params[1] = 0.0f;
+        outMods[i].params[2] = 0.0f;
+        outMods[i].params[3] = 0.0f;
+    }
+    entry = ShaderMap_LookupEntry(name);
+    if (entry == NULL || entry->stageCount <= 0) return;
+    *outCount = entry->stages[0].tcModCount;
+    if (*outCount > Q3_MAX_TCMODS) *outCount = Q3_MAX_TCMODS;
+    for (i = 0; i < *outCount; ++i) {
+        outMods[i] = entry->stages[0].tcMods[i];
+    }
+}
+
+/* Current frame's texture handle for a known animated slot. Caller
+ * already validated the slot; returns 0 on bad input to play safe. */
+static qhandle_t ShaderMap_AnimatedSlotCurrentHandle(int encodedSlot, float shaderTime) {
+    int slot = encodedSlot / Q3_MAX_STAGES;
+    int stageIndex = encodedSlot % Q3_MAX_STAGES;
+    metalShaderMap_t *entry;
+    Q3MetalStage *stage = NULL;
+    float fps;
+    int frameIdx;
+    if (slot < 0 || slot >= s_shaderMapCount) return 0;
+    entry = &s_shaderMap[slot];
+    if (stageIndex >= 0 && stageIndex < entry->stageCount) {
+        stage = &entry->stages[stageIndex];
+    }
+    if (stage != NULL && stage->animFrameCount > 0) {
+        fps = (stage->animFps > 0.0f) ? stage->animFps : 8.0f;
+        frameIdx = (int)(shaderTime * fps) % stage->animFrameCount;
+        if (frameIdx < 0) frameIdx = 0;
+        if (stage->animTextures[frameIdx] == 0) {
+            stage->animTextures[frameIdx] = RegisterTexture(stage->animFrames[frameIdx]);
+        }
+        return stage->animTextures[frameIdx];
+    }
+    if (entry->animFrameCount <= 0) return 0;
+    fps = (entry->animFps > 0.0f) ? entry->animFps : 8.0f;
+    frameIdx = (int)(shaderTime * fps) % entry->animFrameCount;
+    if (frameIdx < 0) frameIdx = 0;
+    if (s_shaderMap[slot].animTextures[frameIdx] == 0) {
+        s_shaderMap[slot].animTextures[frameIdx] =
+            RegisterTexture(s_shaderMap[slot].animFrames[frameIdx]);
+    }
+    return s_shaderMap[slot].animTextures[frameIdx];
+}
+
+static void ShaderMap_Register(const char *name, const char *path, qboolean tcGenEnv) {
+    if (s_shaderMapCount >= MAX_SHADER_MAP_ENTRIES) return;
+    if (ShaderMap_Lookup(name) != NULL) return; /* first wins */
+    Q_strncpyz(s_shaderMap[s_shaderMapCount].shaderName, name,
+        sizeof(s_shaderMap[0].shaderName));
+    Q_strncpyz(s_shaderMap[s_shaderMapCount].mapPath, path,
+        sizeof(s_shaderMap[0].mapPath));
+    s_shaderMap[s_shaderMapCount].tcGenEnv = tcGenEnv;
+    s_shaderMap[s_shaderMapCount].animFrameCount = 0;
+    s_shaderMap[s_shaderMapCount].animFps = 0.0f;
+    s_shaderMap[s_shaderMapCount].cullMode = METAL_SHADER_CULL_BACK;
+    s_shaderMap[s_shaderMapCount].stageCount = 0;
+    s_shaderMap[s_shaderMapCount].pbrMatClass = q3_pbr_classify_shader(name);
+    q3_pbr_class_params(s_shaderMap[s_shaderMapCount].pbrMatClass,
+                        &s_shaderMap[s_shaderMapCount].pbrRoughness,
+                        &s_shaderMap[s_shaderMapCount].pbrMetallic);
+    s_shaderMapCount += 1;
+}
+
+/* Register an animated shader entry. frames[] contains up to frameCount
+ * texture paths. Later animation resolves to the current frame based on
+ * cls.realtime. */
+static void ShaderMap_RegisterAnimated(const char *name,
+                                       char frames[][MAX_QPATH],
+                                       int frameCount,
+                                       float fps,
+                                       qboolean tcGenEnv) {
+    int i;
+    int maxFrames = frameCount < METAL_ANIMMAP_MAX_FRAMES ? frameCount : METAL_ANIMMAP_MAX_FRAMES;
+    if (s_shaderMapCount >= MAX_SHADER_MAP_ENTRIES) return;
+    if (ShaderMap_Lookup(name) != NULL) return;
+    if (maxFrames <= 0) return;
+    Q_strncpyz(s_shaderMap[s_shaderMapCount].shaderName, name,
+        sizeof(s_shaderMap[0].shaderName));
+    Q_strncpyz(s_shaderMap[s_shaderMapCount].mapPath, frames[0],
+        sizeof(s_shaderMap[0].mapPath));
+    s_shaderMap[s_shaderMapCount].tcGenEnv = tcGenEnv;
+    s_shaderMap[s_shaderMapCount].animFrameCount = maxFrames;
+    s_shaderMap[s_shaderMapCount].animFps = (fps > 0.0f) ? fps : 8.0f;
+    s_shaderMap[s_shaderMapCount].cullMode = METAL_SHADER_CULL_BACK;
+    s_shaderMap[s_shaderMapCount].stageCount = 0;
+    s_shaderMap[s_shaderMapCount].pbrMatClass = q3_pbr_classify_shader(name);
+    q3_pbr_class_params(s_shaderMap[s_shaderMapCount].pbrMatClass,
+                        &s_shaderMap[s_shaderMapCount].pbrRoughness,
+                        &s_shaderMap[s_shaderMapCount].pbrMetallic);
+    for (i = 0; i < maxFrames; ++i) {
+        Q_strncpyz(s_shaderMap[s_shaderMapCount].animFrames[i], frames[i],
+                   sizeof(s_shaderMap[0].animFrames[i]));
+        s_shaderMap[s_shaderMapCount].animTextures[i] = 0;
+    }
+    s_shaderMapCount += 1;
+}
+
+static qboolean NormalizeFogColorChannels(const char *shaderName, float fogColor[3]) {
+    float raw[3];
+    float maxChannel;
+    float scale = 0.0f;
+    raw[0] = fogColor[0];
+    raw[1] = fogColor[1];
+    raw[2] = fogColor[2];
+    maxChannel = raw[0];
+    if (raw[1] > maxChannel) maxChannel = raw[1];
+    if (raw[2] > maxChannel) maxChannel = raw[2];
+    if (maxChannel <= 1.5f) {
+        return qfalse;
+    }
+    /* Q3 fogparms are authored in 0..1, but some community shaders
+     * shipped percentage-style colors (`64 0 0` == .64 red). Treat
+     * 0..100 as percent, and only fall back to byte normalization for
+     * larger 0..255 values. */
+    if (maxChannel <= 100.0f) {
+        scale = 100.0f;
+    } else if (maxChannel <= 255.0f) {
+        scale = 255.0f;
+    }
+    if (scale > 0.0f) {
+        fogColor[0] = raw[0] / scale;
+        fogColor[1] = raw[1] / scale;
+        fogColor[2] = raw[2] / scale;
+        MetalTelemetryPrintf("metal_fog", PRINT_ALL,
+            "[Q3-FOG] normalized fogparms shader='%s' source=(%.3f,%.3f,%.3f) raw=(%.3f,%.3f,%.3f) scale=%.0f\n",
+            shaderName, raw[0], raw[1], raw[2],
+            fogColor[0], fogColor[1], fogColor[2], scale);
+        return qtrue;
+    }
+    return qfalse;
+}
+
+static void ParseShaderText(const char *text) {
+    const char *p = text;
+    const char *token;
+
+    while (1) {
+        char shaderName[128];
+        char animFrames[METAL_ANIMMAP_MAX_FRAMES][MAX_QPATH];
+        int animFrameCount;
+        float animFps;
+        int depth;
+        qboolean inStage;
+        qboolean gotAnim;
+        qboolean tcGenEnv;
+        int cullMode;
+        /* Top-level deformVertexes wave: parsed at depth==1, stamped
+         * onto every stage on shader close (same pattern as cullMode).
+         * func=0 means the shader has no deform. */
+        int deformWaveFunc;
+        float deformWaveDiv;
+        float deformWaveBase;
+        float deformWaveAmp;
+        float deformWavePhase;
+        float deformWaveFreq;
+        int deformMoveFunc;
+        float deformMoveVector[3];
+        float deformMoveBase;
+        float deformMoveAmp;
+        float deformMovePhase;
+        float deformMoveFreq;
+        /* Top-level deformVertexes bulge — parsed at depth==1, stamped
+         * onto every stage on shader close. bulgeWidth=0 means no
+         * bulge (MSL skips the block). Used by q3dm4's gothic_block /
+         * wallhead organic tube decorations. */
+        float deformBulgeWidth;
+        float deformBulgeHeight;
+        float deformBulgeSpeed;
+        /* deformVertexes autosprite/autoSprite2 (1/2). 0 = no autosprite. */
+        int topAutospriteMode;
+        char skyBoxBase[MAX_QPATH];
+        qboolean gotSkyParms;
+        qboolean gotPortal;
+        qboolean gotFog;
+        qboolean gotLightmapStage;
+        qboolean gotFlare;
+        qboolean gotSky
+
+[…truncated 224305 chars — raise BridgeOptions.maxResultChars, or call the tool with a narrower scope (filter, head, pagination)…]
+
+ene;
+    re.AddAdditiveLightToScene = RE_AddAdditiveLightToScene;
+    re.AddLinearLightToScene = RE_AddLinearLightToScene;
+    re.RenderScene = RE_RenderScene;
+    re.SetColor = RE_SetColor;
+    re.DrawStretchPic = RE_StretchPic;
+    re.DrawStretchRaw = RE_StretchRaw;
+    re.UploadCinematic = RE_UploadCinematic;
+    re.RegisterFont = RE_RegisterFont;
+    re.RemapShader = RE_RemapShader;
+    re.GetEntityToken = RE_GetEntityToken;
+    re.inPVS = R_inPVS;
+    re.TakeVideoFrame = RE_TakeVideoFrame;
+    re.SetColorMappings = R_SetColorMappings;
+    re.ThrottleBackend = RE_ThrottleBackend;
+    re.FinishBloom = RE_FinishBloom;
+    re.CanMinimize = RE_CanMinimize;
+    re.GetConfig = RE_GetConfig;
+    re.VertexLighting = RE_VertexLighting;
+    re.SyncRender = RE_SyncRender;
+
+    ri.Printf(PRINT_ALL, "=== Metal Stub Renderer Initialized ===\n");
+    return &re;
+}
+
+/* STANDALONE stub — CD key not used on iOS */
+#ifdef STANDALONE
+#include "../qcommon/q_shared.h"
+qboolean UI_usesUniqueCDKey(void) { return qfalse; }
+#endif

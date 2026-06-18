@@ -1,0 +1,13 @@
+→ app:     /Users/targus/Library/Developer/Xcode/DerivedData/Quake3-iOS-cckzitrudgsrphcnxezacbpdcsfh/Build/Products/Debug-maccatalyst/Q3_RT.app
+→ logs:    /Users/targus/Desktop/q3sim_sessions/2026-06-17_23-35-11__a59d865b_q3dm11_mac
+→ runtime: 25s
+→ command: demo four; wait 50; video four; wait 1500; stopvideo; quit
+→ cfg:     pushed autoexec.cfg → /Users/targus/Library/Containers/21579E2F-6467-4375-8C90-BE862362FB0F/Data/Documents/baseq3/autoexec.cfg
+→ demos:   mirrored into /Users/targus/Library/Containers/21579E2F-6467-4375-8C90-BE862362FB0F/Data/Documents/baseq3/demos
+→ launched (pid 11462)
+→ stdout:  5363 lines
+→ container: /Users/targus/Library/Containers/21579E2F-6467-4375-8C90-BE862362FB0F/Data
+→ qlog:    /Users/targus/Desktop/q3sim_sessions/2026-06-17_23-35-11__a59d865b_q3dm11_mac/qconsole.log (       2 lines)
+→ diag:    /Users/targus/Desktop/q3sim_sessions/2026-06-17_23-35-11__a59d865b_q3dm11_mac/q3_diag.log (    1506 lines)
+→ avi:     /Users/targus/Desktop/q3sim_sessions/2026-06-17_23-35-11__a59d865b_q3dm11_mac/four.avi (3 MB)
+→ frames:  /Users/targus/Desktop/q3sim_sessions/2026-06-17_23-35-11__a59d865b_q3dm11_mac/frames

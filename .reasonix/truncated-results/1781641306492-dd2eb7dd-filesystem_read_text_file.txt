@@ -1,0 +1,554 @@
+float lumAlpha = max(max(texel.r, texel.g), texel.b);
+                float2 centered = alphaMaskUV - 0.5;
+                float radial = saturate(1.0 - dot(centered, centered) * 2.0);
+                radial = radial * radial * (3.0 - 2.0 * radial);
+                /* forceLuminanceAlpha modes:
+                 *   1 = luminance mask for black-background additive FX
+                 *       (plasma bolts, muzzle flashes, bright cores).
+                 *   2 = inverse-luminance mask for white-background smoke /
+                 *       explosion captures. Apply forced modes regardless of
+                 *       sampled alpha: several replacement/source effect
+                 *       textures have bad semi-opaque alpha, not exactly 1.0,
+                 *       so the old alpha>=0.995 gate left white quads alive. */
+                float baseAlpha = (uniforms.forceLuminanceAlpha == 2u)
+                                ? (1.0 - lumAlpha)
+                                : lumAlpha;
+                /* Force FX cutouts harder. The previous soft-only mask left
+                 * semi-opaque white cards/halos on pickup orbs, muzzle
+                 * flashes, smoke puffs, and capture-derived explosions. */
+                float synthA;
+                if (uniforms.forceLuminanceAlpha == 2u) {
+                    synthA = saturate(baseAlpha * 1.65);
+                    float chroma = max(texel.r, max(texel.g, texel.b)) - min(texel.r, min(texel.g, texel.b));
+                    if (lumAlpha > 0.92 && chroma < 0.14) synthA = 0.0;
+                } else {
+                    /* Dark-background additive FX (muzzle flashes, beams,
+                     * plasma/rail cores) are authored as straight RGB on
+                     * black, not premultiplied alpha. The old squared alpha
+                     * plus RGB premultiply made weapon shots nearly vanish,
+                     * especially through the GL_SRC_ALPHA/GL_ONE path. */
+                    synthA = saturate(baseAlpha * 1.50);
+                }
+                synthA *= radial;
+                if (uniforms.forceLuminanceAlpha != 1u) {
+                    texel.rgb *= synthA;
+                } else if (uniforms.suppressDlights != 0u) {
+                    /* GL_ONE/GL_ONE and GL_SRC_ALPHA/GL_ONE Q3 FX are
+                     * authored for the classic overbright/additive path and
+                     * often have very dark JPG RGB (lightning3new mean is
+                     * ~0.04/0.06/0.09). Boost only black-background additive
+                     * FX after reconstructing their mask so weapon shots read
+                     * as visible beams/flashes without reviving white-card
+                     * inverse-luminance smoke/orb artifacts. */
+                    texel.rgb *= 2.75;
+                }
+                texel.a = synthA;
+            }
+            /* Entity alphaFunc discard — mirrors upstream GLS_ATEST_GT_0 /
+             * GE_80 / LT_80 as fragment kills so grate-style meshes and
+             * any entity using `alphaFunc GT0` (sparks, explosion puffs on
+             * sprite quads once sprite path learns it) show their cutout
+             * shape instead of a solid rectangle. Threshold packing
+             * matches the world pipeline: positive = discard on below,
+             * negative = discard on at-or-above (inverted LT_80). */
+            if (uniforms.alphaTestThreshold > 0.0) {
+                if (texel.a < uniforms.alphaTestThreshold) discard_fragment();
+            } else if (uniforms.alphaTestThreshold < 0.0) {
+                if (texel.a >= -uniforms.alphaTestThreshold) discard_fragment();
+            } else if (texel.a <= 0.025) {
+                /* Several RTX/classic alias textures carry transparent UV
+                 * padding but their Q3 shader stage has no explicit
+                 * alphaFunc. Dropping fully transparent texels here removes
+                 * the white fringe/outline around weapons, pickups, and ammo
+                 * without changing normally opaque model interiors. */
+                discard_fragment();
+            }
+            /* P0.2 debug — r_rt_debug_entity_mask 1: render the surviving
+             * entity coverage as solid white. viewmodelParams.z is a pad
+             * everywhere else (struct-default 0), set per-draw by the main
+             * entity loop only, so HUD/scoreboard sub-pass draws are not
+             * masked. Placed AFTER the alphaFunc/near-transparent discards
+             * so the mask shows exactly the texels that survive and would
+             * be preserved over the RT composite. */
+            if (uniforms.viewmodelParams.z > 0.5) {
+                return float4(1.0, 1.0, 1.0, 1.0);
+            }
+            /* rgbGen: identity (0) — ignore the per-vertex Lambert,
+             * render at full brightness. Matches upstream CGEN_IDENTITY
+             * which sets colors to 0xff. Other modes fall through to
+             * the existing `texel * in.color` multiply (Lambert baked
+             * into vertex color C-side). Alpha follows vertex color in
+             * both cases so additive/alpha blends stay intact. */
+            /* rgbGen selection:
+             *   0 (identity) = texel.rgb * in.color.rgb. This is the
+             *                  "no explicit rgbGen directive" path. PC
+             *                  Q3 defaults alias-model contexts to
+             *                  CGEN_LIGHTING_DIFFUSE here, generating
+             *                  per-vertex Lambert at draw time via
+             *                  RB_CalcDiffuseColor. Our C-side MD3 emit
+             *                  bakes the same `ambient + directed * ndotl
+             *                  * entityColor` into vertex.color (line
+             *                  ~8773 in metal_renderer_stub.c) — so we
+             *                  just multiply by it here. Effect: the
+             *                  viewmodel + player + monster alias models
+             *                  finally react to the BSP lightgrid (dark
+             *                  hallways dim the gun, coloured wall
+             *                  torches tint it, etc.) instead of rendering
+             *                  full-bright regardless of player position.
+             *                  Sprite/beam vertex.color = entity shaderRGBA
+             *                  (set at sprite/beam emit time), so they
+             *                  get correctly tinted via the same path
+             *                  instead of being silently ignored. Was
+             *                  returning bare `texel.rgb` — fixed
+             *                  2026-06-02. PC reference behavior matches.
+             *   3 (wave)     = texel.rgb * clamp(base + sin(2π*(phase +
+             *                  t*freq)) * amp, 0, 1) — matches
+             *                  RB_CalcWaveColor (GF_SIN scope)
+             *   default      = texel.rgb * in.color.rgb (Lambert) */
+            float3 baseRgb;
+            if (uniforms.rgbGenMode == 0u) {
+                baseRgb = texel.rgb * in.color.rgb;
+            } else if (uniforms.rgbGenMode == 3u) {
+                float4 wp = uniforms.rgbGenWaveParams; /* (base, amp, phase, freq) */
+                float glow = clamp(evalWave(uniforms.rgbWaveFunc, wp.x, wp.y, wp.z, wp.w, uniforms.timeSeconds), 0.0, 1.0);
+                baseRgb = texel.rgb * glow;
+            } else if (uniforms.rgbGenMode == 4u) {
+                /* CGEN_CONST: fixed RGB tint. Upstream builds a
+                 * color4ub_t from pStage->constantColor and writes it
+                 * to every vertex color. */
+                baseRgb = texel.rgb * uniforms.rgbConstColor.rgb;
+            } else if (uniforms.rgbGenMode == 5u) {
+                /* CGEN_ENTITY: refEntity_t.shaderRGBA driven directly,
+                 * NOT modulated by per-vertex Lambert. Used by pickup
+                 * glow + a few weapon viewmodel stages where cgame
+                 * sets shaderRGBA each frame to drive the tint. */
+                baseRgb = texel.rgb * uniforms.entityColor.rgb;
+            } else if (uniforms.rgbGenMode == 6u) {
+                /* CGEN_ONE_MINUS_ENTITY: 1 - shaderRGBA. Inverse-tint
+                 * fade used by some teleport / disintegrate shaders. */
+                baseRgb = texel.rgb * (float3(1.0) - uniforms.entityColor.rgb);
+            } else {
+                baseRgb = texel.rgb * in.color.rgb;
+            }
+            /* alphaGen selection:
+             *   0 (identity) = texel.a (force opaque)
+             *   3 (wave)     = texel.a * clamp(base + sin(2π*(phase +
+             *                  t*freq)) * amp, 0, 1) — RB_CalcWaveAlpha
+             *   default      = texel.a * in.color.a (vertex alpha) */
+            float baseA;
+            if (uniforms.alphaGenMode == 0u) {
+                baseA = texel.a;
+            } else if (uniforms.alphaGenMode == 3u) {
+                float4 ap = uniforms.alphaGenWaveParams;
+                float aWave = clamp(evalWave(uniforms.alphaWaveFunc, ap.x, ap.y, ap.z, ap.w, uniforms.timeSeconds), 0.0, 1.0);
+                baseA = texel.a * aWave;
+            } else if (uniforms.alphaGenMode == 4u) {
+                /* AGEN_CONST: fixed alpha multiplier, stashed in
+                 * rgbConstColor.w (unused pad of the rgbGen const
+                 * SIMD4). */
+                baseA = texel.a * uniforms.rgbConstColor.w;
+            } else if (uniforms.alphaGenMode == 5u) {
+                /* AGEN_ENTITY: refEntity_t.shaderRGBA[3]. Drives
+                 * fade-out animations on rocket explosions, gibs,
+                 * plasma trails — cgame ramps this down each frame. */
+                baseA = texel.a * uniforms.entityColor.a;
+            } else if (uniforms.alphaGenMode == 6u) {
+                /* AGEN_ONE_MINUS_ENTITY: 1 - shaderRGBA[3]. Inverse-fade
+                 * for stages that should be visible only as the entity
+                 * fades in/out the opposite direction. */
+                baseA = texel.a * (1.0 - uniforms.entityColor.a);
+            } else {
+                baseA = texel.a * in.color.a;
+            }
+            float4 base = float4(baseRgb, baseA);
+            if (uniforms.suppressDlights == 0u) {
+                float3 dlightN = in.normal;
+                if (length(dlightN) <= 1e-4) {
+                    float3 dx = dfdx(in.worldPos);
+                    float3 dy = dfdy(in.worldPos);
+                    dlightN = normalize(cross(dx, dy));
+                }
+                base.rgb = applyDlights(base.rgb, in.worldPos, dlightN, dlights);
+            }
+            if (uniforms.fogColorDistance.w > 0.0) {
+                float f = q3EntityFogFactor(in.worldPos, uniforms);
+                base.rgb = mix(base.rgb, q3ResolvedFogColor(uniforms.fogColorDistance.xyz), f);
+            }
+            /* PBR Phase 2 — normal-mapped lighting modulation.
+             *
+             * When the Swift binder has a normal map bound to slot 1
+             * (i.e. r_pbrMaterials is on AND the entity's texture handle
+             * mapped to a PBR material with a real .n.rtex.dds normal
+             * slot), apply tangent-space normal-mapped lighting on top
+             * of the existing vertex-color shading.
+             *
+             * Per-pixel TBN basis derived via Mikkelsen's screen-space
+             * derivative trick (Christian Schüler, 2013) — works on Q3
+             * verts that don't carry a tangent attribute:
+             *
+             *   T = (dp2 × N) · duv1.x + (N × dp1) · duv2.x
+             *   B = (dp2 × N) · duv1.y + (N × dp1) · duv2.y
+             *
+             * Lighting model: half-Lambert against a constant sun
+             * direction. Output is a (0.6 .. 1.2) brightness multiplier
+             * over the existing base color — visible 3D relief without
+             * blowing out highlights. Vanilla weapons (no normal map
+             * bound) skip the block entirely via is_null_texture.
+             *
+             * Cost: ~1 extra texture sample + ~12 ALU per fragment
+             * when active, branchless skip when not. Apple Silicon
+             * absorbs both in the fragment budget for the few hundred
+             * pixels a weapon viewmodel occupies. */
+            if (!is_null_texture(normalTexture)) {
+                float3 nMap = normalTexture.sample(textureSampler, in.texCoord).xyz * 2.0 - 1.0;
+
+                float3 N = in.normal;
+                if (length(N) < 1e-4) {
+                    float3 dxN = dfdx(in.worldPos);
+                    float3 dyN = dfdy(in.worldPos);
+                    N = normalize(cross(dxN, dyN));
+                } else {
+                    N = normalize(N);
+                }
+
+                float3 dp1 = dfdx(in.worldPos);
+                float3 dp2 = dfdy(in.worldPos);
+                float2 duv1 = dfdx(in.texCoord);
+                float2 duv2 = dfdy(in.texCoord);
+                float3 dp2perp = cross(dp2, N);
+                float3 dp1perp = cross(N, dp1);
+                float3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+                float3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+                float invmax = rsqrt(max(dot(T, T), dot(B, B)) + 1e-4);
+                T *= invmax;
+                B *= invmax;
+
+                float3 worldN = normalize(T * nMap.x + B * nMap.y + N * nMap.z);
+
+                // Half-Lambert against the map's USD DistantLight when
+                // present; fallback preserves the older viewmodel look.
+                //
+                // PBR Phase 4 — viewmodel-vs-world entity gating.
+                // The pbrNormalScale uniform is 1.0 for viewmodel
+                // draws (RF_DEPTHHACK) and 0.0 for world entities.
+                // Wide (0.6..1.2) range gives the headline 3D-relief
+                // look on the held viewmodel; tight (0.78..1.18) range
+                // suppresses the Mikkelsen TBN derivative instability
+                // that produces high-contrast jagged shading on
+                // rotating world pickups. Linear-mixed so future
+                // half-strength values (e.g. 0.5 for animated but
+                // non-rotating entities) read sensibly.
+                float3 sunDir = uniforms.sunColor.w > 0.5
+                    ? normalize(float3(uniforms.sunDir))
+                    : normalize(float3(0.3, 0.5, 0.7));
+                float NdotL = dot(worldN, sunDir) * 0.5 + 0.5;
+                float halfLambert = NdotL * NdotL;
+
+                float lo = mix(0.78, 0.6, pbrNormalScale);
+                float hi = mix(1.18, 1.2, pbrNormalScale);
+                base.rgb *= mix(lo, hi, halfLambert);
+
+                /* PBR Phase 4 — Cook-Torrance specular accent.
+                 *
+                 * When the material ships both a roughness AND a
+                 * metallic map (currently only rocket launcher), add a
+                 * GGX-distributed Fresnel-tinted highlight on top of
+                 * the half-Lambert diffuse modulation above. The
+                 * specular contribution is the "shiny" the user asked
+                 * for — visible bright highlights that move when you
+                 * rotate the camera, tinted by base color on metallic
+                 * surfaces.
+                 *
+                 * Gated by pbrNormalScale so only viewmodel draws get
+                 * it — rotating world pickups would hit the same TBN
+                 * derivative instability that broke the normal-map
+                 * contrast on them.
+                 *
+                 * Cook-Torrance BRDF math:
+                 *   D = GGX normal distribution (alpha=roughness²)
+                 *   G = Schlick-GGX geometry term
+                 *   F = Schlick Fresnel, F0 lerped from 0.04 (dielectric)
+                 *       to base.rgb (metal) by metallic factor
+                 *   spec = D*F*G / (4*NdotV*NdotL + eps)
+                 *
+                 * Reference: https://google.github.io/filament/Filament.md.html
+                 */
+                // PBR Phase 4 (production): Blinn-Phong specular highlight.
+                //
+                // GGX/Cook-Torrance produced mathematically correct but
+                // visually invisible specular on the rocket viewmodel —
+                // GGX peaks only at mirror angles which Q3 viewmodel
+                // geometry rarely hits relative to a fixed sun direction.
+                // Blinn-Phong with a moderate exponent gives a much
+                // softer/wider highlight that reads as "shiny metal"
+                // across more of the model surface.
+                //
+                // Path was proven alive via magenta diagnostic (the
+                // conditional fires; textures are bound; the branch
+                // taken). Switching to Blinn-Phong is purely a visual
+                // tuning choice for what we render.
+                //
+                // Gating: roughness + metallic textures bound is enough;
+                // pbrNormalScale viewmodel gate dropped because both
+                // viewmodel and rotating pickups handled the highlight
+                // gracefully in testing (the Mikkelsen TBN instability
+                // affects the underlying worldN, but the specular
+                // contribution is too smooth to amplify that artifact).
+                // PBR Phase 4 production (v6). Always-on Fresnel rim:
+                // fires for any weapon that has a normal map (which is
+                // the gate for entering this enclosing block already).
+                // When roughness + metallic textures are also bound
+                // (rocket only at the moment), we sample them for
+                // variable response. Otherwise we use sane defaults so
+                // shotgun and lightning gun also get visible shine.
+                //
+                // Intensity tuned DOWN from v5 (rimStrength range
+                // 0.20..0.55 instead of 0.45..1.00) — earlier setting
+                // read as "marble" on the rocket. New range gives a
+                // clearly visible bright edge without overwhelming the
+                // base color in the interior.
+                {
+                    float roughness = 0.55;  // default — semi-rough
+                    float metallic  = 0.50;  // default — partial metal
+                    bool hasFullPBR = !is_null_texture(roughnessTexture) &&
+                                      !is_null_texture(metallicTexture);
+                    if (!is_null_texture(roughnessTexture)) {
+                        roughness = roughnessTexture.sample(textureSampler, in.texCoord).r;
+                    }
+                    if (!is_null_texture(metallicTexture)) {
+                        metallic = metallicTexture.sample(textureSampler, in.texCoord).r;
+                    }
+
+                    float3 V = normalize(uniforms.cameraPos - in.worldPos);
+                    float NdotV = max(dot(worldN, V), 0.0);
+
+                    if (hasFullPBR) {
+                        /* PBR Phase 5 — Cook-Torrance GGX with Burley diffuse.
+                         *
+                         * Ported from SomaZ/OpenJK rend2 lightall.glsl —
+                         * the gold-standard Q3-engine PBR reference. Adapted
+                         * to MSL and our single fake-sun lighting model
+                         * (vs their multi-light + IBL setup).
+                         *
+                         * The earlier Phase 4 v2 GGX attempt (fdf5f56) failed
+                         * because:
+                         *   1. NdotL term multiplication zeroed spec on
+                         *      surfaces not facing the hardcoded sun
+                         *   2. Single fake sun was so narrow that few pixels
+                         *      hit the peak
+                         *
+                         * Phase 5 fix: use a brighter sun + AMBIENT diffuse
+                         * floor so even unlit-by-sun pixels get baseline
+                         * shading. Plus we keep the Fresnel rim as additive
+                         * accent on top — no longer a replacement, now a
+                         * supplement.
+                         */
+                        float3 L = sunDir;  // already normalized above
+                        float3 H = normalize(V + L);
+                        float NdotL = max(dot(worldN, L), 0.0);
+                        float NdotH = max(dot(worldN, H), 0.0);
+                        float VdotH = max(dot(V, H), 0.0);
+                        float LdotH = max(dot(L, H), 0.0);
+
+                        // D — GGX normal distribution (OpenJK D_GGX)
+                        float alpha  = max(roughness * roughness, 0.0625);
+                        float alpha2 = alpha * alpha;
+                        float d = (NdotH * alpha2 - NdotH) * NdotH + 1.0;
+                        float D = alpha2 / (M_PI_F * d * d + 1e-6);
+
+                        // G — Smith joint approx (OpenJK V_SmithJointApprox)
+                        float Vis_SmithV = NdotL * (max(NdotV, 0.001) * (1.0 - alpha) + alpha);
+                        float Vis_SmithL = NdotV * (NdotL * (1.0 - alpha) + alpha);
+                        float G = 0.5 / max(Vis_SmithV + Vis_SmithL, 1e-6);
+
+                        // F — Schlick Fresnel (OpenJK F_Schlick variant)
+                        float3 F0 = mix(float3(0.04), base.rgb, metallic);
+                        float3 F  = F0 + (float3(1.0) - F0) * pow(1.0 - VdotH, 5.0);
+
+                        // Specular (D * F * G), pre-multiplied by NdotL
+                        float3 spec = D * F * G;
+
+                        // Burley diffuse (OpenJK Diff_Burley)
+                        float f90 = 0.5 + 2.0 * roughness * LdotH * LdotH;
+                        float diffScatterL = 1.0 + (f90 - 1.0) * pow(1.0 - NdotL, 5.0);
+                        float diffScatterV = 1.0 + (f90 - 1.0) * pow(1.0 - NdotV, 5.0);
+                        float3 burley = base.rgb * diffScatterL * diffScatterV * (1.0 / M_PI_F);
+
+                        // Diffuse energy: dielectric contributes all
+                        // unreflected light, metal contributes none
+                        float3 kD = (float3(1.0) - F) * (1.0 - metallic);
+
+                        // Sun intensity scaled UP to compensate for our
+                        // single-light no-IBL setup. Real PBR rigs have
+                        // many lights + sky contribution; we approximate
+                        // by boosting the one light we have.
+                        float3 sunColor = uniforms.sunColor.w > 0.5
+                            ? uniforms.sunColor.rgb * (2.4 * clamp(uniforms.sunIntensity, 0.25, 4.0))
+                            : float3(2.4, 2.2, 1.9);  // warmish white sun
+
+                        // Per-light radiance
+                        float3 radiance = (kD * burley + spec) * sunColor * NdotL;
+
+                        /* PBR Phase 6 — IBL ambient + specular reflection.
+                         *
+                         * Replaces the flat `ambient = base.rgb * 0.35`
+                         * floor with environment-cube-driven irradiance
+                         * (diffuse) + roughness-mip pre-filter (specular).
+                         * envCube is the 64²×6 procedural sky-gradient
+                         * generated by ensurePBREnvCube() on first entity
+                         * draw; mip chain via blit `generateMipmaps`.
+                         *
+                         * Diffuse: sample at world normal, highest mip
+                         *   (smallest, most-blurred — approximates
+                         *   integrated irradiance over the hemisphere).
+                         * Specular: sample at reflection vector R = reflect(-V, N),
+                         *   mip = roughness * maxMip (Epic split-sum
+                         *   pre-filter approximation: rough surfaces sample
+                         *   blurred mips, mirrors sample sharp mip 0).
+                         * Fresnel at NdotV (Karis simplification — no half
+                         *   vector for env sampling). max(1-roughness, F0)
+                         *   guards against over-bright dim metals at rough=1.
+                         * kD energy split: dielectric gets (1-F)*1 of the
+                         *   diffuse term, metal gets (1-F)*0.
+                         *
+                         * Null-guard: when envCube is unbound (cvar off or
+                         * cube alloc failed), fall through to the legacy
+                         * 0.35 ambient floor so the rocket doesn't render
+                         * pitch black on shadow side.
+                         */
+                        float3 iblTerm;
+                        // Skip IBL specular on stages that use tcGen
+                        // environment — vanilla Q3 already samples a 2D
+                        // envmap-source texture (envmapyel/gold etc.) via
+                        // view-derived UVs; adding the cube IBL specular
+                        // on top double-stacks the reflection and renders
+                        // health/yellow + ammo pickups as mirror chrome of
+                        // env/space1 instead of the intended yellow-tinted
+                        // chrome. Keep diffuse-IBL ambient lift via the
+                        // legacy 0.35 floor so the shadow side doesn't
+                        // crater to black.
+                        if (!is_null_texture(envCube) && entTcGenMode != 1) {
+                            float maxMipF = float(envCube.get_num_mip_levels() - 1);
+                            float3 diffuseIBL = envCube.sample(envSampler, worldN, level(maxMipF)).rgb;
+                            float3 R = reflect(-V, worldN);
+                            float specMip = roughness * maxMipF;
+                            float3 specularIBL = envCube.sample(envSampler, R, level(specMip)).rgb;
+                            // Karis NdotV Fresnel with roughness floor
+                            float3 F_v = F0 + (max(float3(1.0 - roughness), F0) - F0)
+                                              * pow(1.0 - NdotV, 5.0);
+                            float3 kD_v = (float3(1.0) - F_v) * (1.0 - metallic);
+                            iblTerm = kD_v * diffuseIBL * base.rgb + F_v * specularIBL;
+                        } else {
+                            iblTerm = base.rgb * 0.35;  // legacy ambient floor
+                        }
+
+                        // Direct sun radiance PEAKS over IBL fill — bright
+                        // highlights on top of the env-driven base shading.
+                        base.rgb = iblTerm + radiance;
+                    }
+
+                    // Fresnel rim — fires for ALL entities (including the
+                    // GGX-path rocket). For rough/matte surfaces it adds
+                    // the silhouette accent that proper PBR alone produces
+                    // via shadowed-edge contrast.
+                    // Phase F — pbrRimParams.x = peak intensity (default 0.55),
+                    // pbrRimParams.y = Fresnel exponent (default 2.5).
+                    float fresnel = pow(1.0 - NdotV, pbrRimParams.y);
+                    float3 rimColor = mix(
+                        float3(0.75, 0.75, 0.78),
+                        base.rgb * 1.25 + 0.15,
+                        metallic
+                    );
+                    /*
+                     * pbrRimParams.x is an actual intensity gate. The old
+                     * mix(0.20, intensity, ...) left a non-zero rim even when
+                     * Swift intentionally bound intensity=0 for entities, which
+                     * showed up as the white halo/outline around weapons and
+                     * pickups. Keep the roughness shaping, but multiply by the
+                     * requested peak so 0 really means OFF.
+                     */
+                    float rimStrength = fresnel
+                                      * pbrRimParams.x
+                                      * mix(0.35, 1.0, 1.0 - roughness);
+                    // GGX-path entities (full PBR) get a much subtler rim
+                    // accent than rim-only entities — they already have
+                    // proper specular from the BRDF.
+                    rimStrength *= hasFullPBR ? 0.35 : 1.0;
+                    base.rgb = mix(base.rgb, rimColor, saturate(rimStrength));
+                }
+            }
+            // 2026-06-10: viewmodel base-color floor. Applied BEFORE emissive
+            // so glow ride-alongs are unaffected. Gate: `.y > 0.5` means
+            // "this draw is RF_DEPTHHACK (first-person weapon)". Floor:
+            // `.x = r_pbr_viewmodel_floor` (default 0.35). Reads
+            // `texel.rgb` as the unlit albedo sample so the viewmodel always
+            // shows its real material color through low-energy IBL — a
+            // gameplay readability exception, not a PBR correctness fix.
+            // World, entity pickup, and HUD sub-pass draws keep the default
+            // (0,0,0,0) which makes the gate false and the floor a no-op.
+            if (uniforms.viewmodelParams.y > 0.5) {
+                base.rgb = max(base.rgb, texel.rgb * uniforms.viewmodelParams.x);
+            }
+            // Emissive accumulation. Same pattern as q3_world_fragment;
+            // gated on intensity > 0 so the default zero-emission path
+            // skips the sample. Sub-rect atlas remap (when active) used
+            // the same texCoord, so emissive ride-alongs are consistent.
+            if (uniforms.emissiveParams.w > 0.0) {
+                float3 eSample = emissiveTexture.sample(textureSampler, in.texCoord).rgb;
+                base.rgb += eSample * uniforms.emissiveParams.xyz * uniforms.emissiveParams.w;
+            }
+            return base;
+        }
+
+
+        /* ================ Sky rendering ================
+         * Q3 sky is NOT drawn with mesh UVs. The BSP's sky brushes
+         * mark a region of screen; actual sky texture is sampled by
+         * view direction (spherical projection for cloud-dome skies,
+         * or cubemap for skybox skies). We do the spherical map.
+         *
+         * Vertex: output world-space position.
+         * Fragment: direction = normalize(worldPos - cameraPos);
+         *           uv.x = atan2(dir.y, dir.x) mapped to [0,1]
+         *           uv.y = asin(dir.z) mapped to [0,1]
+         * Pipeline: no depth write, no lightmap, no vertex color.
+         */
+        struct SkyVertexOut {
+            float4 position [[position]];
+            float3 worldPos;
+            float2 scrollTex;  // raw mesh UV (used for scrolling cloud uv-dome optional)
+        };
+
+        vertex SkyVertexOut q3_sky_vertex(const device WorldVertexIn *vertices [[buffer(0)]],
+                                          constant WorldUniforms &uniforms [[buffer(1)]],
+                                          uint vertexID [[vertex_id]]) {
+            SkyVertexOut out;
+            WorldVertexIn inVertex = 
+
+[…truncated 507633 chars — raise BridgeOptions.maxResultChars, or call the tool with a narrower scope (filter, head, pagination)…]
+
+        case .keyboardF10: return 154
+        case .keyboardF11: return 155
+        case .keyboardF12: return 156
+        case .keyboardGraveAccentAndTilde: return 96
+        default:
+            // Fallback: trust the produced character. Some keyboard
+            // layouts route DEL/BS through a keyCode that doesn't
+            // match `.keyboardDeleteOrBackspace` — catch the actual
+            // 0x7F (DEL) or 0x08 (BS) character and route both to
+            // K_BACKSPACE.
+            if let ch = key.charactersIgnoringModifiers.first,
+               let asc = ch.asciiValue {
+                if asc == 0x7F || asc == 0x08 { return 127 }
+                if asc >= 32 && asc < 127 {
+                    // Printable ASCII — Q3 uses lowercase for letter keys.
+                    if let lower = String(ch).lowercased().first?.asciiValue {
+                        return Int32(lower)
+                    }
+                    return Int32(asc)
+                }
+            }
+            return nil
+        }
+    }
+}

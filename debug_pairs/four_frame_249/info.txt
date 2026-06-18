@@ -1,7 +1,0 @@
-anchor=four_frame_249
-type=ADDITIVE_EFFECTS
-demo=four
-frame_index=249
-ref_source=/Users/targus/Documents/Quake_IoS/reference/four/frames/frame_0249.png
-out_source=/Users/targus/Desktop/q3sim_sessions/2026-04-25_19-15-22__581d0e2_vulkan-parity-autorun_dev/frames_960x444/frame_0249.png
-captured_at=2026-04-25_19-15-22

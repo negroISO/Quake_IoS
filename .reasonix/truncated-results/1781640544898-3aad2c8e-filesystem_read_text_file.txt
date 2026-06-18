@@ -1,0 +1,617 @@
+diff --git a/Quake3-iOS/MetalView.swift b/Quake3-iOS/MetalView.swift
+index ead7349..938c089 100644
+--- a/Quake3-iOS/MetalView.swift
++++ b/Quake3-iOS/MetalView.swift
+@@ -46,33 +46,18 @@ struct MetalView: UIViewRepresentable {
+             var viewProjection: simd_float4x4
+             var cameraPos: SIMD3<Float>    // for sky sphere-mapping
+             var _pad: Float = 0            // pad to 16-byte alignment
+-            // Inline BSP movers reuse the world pipelines/shaders, so the
+-            // model matrix lives in the shared world uniform instead of
+-            // introducing a second "brush entity" pipeline.
+-            var modelMatrix: simd_float4x4 = matrix_identity_float4x4
+         }
+ 
+-        struct WorldDrawUniforms: Equatable {
++        struct WorldDrawUniforms {
+             var tcGen: Float
+-            var tcModCount: Int32           // 0-4 tcMod entries in the chain
+-            var rgbGen: Float               // 0=identity, 1=vertex, 2=lightingDiffuse
++            var tcMod: Float
++            var rgbGen: Float
+             var timeSeconds: Float
+-            var tcModType: SIMD4<Float>     // type per chain entry (1=scroll, 2=wave, 3=rotate, 4=scale, 5=turb)
+-            var tcModParams0: SIMD4<Float>  // chain[0] params
+-            var tcModParams1: SIMD4<Float>  // chain[1] params
+-            var tcModParams2: SIMD4<Float>  // chain[2] params
+-            var tcModParams3: SIMD4<Float>  // chain[3] params
++            var tcModParams: SIMD4<Float>
+             var debugMode: Float
+             var forceWhiteVertColor: Float  // 1.0 for additive (skip BSP vertex color)
+             var alphaTestThreshold: Float   // >0: discard if a<thresh; <0: discard if a>=|thresh|; 0: none
+-            var blendMode: Int32
+-            var alphaGen: Float             // 0=identity, 1=vertex
+-            var _pad0: Float = 0            // 16-byte alignment for the following float4
+-            var _pad1: Float = 0
+-            // Debug pass colorizer: when .a > 0.5 the fragment shader returns this
+-            // flat color instead of sampling. Set per-pass from `metal_debug_passes`.
+-            // 0=opaque (red), 1=filter (green), 2=alpha (blue), 3=additive (yellow).
+-            var debugPassColor: SIMD4<Float> = SIMD4<Float>(0, 0, 0, 0)
++            var _pad0: Float
+         }
+ 
+         // Render debug: 0 = normal, 1 = base only, 2 = lightmap only,
+@@ -80,10 +65,6 @@ struct MetalView: UIViewRepresentable {
+         // lightmap / uv1 issues without touching the build pipeline.
+         private static let worldDebugMode: Float = 0
+ 
+-        // Flip to true to log world-pass stage/drawcall counts each frame.
+-        // Reveals how effective run-length batching is. Flooding — leave off in production.
+-        private static let worldBatchLogEnabled: Bool = false
+-
+         // One-shot: logs the first sky draw's stage layout once per launch.
+         // Confirms killsky_1 + killsky_2 are both wired through as stages.
+         // Instance property (not static) to sidestep Swift 6 strict global
+@@ -109,52 +90,10 @@ struct MetalView: UIViewRepresentable {
+             }
+         }
+ 
+-        /// Full tcMod chain pack — matches the `WorldDrawUniforms`
+-        /// `tcModCount` + `tcModType` + `tcModParams0..3` layout. MSL
+-        /// iterates all active entries via `ApplyTcMod`.
+-        typealias TcModChainPack = (types: SIMD4<Float>,
+-                                    p0: SIMD4<Float>, p1: SIMD4<Float>,
+-                                    p2: SIMD4<Float>, p3: SIMD4<Float>,
+-                                    count: Int32)
+-
+-        /// Flatten the parsed `Q3MetalStage.tcMods[Q3_MAX_TCMODS]` chain
+-        /// into the six uniform fields (types + four params + count).
+-        /// Declaration order preserved; up to 4 entries.
+-        private static func fillTcMods(_ stage: Q3MetalWorldStage) -> TcModChainPack {
+-            var types = SIMD4<Float>(0, 0, 0, 0)
+-            var p0 = SIMD4<Float>(0, 0, 0, 0)
+-            var p1 = SIMD4<Float>(0, 0, 0, 0)
+-            var p2 = SIMD4<Float>(0, 0, 0, 0)
+-            var p3 = SIMD4<Float>(0, 0, 0, 0)
+-            let n = Int(min(stage.tcModCount, 4))
+-            // Q3TcMod tcMods[] is a fixed-size C array (tuple in Swift).
+-            let chain = [stage.tcMods.0, stage.tcMods.1, stage.tcMods.2, stage.tcMods.3]
+-            for i in 0..<n {
+-                let m = chain[i]
+-                types[i] = Float(m.type)
+-                let pp = m.params
+-                let v = SIMD4<Float>(pp.0, pp.1, pp.2, pp.3)
+-                switch i {
+-                case 0: p0 = v
+-                case 1: p1 = v
+-                case 2: p2 = v
+-                case 3: p3 = v
+-                default: break
+-                }
+-            }
+-            return (types, p0, p1, p2, p3, Int32(n))
++        private static func stageTcModParams(_ stage: Q3MetalWorldStage) -> SIMD4<Float> {
++            SIMD4<Float>(stage.tcModParams.0, stage.tcModParams.1, stage.tcModParams.2, stage.tcModParams.3)
+         }
+ 
+-        /// Zero pack used by `disableTcMod` call sites.
+-        private static let kZeroTcModPack: TcModChainPack = (
+-            SIMD4<Float>(0, 0, 0, 0),
+-            SIMD4<Float>(0, 0, 0, 0),
+-            SIMD4<Float>(0, 0, 0, 0),
+-            SIMD4<Float>(0, 0, 0, 0),
+-            SIMD4<Float>(0, 0, 0, 0),
+-            0
+-        )
+-
+         struct GPUEntityVertex {
+             var position: SIMD3<Float>
+             var texCoord: SIMD2<Float>
+@@ -215,7 +154,6 @@ struct MetalView: UIViewRepresentable {
+             float4x4 viewProjection;
+             packed_float3 cameraPos;
+             float _pad;
+-            float4x4 modelMatrix;
+         };
+ 
+         struct WorldVertexOut {
+@@ -223,27 +161,18 @@ struct MetalView: UIViewRepresentable {
+             float2 texCoord;
+             float2 lightmapTexCoord;
+             float4 color;
+-            float3 worldPos;
+         };
+ 
+         struct WorldDrawUniforms {
+             float tcGen;
+-            int   tcModCount;
++            float tcMod;
+             float rgbGen;
+             float timeSeconds;
+-            float4 tcModType;
+-            float4 tcModParams0;
+-            float4 tcModParams1;
+-            float4 tcModParams2;
+-            float4 tcModParams3;
++            float4 tcModParams;
+             float debugMode;
+             float forceWhiteVertColor;
+             float alphaTestThreshold;
+-            int blendMode;
+-            float alphaGen;
+             float _pad0;
+-            float _pad1;
+-            float4 debugPassColor;
+         };
+ 
+         struct EntityVertexIn {
+@@ -267,302 +196,105 @@ struct MetalView: UIViewRepresentable {
+                                               uint vertexID [[vertex_id]]) {
+             WorldVertexOut out;
+             WorldVertexIn inVertex = vertices[vertexID];
+-            float4 worldPosition = uniforms.modelMatrix * float4(inVertex.position, 1.0);
+-            out.position = uniforms.viewProjection * worldPosition;
++            out.position = uniforms.viewProjection * float4(inVertex.position, 1.0);
+             out.texCoord = inVertex.texCoord;
+             out.lightmapTexCoord = inVertex.lightmapTexCoord;
+             out.color = inVertex.color;
+-            // tcMod turb / tcGen environment must see the moved brush in
+-            // real world space, not the submodel's local BSP coordinates.
+-            out.worldPos = worldPosition.xyz;
+             return out;
+         }
+ 
+-        inline float2 ApplyTcMod(float2 uv, float3 worldPos, constant WorldDrawUniforms &u) {
+-            // Iterate the full tcMod chain in declaration order. Up to four
+-            // entries; types[]/params0..3 are populated by Swift-side
+-            // fillTcMods(). chain[i] params selection is a ladder because
+-            // Metal constant buffers don't support dynamic indexing into
+-            // disjoint float4 fields.
+-            for (int i = 0; i < u.tcModCount; ++i) {
+-                int t = int(u.tcModType[i] + 0.5);
+-                float4 p = (i == 0) ? u.tcModParams0
+-                         : (i == 1) ? u.tcModParams1
+-                         : (i == 2) ? u.tcModParams2
+-                                    : u.tcModParams3;
+-                if (t == 1) {
+-                    // scroll
+-                    uv += p.xy * u.timeSeconds;
+-                } else if (t == 2) {
+-                    // wave — params.y=amp, params.w=speed
+-                    float s = sin(u.timeSeconds * p.w) * p.y;
+-                    uv += float2(s, s);
+-                } else if (t == 3) {
+-                    // rotate — params.x=deg/sec
+-                    float a = p.x * u.timeSeconds;
+-                    float c = cos(a);
+-                    float s = sin(a);
+-                    float2 q = uv - 0.5;
+-                    uv = float2(q.x * c - q.y * s, q.x * s + q.y * c) + 0.5;
+-                } else if (t == 4) {
+-                    // scale
+-                    uv *= p.xy;
+-                } else if (t == 5) {
+-                    // turb — params.x=amp, .y=freq, .z=phase. Stock Q3
+-                    // feeds tess.xyz into the turb sine table; we use a
+-                    // 1/128 spatial scale so adjacent lava/slime tiles
+-                    // ripple coherently.
+-                    float amp = p.x;
+-                    float freq = p.y;
+-                    float phase = p.z;
+-                    float tt = (u.timeSeconds + phase) * freq * 2.0 * 3.14159265;
+-                    float2 wp = worldPos.xy * (1.0 / 128.0);
+-                    uv.x += sin(tt + wp.y) * amp;
+-                    uv.y += sin(tt + wp.x) * amp;
+-                }
+-            }
+-            return uv;
+-        }
+-
+-        inline float2 ComputeStageTexCoord(WorldVertexOut in,
+-                                           constant WorldDrawUniforms &u,
+-                                           float3 cameraPos) {
+-            float2 uv;
+-            int tcGen = int(u.tcGen + 0.5);
+-            if (tcGen == 1) {
+-                // tcGen environment — per-fragment facet normal from the
+-                // screen-space derivatives of worldPos. Q3's BSP vertices
+-                // don't carry per-vertex normals; the stock engine uses
+-                // per-face normals from the surface plane. dfdx/dfdy on
+-                // worldPos inside the fragment shader gives us the same
+-                // (one flat normal per triangle). Matches the stock Q3
+-                // envmap look on gothic pillar reliefs, armor trim, etc.
+-                float3 dxPos = dfdx(in.worldPos);
+-                float3 dyPos = dfdy(in.worldPos);
+-                float3 N = normalize(cross(dxPos, dyPos));
+-                float3 viewer = cameraPos - in.worldPos;
+-                float rlen = rsqrt(max(dot(viewer, viewer), 1e-6));
+-                viewer *= rlen;
+-                float d = dot(N, viewer);
+-                float3 R = N * (2.0 * d) - viewer;
+-                // Stock Q3 RB_CalcEnvironmentTexCoords maps
+-                //   st[0] = 0.5 + R.y * 0.5; st[1] = 0.5 - R.z * 0.5;
+-                // i.e. horizontal axis is world Y, vertical axis is world Z
+-                // (inverted so sky maps to the top of the envmap).
+-                uv = float2(0.5 + R.y * 0.5, 0.5 - R.z * 0.5);
+-            } else {
+-                uv = in.texCoord;
+-            }
+-            return ApplyTcMod(uv, in.worldPos, u);
+-        }
+-
+-        inline float4 SampleBase(texture2d<float> tex,
+-                                 sampler s,
+-                                 float2 uv,
+-                                 constant WorldDrawUniforms &u) {
+-            float4 texel = tex.sample(s, uv);
+-            // Explicit alphaFunc (from the shader parser) only. Positive
+-            // threshold = GT0/GE128 (discard below). Negative = LT128
+-            // (discard above). Zero = no test.
+-            //
+-            // The previous implicit "if blendMode opaque/filter && alpha<0.5
+-            // discard" fallback was removed 2026-04-17: it assumed every
+-            // opaque wall had alpha=1, but RGBA textures loaded via
+-            // fallback paths (or JPGs with accidental alpha<128) were
+-            // getting their entire surface discarded — producing the
+-            // "see-through walls" regression. Stock Q3 does not do an
+-            // implicit alpha discard on opaque/filter stages.
+-            float thresh = u.alphaTestThreshold;
+-            if (thresh > 0.0) {
+-                if (texel.a < thresh) discard_fragment();
+-            } else if (thresh < 0.0) {
+-                if (texel.a >= -thresh) discard_fragment();
+-            }
+-            return texel;
+-        }
+-
+-        inline bool WorldDebugReplace(constant WorldDrawUniforms &u,
+-                                      thread float4 &outColor) {
+-            // Debug pass colorizer — solid replace when alpha >= 0.9.
+-            if (u.debugPassColor.a >= 0.9) {
+-                outColor = u.debugPassColor;
+-                return true;
+-            }
+-            return false;
+-        }
+-
+-        inline bool WorldDebugMode(WorldVertexOut in,
+-                                   float4 texel,
+-                                   float4 lightmap,
+-                                   constant WorldDrawUniforms &u,
+-                                   thread float4 &outColor) {
+-            int mode = int(u.debugMode + 0.5);
++        fragment float4 q3_world_fragment(WorldVertexOut in [[stage_in]],
++                                          constant WorldDrawUniforms &drawUniforms [[buffer(0)]],
++                                          texture2d<float> colorTexture [[texture(0)]],
++                                          texture2d<float> lightmapTexture [[texture(1)]],
++                                          sampler textureSampler [[sampler(0)]]) {
++            float2 texCoord = in.texCoord;
++            int tcMod = int(drawUniforms.tcMod + 0.5);
++            int rgbGen = int(drawUniforms.rgbGen + 0.5);
++            if (tcMod == 1) {
++                texCoord += drawUniforms.tcModParams.xy * drawUniforms.timeSeconds;
++            } else if (tcMod == 2) {
++                float s = sin(drawUniforms.timeSeconds * drawUniforms.tcModParams.w) * drawUniforms.tcModParams.y;
++                texCoord += float2(s, s);
++            } else if (tcMod == 3) {
++                float a = drawUniforms.tcModParams.x * drawUniforms.timeSeconds;
++                float c = cos(a);
++                float s = sin(a);
++                float2 p = texCoord - 0.5;
++                texCoord = float2(p.x * c - p.y * s, p.x * s + p.y * c) + 0.5;
++            } else if (tcMod == 4) {
++                texCoord *= drawUniforms.tcModParams.xy;
++            } else if (tcMod == 5) {
++                // tcMod turb — position-dependent sine UV warp, drives
++                // Q3 lava/water surfaces. Stock Q3 uses per-vertex world
++                // position; we don't have it in the world fragment, so
++                // we approximate using texCoord as a position proxy.
++                // Produces the molten-wobble look on lava.
++                // params: (amp, freq, phase, unused)
++                float amp = drawUniforms.tcModParams.x;
++                float freq = drawUniforms.tcModParams.y;
++                float phase = drawUniforms.tcModParams.z;
++                float t = (drawUniforms.timeSeconds + phase) * freq * 2.0 * 3.14159265;
++                texCoord.x += sin(t + texCoord.y * 4.0) * amp;
++                texCoord.y += sin(t + texCoord.x * 4.0) * amp;
++            }
++            float4 texel = colorTexture.sample(textureSampler, texCoord);
++            float4 lightmap = lightmapTexture.sample(textureSampler, in.lightmapTexCoord);
++            int mode = int(drawUniforms.debugMode + 0.5);
+             if (mode == 1) {
+-                outColor = float4(texel.rgb, 1.0);
+-                return true;
++                return float4(texel.rgb, 1.0);
+             }
+             if (mode == 2) {
+-                outColor = float4(lightmap.rgb, 1.0);
+-                return true;
++                return float4(lightmap.rgb, 1.0);
+             }
+             if (mode == 3) {
+-                outColor = float4(in.texCoord, 0.0, 1.0);
+-                return true;
++                return float4(fract(in.lightmapTexCoord.x), fract(in.lightmapTexCoord.y), 0.0, 1.0);
+             }
+             if (mode == 4) {
+-                outColor = float4(in.lightmapTexCoord, 0.0, 1.0);
+-                return true;
+-            }
+-            return false;
+-        }
+-
+-        inline float4 ApplyWorldDebugTint(float4 outColor,
+-                                          constant WorldDrawUniforms &u) {
+-            // Tint (alpha < 0.9 but > 0) falls through to normal shading
+-            // and gets mixed at the end so the texture stays visible.
+-            if (u.debugPassColor.a > 0.01) {
+-                outColor.rgb = mix(outColor.rgb, u.debugPassColor.rgb, u.debugPassColor.a);
+-            }
+-            return outColor;
+-        }
+-
+-        // Apply rgbGen and alphaGen from the stage uniform to the computed
+-        // fragment color. Safety rules (per advisor spec):
+-        //  1. IDENTITY (code 0) is the default — DO NOTHING to color.
+-        //  2. VERTEX / LIGHTING_DIFFUSE (1/2) multiplies color.rgb by
+-        //     vertex.rgb ONLY if vertex color isn't near-zero. Guards
+-        //     against BSP surfaces with (0,0,0) vertex colors that would
+-        //     otherwise go black when the shader explicitly asked for
+-        //     rgbGen vertex but q3map failed to bake vertex lighting.
+-        //  3. alphaGen VERTEX (1) multiplies color.a by vertex.a.
+-        // This function MUST NOT affect shaders that leave rgbGen/alphaGen
+-        // unset — the majority of world BSP shaders.
+-        inline float4 ApplyVertexColorGen(float4 color,
+-                                          float4 vertexColor,
+-                                          constant WorldDrawUniforms &u) {
+-            int rgbGen = int(u.rgbGen + 0.5);
+-            int alphaGen = int(u.alphaGen + 0.5);
+-            if (rgbGen == 1 || rgbGen == 2) {
+-                float3 vc = vertexColor.rgb;
+-                // Safety: skip when vertex color is near-black so an
+-                // uncompiled-lighting BSP surface doesn't disappear.
+-                if (dot(vc, vc) > 0.0001) {
+-                    color.rgb *= vc;
+-                }
+-            }
+-            if (alphaGen == 1) {
+-                color.a *= vertexColor.a;
+-            }
+-            return color;
+-        }
+-
+-        fragment float4 q3_world_frag_opaque(WorldVertexOut in [[stage_in]],
+-                                             constant WorldDrawUniforms &u [[buffer(0)]],
+-                                             constant WorldUniforms &uniforms [[buffer(1)]],
+-                                             texture2d<float> colorTexture [[texture(0)]],
+-                                             texture2d<float> lightmapTexture [[texture(1)]],
+-                                             sampler textureSampler [[sampler(0)]]) {
+-            float4 outColor;
+-            if (WorldDebugReplace(u, outColor)) {
+-                return outColor;
+-            }
+-            float2 texCoord = ComputeStageTexCoord(in, u, uniforms.cameraPos);
+-            float4 texel = SampleBase(colorTexture, textureSampler, texCoord, u);
+-            float4 lightmap = lightmapTexture.sample(textureSampler, in.lightmapTexCoord);
+-            if (WorldDebugMode(in, texel, lightmap, u, outColor)) {
+-                return outColor;
+-            }
+-            outColor = float4(texel.rgb * lightmap.rgb, 1.0);
+-            outColor = ApplyVertexColorGen(outColor, in.color, u);
+-            return ApplyWorldDebugTint(outColor, u);
+-        }
+-
+-        fragment float4 q3_world_frag_alpha(WorldVertexOut in [[stage_in]],
+-                                            constant WorldDrawUniforms &u [[buffer(0)]],
+-                                            constant WorldUniforms &uniforms [[buffer(1)]],
+-                                            texture2d<float> colorTexture [[texture(0)]],
+-                                            texture2d<float> lightmapTexture [[texture(1)]],
+-                                            sampler textureSampler [[sampler(0)]]) {
+-            float4 outColor;
+-            if (WorldDebugReplace(u, outColor)) {
+-                return outColor;
+-            }
+-            float2 texCoord = ComputeStageTexCoord(in, u, uniforms.cameraPos);
+-            float4 texel = SampleBase(colorTexture, textureSampler, texCoord, u);
+-            float4 lightmap = lightmapTexture.sample(textureSampler, in.lightmapTexCoord);
+-            if (WorldDebugMode(in, texel, lightmap, u, outColor)) {
+-                return outColor;
++                return float4(in.color.rgb, 1.0);
+             }
+-            outColor = float4(texel.rgb, texel.a);
+-            outColor = ApplyVertexColorGen(outColor, in.color, u);
+-            return ApplyWorldDebugTint(outColor, u);
+-        }
+-
+-        fragment float4 q3_world_frag_add(WorldVertexOut in [[stage_in]],
+-                                          constant WorldDrawUniforms &u [[buffer(0)]],
+-                                          constant WorldUniforms &uniforms [[buffer(1)]],
+-                                          texture2d<float> colorTexture [[texture(0)]],
+-                                          texture2d<float> lightmapTexture [[texture(1)]],
+-                                          sampler textureSampler [[sampler(0)]]) {
+-            float4 outColor;
+-            if (WorldDebugReplace(u, outColor)) {
+-                return outColor;
+-            }
+-            float2 texCoord = ComputeStageTexCoord(in, u, uniforms.cameraPos);
+-            float4 texel = SampleBase(colorTexture, textureSampler, texCoord, u);
+-            float4 lightmap = lightmapTexture.sample(textureSampler, in.lightmapTexCoord);
+-            if (WorldDebugMode(in, texel, lightmap, u, outColor)) {
+-                return outColor;
+-            }
+-            outColor = float4(texel.rgb * texel.a, texel.a);
+-            outColor = ApplyVertexColorGen(outColor, in.color, u);
+-            return ApplyWorldDebugTint(outColor, u);
+-        }
+-
+-        fragment float4 q3_world_frag_filter(WorldVertexOut in [[stage_in]],
+-                                             constant WorldDrawUniforms &u [[buffer(0)]],
+-                                             constant WorldUniforms &uniforms [[buffer(1)]],
+-                                             texture2d<float> colorTexture [[texture(0)]],
+-                                             texture2d<float> lightmapTexture [[texture(1)]],
+-                                             sampler textureSampler [[sampler(0)]]) {
+-            float4 outColor;
+-            if (WorldDebugReplace(u, outColor)) {
+-                return outColor;
+-            }
+-            float2 texCoord = ComputeStageTexCoord(in, u, uniforms.cameraPos);
+-            float4 texel = SampleBase(colorTexture, textureSampler, texCoord, u);
+-            float4 lightmap = lightmapTexture.sample(textureSampler, in.lightmapTexCoord);
+-            if (WorldDebugMode(in, texel, lightmap, u, outColor)) {
+-                return outColor;
+-            }
+-            outColor = float4(texel.rgb * lightmap.rgb, 1.0);
+-            outColor = ApplyVertexColorGen(outColor, in.color, u);
+-            return ApplyWorldDebugTint(outColor, u);
+-        }
+-
+-        // Phase-1 portal fragment: samples the RTT portalTexture with the
+-        // BSP-baked stage UV. Stages are intentionally ignored by the
+-        // caller — only one drawcall per portal surface and only texture
+-        // slot 0 is bound. No lightmap, no tcMod, no stage blendMode —
+-        // the portal "window" is whatever the RTT pass rendered.
+-        fragment float4 q3_portal_fragment(WorldVertexOut in [[stage_in]],
+-                                           texture2d<float> portalTex [[texture(0)]],
+-                                           sampler textureSampler [[sampler(0)]]) {
+-            return portalTex.sample(textureSampler, in.texCoord);
+-        }
+-
+-        // Entity portal fragment: used when an MD3 entity's surface
+-        // references a portal shader. MD3 UVs are model-space and would
+-        // stretch the RTT across the model, so sample by screen position
+-        // instead. screenSize is passed as drawable dimensions; Metal's
+-        // [[position]] has top-left origin and portalTexture was rendered
+-        // to the same convention, so no Y-flip is needed.
+-        fragment float4 q3_entity_portal_fragment(EntityVertexOut in [[stage_in]],
+-                                                  constant float2 &screenSize [[buffer(0)]],
+-                                                  texture2d<float> portalTex [[texture(0)]],
+-                                                  sampler textureSampler [[sampler(0)]]) {
+-            float2 uv = in.position.xy / screenSize;
+-            return portalTex.sample(textureSampler, uv);
++            // NOTE: No unconditional alpha-test discard here.
++            //
++            // ef21f24 introduced `if (result.a < 0.01) discard_fragment();` to
++            // emulate GL alphaFunc, but Q3 alpha-test is a PER-SHADER-STAGE opt-in
++            // (the `alphaFunc GT0|GE128|LT128` keyword on a stage), not a
++            // world-wide rule. Forcing it on every fragment made q3dm1's two
++            // ornamental arches go see-through whenever their stage0 texture
++            // failed to resolve (see HUD "falling back to white" errors) or when
++            // lightmap*vertexColor multiplied alpha below threshold.
++            //
++            // Until the per-stage shader driver is in place, world fragments must
++            // always write. Alpha-tested stages will be reintroduced through the
++            // Q3 shader parser, not as a global discard.
++            //
++            // Overbright: Q3 lightmaps are authored expecting a 2x boost (stock
++            // r_overBrightBits default = 1, i.e. multiply by 2^1). Without the
++            // boost the whole world renders at half brightness — user reported
++            // the game was 'awfully dark even with phone brightness all the way
++            // up'. saturate() clamps to [0,1] so bright spots don't wrap.
++            // Per-shader alphaFunc: GT0 / GE128 / LT128.
++            // Threshold >0 → discard if alpha < threshold (GT0=0.004, GE128=0.5)
++            // Threshold <0 → discard if alpha >= |threshold| (LT128=-0.5)
++            if (drawUniforms.alphaTestThreshold > 0.0) {
++                if (texel.a < drawUniforms.alphaTestThreshold) discard_fragment();
++            } else if (drawUniforms.alphaTestThreshold < 0.0) {
++                if (texel.a >= -drawUniforms.alphaTestThreshold) discard_fragment();
++            }
++
++            // For additive surfaces (flames, glow), BSP vertex color is
++            // typically (0,0,0) because Q3 shaders use rgbGen identity.
++            // forceWhiteVertColor=1.0 substitutes white, preventing the
++            // multiply from zeroing out the fragment.
++            // Overbright 2x boost reverted (commit ed461eb). Now using the
++            // straightforward texel * lightmap * vertColor combine so the
++            // lighting baseline is unboosted — lets us see real lightmap
++            // output before entity lighting work. Bring the 2x back later
++            // as a tunable r_overBrightBits-style cvar if needed.
++            float3 vertexColor = (rgbGen == 1) ? in.color.rgb : float3(1.0);
++            float3 vc = mix(vertexColor, float3(1.0), drawUniforms.forceWhiteVertColor);
++            float  va = mix(in.color.a,   1.0,          drawUniforms.forceWhiteVertColor);
++            float3 lit = texel.rgb * lightmap.rgb * vc;
++            return float4(lit, texel.a * va);
+         }
+ 
+         vertex EntityVertexOut q3_entity_vertex(const device EntityVertexIn *vertices [[buffer(0)]],
+@@ -577,35 +309,10 @@ struct MetalView: UIViewRepresentable {
+         }
+ 
+         fragment float4 q3_entity_fragment(EntityVertexOut in [[stage_in]],
+-                                           constant float4 &debugPassColor [[buffer(0)]],
+                                            texture2d<float> colorTexture [[texture(0)]],
+                                            sampler textureSampler [[sampler(0)]]) {
+-            if (debugPassColor.a >= 0.9) {
+-                return debugPassColor;  // solid replace
+-            }
+-            float4 texel = colorTexture.sample(textureSampler, in.texCoord);
+-            float4 outColor = texel * in.color;
+-            if (debugPassColor.a > 0.01) {
+-                outColor.rgb = mix(outColor.rgb, debugPassColor.rgb, debugPassColor.a);
+-            }
+-            return outColor;
+-        }
+-
+-        fragment float4 q3_entity_additive_fragment(EntityVertexOut in [[stage_in]],
+-                                                    constant float4 &debugPassColor [[buffer(0)]],
+-                                                    texture2d<float> colorTexture [[texture(0)]],
+-                                                    sampler textureSampler [[sampler(0)]]) {
+-            if (debugPassColor.a >= 0.9) {
+-                return debugPassColor;  // solid replace
+-            }
+             float4 texel = colorTexture.sample(textureSampler, in.texCoord);
+-            float alpha = texel.a * in.color.a;
+-            float3 glow = texel.rgb * alpha * in.color.rgb * 0.35;
+-            float4 outColor = float4(glow, alpha);
+-            if (debugPassColor.a > 0.01) {
+-                outColor.rgb = mix(outColor.rgb, debugPassColor.rgb, debugPassColor.a);
+-            }
+-            return outColor;
++            return texel * in.color;
+         }
+ 
+         /* ================ Sky rendering ================
+@@ -631,11 +338,10 @@ struct MetalView: UIViewRepresentable {
+                                           uint vertexID [[vertex_id]]) {
+             SkyVertexOut out;
+             WorldVertexIn inVertex = vertices[vertexID];
+-            float4 worldPosition = uniforms.modelMatrix * float4(inVertex.position, 1.0);
+-            out.position = uniforms.viewProjection * worldPosition;
++            out.position = uniforms.viewProjection * float4(inVertex.position, 1.0);
+             // Push to max depth so sky always renders behind everything
+             out.position.z = out.position.w;
+-            out.worldPos = worldPosition.xyz;
++            out.worldPos = inVertex.position;
+             out.scrollTex = inVertex.texCoord;
+             return out;
+         }
+@@ -688,25 +394,16 @@ struct MetalView: UIViewRepresentable {
+             // slot: if tcMod==1 use .xy as scroll; if tcMod==4 use
+             
+
+[…truncated 255175 chars — raise BridgeOptions.maxResultChars, or call the tool with a narrower scope (filter, head, pagination)…]
+
+static values, isolating whether
+-         * texture motion artifacts come from the tcMod uniform path.
+-         * NOT CVAR_CHEAT — needs to be settable on non-cheat servers
+-         * for diagnostic use from the on-screen console. */
+-        s_cvarDisableTcMod = ri.Cvar_Get("r_disableTcMod", "0", 0);
+-    }
+-    return s_cvarDisableTcMod ? s_cvarDisableTcMod->integer : 0;
+-}
+-
+-int Q3MetalRenderer_GetPortalView(Q3MetalPortalView *out) {
+-    if (out == NULL || !s_hasPortal) return 0;
+-    *out = s_portalView;
+-    return 1;
+-}
+-
+-int Q3MetalRenderer_HasVisiblePortal(void) {
+-    /* Returns nonzero only when the map has at least one portal-tagged
+-     * BSP surface OR an entity with the portal shader was submitted this
+-     * frame. Swift gates the portal RTT pass on this to skip the cost on
+-     * non-portal maps (the vast majority). */
+-    return (s_worldHasPortalSurface || s_hasVisiblePortalEntity) ? 1 : 0;
+-}
+-
+ refexport_t *GetRefAPI(int apiVersion, refimport_t *rimp) {
+     static refexport_t re;

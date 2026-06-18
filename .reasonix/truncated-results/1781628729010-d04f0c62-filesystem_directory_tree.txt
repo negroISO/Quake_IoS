@@ -1,0 +1,1603 @@
+[
+  {
+    "name": "asm",
+    "type": "directory",
+    "children": [
+      {
+        "name": "common_x64.asm",
+        "type": "file"
+      },
+      {
+        "name": "qasm.h",
+        "type": "file"
+      },
+      {
+        "name": "snd_mix_mmx.s",
+        "type": "file"
+      },
+      {
+        "name": "snd_mix_sse.s",
+        "type": "file"
+      },
+      {
+        "name": "snd_mix_x64.asm",
+        "type": "file"
+      },
+      {
+        "name": "snd_mix_x86_64.s",
+        "type": "file"
+      }
+    ]
+  },
+  {
+    "name": "botlib",
+    "type": "directory",
+    "children": [
+      {
+        "name": "aasfile.h",
+        "type": "file"
+      },
+      {
+        "name": "be_aas.h",
+        "type": "file"
+      },
+      {
+        "name": "be_aas_bsp.h",
+        "type": "file"
+      },
+      {
+        "name": "be_aas_bspq3.c",
+        "type": "file"
+      },
+      {
+        "name": "be_aas_cluster.c",
+        "type": "file"
+      },
+      {
+        "name": "be_aas_cluster.h",
+        "type": "file"
+      },
+      {
+        "name": "be_aas_debug.c",
+        "type": "file"
+      },
+      {
+        "name": "be_aas_debug.h",
+        "type": "file"
+      },
+      {
+        "name": "be_aas_def.h",
+        "type": "file"
+      },
+      {
+        "name": "be_aas_entity.c",
+        "type": "file"
+      },
+      {
+        "name": "be_aas_entity.h",
+        "type": "file"
+      },
+      {
+        "name": "be_aas_file.c",
+        "type": "file"
+      },
+      {
+        "name": "be_aas_file.h",
+        "type": "file"
+      },
+      {
+        "name": "be_aas_funcs.h",
+        "type": "file"
+      },
+      {
+        "name": "be_aas_main.c",
+        "type": "file"
+      },
+      {
+        "name": "be_aas_main.h",
+        "type": "file"
+      },
+      {
+        "name": "be_aas_move.c",
+        "type": "file"
+      },
+      {
+        "name": "be_aas_move.h",
+        "type": "file"
+      },
+      {
+        "name": "be_aas_optimize.c",
+        "type": "file"
+      },
+      {
+        "name": "be_aas_optimize.h",
+        "type": "file"
+      },
+      {
+        "name": "be_aas_reach.c",
+        "type": "file"
+      },
+      {
+        "name": "be_aas_reach.h",
+        "type": "file"
+      },
+      {
+        "name": "be_aas_route.c",
+        "type": "file"
+      },
+      {
+        "name": "be_aas_route.h",
+        "type": "file"
+      },
+      {
+        "name": "be_aas_routealt.c",
+        "type": "file"
+      },
+      {
+        "name": "be_aas_routealt.h",
+        "type": "file"
+      },
+      {
+        "name": "be_aas_sample.c",
+        "type": "file"
+      },
+      {
+        "name": "be_aas_sample.h",
+        "type": "file"
+      },
+      {
+        "name": "be_ai_char.c",
+        "type": "file"
+      },
+      {
+        "name": "be_ai_char.h",
+        "type": "file"
+      },
+      {
+        "name": "be_ai_chat.c",
+        "type": "file"
+      },
+      {
+        "name": "be_ai_chat.h",
+        "type": "file"
+      },
+      {
+        "name": "be_ai_gen.c",
+        "type": "file"
+      },
+      {
+        "name": "be_ai_gen.h",
+        "type": "file"
+      },
+      {
+        "name": "be_ai_goal.c",
+        "type": "file"
+      },
+      {
+        "name": "be_ai_goal.h",
+        "type": "file"
+      },
+      {
+        "name": "be_ai_move.c",
+        "type": "file"
+      },
+      {
+        "name": "be_ai_move.h",
+        "type": "file"
+      },
+      {
+        "name": "be_ai_weap.c",
+        "type": "file"
+      },
+      {
+        "name": "be_ai_weap.h",
+        "type": "file"
+      },
+      {
+        "name": "be_ai_weight.c",
+        "type": "file"
+      },
+      {
+        "name": "be_ai_weight.h",
+        "type": "file"
+      },
+      {
+        "name": "be_ea.c",
+        "type": "file"
+      },
+      {
+        "name": "be_ea.h",
+        "type": "file"
+      },
+      {
+        "name": "be_interface.c",
+        "type": "file"
+      },
+      {
+        "name": "be_interface.h",
+        "type": "file"
+      },
+      {
+        "name": "botlib.h",
+        "type": "file"
+      },
+      {
+        "name": "l_crc.c",
+        "type": "file"
+      },
+      {
+        "name": "l_crc.h",
+        "type": "file"
+      },
+      {
+        "name": "l_libvar.c",
+        "type": "file"
+      },
+      {
+        "name": "l_libvar.h",
+        "type": "file"
+      },
+      {
+        "name": "l_log.c",
+        "type": "file"
+      },
+      {
+        "name": "l_log.h",
+        "type": "file"
+      },
+      {
+        "name": "l_memory.c",
+        "type": "file"
+      },
+      {
+        "name": "l_memory.h",
+        "type": "file"
+      },
+      {
+        "name": "l_precomp.c",
+        "type": "file"
+      },
+      {
+        "name": "l_precomp.h",
+        "type": "file"
+      },
+      {
+        "name": "l_script.c",
+        "type": "file"
+      },
+      {
+        "name": "l_script.h",
+        "type": "file"
+      },
+      {
+        "name": "l_struct.c",
+        "type": "file"
+      },
+      {
+        "name": "l_struct.h",
+        "type": "file"
+      },
+      {
+        "name": "l_utils.h",
+        "type": "file"
+      }
+    ]
+  },
+  {
+    "name": "cgame",
+    "type": "directory",
+    "children": [
+      {
+        "name": ".claude",
+        "type": "directory",
+        "children": [
+          {
+            "name": "auto-memory",
+            "type": "directory",
+            "children": [
+              {
+                "name": "dirty-files",
+                "type": "file"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "cg_consolecmds.c",
+        "type": "file"
+      },
+      {
+        "name": "cg_draw.c",
+        "type": "file"
+      },
+      {
+        "name": "cg_drawtools.c",
+        "type": "file"
+      },
+      {
+        "name": "cg_effects.c",
+        "type": "file"
+      },
+      {
+        "name": "cg_ents.c",
+        "type": "file"
+      },
+      {
+        "name": "cg_event.c",
+        "type": "file"
+      },
+      {
+        "name": "cg_info.c",
+        "type": "file"
+      },
+      {
+        "name": "cg_local.h",
+        "type": "file"
+      },
+      {
+        "name": "cg_localents.c",
+        "type": "file"
+      },
+      {
+        "name": "cg_main.c",
+        "type": "file"
+      },
+      {
+        "name": "cg_marks.c",
+        "type": "file"
+      },
+      {
+        "name": "cg_native.c",
+        "type": "file"
+      },
+      {
+        "name": "cg_newdraw.c",
+        "type": "file"
+      },
+      {
+        "name": "cg_particles.c",
+        "type": "file"
+      },
+      {
+        "name": "cg_players.c",
+        "type": "file"
+      },
+      {
+        "name": "cg_playerstate.c",
+        "type": "file"
+      },
+      {
+        "name": "cg_predict.c",
+        "type": "file"
+      },
+      {
+        "name": "cg_public.h",
+        "type": "file"
+      },
+      {
+        "name": "cg_scoreboard.c",
+        "type": "file"
+      },
+      {
+        "name": "cg_servercmds.c",
+        "type": "file"
+      },
+      {
+        "name": "cg_snapshot.c",
+        "type": "file"
+      },
+      {
+        "name": "cg_syscalls.c",
+        "type": "file"
+      },
+      {
+        "name": "cg_view.c",
+        "type": "file"
+      },
+      {
+        "name": "cg_weapons.c",
+        "type": "file"
+      }
+    ]
+  },
+  {
+    "name": "clean_frontend",
+    "type": "directory",
+    "children": [
+      {
+        "name": "q3_stage.c",
+        "type": "file"
+      },
+      {
+        "name": "q3_stage.h",
+        "type": "file"
+      }
+    ]
+  },
+  {
+    "name": "clean_metal",
+    "type": "directory",
+    "children": []
+  },
+  {
+    "name": "client",
+    "type": "directory",
+    "children": [
+      {
+        "name": "cl_avi.c",
+        "type": "file"
+      },
+      {
+        "name": "cl_cgame.c",
+        "type": "file"
+      },
+      {
+        "name": "cl_cin.c",
+        "type": "file"
+      },
+      {
+        "name": "cl_console.c",
+        "type": "file"
+      },
+      {
+        "name": "cl_curl.c",
+        "type": "file"
+      },
+      {
+        "name": "cl_curl.h",
+        "type": "file"
+      },
+      {
+        "name": "cl_input.c",
+        "type": "file"
+      },
+      {
+        "name": "cl_jpeg.c",
+        "type": "file"
+      },
+      {
+        "name": "cl_keys.c",
+        "type": "file"
+      },
+      {
+        "name": "cl_main.c",
+        "type": "file"
+      },
+      {
+        "name": "cl_net_chan.c",
+        "type": "file"
+      },
+      {
+        "name": "cl_parse.c",
+        "type": "file"
+      },
+      {
+        "name": "cl_scrn.c",
+        "type": "file"
+      },
+      {
+        "name": "cl_ui.c",
+        "type": "file"
+      },
+      {
+        "name": "client.h",
+        "type": "file"
+      },
+      {
+        "name": "keycodes.h",
+        "type": "file"
+      },
+      {
+        "name": "keys.h",
+        "type": "file"
+      },
+      {
+        "name": "snd_adpcm.c",
+        "type": "file"
+      },
+      {
+        "name": "snd_codec.c",
+        "type": "file"
+      },
+      {
+        "name": "snd_codec.h",
+        "type": "file"
+      },
+      {
+        "name": "snd_codec_ogg.c",
+        "type": "file"
+      },
+      {
+        "name": "snd_codec_wav.c",
+        "type": "file"
+      },
+      {
+        "name": "snd_dma.c",
+        "type": "file"
+      },
+      {
+        "name": "snd_local.h",
+        "type": "file"
+      },
+      {
+        "name": "snd_main.c",
+        "type": "file"
+      },
+      {
+        "name": "snd_mem.c",
+        "type": "file"
+      },
+      {
+        "name": "snd_mix.c",
+        "type": "file"
+      },
+      {
+        "name": "snd_public.h",
+        "type": "file"
+      },
+      {
+        "name": "snd_wavelet.c",
+        "type": "file"
+      }
+    ]
+  },
+  {
+    "name": "game",
+    "type": "directory",
+    "children": [
+      {
+        "name": "ai_chat.c",
+        "type": "file"
+      },
+      {
+        "name": "ai_chat.h",
+        "type": "file"
+      },
+      {
+        "name": "ai_cmd.c",
+        "type": "file"
+      },
+      {
+        "name": "ai_cmd.h",
+        "type": "file"
+      },
+      {
+        "name": "ai_dmnet.c",
+        "type": "file"
+      },
+      {
+        "name": "ai_dmnet.h",
+        "type": "file"
+      },
+      {
+        "name": "ai_dmq3.c",
+        "type": "file"
+      },
+      {
+        "name": "ai_dmq3.h",
+        "type": "file"
+      },
+      {
+        "name": "ai_main.c",
+        "type": "file"
+      },
+      {
+        "name": "ai_main.h",
+        "type": "file"
+      },
+      {
+        "name": "ai_team.c",
+        "type": "file"
+      },
+      {
+        "name": "ai_team.h",
+        "type": "file"
+      },
+      {
+        "name": "ai_vcmd.c",
+        "type": "file"
+      },
+      {
+        "name": "ai_vcmd.h",
+        "type": "file"
+      },
+      {
+        "name": "bg_lib.c",
+        "type": "file"
+      },
+      {
+        "name": "bg_lib.h",
+        "type": "file"
+      },
+      {
+        "name": "bg_local.h",
+        "type": "file"
+      },
+      {
+        "name": "bg_misc.c",
+        "type": "file"
+      },
+      {
+        "name": "bg_pmove.c",
+        "type": "file"
+      },
+      {
+        "name": "bg_public.h",
+        "type": "file"
+      },
+      {
+        "name": "bg_slidemove.c",
+        "type": "file"
+      },
+      {
+        "name": "chars.h",
+        "type": "file"
+      },
+      {
+        "name": "g_active.c",
+        "type": "file"
+      },
+      {
+        "name": "g_arenas.c",
+        "type": "file"
+      },
+      {
+        "name": "g_bot.c",
+        "type": "file"
+      },
+      {
+        "name": "g_client.c",
+        "type": "file"
+      },
+      {
+        "name": "g_cmds.c",
+        "type": "file"
+      },
+      {
+        "name": "g_combat.c",
+        "type": "file"
+      },
+      {
+        "name": "g_items.c",
+        "type": "file"
+      },
+      {
+        "name": "g_local.h",
+        "type": "file"
+      },
+      {
+        "name": "g_main.c",
+        "type": "file"
+      },
+      {
+        "name": "g_mem.c",
+        "type": "file"
+      },
+      {
+        "name": "g_misc.c",
+        "type": "file"
+      },
+      {
+        "name": "g_missile.c",
+        "type": "file"
+      },
+      {
+        "name": "g_mover.c",
+        "type": "file"
+      },
+      {
+        "name": "g_public.h",
+        "type": "file"
+      },
+      {
+        "name": "g_rankings.c",
+        "type": "file"
+      },
+      {
+        "name": "g_rankings.h",
+        "type": "file"
+      },
+      {
+        "name": "g_session.c",
+        "type": "file"
+      },
+      {
+        "name": "g_spawn.c",
+        "type": "file"
+      },
+      {
+        "name": "g_svcmds.c",
+        "type": "file"
+      },
+      {
+        "name": "g_syscalls.c",
+        "type": "file"
+      },
+      {
+        "name": "g_target.c",
+        "type": "file"
+      },
+      {
+        "name": "g_team.c",
+        "type": "file"
+      },
+      {
+        "name": "g_team.h",
+        "type": "file"
+      },
+      {
+        "name": "g_trigger.c",
+        "type": "file"
+      },
+      {
+        "name": "g_utils.c",
+        "type": "file"
+      },
+      {
+        "name": "g_weapon.c",
+        "type": "file"
+      },
+      {
+        "name": "inv.h",
+        "type": "file"
+      },
+      {
+        "name": "match.h",
+        "type": "file"
+      },
+      {
+        "name": "syn.h",
+        "type": "file"
+      }
+    ]
+  },
+  {
+    "name": "ios",
+    "type": "directory",
+    "children": [
+      {
+        "name": "ios_local.h",
+        "type": "file"
+      },
+      {
+        "name": "ios_main.m",
+        "type": "file"
+      },
+      {
+        "name": "metal_renderer_shared.h",
+        "type": "file"
+      },
+      {
+        "name": "metal_renderer_stub.c",
+        "type": "file"
+      },
+      {
+        "name": "q3_pbr.c",
+        "type": "file"
+      },
+      {
+        "name": "q3_pbr.h",
+        "type": "file"
+      },
+      {
+        "name": "vendor",
+        "type": "directory",
+        "children": [
+          {
+            "name": "xxhash.h",
+            "type": "file"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "libcurl",
+    "type": "directory",
+    "children": [
+      {
+        "name": "conf751.sh",
+        "type": "file"
+      },
+      {
+        "name": "conf840.sh",
+        "type": "file"
+      },
+      {
+        "name": "windows",
+        "type": "directory",
+        "children": [
+          {
+            "name": "include",
+            "type": "directory",
+            "children": [
+              {
+                "name": "curl",
+                "type": "directory",
+                "children": [
+                  {
+                    "name": "curl.h",
+                    "type": "file"
+                  },
+                  {
+                    "name": "curlver.h",
+                    "type": "file"
+                  },
+                  {
+                    "name": "easy.h",
+                    "type": "file"
+                  },
+                  {
+                    "name": "header.h",
+                    "type": "file"
+                  },
+                  {
+                    "name": "mprintf.h",
+                    "type": "file"
+                  },
+                  {
+                    "name": "multi.h",
+                    "type": "file"
+                  },
+                  {
+                    "name": "options.h",
+                    "type": "file"
+                  },
+                  {
+                    "name": "stdcheaders.h",
+                    "type": "file"
+                  },
+                  {
+                    "name": "system.h",
+                    "type": "file"
+                  },
+                  {
+                    "name": "typecheck-gcc.h",
+                    "type": "file"
+                  },
+                  {
+                    "name": "urlapi.h",
+                    "type": "file"
+                  },
+                  {
+                    "name": "websockets.h",
+                    "type": "file"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "name": "mingw",
+            "type": "directory",
+            "children": [
+              {
+                "name": "lib32",
+                "type": "directory",
+                "children": [
+                  {
+                    "name": "libcurl.a",
+                    "type": "file"
+                  }
+                ]
+              },
+              {
+                "name": "lib64",
+                "type": "directory",
+                "children": [
+                  {
+                    "name": "libcurl.a",
+                    "type": "file"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "name": "vs2005",
+            "type": "directory",
+            "children": [
+              {
+                "name": "lib32",
+                "type": "directory",
+                "children": [
+                  {
+                    "name": "libcurl_a.lib",
+                    "type": "file"
+                  },
+                  {
+                    "name": "libcurl_a_debug.lib",
+                    "type": "file"
+                  }
+                ]
+              },
+              {
+                "name": "lib64",
+                "type": "directory",
+                "children": [
+                  {
+                    "name": "libcurl_a.lib",
+                    "type": "file"
+                  },
+                  {
+                    "name": "libcurl_a_debug.lib",
+                    "type": "file"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "name": "vs2017",
+            "type": "directory",
+            "children": [
+              {
+                "name": "lib32",
+                "type": "directory",
+                "children": [
+                  {
+                    "name": "libcurl_a.lib",
+                    "type": "file"
+                  },
+                  {
+                    "name": "libcurl_a_debug.lib",
+                    "type": "file"
+                  }
+                ]
+              },
+              {
+                "name": "lib64",
+                "type": "directory",
+                "children": [
+                  {
+                    "name": "libcurl_a.lib",
+                    "type": "file"
+                  },
+                  {
+                    "name": "libcurl_a_debug.lib",
+                    "type": "file"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "libjpeg",
+    "type": "directory",
+    "children": [
+      {
+        "name": "README",
+        "type": "file"
+      },
+      {
+        "name": "jaricom.c",
+        "type": "file"
+      },
+      {
+        "name": "jcapimin.c",
+        "type": "file"
+      },
+      {
+        "name": "jcapistd.c",
+        "type": "file"
+      },
+      {
+        "name": "jcarith.c",
+        "type": "file"
+      },
+      {
+        "name": "jccoefct.c",
+        "type": "file"
+      },
+      {
+        "name": "jccolor.c",
+        "type": "file"
+      },
+      {
+        "name": "jcdctmgr.c",
+        "type": "file"
+      },
+      {
+        "name": "jchuff.c",
+        "type": "file"
+      },
+      {
+        "name": "jcinit.c",
+        "type": "file"
+      },
+      {
+        "name": "jcmainct.c",
+        "type": "file"
+      },
+      {
+        "name": "jcmarker.c",
+        "type": "file"
+      },
+      {
+        "name": "jcmaster.c",
+        "type": "file"
+      },
+      {
+        "name": "jcomapi.c",
+        "type": "file"
+      },
+      {
+        "name": "jconfig.h",
+        "type": "file"
+      },
+      {
+        "name": "jcparam.c",
+        "type": "file"
+      },
+      {
+        "name": "jcprepct.c",
+        "type": "file"
+      },
+      {
+        "name": "jcsample.c",
+        "type": "file"
+      },
+      {
+        "name": "jctrans.c",
+        "type": "file"
+      },
+      {
+        "name": "jdapimin.c",
+        "type": "file"
+      },
+      {
+        "name": "jdapistd.c",
+        "type": "file"
+      },
+      {
+        "name": "jdarith.c",
+        "type": "file"
+      },
+      {
+        "name": "jdatadst.c",
+        "type": "file"
+      },
+      {
+        "name": "jdatasrc.c",
+        "type": "file"
+      },
+      {
+        "name": "jdcoefct.c",
+        "type": "file"
+      },
+      {
+        "name": "jdcolor.c",
+        "type": "file"
+      },
+      {
+        "name": "jdct.h",
+        "type": "file"
+      },
+      {
+        "name": "jddctmgr.c",
+        "type": "file"
+      },
+      {
+        "name": "jdhuff.c",
+        "type": "file"
+      },
+      {
+        "name": "jdinput.c",
+        "type": "file"
+      },
+      {
+        "name": "jdmainct.c",
+        "type": "file"
+      },
+      {
+        "name": "jdmarker.c",
+        "type": "file"
+      },
+      {
+        "name": "jdmaster.c",
+        "type": "file"
+      },
+      {
+        "name": "jdmerge.c",
+        "type": "file"
+      },
+      {
+        "name": "jdpostct.c",
+        "type": "file"
+      },
+      {
+        "name": "jdsample.c",
+        "type": "file"
+      },
+      {
+        "name": "jdtrans.c",
+        "type": "file"
+      },
+      {
+        "name": "jerror.c",
+        "type": "file"
+      },
+      {
+        "name": "jerror.h",
+        "type": "file"
+      },
+      {
+        "name": "jfdctflt.c",
+        "type": "file"
+      },
+      {
+        "name": "jfdctfst.c",
+        "type": "file"
+      },
+      {
+        "name": "jfdctint.c",
+        "type": "file"
+      },
+      {
+        "name": "jidctflt.c",
+        "type": "file"
+      },
+      {
+        "name": "jidctfst.c",
+        "type": "file"
+      },
+      {
+        "name": "jidctint.c",
+        "type": "file"
+      },
+      {
+        "name": "jinclude.h",
+        "type": "file"
+      },
+      {
+        "name": "jmemmgr.c",
+        "type": "file"
+      },
+      {
+        "name": "jmemnobs.c",
+        "type": "file"
+      },
+      {
+        "name": "jmemsys.h",
+        "type": "file"
+      },
+      {
+        "name": "jmorecfg.h",
+        "type": "file"
+      },
+      {
+        "name": "jpegint.h",
+        "type": "file"
+      },
+      {
+        "name": "jpeglib.h",
+        "type": "file"
+      },
+      {
+        "name": "jquant1.c",
+        "type": "file"
+      },
+      {
+        "name": "jquant2.c",
+        "type": "file"
+      },
+      {
+        "name": "jutils.c",
+        "type": "file"
+      },
+      {
+        "name": "jversion.h",
+        "type": "file"
+      },
+      {
+        "name": "libjpeg-changes.diff",
+        "type": "file"
+      }
+    ]
+  },
+  {
+    "name": "libogg",
+    "type": "directory",
+    "children": [
+      {
+        "name": "COPYING",
+        "type": "file"
+      },
+      {
+        "name": "include",
+        "type": "directory",
+        "children": [
+          {
+            "name": "ogg",
+            "type": "directory",
+            "children": [
+              {
+                "name": "config_types.h",
+                "type": "file"
+              },
+              {
+                "name": "ogg.h",
+                "type": "file"
+              },
+              {
+                "name": "os_types.h",
+                "type": "file"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "src",
+        "type": "directory",
+        "children": [
+          {
+            "name": "bitwise.c",
+            "type": "file"
+          },
+          {
+            "name": "crctable.h",
+            "type": "file"
+          },
+          {
+            "name": "framing.c",
+            "type": "file"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "libsdl",
+    "type": "directory",
+    "children": [
+      {
+        "name": "include",
+        "type": "directory",
+        "children": [
+          {
+            "name": "SDL2",
+            "type": "directory",
+            "children": [
+              {
+                "name": "SDL.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_assert.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_atomic.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_audio.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_bits.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_blendmode.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_clipboard.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_config.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_cpuinfo.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_egl.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_endian.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_error.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_events.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_filesystem.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_gamecontroller.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_gesture.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_haptic.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_hints.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_joystick.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_keyboard.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_keycode.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_loadso.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_log.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_main.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_messagebox.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_mouse.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_mutex.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_name.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_opengl.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_opengl_glext.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_opengles.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_opengles2.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_opengles2_gl2.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_opengles2_gl2ext.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_opengles2_gl2platform.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_opengles2_khrplatform.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_pixels.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_platform.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_power.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_quit.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_rect.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_render.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_revision.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_rwops.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_scancode.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_sensor.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_shape.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_stdinc.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_surface.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_system.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_syswm.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_test.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_test_assert.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_test_common.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_test_compare.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_test_crc32.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_test_font.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_test_fuzzer.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_test_harness.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_test_images.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_test_log.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_test_md5.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_test_memory.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_test_random.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_thread.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_timer.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_touch.h",
+                "type": "file"
+              },
+              {
+                "name": "SDL_types.h",
+                "type": "file"
+              },
+              {
+
+[…truncated 32771 chars — raise BridgeOptions.maxResultChars, or call the tool with a narrower scope (filter, head, pagination)…]
+
+ "file"
+      },
+      {
+        "name": "resource.h",
+        "type": "file"
+      },
+      {
+        "name": "win_gamma.c",
+        "type": "file"
+      },
+      {
+        "name": "win_glimp.c",
+        "type": "file"
+      },
+      {
+        "name": "win_input.c",
+        "type": "file"
+      },
+      {
+        "name": "win_local.h",
+        "type": "file"
+      },
+      {
+        "name": "win_main.c",
+        "type": "file"
+      },
+      {
+        "name": "win_minimize.c",
+        "type": "file"
+      },
+      {
+        "name": "win_qgl.c",
+        "type": "file"
+      },
+      {
+        "name": "win_qvk.c",
+        "type": "file"
+      },
+      {
+        "name": "win_resource.rc",
+        "type": "file"
+      },
+      {
+        "name": "win_shared.c",
+        "type": "file"
+      },
+      {
+        "name": "win_snd.c",
+        "type": "file"
+      },
+      {
+        "name": "win_syscon.c",
+        "type": "file"
+      },
+      {
+        "name": "win_wndproc.c",
+        "type": "file"
+      }
+    ]
+  }
+]

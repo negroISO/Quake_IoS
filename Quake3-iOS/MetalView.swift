@@ -1,5 +1,6 @@
 import SwiftUI
 import MetalKit
+import MetalPerformanceShaders
 #if canImport(MetalFX)
 import MetalFX
 #endif
@@ -25,12 +26,12 @@ func Q3MetalOutputTargetSize(screen: UIScreen? = nil) -> CGSize {
     return CGSize(width: w, height: h)
 }
 
-/// MetalFX upscale quality picker. Persists via UserDefaults; the launcher
-/// menu sets it before Quake3_Init runs. C-side cmdline picks up the input
-/// render resolution via Q3_SetRenderResolution; Coordinator creates an
-/// offscreen RT at that size and uses MTLFXSpatialScaler to upscale to the
-/// drawable each frame. Native quality bypasses the RT — Q3 renders direct
-/// to the drawable as before (no MetalFX overhead).
+/// Upscale quality picker. Persists via UserDefaults; the launcher menu sets
+/// it before Quake3_Init runs. C-side cmdline picks up the input render
+/// resolution via Q3_SetRenderResolution. Coordinator renders the 3D scene to
+/// an offscreen RT at that size, prefers MetalFX temporal upscale to the
+/// drawable, then draws 2D HUD/UI at native output resolution. Native quality
+/// bypasses the RT — Q3 renders direct to the drawable as before.
 enum Q3UpscaleQuality: String, CaseIterable {
     case native = "native"
     case high = "high"
@@ -99,6 +100,32 @@ enum Q3UpscaleQuality: String, CaseIterable {
         }
     }
 }
+/// Internal backend override for the upscale path. Default prefers real
+/// MetalFX temporal scaling when available; compute is the existing linear
+/// spatial fallback; off forces native/direct rendering.
+enum Q3MetalFXBackendPreference: String {
+    case temporal
+    case compute
+    case off
+
+    static var current: Q3MetalFXBackendPreference {
+        let raw = ProcessInfo.processInfo.environment["Q3_METALFX_BACKEND"]?.lowercased() ?? "temporal"
+        switch raw {
+        case "temporal", "metalfx", "auto", "default": return .temporal
+        case "compute", "spatial": return .compute
+        case "off", "none", "native", "false", "0": return .off
+        default:
+            NSLog("[Q3-METALFX] ignoring invalid Q3_METALFX_BACKEND=%@", raw)
+            return .temporal
+        }
+    }
+}
+
+private enum Q3UpscaleBackendActive: String {
+    case none
+    case temporal
+    case compute
+}
 
 /// MetalFX frame interpolation toggle. When .on, the renderer creates an
 /// MTLFXFrameInterpolator (iOS 18+) and emits one synthesized in-between
@@ -160,10 +187,24 @@ enum Q3RTMix: String, CaseIterable {
     static let userDefaultsKey = "q3_rt_mix"
 
     static var current: Q3RTMix {
-        if let envRaw = ProcessInfo.processInfo.environment["Q3_RT_MIX"],
-           let envQ = Q3RTMix(rawValue: envRaw) {
-            NSLog("[Q3-RT] using env var Q3_RT_MIX=%@", envRaw)
-            return envQ
+        if let envRaw = ProcessInfo.processInfo.environment["Q3_RT_MIX"] {
+            let envKey = envRaw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let envQ: Q3RTMix?
+            switch envKey {
+            case "off", "raster", "false", "no":
+                envQ = .off
+            case "blend", "mixed", "mix", "half":
+                envQ = .blend
+            case "pure", "rt", "on", "true", "yes":
+                envQ = .pure
+            default:
+                envQ = Q3RTMix(rawValue: envKey)
+            }
+            if let envQ {
+                NSLog("[Q3-RT] using env var Q3_RT_MIX=%@ -> %@", envRaw, envQ.rawValue)
+                return envQ
+            }
+            NSLog("[Q3-RT] ignoring invalid Q3_RT_MIX=%@", envRaw)
         }
         let raw = UserDefaults.standard.string(forKey: userDefaultsKey) ?? "0"
         return Q3RTMix(rawValue: raw) ?? .off
@@ -392,6 +433,8 @@ struct MetalView: UIViewRepresentable {
             // P1/P3 (must mirror MSL): x=lightCount, y=r_rt_light_scale,
             // z=r_rt_reflections, w=r_rt_refl_roughness_max
             var rtLightParams: SIMD4<Float> = SIMD4(0, 1, 0, 0.45)
+            // RT PBR controls. x = r_pbr_parallax_scale (0 disables RT height UV offset).
+            var rtPBRParams: SIMD4<Float> = SIMD4(0, 0, 0, 0)
         }
 
         struct RTPrimitiveMaterial {
@@ -399,6 +442,9 @@ struct MetalView: UIViewRepresentable {
             var lightmapSlot: UInt32
             var tcModCount: UInt32
             var _pad0: UInt32 = 0
+            // x=normal slot, y=height slot, z=roughness slot, w=metallic slot.
+            // UInt32.max means "no RT PBR sidecar for this channel".
+            var pbrSlots: SIMD4<UInt32> = SIMD4(repeating: UInt32.max)
             var alphaTcModControl: SIMD4<Float> // x=alphaTestThreshold
             var materialFlags: SIMD4<UInt32>    // x=isSky, y=isEmissive
             var materialParams: SIMD4<Float>    // x=emissiveIntensity
@@ -502,10 +548,11 @@ struct MetalView: UIViewRepresentable {
             var pbrRoughness: Float = 0.55
             var pbrMetallic: Float = 0.30
             var _pad0: Float = 0
-            /* Parallax (height map) params — MUST stay the LAST field and
+            /* Parallax/normal tuning params — MUST stay the LAST field and
              * mirror the MSL struct tail exactly. .x = parallax scale
              * (r_pbr_parallax_scale, 0 = off / no height map bound),
-             * .y/.z = pad, .w = parallax debug tint gate (r_pbr_parallax_tint). */
+             * .y = normal map XY scale (r_pbr_normal_scale), .z = SSR reflectivity mask,
+             * .w = parallax debug tint gate (r_pbr_parallax_tint). */
             var parallaxParams: SIMD4<Float> = SIMD4(0, 0, 0, 0)
         }
 
@@ -522,6 +569,10 @@ struct MetalView: UIViewRepresentable {
         // concurrency — Coordinator itself is main-actor driven, so the
         // bool is safe here without any isolation attribute.
         private var skyStagesLogged: Bool = false
+        // One-shot: logs the enforced runtime sky raster state. Kept separate
+        // from skyStagesLogged so stage layout and policy proof can evolve
+        // independently.
+        private var skyPolicyLogged: Bool = false
 
         private static func metalCullMode(for stageCullMode: UInt32) -> MTLCullMode {
             Q3MetalStateMap.cullMode(stageCullMode)
@@ -1313,7 +1364,7 @@ struct MetalView: UIViewRepresentable {
          * 128 Q3MetalLight entries (32B each). This is 4112B, just over
          * Metal's set*Bytes comfort zone, so bindDlightBlock uses a tiny
          * MTLBuffer when the block exceeds 4KB. */
-        private static let dlightMaxCount = 128
+        private static let dlightMaxCount = 512
         private static let dlightHeaderSize = 16
         private static let dlightBlockSize = dlightHeaderSize + dlightMaxCount * MemoryLayout<Q3MetalLight>.stride
 
@@ -1604,7 +1655,7 @@ struct MetalView: UIViewRepresentable {
             uint _pad0;
             uint _pad1;
             uint _pad2;
-            MSLLight lights[128];
+            MSLLight lights[512];
         };
 
         /* Apply additive dlight contribution to a lit color. Each light is
@@ -1719,8 +1770,9 @@ struct MetalView: UIViewRepresentable {
             float pbrRoughness;
             float pbrMetallic;
             float _pad0;
-            // Parallax params — LAST field, mirrors Swift struct tail.
-            // .x = scale (0 = off), .y/.z = pad, .w = debug tint gate.
+            // Parallax/normal tuning params — LAST field, mirrors Swift struct tail.
+            // .x = parallax scale (0 = off), .y = normal-map XY scale,
+            // .z = SSR reflectivity mask, .w = debug tint gate.
             float4 parallaxParams;
         };
 
@@ -2281,16 +2333,20 @@ struct MetalView: UIViewRepresentable {
             float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
             float texel = uniforms.sunShadowParams.z;
             float bias = uniforms.sunShadowParams.x;
+            int radius = int(clamp(round(uniforms.sunShadowParams.w), 1.0, 4.0));
             constexpr sampler shadowSampler(coord::normalized, address::clamp_to_edge, filter::linear);
             float receiver = ndc.z - bias;
             float visible = 0.0;
-            for (int y = -1; y <= 1; ++y) {
-                for (int x = -1; x <= 1; ++x) {
+            float taps = 0.0;
+            for (int y = -4; y <= 4; ++y) {
+                for (int x = -4; x <= 4; ++x) {
+                    if (abs(x) > radius || abs(y) > radius) { continue; }
                     float d = sunShadowMap.sample(shadowSampler, uv + float2(x, y) * texel);
                     visible += (receiver <= d) ? 1.0 : 0.0;
+                    taps += 1.0;
                 }
             }
-            return visible * (1.0 / 9.0);
+            return visible / max(taps, 1.0);
         }
 
         fragment float4 q3_world_fragment(WorldVertexOut in [[stage_in]],
@@ -2618,6 +2674,9 @@ struct MetalView: UIViewRepresentable {
             if (!is_null_texture(worldNormalMap)) {
                 float2 nmUV = texCoord * 0.5;
                 float3 nMap = worldNormalMap.sample(textureSampler, nmUV).xyz * 2.0 - 1.0;
+                float normalScale = max(drawUniforms.parallaxParams.y, 0.0);
+                nMap.xy *= normalScale;
+                nMap = normalize(nMap);
 
                 float3 dp1 = dfdx(in.worldPos);
                 float3 dp2 = dfdy(in.worldPos);
@@ -2773,7 +2832,18 @@ struct MetalView: UIViewRepresentable {
             if (parallaxDebugTint) {
                 lit *= float3(0.6, 0.6, 1.4);
             }
-            return float4(lit, texel.a * va);
+            /* Raster SSR mask piggybacks in destination alpha for opaque
+             * world surfaces only. All blended/lightmap/additive world
+             * pipelines preserve destination alpha, so this survives until
+             * the post-world SSR compute pass and never affects visible
+             * color blending. Swift writes reflectivity into
+             * parallaxParams.z only when r_pbr_ssr is enabled and the
+             * material is metallic/allowlisted. */
+            float ssrMask = 0.0;
+            if (!additiveStage && drawUniforms.stageUsesLightmap < 0.5 && drawUniforms.fogOnly < 0.5) {
+                ssrMask = saturate(drawUniforms.parallaxParams.z);
+            }
+            return float4(lit, ssrMask);
         }
 
         vertex EntityVertexOut q3_entity_vertex(const device EntityVertexIn *vertices [[buffer(0)]],
@@ -3540,74 +3610,189 @@ struct MetalView: UIViewRepresentable {
 
         private var commandQueue: MTLCommandQueue?
 
-        /* MetalFX spatial upscale (Q3UpscaleQuality picker).
+        /* MetalFX temporal upscale (Q3UpscaleQuality picker).
          *   - upscaleQuality is read once from UserDefaults at Coordinator
          *     init. Quake3_iOSApp also calls Q3_SetRenderResolution() before
          *     Quake3_Init so Q3's cmdline gets r_customwidth/height matching
          *     upscaleColorTarget's dimensions.
-         *   - When != .native: every frame's main render encoder is pointed
-         *     at upscaleColorTarget instead of the drawable, viewport +
-         *     depth attachment use the RT's size, and after encoder.endEncoding
-         *     the spatialScaler upscales RT → drawable. encodePostprocess
-         *     still runs on the drawable (full-res tone curve).
-         *   - When .native: the RT is nil and we render direct to drawable
-         *     like before. spatialScaler is also nil — no MetalFX overhead. */
+         *   - When != .native and backend != off: the 3D scene renders into
+         *     RGBA16F low-res color + depth, a compute pass writes RG16F
+         *     current-pixel → previous-pixel motion vectors, MetalFX temporal
+         *     upscales to the drawable, and 2D HUD/UI draws afterward at
+         *     native drawable resolution. If temporal is unavailable, the old
+         *     compute spatial scaler remains the fallback.
+         *   - When .native/backend off: render direct to drawable. */
         private var upscaleQuality: Q3UpscaleQuality = Q3UpscaleQuality.current
+        private let metalFXBackendPreference: Q3MetalFXBackendPreference = Q3MetalFXBackendPreference.current
+        private var activeUpscaleBackend: Q3UpscaleBackendActive = .none
+        private let sceneUpscalePixelFormat: MTLPixelFormat = .rgba16Float
+        private let motionVectorPixelFormat: MTLPixelFormat = .rg16Float
         private var upscaleColorTarget: MTLTexture?
         private var upscaleDepthTarget: MTLTexture?
-        #if canImport(MetalFX)
-        private var spatialScaler: MTLFXSpatialScaler?
+        private var motionVectorTexture: MTLTexture?
+        #if canImport(MetalFX) && !os(visionOS) && !targetEnvironment(macCatalyst)
+        private var temporalScaler: MTLFXTemporalScaler?
         #endif
         private var spatialUpscalePipelineState: MTLComputePipelineState?
+        private var motionVectorPipelineState: MTLComputePipelineState?
         /// Cached (inputW, inputH, outputW, outputH) the scaler was built
         /// for; rebuild lazily on any change (drawable resize, quality flip).
         private var spatialScalerKey: (Int, Int, Int, Int) = (0, 0, 0, 0)
+        private var temporalHistoryResetPending = true
+        private var temporalFrameIndex: UInt32 = 0
+        private var temporalCurrentJitterPixels = SIMD2<Float>(0, 0)
+        private var temporalPreviousJitterPixels = SIMD2<Float>(0, 0)
+        private var temporalPreviousViewProjection: simd_float4x4?
+        private var temporalPreviousCameraPos: SIMD3<Float>?
+        private var temporalPreviousCameraForward: SIMD3<Float>?
+        private var temporalLastWorldGeneration: UInt32 = 0
 
-        /// (Re)build the offscreen color + depth RT and the MTLFXSpatialScaler
-        /// for the given input/output dimensions. Returns false if the device
-        /// can't host MetalFX (very old hardware) — caller falls back to direct
-        /// rendering. Called from draw() lazily when upscaleQuality != .native.
-        private func ensureSpatialUpscaleTargets(device: MTLDevice,
-                                                 inputW: Int, inputH: Int,
-                                                 outputW: Int, outputH: Int) -> Bool {
+        private var wantsUpscaleOffscreen: Bool {
+            upscaleQuality != .native && metalFXBackendPreference != .off
+        }
+
+        private func markTemporalReset(_ reason: String) {
+            temporalHistoryResetPending = true
+            temporalPreviousViewProjection = nil
+            temporalPreviousCameraPos = nil
+            temporalPreviousCameraForward = nil
+            let msg = "[Q3-MOTION] reset reason=\(reason)"
+            print(msg)
+            pbrLog(msg)
+        }
+
+        private func halton(_ index: UInt32, _ base: UInt32) -> Float {
+            var i = index
+            var f: Float = 1
+            var r: Float = 0
+            while i > 0 {
+                f /= Float(base)
+                r += f * Float(i % base)
+                i /= base
+            }
+            return r
+        }
+
+        private func nextTemporalJitterPixels() -> SIMD2<Float> {
+            temporalFrameIndex &+= 1
+            return SIMD2<Float>(halton(temporalFrameIndex, 2) - 0.5,
+                                halton(temporalFrameIndex, 3) - 0.5)
+        }
+
+        /// (Re)build the offscreen color/depth/motion textures and temporal
+        /// scaler for the given input/output dimensions. Returns the active
+        /// backend; .none means caller should render direct/native.
+        private func ensureUpscaleTargets(device: MTLDevice,
+                                          inputW: Int, inputH: Int,
+                                          outputW: Int, outputH: Int,
+                                          outputPixelFormat: MTLPixelFormat) -> Q3UpscaleBackendActive {
+            guard metalFXBackendPreference != .off else {
+                activeUpscaleBackend = .none
+                return .none
+            }
             let key = (inputW, inputH, outputW, outputH)
-            if upscaleColorTarget != nil && upscaleDepthTarget != nil && spatialScalerKey == key { return true }
+            if upscaleColorTarget != nil,
+               upscaleDepthTarget != nil,
+               motionVectorTexture != nil,
+               spatialScalerKey == key,
+               activeUpscaleBackend != .none {
+                return activeUpscaleBackend
+            }
 
-            // Color RT (.private, [renderTarget, shaderRead] — Q3 renders
-            // INTO this, MetalFX READS this).
+            upscaleColorTarget = nil
+            upscaleDepthTarget = nil
+            motionVectorTexture = nil
+            activeUpscaleBackend = .none
+            #if canImport(MetalFX) && !os(visionOS) && !targetEnvironment(macCatalyst)
+            temporalScaler = nil
+            #endif
+            spatialScalerKey = key
+            markTemporalReset("scaler-rebuild")
+
             let colorDesc = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: .bgra8Unorm,
+                pixelFormat: sceneUpscalePixelFormat,
                 width: inputW, height: inputH, mipmapped: false)
             colorDesc.usage = [.renderTarget, .shaderRead]
             colorDesc.storageMode = .private
             colorDesc.textureType = .type2D
             guard let color = device.makeTexture(descriptor: colorDesc) else {
-                print("[MetalFX] ensureSpatialUpscaleTargets: color RT alloc failed (\(inputW)×\(inputH))")
-                return false
+                print("[Q3-METALFX] fallback reason=color-rt-alloc-failed")
+                return .none
             }
-            color.label = "Q3.upscale.color"
+            color.label = "Q3.metalfx.sceneColor.rgba16f"
             upscaleColorTarget = color
 
-            // Depth RT (.private, renderTarget) — same dims as color RT.
             let depthDesc = MTLTextureDescriptor.texture2DDescriptor(
                 pixelFormat: .depth32Float,
                 width: inputW, height: inputH, mipmapped: false)
-            depthDesc.usage = [.renderTarget]
+            depthDesc.usage = [.renderTarget, .shaderRead]
             depthDesc.storageMode = .private
             depthDesc.textureType = .type2D
             guard let depth = device.makeTexture(descriptor: depthDesc) else {
-                print("[MetalFX] ensureSpatialUpscaleTargets: depth RT alloc failed (\(inputW)×\(inputH))")
-                return false
+                print("[Q3-METALFX] fallback reason=depth-rt-alloc-failed")
+                return .none
             }
-            depth.label = "Q3.upscale.depth"
+            depth.label = "Q3.metalfx.sceneDepth.depth32"
             upscaleDepthTarget = depth
 
-            spatialScalerKey = key
-            #if canImport(MetalFX)
-            spatialScaler = nil
-            #endif
-            print("[Q3-UPSCALE] compute scaler ready: \(inputW)×\(inputH) → \(outputW)×\(outputH) (\(upscaleQuality.label))")
-            return true
+            let motionDesc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: motionVectorPixelFormat,
+                width: inputW, height: inputH, mipmapped: false)
+            motionDesc.usage = [.shaderWrite, .shaderRead]
+            motionDesc.storageMode = .private
+            motionDesc.textureType = .type2D
+            guard let motion = device.makeTexture(descriptor: motionDesc) else {
+                print("[Q3-METALFX] fallback reason=motion-rt-alloc-failed")
+                activeUpscaleBackend = .compute
+                return .compute
+            }
+            motion.label = "Q3.metalfx.motion.rg16f"
+            motionVectorTexture = motion
+
+            if metalFXBackendPreference == .temporal {
+                #if canImport(MetalFX) && !os(visionOS) && !targetEnvironment(macCatalyst)
+                if #available(iOS 16.0, macCatalyst 16.0, *) {
+                    let desc = MTLFXTemporalScalerDescriptor()
+                    desc.colorTextureFormat = sceneUpscalePixelFormat
+                    desc.depthTextureFormat = .depth32Float
+                    desc.motionTextureFormat = motionVectorPixelFormat
+                    desc.outputTextureFormat = outputPixelFormat
+                    desc.inputWidth = inputW
+                    desc.inputHeight = inputH
+                    desc.outputWidth = outputW
+                    desc.outputHeight = outputH
+                    desc.isAutoExposureEnabled = false
+                    // Static render-scale path: descriptor input/output sizes
+                    // are rebuilt on quality/drawable changes, so no dynamic
+                    // input-content range is needed here.
+                    desc.isInputContentPropertiesEnabled = false
+                    desc.requiresSynchronousInitialization = false
+                    if #available(iOS 27.0, macCatalyst 27.0, *) {
+                        desc.isOutputResolutionMotionVectorsEnabled = false
+                        desc.isJitteredMotionVectorsEnabled = false
+                    }
+                    if let scaler = desc.makeTemporalScaler(device: device) {
+                        temporalScaler = scaler
+                        activeUpscaleBackend = .temporal
+                        let msg = "[Q3-METALFX] temporal ready input=\(inputW)x\(inputH) output=\(outputW)x\(outputH) fmt=rgba16Float motion=rg16Float"
+                        print(msg)
+                        pbrLog(msg)
+                        return .temporal
+                    }
+                    print("[Q3-METALFX] fallback reason=makeTemporalScaler-returned-nil")
+                } else {
+                    print("[Q3-METALFX] fallback reason=temporal-api-unavailable")
+                }
+                #else
+                print("[Q3-METALFX] fallback reason=metalfx-unavailable-or-catalyst")
+                #endif
+            } else {
+                print("[Q3-METALFX] fallback reason=backend-forced-compute")
+            }
+
+            activeUpscaleBackend = .compute
+            print("[Q3-METALFX] compute fallback ready input=\(inputW)x\(inputH) output=\(outputW)x\(outputH) fmt=rgba16Float")
+            return .compute
         }
 
         private var uiPipelineState: MTLRenderPipelineState?
@@ -3624,6 +3809,12 @@ struct MetalView: UIViewRepresentable {
         private var fogVolumePipelineState: MTLRenderPipelineState?
         private var sceneDepthTexture: MTLTexture?
         private var sceneDepthTextureSize = MTLSize(width: 0, height: 0, depth: 1)
+        private var ssrPipelineState: MTLComputePipelineState?
+        private var ssrScratchTexture: MTLTexture?
+        private var ssrScratchTextureSize = MTLSize(width: 0, height: 0, depth: 1)
+        private var ssrScratchPixelFormat: MTLPixelFormat = .invalid
+        private var ssrLogPrintedOnce = false
+        private var frameHasRasterSSRMask = false
         /* Alpha-modulated additive (GL_SRC_ALPHA/GL_ONE) — blendMode=1. */
         private var worldAdditivePipelineState: MTLRenderPipelineState?
         /* Full-intensity additive (GL_ONE/GL_ONE) — blendMode=5. NEVER
@@ -3686,6 +3877,7 @@ struct MetalView: UIViewRepresentable {
         private var sunShadowPipelineState: MTLRenderPipelineState?
         private var sunShadowTexture: MTLTexture?
         private var sunShadowTextureSize = MTLSize(width: 0, height: 0, depth: 1)
+        private var sunShadowDummyTexture: MTLTexture?
         private var sunShadowLoggedMaps = Set<String>()
         private var rtTextureSize = MTLSize(width: 0, height: 0, depth: 1)
         private var rtCompositeTextureSize = MTLSize(width: 0, height: 0, depth: 1)
@@ -3695,19 +3887,38 @@ struct MetalView: UIViewRepresentable {
         private var rtASVertexBuffer: MTLBuffer?
         private var rtASPositionBuffer: MTLBuffer?
         private var rtASIndexBuffer: MTLBuffer?
+        // RT world AS may use a compact index stream that excludes sky/portal/
+        // fog carrier draws. Primitive IDs then no longer match
+        // draw.firstIndex/3, so keep draw-index → compact first-triangle for
+        // RTPrimitiveMaterial refreshes.
+        private var rtASCompactDrawFirstTri: [Int: Int] = [:]
+        private var rtASPrimitiveCount: Int = 0
         private var entityAccelerationStructure: MTLAccelerationStructure?
         private var entityASSize = 0
         private var entityASLogCounter: UInt64 = 0
         private var rtPrimitiveMaterialBuffer: MTLBuffer?
         private var rtPrimitiveMaterialBufferCache: [UInt64: MTLBuffer] = [:]
-        private let rtMaxAlbedoSlots = 110
+        // Metal exposes 128 texture argument slots to this compute kernel.
+        // Layout: 0=RT output, 1=env, 2..79=albedo, 80..95=lightmaps,
+        // 96..103=normal, 104..111=height, 112..119=roughness,
+        // 120..127=metallic.
+        private let rtMaxAlbedoSlots = 78
         private let rtMaxLightmapSlots = 16
-        private var rtAlbedoHandles = [UInt32](repeating: 0, count: 110)
+        private let rtMaxPBRSidecarSlots = 8
+        private let rtLightmapTextureBase = 80
+        private let rtNormalTextureBase = 96
+        private let rtHeightTextureBase = 104
+        private let rtRoughnessTextureBase = 112
+        private let rtMetallicTextureBase = 120
+        private var rtAlbedoHandles = [UInt32](repeating: 0, count: 78)
         private var rtLightmapHandles = [UInt32](repeating: 0, count: 16)
+        private var rtPBRSidecarHandles = [UInt32](repeating: 0, count: 8)
+        private var rtForceClassicAlbedoHandles = Set<UInt32>()
         private var rtLogPrintedOnce = false
         private var rtOverlayLogPrintedOnce = false
         // P0.2: one-shot log gate for the r_rt_preserve_entities mode line.
         private var rtPreserveEntitiesLogged = false
+        private var sunShadowModeDebugLogged = false
         // P1: per-map RT light set (RTX Remix authored, baked to JSON).
         private var rtLightBuffer: MTLBuffer?
         private var rtLightBufferCapacity: Int = 0
@@ -3728,6 +3939,23 @@ struct MetalView: UIViewRepresentable {
             var dirType: SIMD4<Float>
         }
 
+        /// Resolve a file under baseq3, preferring persistent
+        /// Documents/baseq3 over the app bundle. This lets device dev builds
+        /// use Q3_SKIP_BUNDLED_BASEQ3=1 after scripts/q3push_baseq3.sh seeds
+        /// the app data container once.
+        private func baseq3FilePath(_ relativePath: String) -> String? {
+            let fm = FileManager.default
+            if let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first {
+                let path = docs.appendingPathComponent("baseq3").appendingPathComponent(relativePath).path
+                if fm.fileExists(atPath: path) { return path }
+            }
+            if let bundleRoot = Bundle.main.resourcePath {
+                let path = bundleRoot + "/baseq3/" + relativePath
+                if fm.fileExists(atPath: path) { return path }
+            }
+            return nil
+        }
+
         /// Loads baseq3/pbr/lights/<map>.json (baked by
         /// scripts/rt_lights_from_usda.py from the RTX Remix per-map light
         /// authoring) into a GPU buffer. Distant lights are sorted to slot 0
@@ -3743,8 +3971,8 @@ struct MetalView: UIViewRepresentable {
                 rtLightCount = 0
                 var authored: [RTLightGPU] = []
                 if !map.isEmpty,
-                   let res = Bundle.main.resourcePath,
-                   let data = FileManager.default.contents(atPath: res + "/baseq3/pbr/lights/\(map).json"),
+                   let lightPath = baseq3FilePath("pbr/lights/\(map).json"),
+                   let data = FileManager.default.contents(atPath: lightPath),
                    let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let arr = obj["lights"] as? [[String: Any]] {
                     for l in arr {
@@ -3915,6 +4143,15 @@ struct MetalView: UIViewRepresentable {
             var gamma: Float
         }
 
+        private struct SSRUniforms {
+            var viewProjection: simd_float4x4
+            var inverseViewProjection: simd_float4x4
+            var cameraPos: SIMD3<Float>
+            var strength: Float
+            // x=max steps, y=world step scale, z=depth thickness, w=edge fade scale
+            var params: SIMD4<Float>
+        }
+
         private struct RTBlendUniforms {
             var mixAmount: Float
             var bloomIntensity: Float
@@ -3956,6 +4193,156 @@ struct MetalView: UIViewRepresentable {
                 float2 uv = (float2(tid) + 0.5) / float2(max(w, 1u), max(h, 1u));
                 output.write(source.sample(s, uv), tid);
             }
+
+            struct MotionUniforms {
+                float4x4 currentInvViewProjection;
+                float4x4 previousViewProjection;
+                float2 renderSize;
+                float reset;
+                float _pad;
+            };
+
+            kernel void q3_motion_vectors(depth2d<float> depthTexture [[texture(0)]],
+                                          texture2d<half, access::write> motionTexture [[texture(1)]],
+                                          constant MotionUniforms &u [[buffer(0)]],
+                                          uint2 tid [[thread_position_in_grid]]) {
+                uint w = motionTexture.get_width();
+                uint h = motionTexture.get_height();
+                if (tid.x >= w || tid.y >= h) return;
+                if (u.reset > 0.5) {
+                    motionTexture.write(half4(0.0h, 0.0h, 0.0h, 0.0h), tid);
+                    return;
+                }
+                constexpr sampler nearestS(filter::nearest, address::clamp_to_edge);
+                float2 size = max(u.renderSize, float2(1.0));
+                float2 pixel = float2(tid) + 0.5;
+                float z = depthTexture.sample(nearestS, pixel / size);
+                if (z >= 0.999999) {
+                    motionTexture.write(half4(0.0h, 0.0h, 0.0h, 0.0h), tid);
+                    return;
+                }
+                float2 currentNdc = float2(pixel.x / size.x * 2.0 - 1.0,
+                                           1.0 - pixel.y / size.y * 2.0);
+                float4 worldH = u.currentInvViewProjection * float4(currentNdc, z, 1.0);
+                float3 worldPos = worldH.xyz / max(abs(worldH.w), 1.0e-6);
+                float4 prevClip = u.previousViewProjection * float4(worldPos, 1.0);
+                if (abs(prevClip.w) <= 1.0e-6) {
+                    motionTexture.write(half4(0.0h, 0.0h, 0.0h, 0.0h), tid);
+                    return;
+                }
+                float3 prevNdc3 = prevClip.xyz / prevClip.w;
+                if (prevNdc3.z < 0.0 || prevNdc3.z > 1.0) {
+                    motionTexture.write(half4(0.0h, 0.0h, 0.0h, 0.0h), tid);
+                    return;
+                }
+                float2 prevPixel = float2((prevNdc3.x * 0.5 + 0.5) * size.x,
+                                          (1.0 - (prevNdc3.y * 0.5 + 0.5)) * size.y);
+                float2 motionPx = clamp(prevPixel - pixel, float2(-32752.0), float2(32752.0));
+                motionTexture.write(half4(half(motionPx.x), half(motionPx.y), 0.0h, 0.0h), tid);
+            }
+
+            struct SSRUniforms {
+                float4x4 viewProjection;
+                float4x4 inverseViewProjection;
+                packed_float3 cameraPos;
+                float strength;
+                float4 params;
+            };
+
+            static inline float3 q3_ssr_reconstruct(float2 uv, float z, constant SSRUniforms &u) {
+                float2 ndc = uv * 2.0 - 1.0;
+                float4 h = u.inverseViewProjection * float4(ndc, z, 1.0);
+                return h.xyz / max(h.w, 1.0e-6);
+            }
+
+            static inline float3 q3_ssr_project(float3 worldPos, constant SSRUniforms &u, thread float2 &uv) {
+                float4 clip = u.viewProjection * float4(worldPos, 1.0);
+                float invW = 1.0 / max(abs(clip.w), 1.0e-6);
+                float3 ndc = clip.xyz * invW;
+                uv = ndc.xy * 0.5 + 0.5;
+                return ndc;
+            }
+
+            kernel void q3_ssr(texture2d<float, access::sample> source [[texture(0)]],
+                               texture2d<float, access::read_write> output [[texture(1)]],
+                               depth2d<float> sceneDepth [[texture(2)]],
+                               constant SSRUniforms &u [[buffer(0)]],
+                               uint2 tid [[thread_position_in_grid]]) {
+                uint w = output.get_width();
+                uint h = output.get_height();
+                constexpr uint blockSize = 4u;
+                uint2 baseTid = tid * blockSize;
+                if (baseTid.x >= w || baseTid.y >= h) return;
+                constexpr sampler linearS(filter::linear, address::clamp_to_edge);
+                constexpr sampler nearestS(filter::nearest, address::clamp_to_edge);
+                float2 size = float2(max(w, 1u), max(h, 1u));
+                float2 uv = (float2(baseTid) + float(blockSize) * 0.5) / size;
+                float4 base = source.sample(linearS, uv);
+                float mask = saturate(base.a);
+                if (mask <= 0.01 || u.strength <= 0.0) {
+                    // Output already contains the source color; avoid full-frame
+                    // rewrites when no surface requested SSR in this block.
+                    return;
+                }
+                float z = sceneDepth.sample(nearestS, uv);
+                if (z >= 0.999999) {
+                    return;
+                }
+
+                float3 p = q3_ssr_reconstruct(uv, z, u);
+                float2 uvx = (float2(min(baseTid.x + blockSize, w - 1u), baseTid.y) + 0.5) / size;
+                float2 uvy = (float2(baseTid.x, min(baseTid.y + blockSize, h - 1u)) + 0.5) / size;
+                float zx = sceneDepth.sample(nearestS, uvx);
+                float zy = sceneDepth.sample(nearestS, uvy);
+                float3 px = q3_ssr_reconstruct(uvx, zx, u);
+                float3 py = q3_ssr_reconstruct(uvy, zy, u);
+                float3 N = normalize(cross(px - p, py - p));
+                float3 C = float3(u.cameraPos);
+                float3 V = normalize(p - C);
+                if (dot(N, -V) < 0.0) { N = -N; }
+                float fresnel = pow(saturate(1.0 - dot(N, -V)), 1.5);
+                float3 R = reflect(V, N);
+                if (R.z == 0.0 && R.x == 0.0 && R.y == 0.0) {
+                    return;
+                }
+
+                int maxSteps = int(clamp(u.params.x, 1.0, 32.0));
+                float stepLen = max(8.0, length(p - C) * max(u.params.y, 0.01));
+                float thickness = max(u.params.z, 0.001);
+                float3 rayP = p + N * 1.5;
+                float3 hitRGB = 0.0;
+                float hitFade = 0.0;
+                for (int i = 0; i < maxSteps; ++i) {
+                    rayP += R * stepLen;
+                    float2 hitUV;
+                    float3 ndc = q3_ssr_project(rayP, u, hitUV);
+                    if (hitUV.x <= 0.001 || hitUV.x >= 0.999 || hitUV.y <= 0.001 || hitUV.y >= 0.999 || ndc.z <= 0.0 || ndc.z >= 1.0) {
+                        break;
+                    }
+                    float sceneZ = sceneDepth.sample(nearestS, hitUV);
+                    if (sceneZ >= 0.999999) { continue; }
+                    float dz = ndc.z - sceneZ;
+                    if (dz > -thickness && dz < thickness * 9.0) {
+                        hitRGB = source.sample(linearS, hitUV).rgb;
+                        float edge = min(min(hitUV.x, 1.0 - hitUV.x), min(hitUV.y, 1.0 - hitUV.y));
+                        hitFade = saturate(edge * max(u.params.w, 1.0));
+                        break;
+                    }
+                }
+                float amount = saturate(mask * u.strength * hitFade * (0.35 + 0.65 * fresnel));
+                if (amount <= 0.001) { return; }
+                for (uint oy = 0; oy < blockSize; ++oy) {
+                    for (uint ox = 0; ox < blockSize; ++ox) {
+                        uint2 p2 = baseTid + uint2(ox, oy);
+                        if (p2.x < w && p2.y < h) {
+                            float2 puv = (float2(p2) + 0.5) / size;
+                            float4 src = source.sample(linearS, puv);
+                            float3 rgb = mix(src.rgb, hitRGB, amount);
+                            output.write(float4(rgb, 1.0), p2);
+                        }
+                    }
+                }
+            }
             """
             do {
                 let lib = try device.makeLibrary(source: src, options: nil)
@@ -3967,6 +4354,12 @@ struct MetalView: UIViewRepresentable {
                 postprocessPipelineState = pso
                 if let upFn = lib.makeFunction(name: "q3_spatial_upscale") {
                     spatialUpscalePipelineState = try? device.makeComputePipelineState(function: upFn)
+                }
+                if let motionFn = lib.makeFunction(name: "q3_motion_vectors") {
+                    motionVectorPipelineState = try? device.makeComputePipelineState(function: motionFn)
+                }
+                if let ssrFn = lib.makeFunction(name: "q3_ssr") {
+                    ssrPipelineState = try? device.makeComputePipelineState(function: ssrFn)
                 }
                 if !postprocessLogPrintedOnce {
                     print("[MTL_POSTPROC] q3_postprocess pipeline ready")
@@ -3983,9 +4376,13 @@ struct MetalView: UIViewRepresentable {
         private func encodePostprocess(commandBuffer: MTLCommandBuffer,
                                        drawable: CAMetalDrawable) {
             guard Q3_PostprocessEnabled() != 0 else { return }
-            guard let device = commandBuffer.device as MTLDevice?,
-                  let pso = ensurePostprocessPipeline(device: device),
-                  let enc = commandBuffer.makeComputeCommandEncoder() else {
+            guard let device = commandBuffer.device as MTLDevice? else { return }
+            guard let pso = ensurePostprocessPipeline(device: device) else {
+                print("[MTL_POSTPROC] ERROR: pipeline creation failed, skipping postprocess")
+                return
+            }
+            guard let enc = commandBuffer.makeComputeCommandEncoder() else {
+                print("[MTL_POSTPROC] ERROR: failed to create compute encoder")
                 return
             }
             enc.label = "Q3.postprocess"
@@ -4005,6 +4402,95 @@ struct MetalView: UIViewRepresentable {
             postprocessEncodeCount += 1
             if postprocessEncodeCount == 1 || postprocessEncodeCount % 120 == 0 {
                 print("[MTL_POSTPROC] encode #\(postprocessEncodeCount) intensity=\(u.intensity) gamma=\(u.gamma) size=\(w)x\(h)")
+            }
+        }
+
+        @MainActor
+        private func ensureSSRScratchTexture(device: MTLDevice,
+                                             width: Int,
+                                             height: Int,
+                                             pixelFormat: MTLPixelFormat) -> MTLTexture? {
+            let w = max(width, 1)
+            let h = max(height, 1)
+            if let ssrScratchTexture,
+               ssrScratchTextureSize.width == w,
+               ssrScratchTextureSize.height == h,
+               ssrScratchPixelFormat == pixelFormat {
+                return ssrScratchTexture
+            }
+            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: pixelFormat,
+                                                                width: w,
+                                                                height: h,
+                                                                mipmapped: false)
+            desc.usage = [.shaderRead, .shaderWrite]
+            desc.storageMode = .private
+            guard let tex = device.makeTexture(descriptor: desc) else { return nil }
+            tex.label = "Q3.ssr.colorScratch"
+            ssrScratchTexture = tex
+            ssrScratchTextureSize = MTLSize(width: w, height: h, depth: 1)
+            ssrScratchPixelFormat = pixelFormat
+            return tex
+        }
+
+        @MainActor
+        private func encodeRasterSSR(commandBuffer: MTLCommandBuffer,
+                                     colorTexture: MTLTexture,
+                                     depthTexture: MTLTexture?,
+                                     sceneView: Q3MetalSceneView) {
+            guard Q3_PBRSSREnabled() != 0, Q3_RTMix() <= 0.001 else { return }
+            guard frameHasRasterSSRMask else { return }
+            guard let depthTexture else { return }
+            guard let device = commandBuffer.device as MTLDevice?,
+                  let _ = ensurePostprocessPipeline(device: device),
+                  let pso = ssrPipelineState,
+                  let scratch = ensureSSRScratchTexture(device: device,
+                                                        width: colorTexture.width,
+                                                        height: colorTexture.height,
+                                                        pixelFormat: colorTexture.pixelFormat) else {
+                return
+            }
+            if let blit = commandBuffer.makeBlitCommandEncoder() {
+                blit.label = "Q3.ssr.copyColor"
+                blit.copy(from: colorTexture,
+                          sourceSlice: 0,
+                          sourceLevel: 0,
+                          sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                          sourceSize: MTLSize(width: colorTexture.width, height: colorTexture.height, depth: 1),
+                          to: scratch,
+                          destinationSlice: 0,
+                          destinationLevel: 0,
+                          destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+                blit.endEncoding()
+            }
+            guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
+            enc.label = "Q3.ssr"
+            enc.setComputePipelineState(pso)
+            enc.setTexture(scratch, index: 0)
+            enc.setTexture(colorTexture, index: 1)
+            enc.setTexture(depthTexture, index: 2)
+            let viewProjection = makeWorldViewProjection(sceneView)
+            let cameraPos = SIMD3<Float>(sceneView.viewOrigin.0,
+                                         sceneView.viewOrigin.1,
+                                         sceneView.viewOrigin.2)
+            var u = SSRUniforms(viewProjection: viewProjection,
+                                inverseViewProjection: simd_inverse(viewProjection),
+                                cameraPos: cameraPos,
+                                strength: 0.42,
+                                params: SIMD4<Float>(8, 0.055, 0.006, 6.0))
+            enc.setBytes(&u, length: MemoryLayout<SSRUniforms>.stride, index: 0)
+            let threads = MTLSize(width: 8, height: 8, depth: 1)
+            let ssrW = (colorTexture.width + 3) / 4
+            let ssrH = (colorTexture.height + 3) / 4
+            let groups = MTLSize(width: (ssrW + 7) / 8,
+                                 height: (ssrH + 7) / 8,
+                                 depth: 1)
+            enc.dispatchThreadgroups(groups, threadsPerThreadgroup: threads)
+            enc.endEncoding()
+            if !ssrLogPrintedOnce {
+                ssrLogPrintedOnce = true
+                let msg = "[Q3-SSR] enabled size=\(colorTexture.width)x\(colorTexture.height) depth=\(depthTexture.label ?? "?")"
+                print(msg)
+                pbrLog(msg)
             }
         }
 
@@ -4034,6 +4520,101 @@ struct MetalView: UIViewRepresentable {
             enc.endEncoding()
         }
 
+        struct MotionUniforms {
+            var currentInvViewProjection: simd_float4x4
+            var previousViewProjection: simd_float4x4
+            var renderSize: SIMD2<Float>
+            var reset: Float
+            var pad: Float = 0
+        }
+
+        @MainActor
+        private func ensureMotionVectorPipeline(device: MTLDevice) -> MTLComputePipelineState? {
+            if let motionVectorPipelineState { return motionVectorPipelineState }
+            _ = ensurePostprocessPipeline(device: device)
+            return motionVectorPipelineState
+        }
+
+        @MainActor
+        private func encodeMotionVectors(commandBuffer: MTLCommandBuffer,
+                                         depth: MTLTexture,
+                                         motion: MTLTexture,
+                                         currentViewProjection: simd_float4x4,
+                                         previousViewProjection: simd_float4x4?,
+                                         reset: Bool) {
+            guard let device = commandBuffer.device as MTLDevice?,
+                  let pso = ensureMotionVectorPipeline(device: device),
+                  let enc = commandBuffer.makeComputeCommandEncoder() else { return }
+            enc.label = "Q3.motionVectors"
+            enc.setComputePipelineState(pso)
+            enc.setTexture(depth, index: 0)
+            enc.setTexture(motion, index: 1)
+            var u = MotionUniforms(currentInvViewProjection: simd_inverse(currentViewProjection),
+                                   previousViewProjection: previousViewProjection ?? currentViewProjection,
+                                   renderSize: SIMD2<Float>(Float(motion.width), Float(motion.height)),
+                                   reset: reset ? 1.0 : 0.0)
+            enc.setBytes(&u, length: MemoryLayout<MotionUniforms>.stride, index: 0)
+            let tg = MTLSize(width: 8, height: 8, depth: 1)
+            let groups = MTLSize(width: (motion.width + 7) / 8,
+                                 height: (motion.height + 7) / 8,
+                                 depth: 1)
+            enc.dispatchThreadgroups(groups, threadsPerThreadgroup: tg)
+            enc.endEncoding()
+        }
+
+        @MainActor
+        private func encodeUpscaleToDrawable(commandBuffer: MTLCommandBuffer,
+                                             color: MTLTexture,
+                                             depth: MTLTexture?,
+                                             motion: MTLTexture?,
+                                             output: MTLTexture,
+                                             currentViewProjection: simd_float4x4?,
+                                             reset: Bool) {
+            if activeUpscaleBackend == .temporal,
+               let depth,
+               let motion,
+               let currentViewProjection {
+                encodeMotionVectors(commandBuffer: commandBuffer,
+                                    depth: depth,
+                                    motion: motion,
+                                    currentViewProjection: currentViewProjection,
+                                    previousViewProjection: temporalPreviousViewProjection,
+                                    reset: reset)
+                #if canImport(MetalFX) && !os(visionOS) && !targetEnvironment(macCatalyst)
+                if #available(iOS 16.0, macCatalyst 16.0, *), let temporalScaler {
+                    temporalScaler.colorTexture = color
+                    temporalScaler.depthTexture = depth
+                    temporalScaler.motionTexture = motion
+                    temporalScaler.outputTexture = output
+                    temporalScaler.inputContentWidth = color.width
+                    temporalScaler.inputContentHeight = color.height
+                    temporalScaler.jitterOffsetX = temporalCurrentJitterPixels.x
+                    temporalScaler.jitterOffsetY = temporalCurrentJitterPixels.y
+                    temporalScaler.motionVectorScaleX = 1.0
+                    temporalScaler.motionVectorScaleY = 1.0
+                    temporalScaler.isDepthReversed = false
+                    temporalScaler.reset = reset
+                    temporalScaler.encode(commandBuffer: commandBuffer)
+                    temporalPreviousViewProjection = currentViewProjection
+                    temporalPreviousJitterPixels = temporalCurrentJitterPixels
+                    temporalHistoryResetPending = false
+                    return
+                }
+                #endif
+                print("[Q3-METALFX] fallback reason=temporal-missing-at-encode")
+                activeUpscaleBackend = .compute
+            }
+
+            encodeSpatialUpscale(commandBuffer: commandBuffer,
+                                 source: color,
+                                 output: output)
+            if let currentViewProjection {
+                temporalPreviousViewProjection = currentViewProjection
+            }
+            temporalPreviousJitterPixels = temporalCurrentJitterPixels
+            temporalHistoryResetPending = false
+        }
+
 
         @MainActor
         private func makeRTLibrary(device: MTLDevice) -> MTLLibrary? {
@@ -4057,6 +4638,8 @@ struct MetalView: UIViewRepresentable {
                 // P1/P3: x = light count, y = r_rt_light_scale,
                 // z = r_rt_reflections (0/1), w = r_rt_refl_roughness_max.
                 float4 rtLightParams;
+                // RT PBR controls. x = r_pbr_parallax_scale (0 disables RT height UV offset).
+                float4 rtPBRParams;
             };
 
             // P1: RTX Remix authored per-map light (baked from
@@ -4085,6 +4668,7 @@ struct MetalView: UIViewRepresentable {
                 uint lightmapSlot;
                 uint tcModCount;
                 uint _pad0;
+                uint4 pbrSlots; // x=normal, y=height, z=roughness, w=metallic; UINT_MAX = none
                 float4 alphaTcModControl;
                 uint4 materialFlags;
                 float4 materialParams;
@@ -4154,8 +4738,12 @@ struct MetalView: UIViewRepresentable {
 
             kernel void rtKernel(texture2d<float, access::write> output [[texture(0)]],
                                  texturecube<float> envCube [[texture(1)]],
-                                 array<texture2d<float>, 110> albedoTextures [[texture(2)]],
-                                 array<texture2d<float>, 16> lightmapTextures [[texture(112)]],
+                                 array<texture2d<float>, 78> albedoTextures [[texture(2)]],
+                                 array<texture2d<float>, 16> lightmapTextures [[texture(80)]],
+                                 array<texture2d<float>, 8> normalTextures [[texture(96)]],
+                                 array<texture2d<float>, 8> heightTextures [[texture(104)]],
+                                 array<texture2d<float>, 8> roughnessTextures [[texture(112)]],
+                                 array<texture2d<float>, 8> metallicTextures [[texture(120)]],
                                  constant RayTracingUniforms &uniforms [[buffer(0)]],
                                  acceleration_structure<> worldAS [[buffer(1)]],
                                  const device uint *indices [[buffer(2)]],
@@ -4201,6 +4789,9 @@ struct MetalView: UIViewRepresentable {
                     uint i0 = indices[tri * 3 + 0];
                     uint i1 = indices[tri * 3 + 1];
                     uint i2 = indices[tri * 3 + 2];
+                    float3 p0 = float3(vertices[i0].position);
+                    float3 p1 = float3(vertices[i1].position);
+                    float3 p2 = float3(vertices[i2].position);
                     float3 n0 = float3(vertices[i0].normal);
                     float3 n1 = float3(vertices[i1].normal);
                     float3 n2 = float3(vertices[i2].normal);
@@ -4208,9 +4799,6 @@ struct MetalView: UIViewRepresentable {
                     float w = 1.0 - bary.x - bary.y;
                     float3 N = n0 * w + n1 * bary.x + n2 * bary.y;
                     if (dot(N, N) < 1.0e-6) {
-                        float3 p0 = float3(vertices[i0].position);
-                        float3 p1 = float3(vertices[i1].position);
-                        float3 p2 = float3(vertices[i2].position);
                         N = cross(p1 - p0, p2 - p0);
                     }
                     N = normalize(N);
@@ -4234,7 +4822,7 @@ struct MetalView: UIViewRepresentable {
                         // camera rays while still letting reflective rays sample
                         // envCube in the reflection/miss paths.
                         outputAlpha = 0.0;
-                    } else if (mat.albedoSlot < 110) {
+                    } else if (mat.albedoSlot < 78) {
                         float2 uv0 = vertices[i0].texCoord;
                         float2 uv1 = vertices[i1].texCoord;
                         float2 uv2 = vertices[i2].texCoord;
@@ -4257,6 +4845,54 @@ struct MetalView: UIViewRepresentable {
                         }
                         constexpr sampler repeatSampler(filter::linear, address::repeat);
                         constexpr sampler clampSampler(filter::linear, address::clamp_to_edge);
+                        float blendMode = mat.materialParams.y;
+                        bool additiveBlend = (abs(blendMode - 1.0) < 0.5 || abs(blendMode - 5.0) < 0.5);
+                        bool alphaSensitive = (mat.materialFlags.z != 0 || mat.materialFlags.w != 0 || additiveBlend);
+                        bool pbrEligible = (mat.materialFlags.x == 0 &&
+                                            mat.materialFlags.z == 0 &&
+                                            mat.materialFlags.w == 0 &&
+                                            !additiveBlend &&
+                                            mat.spriteAtlasParams.x <= 0.5);
+
+                        float3 shadeN = N;
+                        float3 T = float3(0.0);
+                        float3 B = float3(0.0);
+                        if (pbrEligible && (mat.pbrSlots.x < 8u || mat.pbrSlots.y < 8u)) {
+                            float3 dp1 = p1 - p0;
+                            float3 dp2 = p2 - p0;
+                            float2 duv1 = uv1 - uv0;
+                            float2 duv2 = uv2 - uv0;
+                            float det = duv1.x * duv2.y - duv1.y * duv2.x;
+                            if (abs(det) > 1.0e-6) {
+                                float invDet = 1.0 / det;
+                                T = normalize((dp1 * duv2.y - dp2 * duv1.y) * invDet);
+                                B = normalize((dp2 * duv1.x - dp1 * duv2.x) * invDet);
+                            } else {
+                                float3 upAxis = (abs(N.z) < 0.999) ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
+                                T = normalize(cross(upAxis, N));
+                                B = normalize(cross(N, T));
+                            }
+                            T = normalize(T - N * dot(N, T));
+                            B = normalize(cross(N, T));
+
+                            if (mat.pbrSlots.y < 8u && uniforms.rtPBRParams.x > 0.0001) {
+                                float h = heightTextures[mat.pbrSlots.y].sample(repeatSampler, uv).r;
+                                float3 Vp = normalize(uniforms.cameraPos.xyz - hitPos);
+                                float2 viewTS = float2(dot(Vp, T), dot(Vp, B)) / max(abs(dot(Vp, N)), 0.25);
+                                // Keep default RT scale equivalent to the prior 0.030 offset
+                                // when r_pbr_parallax_scale is at its 0.02 raster default.
+                                float parallaxScale = max(uniforms.rtPBRParams.x, 0.0) * 1.5;
+                                uv += viewTS * ((h - 0.5) * parallaxScale);
+                            }
+                            if (mat.pbrSlots.x < 8u) {
+                                float3 nMap = normalTextures[mat.pbrSlots.x].sample(repeatSampler, uv).xyz * 2.0 - 1.0;
+                                nMap.xy *= 0.85;
+                                nMap = normalize(nMap);
+                                shadeN = normalize(T * nMap.x + B * nMap.y + N * nMap.z);
+                                normalColor = shadeN * 0.5 + 0.5;
+                                N = shadeN;
+                            }
+                        }
                         // PBR animation atlases (jump pads, teleporters, lamp flares) are stored
                         // as cols×rows sprite sheets. Raster world/entity shaders already remap
                         // to the current frame; pure RT must do the same or it samples the whole
@@ -4276,9 +4912,6 @@ struct MetalView: UIViewRepresentable {
                                         (localUV.y + row) / aRows);
                         }
                         float4 albedoSample = albedoTextures[mat.albedoSlot].sample(repeatSampler, uv);
-                        float blendMode = mat.materialParams.y;
-                        bool additiveBlend = (abs(blendMode - 1.0) < 0.5 || abs(blendMode - 5.0) < 0.5);
-                        bool alphaSensitive = (mat.materialFlags.z != 0 || mat.materialFlags.w != 0 || additiveBlend);
                         float sampledAlpha = albedoSample.a;
                         // Several RTX/effect DDS captures are effectively RGB-only even though
                         // the original Q3 shader expects luminance alpha. Synthesize alpha in
@@ -4295,7 +4928,7 @@ struct MetalView: UIViewRepresentable {
                             // intersection/multi-hit logic, so alpha holes preserve raster.
                             color = float3(0.0);
                             outputAlpha = 0.0;
-                        } else if (additiveBlend) {
+                                } else if (additiveBlend) {
                             // Additive Q3 stages (flares, smoke/energy sprites, portals) are
                             // self-lit effect passes, not lightmapped world. Preserve raster via
                             // alpha instead of turning RGB-only DDS effects into solid squares.
@@ -4306,11 +4939,11 @@ struct MetalView: UIViewRepresentable {
                         } else if (mat.materialFlags.w != 0) {
                             // First-pass translucency: shade blended surfaces but emit partial
                             // alpha so the composite pass preserves raster behind/through them.
-                            float3 lightmap = float3(1.0);
+                            float ambientFloor = uniforms.rtToneParams.z;
+                            float3 lightmap = float3(ambientFloor);
                             if (mat.lightmapSlot < 16) {
                                 lightmap = lightmapTextures[mat.lightmapSlot].sample(clampSampler, lmuv).rgb;
                             }
-                            float ambientFloor = uniforms.rtToneParams.z;
                             color = albedoSample.rgb * max(lightmap * 1.25, float3(ambientFloor));
                             if (mat.materialFlags.y != 0) {
                                 color += albedoSample.rgb * mat.materialParams.x * effectiveAlpha;
@@ -4318,11 +4951,11 @@ struct MetalView: UIViewRepresentable {
                             }
                             outputAlpha = clamp(effectiveAlpha, 0.0, 0.70);
                         } else {
-                            float3 lightmap = float3(1.0);
+                            float ambientFloor = uniforms.rtToneParams.z;
+                            float3 lightmap = float3(ambientFloor);
                             if (mat.lightmapSlot < 16) {
                                 lightmap = lightmapTextures[mat.lightmapSlot].sample(clampSampler, lmuv).rgb;
                             }
-                            float ambientFloor = uniforms.rtToneParams.z;
                             color = albedoSample.rgb * max(lightmap * 1.25, float3(ambientFloor));
                             if (mat.materialFlags.y != 0) {
                                 color += albedoSample.rgb * mat.materialParams.x;
@@ -4339,7 +4972,7 @@ struct MetalView: UIViewRepresentable {
                                 if (bounceHit.type == intersection_type::triangle) {
                                     uint btri = bounceHit.primitive_id;
                                     RTPrimitiveMaterial bounceMat = primitiveMaterials[btri];
-                                    if (bounceMat.materialFlags.y != 0 && bounceMat.albedoSlot < 110) {
+                                    if (bounceMat.materialFlags.y != 0 && bounceMat.albedoSlot < 78) {
                                         uint bi0 = indices[btri * 3 + 0];
                                         uint bi1 = indices[btri * 3 + 1];
                                         uint bi2 = indices[btri * 3 + 2];
@@ -4444,6 +5077,14 @@ struct MetalView: UIViewRepresentable {
                             if (uniforms.rtLightParams.z > 0.5) {
                                 float rough = mat.materialParams.z;
                                 float metal = mat.materialParams.w;
+                                if (mat.pbrSlots.z < 8u) {
+                                    rough = roughnessTextures[mat.pbrSlots.z].sample(repeatSampler, uv).r;
+                                }
+                                if (mat.pbrSlots.w < 8u) {
+                                    metal = metallicTextures[mat.pbrSlots.w].sample(repeatSampler, uv).r;
+                                }
+                                rough = clamp(rough, 0.04, 1.0);
+                                metal = clamp(metal, 0.0, 1.0);
                                 if (metal > 0.5 || rough < uniforms.rtLightParams.w) {
                                     float3 V = -rayDir;
                                     float3 R = reflect(rayDir, N);
@@ -4460,7 +5101,7 @@ struct MetalView: UIViewRepresentable {
                                         RTPrimitiveMaterial rmat = primitiveMaterials[rtri];
                                         float3 reflHitOrigin = hitPos + N * 0.75;
                                         float3 reflHitPos = reflHitOrigin + R * rh.distance;
-                                        if (rmat.albedoSlot < 110) {
+                                        if (rmat.albedoSlot < 78) {
                                             uint ri0 = indices[rtri * 3 + 0];
                                             uint ri1 = indices[rtri * 3 + 1];
                                             uint ri2 = indices[rtri * 3 + 2];
@@ -4498,7 +5139,7 @@ struct MetalView: UIViewRepresentable {
                                                              (rLocalUV.y + rRow) / rRows);
                                             }
                                             float3 ralb = albedoTextures[rmat.albedoSlot].sample(repeatSampler, ruv).rgb;
-                                            float3 rlight = float3(1.0);
+                                            float3 rlight = float3(uniforms.rtToneParams.z);
                                             if (rmat.lightmapSlot < 16) {
                                                 rlight = lightmapTextures[rmat.lightmapSlot].sample(clampSampler, rlm).rgb;
                                             }
@@ -4654,13 +5295,17 @@ struct MetalView: UIViewRepresentable {
         }
 
         @MainActor
-        private func buildRTPrimitiveMaterials(device: MTLDevice, primitiveCount: Int, log: Bool = true) {
+        private func buildRTPrimitiveMaterials(device: MTLDevice,
+                                               primitiveCount: Int,
+                                               compactDrawFirstTri: [Int: Int]? = nil,
+                                               log: Bool = true) {
             let invalid = UInt32.max
             let invalidMaterial = RTPrimitiveMaterial(
                 albedoSlot: invalid,
                 lightmapSlot: invalid,
                 tcModCount: 0,
                 _pad0: 0,
+                pbrSlots: SIMD4<UInt32>(invalid, invalid, invalid, invalid),
                 alphaTcModControl: SIMD4<Float>(0, 0, 0, 0),
                 materialFlags: SIMD4<UInt32>(0, 0, 0, 0),
                 materialParams: SIMD4<Float>(0, 0, 0, 0),
@@ -4672,6 +5317,8 @@ struct MetalView: UIViewRepresentable {
                 spriteAtlasParams: SIMD4<Float>(0, 0, 0, 0))
             rtAlbedoHandles = [UInt32](repeating: 0, count: rtMaxAlbedoSlots)
             rtLightmapHandles = [UInt32](repeating: 0, count: rtMaxLightmapSlots)
+            rtPBRSidecarHandles = [UInt32](repeating: 0, count: rtMaxPBRSidecarSlots)
+            var forceClassicAlbedoHandles = Set<UInt32>()
 
             // 2026-06-10: prealloc strategy A — eliminate the 3.9 MB Swift
             // `[RTPrimitiveMaterial]` intermediate that the old code allocated
@@ -4711,6 +5358,15 @@ struct MetalView: UIViewRepresentable {
 
             let drawCount = Int(Q3MetalRenderer_GetWorldAllDrawCommandCount())
             let draws = UnsafeBufferPointer(start: drawsPtr, count: drawCount)
+            let compactFirstTri = compactDrawFirstTri ?? rtASCompactDrawFirstTri
+            let usesCompactPrimitiveOrder = !compactFirstTri.isEmpty
+
+            func rtFirstTri(forDrawIndex drawIndex: Int, draw: Q3MetalWorldDrawCmd) -> Int? {
+                if usesCompactPrimitiveOrder {
+                    return compactFirstTri[drawIndex]
+                }
+                return Int(draw.firstIndex / 3)
+            }
 
             /* Pick the 16 most important handles by covered triangle count,
              * not the first 16 encountered. The first-come table made large
@@ -4718,7 +5374,34 @@ struct MetalView: UIViewRepresentable {
              * tiny early detail draws consumed slots. */
             var albedoWeights: [UInt32: Int] = [:]
             var lightmapWeights: [UInt32: Int] = [:]
+            var pbrSidecarWeights: [UInt32: Int] = [:]
             let fogOnlyBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY)
+            let skyFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
+            let portalFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_PORTAL)
+
+            func isClassicRTFXStage(_ s: Q3MetalWorldStage) -> Bool {
+                let n = textureNameForLog(s.textureHandle).lowercased()
+                return n.hasPrefix("textures/skies/") ||
+                       n.hasPrefix("textures/sfx/") ||
+                       n.hasPrefix("textures/effects/") ||
+                       n.hasPrefix("textures/liquids/")
+            }
+
+            func rtShouldForceClassicAlbedo(_ s: Q3MetalWorldStage) -> Bool {
+                let n = textureNameForLog(s.textureHandle).lowercased()
+                if n.contains("textures/sfx/launchpad_diamond") { return false }
+                let blend = Self.worldBlendClass(for: s)
+                return shouldPreferClassicTextureForAlphaFX(n, isEntity: false) ||
+                       blend == 1 || blend == 3 || blend == 5 ||
+                       s.alphaFunc != 0 ||
+                       s.tcGen == 1 ||
+                       s.autospriteMode != 0
+            }
+
+            func rtDrawMustStayClassic(_ draw: Q3MetalWorldDrawCmd, stage: Q3MetalWorldStage) -> Bool {
+                if (draw.flags & (skyFlagBit | portalFlagBit)) != 0 { return true }
+                return isClassicRTFXStage(stage) || rtShouldForceClassicAlbedo(stage)
+            }
 
             func rtRepresentativeStage(for draw: Q3MetalWorldDrawCmd) -> Q3MetalWorldStage? {
                 let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
@@ -4737,21 +5420,74 @@ struct MetalView: UIViewRepresentable {
                 // base texture (q3tourney4: chrome_metal, pewter_shiney, etc.).
                 // Using stage 0 makes solid walls sample chrome/water-like FX.
                 // Prefer the first non-env opaque base stage, then any non-env
-                // base stage, and only fall back to stage 0 when no better
-                // albedo-bearing stage exists.
+                // base stage. Also reject classic FX underlays (`textures/sfx/*`
+                // firegorre/fireswirl2) when a later concrete wall/floor stage
+                // exists; those FX stages are animation overlays/underlays and
+                // their tcMods must not become the RT primitive material.
+                if let s = candidates({ $0.tcGen != 1 && !isClassicRTFXStage($0) && Self.worldBlendClass(for: $0) == 0 }) { return s }
+                if let s = candidates({ $0.tcGen != 1 && !isClassicRTFXStage($0) }) { return s }
                 if let s = candidates({ $0.tcGen != 1 && Self.worldBlendClass(for: $0) == 0 }) { return s }
                 if let s = candidates({ $0.tcGen != 1 }) { return s }
                 if let s = candidates({ _ in true }) { return s }
                 return nil
             }
 
-            for draw in draws where draw.indexCount >= 3 {
+            func hasStructuralOwnerPeer(drawIndex: Int,
+                                        draw: Q3MetalWorldDrawCmd,
+                                        ownerHandle: UInt32) -> Bool {
+                guard ownerHandle != 0 else { return false }
+                for (peerIndex, peer) in draws.enumerated() where peerIndex != drawIndex && peer.indexCount >= 3 {
+                    guard peer.firstIndex == draw.firstIndex,
+                          peer.indexCount == draw.indexCount,
+                          (peer.flags & fogOnlyBit) == 0 else { continue }
+                    let peerStageCount = min(Int(peer.stageCount), Int(Q3_METAL_MAX_STAGES))
+                    guard peerStageCount > 0 else { continue }
+                    for i in 0..<peerStageCount {
+                        let peerStage = Self.worldStage(peer, i)
+                        guard peerStage.useLightmap == 0,
+                              peerStage.textureHandle != 0,
+                              !isClassicRTFXStage(peerStage),
+                              Self.worldPBRMaterialHandle(for: peerStage) == ownerHandle else { continue }
+                        return true
+                    }
+                }
+                return false
+            }
+
+            func shouldSkipClassicFXSplitDraw(drawIndex: Int,
+                                              draw: Q3MetalWorldDrawCmd,
+                                              stage: Q3MetalWorldStage,
+                                              materialHandle: UInt32) -> Bool {
+                guard stage.useLightmap == 0,
+                      stage.textureHandle != 0,
+                      materialHandle != stage.textureHandle,
+                      isClassicRTFXStage(stage) else { return false }
+                return hasStructuralOwnerPeer(drawIndex: drawIndex,
+                                              draw: draw,
+                                              ownerHandle: materialHandle)
+            }
+
+            for (drawIndex, draw) in draws.enumerated() where draw.indexCount >= 3 {
                 if (draw.flags & fogOnlyBit) != 0 { continue }
+                guard rtFirstTri(forDrawIndex: drawIndex, draw: draw) != nil else { continue }
                 guard let stage = rtRepresentativeStage(for: draw) else { continue }
                 let triCount = max(1, Int(draw.indexCount / 3))
                 let materialHandle = Self.worldPBRMaterialHandle(for: stage)
+                let forceClassicRT = rtDrawMustStayClassic(draw, stage: stage)
+                if shouldSkipClassicFXSplitDraw(drawIndex: drawIndex,
+                                                draw: draw,
+                                                stage: stage,
+                                                materialHandle: materialHandle) {
+                    continue
+                }
                 if stage.useLightmap == 0 && stage.textureHandle != 0 {
                     albedoWeights[materialHandle, default: 0] += triCount
+                    if forceClassicRT {
+                        forceClassicAlbedoHandles.insert(materialHandle)
+                    }
+                    if !forceClassicRT && pbrMaterialHasAuxSlots(materialHandle) {
+                        pbrSidecarWeights[materialHandle, default: 0] += triCount
+                    }
                 }
                 if draw.lightmapTextureHandle != 0 {
                     lightmapWeights[draw.lightmapTextureHandle, default: 0] += triCount
@@ -4765,8 +5501,34 @@ struct MetalView: UIViewRepresentable {
                 }.prefix(limit).map { $0.key })
             }
 
+            func rtSidecarPriority(_ handle: UInt32, _ weight: Int) -> Int {
+                let n = textureNameForLog(handle).lowercased()
+                // Keep the known q3tourney/q3dm classic-FX-owner materials in
+                // the tiny RT sidecar table even though they cover only a few
+                // triangles. These are the surfaces that otherwise regress
+                // from "firegorre/fireswirl repeated as base" to "structural
+                // owner selected, but no RT normal/height/rough/metal slot".
+                if n.contains("textures/gothic_floor/largerblock3b_ow") ||
+                   n.contains("textures/gothic_floor/center2trn") {
+                    return 1_000_000_000 + weight
+                }
+                return weight
+            }
+
+            func topPBRSidecarHandles(_ weights: [UInt32: Int], limit: Int) -> [UInt32] {
+                Array(weights.sorted { lhs, rhs in
+                    let lp = rtSidecarPriority(lhs.key, lhs.value)
+                    let rp = rtSidecarPriority(rhs.key, rhs.value)
+                    if lp != rp { return lp > rp }
+                    if lhs.value != rhs.value { return lhs.value > rhs.value }
+                    return lhs.key < rhs.key
+                }.prefix(limit).map { $0.key })
+            }
+
             let topAlbedos = topHandles(albedoWeights, limit: rtMaxAlbedoSlots)
             let topLightmaps = topHandles(lightmapWeights, limit: rtMaxLightmapSlots)
+            let topPBRSidecars = topPBRSidecarHandles(pbrSidecarWeights, limit: rtMaxPBRSidecarSlots)
+            rtForceClassicAlbedoHandles = forceClassicAlbedoHandles
             for (i, h) in topAlbedos.enumerated() {
                 rtAlbedoHandles[i] = h
                 _ = texture(for: h, device: device)
@@ -4775,19 +5537,68 @@ struct MetalView: UIViewRepresentable {
                 rtLightmapHandles[i] = h
                 _ = texture(for: h, device: device)
             }
+            for (i, h) in topPBRSidecars.enumerated() {
+                rtPBRSidecarHandles[i] = h
+                _ = pbrNormalTexture(for: h, allowGenericFallback: false)
+                _ = pbrHeightTexture(for: h)
+                _ = pbrRoughnessTexture(for: h)
+                _ = pbrMetallicTexture(for: h)
+            }
             let albedoSlots = Dictionary(uniqueKeysWithValues: topAlbedos.enumerated().map { (UInt32($0.offset), $0.element) }.map { ($0.1, $0.0) })
             let lightmapSlots = Dictionary(uniqueKeysWithValues: topLightmaps.enumerated().map { (UInt32($0.offset), $0.element) }.map { ($0.1, $0.0) })
+            let pbrSidecarSlots = Dictionary(uniqueKeysWithValues: topPBRSidecars.enumerated().map { (UInt32($0.offset), $0.element) }.map { ($0.1, $0.0) })
 
             var assigned = 0
+            var overwrittenByHigherPriority = 0
             var skippedOverwrite = 0
-            for draw in draws where draw.indexCount >= 3 {
+            var skippedClassicFXSplit = 0
+            var forcedClassicRTStages = 0
+            var classicPromotedRTStages = 0
+            var classicSidecarCandidatesSuppressed = 0
+            // RT AS has one material per primitive, while the Q3 world draw list
+            // can contain several draw records for the exact same triangle span
+            // (classic env/chrome/filter/effect overlay plus structural base).
+            // First-come assignment made nv15 use `textures/effects/tinfx.tga`
+            // for many walls because those overlay draws appeared before
+            // `textures/base_trim/pewter_shiney.tga` with the same firstTri.
+            // Keep the one-material model but let structural/PBR candidates
+            // replace classic-FX overlay candidates for the same primitive.
+            var materialPriorities = [UInt8](repeating: 0, count: primitiveCount)
+            var rtMaterialDiagnostics: [String] = []
+            for (drawIndex, draw) in draws.enumerated() where draw.indexCount >= 3 {
                 if (draw.flags & fogOnlyBit) != 0 { continue }
+                guard let firstTri = rtFirstTri(forDrawIndex: drawIndex, draw: draw) else { continue }
                 guard let stage = rtRepresentativeStage(for: draw) else { continue }
-                let skyFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
                 let isSkyDraw = (draw.flags & skyFlagBit) != 0
                 let materialHandle = Self.worldPBRMaterialHandle(for: stage)
+                let stageName = textureNameForLog(stage.textureHandle)
+                let materialName = textureNameForLog(materialHandle)
+                let forceClassicRT = rtDrawMustStayClassic(draw, stage: stage)
+                if forceClassicRT {
+                    forcedClassicRTStages += 1
+                }
+                if shouldSkipClassicFXSplitDraw(drawIndex: drawIndex,
+                                                draw: draw,
+                                                stage: stage,
+                                                materialHandle: materialHandle) {
+                    skippedClassicFXSplit += 1
+                    if log && rtMaterialDiagnostics.count < 64 {
+                        rtMaterialDiagnostics.append(String(format:
+                            "[RT-MAT] skip classic FX split draw=%d firstTri=%d tris=%d stageTex=%u '%@' owner=%u '%@' reason=structural-owner-peer flags=0x%08x",
+                            drawIndex, Int(draw.firstIndex / 3), Int(draw.indexCount / 3),
+                            stage.textureHandle, stageName,
+                            materialHandle, materialName,
+                            draw.flags))
+                    }
+                    continue
+                }
                 let aSlotOptional = albedoSlots[materialHandle]
                 let lSlotOptional = lightmapSlots[draw.lightmapTextureHandle]
+                let rawPBRSlotOptional = pbrSidecarSlots[materialHandle]
+                if forceClassicRT && rawPBRSlotOptional != nil {
+                    classicSidecarCandidatesSuppressed += 1
+                }
+                let pbrSlotOptional = forceClassicRT ? nil : rawPBRSlotOptional
                 guard stage.useLightmap == 0 else { continue }
                 // Task 1 RT fallback: an opaque world primitive only needs its
                 // original/base Q3 texture slot. If its lightmap did not make the
@@ -4798,7 +5609,13 @@ struct MetalView: UIViewRepresentable {
                 let aSlot = aSlotOptional ?? 0
                 let lSlot = lSlotOptional ?? invalid
                 let blendMode = Self.worldBlendClass(for: stage)
-                let isEmissive = (blendMode == 1 || blendMode == 5)
+                // RT only has one material for the primitive. When a structural
+                // PBR/base draw wins over an earlier classic FX overlay, keep it
+                // opaque in RT even if the Q3 shader stage used src-alpha blend
+                // for raster composition. Otherwise r_rt_mix=1 still preserves
+                // 30–100% raster via RT alpha and nv15 remains flat/overbright.
+                let rtBlendMode = (!forceClassicRT && pbrSlotOptional != nil && blendMode == 2) ? 0 : blendMode
+                let isEmissive = (rtBlendMode == 1 || rtBlendMode == 5)
                 // P3: per-material roughness/metallic for the kernel's
                 // reflection gate. PBR constants when authored; otherwise a
                 // matte dielectric default so reflections stay off.
@@ -4813,42 +5630,82 @@ struct MetalView: UIViewRepresentable {
                     if m.roughness_constant >= 0 { rtRough = m.roughness_constant }
                     if m.metallic_constant >= 0 { rtMetal = m.metallic_constant }
                 }
-                let firstTri = Int(draw.firstIndex / 3)
+                let normalSlot = (pbrSlotOptional != nil && pbrNormalTexture(for: materialHandle, allowGenericFallback: false) != nil) ? pbrSlotOptional! : invalid
+                let heightSlot = (pbrSlotOptional != nil && pbrHeightTexture(for: materialHandle) != nil) ? pbrSlotOptional! : invalid
+                let roughnessSlot = (pbrSlotOptional != nil && pbrRoughnessTexture(for: materialHandle) != nil) ? pbrSlotOptional! : invalid
+                let metallicSlot = (pbrSlotOptional != nil && pbrMetallicTexture(for: materialHandle) != nil) ? pbrSlotOptional! : invalid
+                var materialPriority: UInt8 = isSkyDraw ? 8 : 16
+                if !forceClassicRT { materialPriority += 48 }
+                if blendMode == 0 { materialPriority += 16 }
+                if pbrSlotOptional != nil { materialPriority += 8 }
+                if !isClassicRTFXStage(stage) { materialPriority += 4 }
+                if forceClassicRT &&
+                    (normalSlot != invalid || heightSlot != invalid ||
+                     roughnessSlot != invalid || metallicSlot != invalid) {
+                    classicPromotedRTStages += 1
+                }
                 let triCount = Int(draw.indexCount / 3)
                 guard firstTri < primitiveCount else { continue }
                 let end = min(firstTri + triCount, primitiveCount)
                 let chain = worldTcModChain(for: stage)
                 let tcCount = UInt32(max(0, min(Int(chain.count), 4)))
+                let targetFXOwner = stageName.contains("firegorre") || stageName.contains("fireswirl") ||
+                    materialName.contains("largerblock3b_ow") || materialName.contains("center2trn")
+                if log && (rtMaterialDiagnostics.count < 24 || targetFXOwner) && rtMaterialDiagnostics.count < 64 {
+                    let lmText = lSlot == invalid ? "none" : "\(lSlot)"
+                    let sidecarText = pbrSlotOptional == nil ? "none" : "\(pbrSlotOptional!)"
+                    rtMaterialDiagnostics.append(String(format:
+                        "[RT-MAT] draw=%d firstTri=%d tris=%d stageTex=%u '%@' owner=%u '%@' albedoSlot=%@ lightmapSlot=%@ sidecarSlot=%@ forceClassic=%u pbrSlots=(n:%@ h:%@ r:%@ m:%@) blend=%u rough=%.3f metal=%.3f tcMods=%u atlas=(%.1f,%.1f,%.1f,%.1f) flags=0x%08x",
+                        drawIndex, firstTri, triCount, stage.textureHandle, stageName,
+                        materialHandle, materialName,
+                        aSlotOptional == nil ? "none" : "\(aSlot)",
+                        lmText, sidecarText,
+                        forceClassicRT ? 1 : 0,
+                        normalSlot == invalid ? "none" : "\(normalSlot)",
+                        heightSlot == invalid ? "none" : "\(heightSlot)",
+                        roughnessSlot == invalid ? "none" : "\(roughnessSlot)",
+                        metallicSlot == invalid ? "none" : "\(metallicSlot)",
+                        rtBlendMode, rtRough, rtMetal, tcCount,
+                        rtAtlasParams.x, rtAtlasParams.y, rtAtlasParams.z, rtAtlasParams.w,
+                        draw.flags))
+                }
                 let tcTypes = SIMD4<UInt32>(
                     tcCount > 0 ? UInt32(max(0, Int(stage.tcMods.0.type))) : 0,
                     tcCount > 1 ? UInt32(max(0, Int(stage.tcMods.1.type))) : 0,
                     tcCount > 2 ? UInt32(max(0, Int(stage.tcMods.2.type))) : 0,
                     tcCount > 3 ? UInt32(max(0, Int(stage.tcMods.3.type))) : 0)
                 let alphaThreshold = Self.alphaTestThreshold(for: stage.alphaFunc)
+                let candidateMaterial = RTPrimitiveMaterial(
+                    albedoSlot: aSlot,
+                    lightmapSlot: lSlot,
+                    tcModCount: tcCount,
+                    _pad0: 0,
+                    pbrSlots: SIMD4<UInt32>(normalSlot, heightSlot, roughnessSlot, metallicSlot),
+                    alphaTcModControl: SIMD4<Float>(alphaThreshold, Float(tcCount), 0, 0),
+                    // flags: x=sky, y=emissive, z=alpha-test, w=blended/translucent.
+                    // RT shades blended/translucent world surfaces with partial alpha
+                    // so grates/flames/portals preserve raster behind them.
+                    materialFlags: SIMD4<UInt32>(isSkyDraw ? 1 : 0,
+                                                 isEmissive ? 1 : 0,
+                                                 alphaThreshold != 0 ? 1 : 0,
+                                                 rtBlendMode != 0 ? 1 : 0),
+                    // .z = roughness, .w = metallic (P3 reflections).
+                    materialParams: SIMD4<Float>(isEmissive ? 0.8 : 0.0, Float(rtBlendMode), rtRough, rtMetal),
+                    tcModTypes: tcTypes,
+                    tcModParams0: chain.p0,
+                    tcModParams1: chain.p1,
+                    tcModParams2: chain.p2,
+                    tcModParams3: chain.p3,
+                    spriteAtlasParams: rtAtlasParams)
                 for tri in firstTri..<end {
                     if materials[tri].albedoSlot == invalid {
-                        materials[tri] = RTPrimitiveMaterial(
-                            albedoSlot: aSlot,
-                            lightmapSlot: lSlot,
-                            tcModCount: tcCount,
-                            _pad0: 0,
-                            alphaTcModControl: SIMD4<Float>(alphaThreshold, Float(tcCount), 0, 0),
-                            // flags: x=sky, y=emissive, z=alpha-test, w=blended/translucent.
-                            // RT shades blended/translucent world surfaces with partial alpha
-                            // so grates/flames/portals preserve raster behind them.
-                            materialFlags: SIMD4<UInt32>(isSkyDraw ? 1 : 0,
-                                                         isEmissive ? 1 : 0,
-                                                         alphaThreshold != 0 ? 1 : 0,
-                                                         blendMode != 0 ? 1 : 0),
-                            // .z = roughness, .w = metallic (P3 reflections).
-                            materialParams: SIMD4<Float>(isEmissive ? 0.8 : 0.0, Float(blendMode), rtRough, rtMetal),
-                            tcModTypes: tcTypes,
-                            tcModParams0: chain.p0,
-                            tcModParams1: chain.p1,
-                            tcModParams2: chain.p2,
-                            tcModParams3: chain.p3,
-                            spriteAtlasParams: rtAtlasParams)
+                        materials[tri] = candidateMaterial
+                        materialPriorities[tri] = materialPriority
                         assigned += 1
+                    } else if materialPriority > materialPriorities[tri] {
+                        materials[tri] = candidateMaterial
+                        materialPriorities[tri] = materialPriority
+                        overwrittenByHigherPriority += 1
                     } else {
                         skippedOverwrite += 1
                     }
@@ -4864,7 +5721,14 @@ struct MetalView: UIViewRepresentable {
                         lightmapFallbacks += 1
                     }
                 }
-                print("[RT] material table: albedo=\(topAlbedos.count)/\(albedoWeights.count) lightmap=\(topLightmaps.count)/\(lightmapWeights.count) assigned=\(assigned)/\(primitiveCount) originalNoLightmap=\(lightmapFallbacks) skippedOverwrite=\(skippedOverwrite)")
+                print("[RT] material table: albedo=\(topAlbedos.count)/\(albedoWeights.count) lightmap=\(topLightmaps.count)/\(lightmapWeights.count) pbrSidecars=\(topPBRSidecars.count)/\(pbrSidecarWeights.count) assigned=\(assigned)/\(primitiveCount) overwrittenByHigherPriority=\(overwrittenByHigherPriority) originalNoLightmap=\(lightmapFallbacks) skippedOverwrite=\(skippedOverwrite) skippedClassicFXSplit=\(skippedClassicFXSplit) forcedClassicRTStages=\(forcedClassicRTStages) classicSidecarCandidatesSuppressed=\(classicSidecarCandidatesSuppressed) classicPromotedRTStages=\(classicPromotedRTStages)")
+                if !topPBRSidecars.isEmpty {
+                    let sidecarSummary = topPBRSidecars.enumerated().map { idx, handle in
+                        "#\(idx):h=\(handle) '\(textureNameForLog(handle))' tris=\(pbrSidecarWeights[handle] ?? 0)"
+                    }.joined(separator: " | ")
+                    print("[RT] pbr sidecars: \(sidecarSummary)")
+                }
+                for line in rtMaterialDiagnostics { print(line) }
             }
         }
 
@@ -4883,12 +5747,22 @@ struct MetalView: UIViewRepresentable {
                 let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
                 guard stageCount > 0 else { continue }
                 let stage = Self.worldStage(draw, 0)
-                mix(UInt64(stage.textureHandle))
+                /* Do NOT include stage.textureHandle here. The C renderer
+                 * retargets animMap world stages every frame
+                 * (s_world.animShaderSlots → current frame handle), so the
+                 * texture handle is deliberately volatile even when the BSP
+                 * primitive layout/material semantics are unchanged. Including
+                 * it made q3dm1/q3dm5 miss this cache every 30 Hz and rebuild
+                 * Q3.RT.primitiveMaterials (~50 ms) for every animation frame.
+                 * Keep the signature to stable draw-shape fields; the table is
+                 * rebuilt on world/AS generation changes. */
+                mix(UInt64(stageCount))
                 mix(UInt64(draw.lightmapTextureHandle) << 1)
                 mix(UInt64(draw.flags) << 2)
                 mix(UInt64(stage.useLightmap) << 3)
                 mix(UInt64(stage.blendMode) << 4)
                 mix(UInt64(draw.indexCount) << 5)
+                mix(UInt64(Self.worldPBRMaterialHandle(for: stage)) << 6)
             }
             return h
         }
@@ -4961,7 +5835,9 @@ struct MetalView: UIViewRepresentable {
             guard let ib = worldIndexBuffer else { return nil }
             let vertexCount = Int(Q3MetalRenderer_GetWorldVertexCount())
             let indexCount = Int(Q3MetalRenderer_GetWorldIndexCount())
-            guard vertexCount > 0, indexCount >= 3, let src = Q3MetalRenderer_GetWorldVertices() else { return nil }
+            guard vertexCount > 0, indexCount >= 3,
+                  let src = Q3MetalRenderer_GetWorldVertices(),
+                  let fullIndexPtr = Q3MetalRenderer_GetWorldIndices() else { return nil }
 
             let verts = UnsafeBufferPointer(start: src, count: vertexCount)
             var compactPositions = [Float]()
@@ -4980,17 +5856,87 @@ struct MetalView: UIViewRepresentable {
             positionBuffer.label = "Q3.RT.positions.compact"
             rtASPositionBuffer = positionBuffer
 
-            buildRTPrimitiveMaterials(device: device, primitiveCount: indexCount / 3)
+            let fullIndices = UnsafeBufferPointer(start: fullIndexPtr, count: indexCount)
+            let skyFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
+            let portalFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_PORTAL)
+            let fogOnlyBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY)
+            var compactDrawFirstTri: [Int: Int] = [:]
+            var compactIndices: [UInt32] = []
+            var excludedDraws = 0
+            var excludedTris = 0
+            let fullPrimitiveCount = indexCount / 3
+            if let drawsPtr = Q3MetalRenderer_GetWorldAllDrawCommands() {
+                let drawCount = Int(Q3MetalRenderer_GetWorldAllDrawCommandCount())
+                let draws = UnsafeBufferPointer(start: drawsPtr, count: drawCount)
+                var includeFullTri = [Bool](repeating: true, count: fullPrimitiveCount)
+                compactDrawFirstTri.reserveCapacity(drawCount)
+                compactIndices.reserveCapacity(indexCount)
+                for draw in draws where draw.indexCount >= 3 {
+                    let first = Int(draw.firstIndex)
+                    let count = Int(draw.indexCount)
+                    guard first >= 0, count >= 3, first + count <= indexCount else { continue }
+                    if (draw.flags & (skyFlagBit | portalFlagBit | fogOnlyBit)) != 0 {
+                        let firstTri = first / 3
+                        let triCount = count / 3
+                        excludedDraws += 1
+                        excludedTris += triCount
+                        for tri in firstTri..<min(firstTri + triCount, includeFullTri.count) {
+                            includeFullTri[tri] = false
+                        }
+                    }
+                }
+                var fullTriToCompact = [Int](repeating: -1, count: fullPrimitiveCount)
+                for tri in 0..<fullPrimitiveCount where includeFullTri[tri] {
+                    fullTriToCompact[tri] = compactIndices.count / 3
+                    let first = tri * 3
+                    compactIndices.append(fullIndices[first])
+                    compactIndices.append(fullIndices[first + 1])
+                    compactIndices.append(fullIndices[first + 2])
+                }
+                for (drawIndex, draw) in draws.enumerated() where draw.indexCount >= 3 {
+                    let first = Int(draw.firstIndex)
+                    let count = Int(draw.indexCount)
+                    guard first >= 0, count >= 3, first + count <= indexCount else { continue }
+                    if (draw.flags & (skyFlagBit | portalFlagBit | fogOnlyBit)) != 0 { continue }
+                    let firstTri = first / 3
+                    guard firstTri < fullTriToCompact.count,
+                          fullTriToCompact[firstTri] >= 0 else { continue }
+                    // Draw ranges remain contiguous after deleting whole sky/
+                    // portal/fog carrier ranges; material assignment writes
+                    // draw.indexCount/3 primitives starting here.
+                    compactDrawFirstTri[drawIndex] = fullTriToCompact[firstTri]
+                }
+            }
+            let useCompactIndices = !compactIndices.isEmpty && excludedDraws > 0
+            let rtIndexCount = useCompactIndices ? compactIndices.count : indexCount
+            let rtPrimitiveCount = rtIndexCount / 3
+            let rtIndexBuffer: MTLBuffer
+            if useCompactIndices,
+               let compactIB = device.makeBuffer(bytes: compactIndices,
+                                                 length: compactIndices.count * MemoryLayout<UInt32>.stride,
+                                                 options: .storageModeShared) {
+                compactIB.label = "Q3.RT.ib.world.compact"
+                rtIndexBuffer = compactIB
+                rtASCompactDrawFirstTri = compactDrawFirstTri
+            } else {
+                rtIndexBuffer = ib
+                rtASCompactDrawFirstTri = [:]
+            }
+            rtASPrimitiveCount = rtPrimitiveCount
+
+            buildRTPrimitiveMaterials(device: device,
+                                      primitiveCount: rtPrimitiveCount,
+                                      compactDrawFirstTri: useCompactIndices ? compactDrawFirstTri : nil)
 
             let geomDesc = MTLAccelerationStructureTriangleGeometryDescriptor()
             geomDesc.vertexBuffer = positionBuffer
             geomDesc.vertexBufferOffset = 0
             geomDesc.vertexStride = 3 * MemoryLayout<Float>.stride
             geomDesc.vertexFormat = .float3
-            geomDesc.indexBuffer = ib
+            geomDesc.indexBuffer = rtIndexBuffer
             geomDesc.indexBufferOffset = 0
             geomDesc.indexType = .uint32
-            geomDesc.triangleCount = indexCount / 3
+            geomDesc.triangleCount = rtPrimitiveCount
             geomDesc.opaque = true
             let asDesc = MTLPrimitiveAccelerationStructureDescriptor()
             asDesc.geometryDescriptors = [geomDesc]
@@ -5009,13 +5955,13 @@ struct MetalView: UIViewRepresentable {
             enc.endEncoding()
             cb.commit(); cb.waitUntilCompleted()
             if let err = cb.error { print("[RT] AS build failed: \(err)"); return nil }
-            rtASVertexBuffer = worldVertexBuffer; rtASIndexBuffer = ib
+            rtASVertexBuffer = worldVertexBuffer; rtASIndexBuffer = rtIndexBuffer
             rtLastMaterialSignature = rtWorldMaterialSignature()
             rtPrimitiveMaterialBufferCache.removeAll(keepingCapacity: true)
             if rtLastMaterialSignature != 0, let buf = rtPrimitiveMaterialBuffer {
                 rtPrimitiveMaterialBufferCache[rtLastMaterialSignature] = buf
             }
-            print("[RT] built world AS: vertices=\(vertexCount) indices=\(indexCount) tris=\(indexCount / 3) size=\(sizes.accelerationStructureSize)")
+            print("[RT] built world AS: vertices=\(vertexCount) indices=\(rtIndexCount)/\(indexCount) tris=\(rtPrimitiveCount)/\(indexCount / 3) excludedDraws=\(excludedDraws) excludedTris=\(excludedTris) compact=\(useCompactIndices ? 1 : 0) size=\(sizes.accelerationStructureSize)")
             return accel
         }
 
@@ -5120,6 +6066,8 @@ struct MetalView: UIViewRepresentable {
             if Self.isWeaponViewmodelBaseSkin(n) { return false }
             if n.hasPrefix("sprites/") || n.hasPrefix("gfx/") || n.hasPrefix("models/weaphits/") ||
                n.hasPrefix("models/ammo/rocket/rockfl") || n.hasPrefix("models/mapobjects/teleporter/") ||
+               n.hasPrefix("models/mapobjects/lamps/") ||
+               n.hasPrefix("textures/skies/") ||
                n.hasPrefix("textures/sfx/") || n.hasPrefix("textures/effects/") {
                 return true
             }
@@ -5159,7 +6107,7 @@ struct MetalView: UIViewRepresentable {
                 "sprites/", "gfx/", "icons/", "menu/", "levelshots/", "powerups/",
                 "models/weaphits/", "models/ammo/", "models/powerups/",
                 "models/mapobjects/", "models/weapons2/",
-                "textures/sfx/", "textures/effects/", "textures/base_light/",
+                "textures/skies/", "textures/sfx/", "textures/effects/", "textures/base_light/",
                 "textures/gothic_light/", "textures/base_trim/techborder_fx"
             ]
             if classicPrefixes.contains(where: { n.hasPrefix($0) }) { return true }
@@ -5250,21 +6198,66 @@ struct MetalView: UIViewRepresentable {
         }
 
         @MainActor
+        private func worldSSRReflectivity(handle: UInt32,
+                                          stage: Q3MetalWorldStage,
+                                          selection: WorldTextureSelection) -> Float {
+            guard Q3_PBRSSREnabled() != 0,
+                  stage.useLightmap == 0 else { return 0.0 }
+            let blend = Self.worldBlendClass(for: stage)
+            // SSR only for opaque world stages. Blended/additive/filter stages
+            // preserve the opaque pass mask in destination alpha.
+            guard blend == 0 else { return 0.0 }
+            if selection.useWorldPBR && stage.pbrMetallic >= 0.5 {
+                return min(max(stage.pbrMetallic, 0.0), 1.0)
+            }
+            let n = textureNameForLog(handle).lowercased()
+            let allowTokens = [
+                "textures/base_floor/diamond2c_ow",
+                "diamond2c",
+                "jumppad",
+                "jump_pad",
+                "launchpad",
+                "launch",
+                "mirror",
+                "chrome"
+            ]
+            if allowTokens.contains(where: { n.contains($0) }) {
+                return 0.75
+            }
+            if stage.tcGen == 1 {
+                return 0.65
+            }
+            return 0.0
+        }
+
+        @MainActor
         private func worldTextureSelectionForPBRDebug(handle: UInt32,
                                                       fallback: MTLTexture,
                                                       stage: Q3MetalWorldStage,
                                                       materialHandle: UInt32? = nil) -> WorldTextureSelection {
             let name = textureNameForLog(handle)
             let pbrHandle = materialHandle ?? handle
+            let lowerName = name.lowercased()
+            let blendClass = Self.worldBlendClass(for: stage)
+            let preferClassicFX = shouldPreferClassicTextureForAlphaFX(name, isEntity: false)
+            let preserveClassicMask =
+                preferClassicFX ||
+                blendClass == 1 || blendClass == 3 || blendClass == 5 ||
+                stage.alphaFunc != 0 ||
+                stage.tcGen == 1 ||
+                stage.autospriteMode != 0
             let isFXStage = stage.blendMode != 0 ||
                             stage.alphaFunc != 0 ||
-                            shouldPreferClassicTextureForAlphaFX(name, isEntity: false)
+                            preferClassicFX
             if isFXStage {
-                // Most blended/FX stages must stay classic, but Remix animation atlases
-                // (launchpads/jumppads/etc.) are authored as replacement PBR strips.
-                // Let those use PBR albedo so the atlas remap can animate while the
-                // existing pass/blend state still comes from the Q3 shader stage.
-                let fxAtlasParams = pbrSpriteAtlasParams(for: handle, atlasTime: Float(CACurrentMediaTime() - frameTimeOrigin))
+                // Most blended/FX stages must stay classic. Only allow Remix
+                // animation atlases on non-mask-critical alpha overlays. Additive
+                // lamp/flare stages need the authored black/alpha cutout; PBR
+                // atlas carrier pixels show up as square quads under GL_ONE/ONE.
+                let allowMaskCriticalAtlas = lowerName.contains("textures/sfx/launchpad_diamond")
+                let fxAtlasParams = (preserveClassicMask && !allowMaskCriticalAtlas)
+                    ? SIMD4<Float>(0, 0, 0, 0)
+                    : pbrSpriteAtlasParams(for: handle, atlasTime: Float(CACurrentMediaTime() - frameTimeOrigin))
                 if fxAtlasParams.x > 0.5, let pbr = pbrAlbedoTexture(for: handle) {
                     if loggedPBROnlyWorldMisses.insert(handle).inserted {
                         pbrLog("[Q3-PBR] world FX atlas override handle=\(handle) name='\(name)' cols=\(fxAtlasParams.x) rows=\(fxAtlasParams.y) fps=\(fxAtlasParams.z)")
@@ -5280,6 +6273,16 @@ struct MetalView: UIViewRepresentable {
                                                  atlasParams: fxAtlasParams,
                                                  materialHandle: handle)
                 }
+                if pbrHandle != handle {
+                    if loggedPBROnlyWorldMisses.insert(handle).inserted {
+                        pbrLog("[Q3-PBR] world FX underlay stays classic handle=\(handle) name='\(name)' ownerHandle=\(pbrHandle) owner='\(textureNameForLog(pbrHandle))'")
+                    }
+                    return WorldTextureSelection(texture: fallback,
+                                                 useWorldPBR: false,
+                                                 classicFX: true,
+                                                 atlasParams: nil,
+                                                 materialHandle: pbrHandle)
+                }
                 // RTX-Remix authored emissive/PBR floor + wall shaders
                 // (q3dm1 textures/gothic_floor/largerblock3b_ow,
                 // textures/gothic_block/killblockgeomtrn) have alpha-blend
@@ -5288,13 +6291,22 @@ struct MetalView: UIViewRepresentable {
                 // entry. The plain FX path returns useWorldPBR:false which
                 // skips loading and binding those sidecars — the surface
                 // reads as flat color even though the assets ship.
-                // Promote to useWorldPBR:true ONLY for FX stages where the
-                // material has real authored sidecar maps; pure FX sprites
-                // without sidecars stay on the classic path.
-                if pbrMaterialHasAuxSlots(pbrHandle), let pbr = pbrAlbedoTexture(for: pbrHandle) {
+                //
+                // Keep this promotion narrowly scoped to source-alpha world
+                // overlays. Additive/filter/alpha-test light and sprite stages
+                // rely on the authored Q3 RGB/alpha mask. PBR replacement
+                // atlases commonly have non-black carrier pixels/no cutout
+                // alpha, and GL_ONE/GL_ONE then renders the full rectangular
+                // quad around lamps/flares.
+                let canPromoteFXStageToPBR =
+                    blendClass == 2 &&
+                    !preserveClassicMask
+                if canPromoteFXStageToPBR,
+                   pbrMaterialHasAuxSlots(pbrHandle),
+                   let pbr = pbrAlbedoTexture(for: pbrHandle) {
                     if loggedPBROnlyWorldMisses.insert(handle).inserted {
                         let materialName = (pbrHandle != handle) ? " materialHandle=\(pbrHandle) material='\(textureNameForLog(pbrHandle))'" : ""
-                        pbrLog("[Q3-PBR] world FX-stage + PBR-sidecars handle=\(handle) name='\(name)'\(materialName)")
+                        pbrLog("[Q3-PBR] world alpha FX-stage + PBR-sidecars handle=\(handle) name='\(name)'\(materialName)")
                     }
                     return WorldTextureSelection(texture: pbr,
                                                  useWorldPBR: true,
@@ -5383,10 +6395,15 @@ struct MetalView: UIViewRepresentable {
                         rtPrimitiveMaterialBuffer = cached
                         rtLastMaterialSignature = sig
                     } else {
-                        let primitiveCount = Int(Q3MetalRenderer_GetWorldIndexCount()) / 3
+                        let primitiveCount = rtASPrimitiveCount > 0
+                            ? rtASPrimitiveCount
+                            : Int(Q3MetalRenderer_GetWorldIndexCount()) / 3
                         if primitiveCount > 0 {
                             let t0 = CACurrentMediaTime()
-                            buildRTPrimitiveMaterials(device: device, primitiveCount: primitiveCount, log: false)
+                            buildRTPrimitiveMaterials(device: device,
+                                                      primitiveCount: primitiveCount,
+                                                      compactDrawFirstTri: rtASCompactDrawFirstTri.isEmpty ? nil : rtASCompactDrawFirstTri,
+                                                      log: false)
                             rtLastMaterialSignature = sig
                             if let buf = rtPrimitiveMaterialBuffer {
                                 if rtPrimitiveMaterialBufferCache.count > 96 {
@@ -5474,6 +6491,7 @@ struct MetalView: UIViewRepresentable {
                 Q3_RTLightScale(),
                 Q3_RTReflections() != 0 ? 1.0 : 0.0,
                 Q3_RTReflRoughnessMax())
+            uniforms.rtPBRParams = SIMD4<Float>(Q3_PBRParallaxScale(), 0, 0, 0)
             if !rtOverlayLogPrintedOnce {
                 print("[RT] overlay active mix=\(mixValue) trace=\(traceW)x\(traceH) scale=\(rtResolutionScale) bounces=\(rtBounceCount) taa=\(rtTAAEnabled ? 1 : 0) composite=\(renderW)x\(renderH) camera=\(cameraPos)")
                 rtOverlayLogPrintedOnce = true
@@ -5504,10 +6522,24 @@ struct MetalView: UIViewRepresentable {
                 let fallbackTex = ensureRTWhiteTexture(device: device)
                 for i in 0..<rtMaxAlbedoSlots {
                     let h = rtAlbedoHandles[i]
-                    enc.setTexture(pbrAlbedoTexture(for: h) ?? texture(for: h, device: device) ?? fallbackTex, index: 2 + i)
+                    let tex = rtForceClassicAlbedoHandles.contains(h)
+                        ? (texture(for: h, device: device) ?? pbrAlbedoTexture(for: h) ?? fallbackTex)
+                        : (pbrAlbedoTexture(for: h) ?? texture(for: h, device: device) ?? fallbackTex)
+                    enc.setTexture(tex, index: 2 + i)
                 }
                 for i in 0..<rtMaxLightmapSlots {
-                    enc.setTexture(texture(for: rtLightmapHandles[i], device: device) ?? fallbackTex, index: 112 + i)
+                    enc.setTexture(texture(for: rtLightmapHandles[i], device: device) ?? fallbackTex, index: rtLightmapTextureBase + i)
+                }
+                let flatNormalTex = pbrFlatNormalDefault() ?? fallbackTex
+                let heightFallbackTex = pbrEmissiveDefault() ?? fallbackTex
+                let roughFallbackTex = pbrRoughnessDefault() ?? fallbackTex
+                let metalFallbackTex = pbrMetallicDefault() ?? fallbackTex
+                for i in 0..<rtMaxPBRSidecarSlots {
+                    let h = rtPBRSidecarHandles[i]
+                    enc.setTexture(pbrNormalTexture(for: h, allowGenericFallback: false) ?? flatNormalTex, index: rtNormalTextureBase + i)
+                    enc.setTexture(pbrHeightTexture(for: h) ?? heightFallbackTex, index: rtHeightTextureBase + i)
+                    enc.setTexture(pbrRoughnessTexture(for: h) ?? roughFallbackTex, index: rtRoughnessTextureBase + i)
+                    enc.setTexture(pbrMetallicTexture(for: h) ?? metalFallbackTex, index: rtMetallicTextureBase + i)
                 }
                 enc.setBytes(&uniforms, length: MemoryLayout<RayTracingUniforms>.stride, index: 0)
                 enc.setAccelerationStructure(worldAS, bufferIndex: 1)
@@ -5990,6 +7022,77 @@ struct MetalView: UIViewRepresentable {
             return MTKTextureLoader(device: dev)
         }()
 
+        /// Per-channel maximum texture dimension for iOS/visionOS.
+        /// Mac Catalyst has no cap (empty dict = unlimited).
+        /// Caps preserve aspect ratio — a 3840×956 asset becomes 1024×255,
+        /// not 1024×1024. Animation strips (e.g. 1024×20480) are limited
+        /// on the short axis only; the long axis scales proportionally.
+        #if os(iOS)
+        private let pbrMaxTextureDimension: [String: Int] = [
+            "albedo": 1024,
+            "normal": 1024,
+            "roughness": 512,
+            "metallic": 512,
+            "height": 512,
+            "emissive": 1024,
+        ]
+        #else
+        private let pbrMaxTextureDimension: [String: Int] = [:]
+        #endif
+
+        /// Returns width/height capped to the per-channel limit while
+        /// preserving the exact aspect ratio. When the largest dimension
+        /// is already ≤ the cap, returns the original dimensions unchanged.
+        /// Minimum 1×1 — never returns a zero dimension.
+        private func pbrCappedDimensions(channel: String, width: Int, height: Int) -> (Int, Int) {
+            guard let cap = pbrMaxTextureDimension[channel], cap > 0 else {
+                return (width, height)
+            }
+            let maxDim = max(width, height)
+            guard maxDim > cap else { return (width, height) }
+            let scale = Float(cap) / Float(maxDim)
+            let newW = max(1, Int(Float(width) * scale))
+            let newH = max(1, Int(Float(height) * scale))
+            return (newW, newH)
+        }
+
+        /// If `tex` exceeds the per-channel dimension cap, GPU-downscales
+        /// via MPSImageBilinearScale and returns the capped texture with
+        /// auto-generated mipmaps. Returns nil when no cap is needed.
+        private func pbrEnsureCappedTexture(_ tex: MTLTexture, channel: String, path: String, label: String) -> MTLTexture? {
+            let (cappedW, cappedH) = pbrCappedDimensions(channel: channel, width: tex.width, height: tex.height)
+            if cappedW == tex.width && cappedH == tex.height { return nil }
+            guard let device = self.commandQueue?.device,
+                  let queue = self.commandQueue else {
+                pbrLog("[Q3-PBR-SWIFT] cap scale FAILED channel=\(channel) — no Metal device/queue")
+                return nil
+            }
+            let desc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: tex.pixelFormat,
+                width: cappedW, height: cappedH,
+                mipmapped: true)
+            desc.usage = [.shaderRead, .shaderWrite]
+            desc.storageMode = .private
+            guard let capped = device.makeTexture(descriptor: desc) else {
+                pbrLog("[Q3-PBR-SWIFT] cap scale FAILED channel=\(channel) — MTLTexture alloc failed")
+                return nil
+            }
+            capped.label = "\(label).capped"
+            guard let cmdBuf = queue.makeCommandBuffer() else { return nil }
+            let scale = MPSImageBilinearScale(device: device)
+            scale.encode(commandBuffer: cmdBuf, sourceTexture: tex, destinationTexture: capped)
+            if capped.mipmapLevelCount > 1 {
+                if let blit = cmdBuf.makeBlitCommandEncoder() {
+                    blit.generateMipmaps(for: capped)
+                    blit.endEncoding()
+                }
+            }
+            cmdBuf.commit()
+            cmdBuf.waitUntilCompleted()
+            pbrLog("[Q3-PBR-SWIFT] scaled \(tex.width)x\(tex.height) -> \(cappedW)x\(cappedH) channel=\(channel)")
+            return capped
+        }
+
         /// Returns the PBR albedo texture for a Q3 handle, or nil when
         /// no PBR material was bound or the DDS load fails. First call
         /// per handle does the load; subsequent calls hit the cache.
@@ -6119,7 +7222,11 @@ struct MetalView: UIViewRepresentable {
         /// ship in) — that's the only format the indirect-name path
         /// currently surfaces. Returns nil for anything else; the
         /// caller falls back to its existing behaviour.
-        private func loadCaptureFormatDDS(path: String, label: String) -> MTLTexture? {
+        /// When `channel` is non-nil, width/height are capped to the
+        /// per-channel limit (see pbrMaxTextureDimension). Original mip
+        /// levels that exceed the cap are skipped; the first mip that
+        /// fits becomes mip0 in the returned texture.
+        private func loadCaptureFormatDDS(path: String, label: String, channel: String? = nil) -> MTLTexture? {
             guard let device = self.commandQueue?.device else { return nil }
             guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
                 if !shouldSkipCaptureDDSFailure(path: path) {
@@ -6148,10 +7255,10 @@ struct MetalView: UIViewRepresentable {
                 }
             }
             // DDS_HEADER fields
-            let height   = u32(12)
-            let width    = u32(16)
+            let origWidth  = Int(u32(16))
+            let origHeight = Int(u32(12))
             let headerPitch = u32(20)              // dwPitchOrLinearSize — may be bogus
-            let mipCount = max(1, u32(28))
+            let origMipCount = max(1, Int(u32(28)))
             // FOURCC at offset 84-87
             let fourcc   = data.subdata(in: 84..<88)
             let isDX10   = fourcc == Data([0x44, 0x58, 0x31, 0x30])
@@ -6178,12 +7285,26 @@ struct MetalView: UIViewRepresentable {
                 }
                 return nil
             }
-            let computedRowBytes = Int(width) * bytesPerPixel
+            // Apply per-channel dimension cap: skip original mips until
+            // we find the first level that fits within the cap.
+            var baseW = origWidth
+            var baseH = origHeight
+            var mipSkip = 0
+            if let ch = channel {
+                let (cappedW, cappedH) = pbrCappedDimensions(channel: ch, width: origWidth, height: origHeight)
+                while (baseW > cappedW || baseH > cappedH) && mipSkip < origMipCount - 1 {
+                    baseW = max(1, baseW / 2)
+                    baseH = max(1, baseH / 2)
+                    mipSkip += 1
+                }
+            }
+            let levelCount = origMipCount - mipSkip
+            let computedRowBytes = baseW * bytesPerPixel
             let desc = MTLTextureDescriptor.texture2DDescriptor(
                 pixelFormat: pixelFormat,
-                width: Int(width), height: Int(height),
-                mipmapped: mipCount > 1)
-            desc.mipmapLevelCount = Int(mipCount)
+                width: baseW, height: baseH,
+                mipmapped: levelCount > 1)
+            desc.mipmapLevelCount = levelCount
             desc.usage = [.shaderRead]
             desc.storageMode = .shared
             guard let tex = device.makeTexture(descriptor: desc) else {
@@ -6191,29 +7312,36 @@ struct MetalView: UIViewRepresentable {
                 return nil
             }
             tex.label = label
-            // Header is 4 (magic) + 124 (DDS_HEADER) + 20 (DX10 ext) = 148
+            // Header is 4 (magic) + 124 (DDS_HEADER) + 20 (DX10 ext) = 148.
+            // Walk original mips to skip past the ones we're discarding,
+            // then copy the remaining levels into the capped texture.
             var cursor = 148
-            var mipW = Int(width)
-            var mipH = Int(height)
-            for level in 0..<Int(mipCount) {
+            var mipW = origWidth
+            var mipH = origHeight
+            var cappedLevel = 0
+            for level in 0..<origMipCount {
                 let bytesPerRow = mipW * bytesPerPixel
                 let size = bytesPerRow * mipH
                 guard cursor + size <= data.count else {
                     pbrLog("[Q3-PBR-SWIFT] capture-dds short read at mip=\(level) need=\(size) avail=\(data.count - cursor) path=\(path)")
                     return nil
                 }
-                data.withUnsafeBytes { raw in
-                    let base = raw.baseAddress!.advanced(by: cursor)
-                    tex.replace(region: MTLRegionMake2D(0, 0, mipW, mipH),
-                                mipmapLevel: level,
-                                withBytes: base,
-                                bytesPerRow: bytesPerRow)
+                if level >= mipSkip {
+                    data.withUnsafeBytes { raw in
+                        let base = raw.baseAddress!.advanced(by: cursor)
+                        tex.replace(region: MTLRegionMake2D(0, 0, mipW, mipH),
+                                    mipmapLevel: cappedLevel,
+                                    withBytes: base,
+                                    bytesPerRow: bytesPerRow)
+                    }
+                    cappedLevel += 1
                 }
                 cursor += size
                 mipW = max(1, mipW / 2)
                 mipH = max(1, mipH / 2)
             }
-            pbrLog("[Q3-PBR-SWIFT] capture-dds tolerant-load OK \(width)x\(height) mips=\(mipCount) dxgi=\(dxgiFormat) headerPitch=\(headerPitch) computedRowBytes=\(computedRowBytes) path=\(path)")
+            let capNote = channel != nil ? " capped=\(baseW)x\(baseH)" : ""
+            pbrLog("[Q3-PBR-SWIFT] capture-dds tolerant-load OK \(origWidth)x\(origHeight) mips=\(origMipCount) dxgi=\(dxgiFormat) headerPitch=\(headerPitch) computedRowBytes=\(computedRowBytes)\(capNote) path=\(path)")
             return tex
         }
 
@@ -6396,6 +7524,13 @@ struct MetalView: UIViewRepresentable {
             ]
             do {
                 let tex = try loader.newTexture(URL: url, options: opts)
+                // Apply per-channel dimension cap on iOS — re-loads via
+                // capped DDS reader if the texture exceeds the limit.
+                if let capped = pbrEnsureCappedTexture(tex, channel: "albedo", path: path, label: "Q3.pbr.albedo.h\(handle)") {
+                    pbrAlbedoCache[handle] = capped
+                    pbrLog("[Q3-PBR-SWIFT] loaded albedo (capped) handle=\(handle) size=\(capped.width)x\(capped.height) path=\(path)")
+                    return capped
+                }
                 tex.label = "Q3.pbr.albedo.h\(handle)"
                 pbrAlbedoCache[handle] = tex
                 pbrLog("[Q3-PBR-SWIFT] loaded albedo handle=\(handle) size=\(tex.width)x\(tex.height) path=\(path)")
@@ -6408,7 +7543,7 @@ struct MetalView: UIViewRepresentable {
                 // and item materials do not fall back to magenta/classic only
                 // just because the Apple loader refused the capture wrapper.
                 pbrLog("[Q3-PBR-SWIFT] MTKLoader rejected albedo handle=\(handle) err=\(error.localizedDescription) — trying capture-format reader path=\(path)")
-                if let tex = loadCaptureFormatDDS(path: path, label: "Q3.pbr.albedo.h\(handle).capture") {
+                if let tex = loadCaptureFormatDDS(path: path, label: "Q3.pbr.albedo.h\(handle).capture", channel: "albedo") {
                     pbrAlbedoCache[handle] = tex
                     pbrLog("[Q3-PBR-SWIFT] loaded albedo (capture-format) handle=\(handle) size=\(tex.width)x\(tex.height) path=\(path)")
                     return tex
@@ -6470,6 +7605,11 @@ struct MetalView: UIViewRepresentable {
             ]
             do {
                 let tex = try loader.newTexture(URL: url, options: opts)
+                if let capped = pbrEnsureCappedTexture(tex, channel: "normal", path: path, label: "Q3.pbr.normal.h\(handle)") {
+                    pbrNormalCache[handle] = capped
+                    pbrLog("[Q3-PBR-SWIFT] loaded normal (capped) handle=\(handle) size=\(capped.width)x\(capped.height) path=\(path)")
+                    return capped
+                }
                 tex.label = "Q3.pbr.normal.h\(handle)"
                 pbrNormalCache[handle] = tex
                 pbrLog("[Q3-PBR-SWIFT] loaded normal handle=\(handle) size=\(tex.width)x\(tex.height) path=\(path)")
@@ -6491,8 +7631,7 @@ struct MetalView: UIViewRepresentable {
             if pbrGenericNormalAttempted { return nil }
             pbrGenericNormalAttempted = true
             guard let loader = pbrTextureLoader else { return nil }
-            guard let bundleRoot = Bundle.main.resourcePath else { return nil }
-            let path = bundleRoot + "/baseq3/pbr/assets/ingested/shotgun.n.rtex.dds"
+            guard let path = baseq3FilePath("pbr/assets/ingested/shotgun.n.rtex.dds") else { return nil }
             let url = URL(fileURLWithPath: path)
             let opts: [MTKTextureLoader.Option: Any] = [
                 .SRGB:                NSNumber(value: false),
@@ -7080,6 +8219,11 @@ struct MetalView: UIViewRepresentable {
                     ]
                     do {
                         let tex = try loader.newTexture(URL: url, options: opts)
+                        if let capped = pbrEnsureCappedTexture(tex, channel: "roughness", path: path, label: "Q3.pbr.roughness.h\(handle)") {
+                            pbrRoughnessCache[handle] = capped
+                            pbrLog("[Q3-PBR-SWIFT] loaded roughness (capped) handle=\(handle) size=\(capped.width)x\(capped.height) path=\(path)")
+                            return capped
+                        }
                         tex.label = "Q3.pbr.roughness.h\(handle)"
                         pbrRoughnessCache[handle] = tex
                         pbrLog("[Q3-PBR-SWIFT] loaded roughness handle=\(handle) size=\(tex.width)x\(tex.height) path=\(path)")
@@ -7139,6 +8283,11 @@ struct MetalView: UIViewRepresentable {
                     ]
                     do {
                         let tex = try loader.newTexture(URL: url, options: opts)
+                        if let capped = pbrEnsureCappedTexture(tex, channel: "metallic", path: path, label: "Q3.pbr.metallic.h\(handle)") {
+                            pbrMetallicCache[handle] = capped
+                            pbrLog("[Q3-PBR-SWIFT] loaded metallic (capped) handle=\(handle) size=\(capped.width)x\(capped.height) path=\(path)")
+                            return capped
+                        }
                         tex.label = "Q3.pbr.metallic.h\(handle)"
                         pbrMetallicCache[handle] = tex
                         pbrLog("[Q3-PBR-SWIFT] loaded metallic handle=\(handle) size=\(tex.width)x\(tex.height) path=\(path)")
@@ -7247,6 +8396,11 @@ struct MetalView: UIViewRepresentable {
             ]
             do {
                 let tex = try loader.newTexture(URL: url, options: opts)
+                if let capped = pbrEnsureCappedTexture(tex, channel: "emissive", path: path, label: "Q3.pbr.emissive.h\(handle)") {
+                    pbrEmissiveCache[handle] = capped
+                    pbrLog("[Q3-PBR-SWIFT] loaded emissive (capped) handle=\(handle) size=\(capped.width)x\(capped.height) path=\(path)")
+                    return capped
+                }
                 tex.label = "Q3.pbr.emissive.h\(handle)"
                 pbrEmissiveCache[handle] = tex
                 pbrLog("[Q3-PBR-SWIFT] loaded emissive handle=\(handle) size=\(tex.width)x\(tex.height) path=\(path)")
@@ -7287,6 +8441,11 @@ struct MetalView: UIViewRepresentable {
             ]
             do {
                 let tex = try loader.newTexture(URL: URL(fileURLWithPath: path), options: opts)
+                if let capped = pbrEnsureCappedTexture(tex, channel: "height", path: path, label: "Q3.pbr.height.h\(handle)") {
+                    pbrHeightCache[handle] = capped
+                    pbrLog("[Q3-PBR-SWIFT] loaded height (capped) handle=\(handle) size=\(capped.width)x\(capped.height) path=\(path)")
+                    return capped
+                }
                 tex.label = "Q3.pbr.height.h\(handle)"
                 pbrHeightCache[handle] = tex
                 pbrLog("[Q3-PBR-SWIFT] loaded height handle=\(handle) size=\(tex.width)x\(tex.height) path=\(path)")
@@ -7371,8 +8530,7 @@ struct MetalView: UIViewRepresentable {
             // shader falls back to vanilla when PBR is disabled.
             if q3_pbr_enabled() == 0 { return nil }
             guard let loader = pbrTextureLoader else { return nil }
-            guard let bundleRoot = Bundle.main.resourcePath else { return nil }
-            let path = bundleRoot + "/baseq3/pbr/assets/ingested/metal_plate_normal_2k_OTH_Normal.n.rtex.dds"
+            guard let path = baseq3FilePath("pbr/assets/ingested/metal_plate_normal_2k_OTH_Normal.n.rtex.dds") else { return nil }
             pbrLog("[Q3-PBR-SWIFT] world-normal trying path=\(path)")
             let url = URL(fileURLWithPath: path)
             let opts: [MTKTextureLoader.Option: Any] = [
@@ -7461,43 +8619,42 @@ struct MetalView: UIViewRepresentable {
                 configureRenderer(for: view)
             }
 
-            /* MetalFX upscale path: when upscaleQuality != .native, we
-             * render the frame at a lower resolution (renderW × renderH)
-             * into upscaleColorTarget and then MetalFX spatially upscales
-             * to the drawable. The Q3 renderer needs to know its
-             * "effective drawable" is the RT size so projection / viewport
-             * / scissor math is consistent with what we'll actually feed
-             * to MetalFX. Native quality keeps the existing direct path. */
+            /* MetalFX upscale path: when upscaleQuality != .native and
+             * backend != off, render the 3D scene at lower resolution, upscale
+             * it to the drawable, then draw 2D HUD/UI natively. The Q3
+             * renderer sees the low-res "effective drawable" so projection /
+             * viewport / scissor math matches the scene RT. Native/off keeps
+             * the existing direct path. */
             let outputW = Int(view.drawableSize.width)
             let outputH = Int(view.drawableSize.height)
-            // Keep "Native" literal even with RT enabled. The old safety
-            // override silently forced Native+RT through the 0.75 MetalFX
-            // path; on current iOS/Xcode that path can assert inside
-            // MetalFX with "Motion texture must not be nil" even though
-            // frame interpolation is off. RT already has its own
-            // r_rt_resolution_scale knob, so do not require MetalFX here.
             let effectiveUpscaleQuality: Q3UpscaleQuality = upscaleQuality
-            let upscaleActive: Bool
-            let renderW: Int
-            let renderH: Int
-            if effectiveUpscaleQuality != .native, let device = view.device, outputW > 0, outputH > 0 {
+            var upscaleActive = false
+            var renderW = outputW
+            var renderH = outputH
+            if wantsUpscaleOffscreen, let device = view.device, outputW > 0, outputH > 0 {
                 let rs = effectiveUpscaleQuality.renderSize(forOutput: view.drawableSize)
                 let rW = max(1, Int(rs.width))
                 let rH = max(1, Int(rs.height))
-                if ensureSpatialUpscaleTargets(device: device, inputW: rW, inputH: rH, outputW: outputW, outputH: outputH) {
+                let backend = ensureUpscaleTargets(device: device,
+                                                   inputW: rW,
+                                                   inputH: rH,
+                                                   outputW: outputW,
+                                                   outputH: outputH,
+                                                   outputPixelFormat: view.colorPixelFormat)
+                if backend != .none {
                     upscaleActive = true
                     renderW = rW
                     renderH = rH
                 } else {
-                    // MetalFX unavailable on this device — fall back.
+                    // Allocation failure: direct/native is safer than a partial
+                    // offscreen path. This should be rare; normal unsupported
+                    // temporal cases use compute fallback above.
                     upscaleActive = false
                     renderW = outputW
                     renderH = outputH
                 }
             } else {
-                upscaleActive = false
-                renderW = outputW
-                renderH = outputH
+                activeUpscaleBackend = .none
             }
             Q3MetalRenderer_UpdateDrawableSize(Int32(renderW), Int32(renderH))
 
@@ -7513,9 +8670,10 @@ struct MetalView: UIViewRepresentable {
                   let descriptor = view.currentRenderPassDescriptor,
                   let commandQueue,
                   let uiSamplerState,
-                  let worldSamplerState,
-                  let commandBuffer = commandQueue.makeCommandBuffer()
+                  let worldSamplerState
             else { return }
+            startGPUTraceCaptureIfNeeded(commandQueue: commandQueue)
+            guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
             let drawableAcquireMs = (CACurrentMediaTime() - drawableAcquireStart) * 1000.0
             commandBuffer.label = "Q3.frame"
 
@@ -7524,6 +8682,17 @@ struct MetalView: UIViewRepresentable {
             let q3FrameMs = (CACurrentMediaTime() - q3FrameStart) * 1000.0
 
             guard let snapshot = Q3MetalRenderer_GetFrameSnapshot()?.pointee else { return }
+            if upscaleActive && activeUpscaleBackend == .temporal {
+                if snapshot.worldGeneration != temporalLastWorldGeneration {
+                    markTemporalReset("world-generation-\(temporalLastWorldGeneration)-to-\(snapshot.worldGeneration)")
+                    temporalLastWorldGeneration = snapshot.worldGeneration
+                }
+                temporalCurrentJitterPixels = nextTemporalJitterPixels()
+            } else {
+                temporalCurrentJitterPixels = SIMD2<Float>(0, 0)
+            }
+
+            let drawableDepthTexture = descriptor.depthAttachment.texture
 
             descriptor.colorAttachments[0].clearColor = MTLClearColor(
                 red: Double(snapshot.clearColor.0),
@@ -7569,24 +8738,39 @@ struct MetalView: UIViewRepresentable {
             }
 
             let wantsFogRayBox = hasRenderableFogVolume()
-            let sceneDepth = wantsFogRayBox ? view.device.flatMap { device in
+            let wantsRasterSSR = (Q3_PBRSSREnabled() != 0 && Q3_RTMix() <= 0.001)
+            frameHasRasterSSRMask = false
+            let sceneDepth = (wantsFogRayBox || wantsRasterSSR) ? view.device.flatMap { device in
                 ensureSceneDepthTexture(device: device,
                                         width: renderW,
                                         height: renderH)
             } : nil
-            if let sceneDepth, !upscaleActive {
-                // Native path: drive the descriptor's depth from our scene
-                // depth (drawable-sized). Upscale path already set depth
-                // to upscaleDepthTarget above.
+            if let sceneDepth, (!upscaleActive || wantsRasterSSR) {
+                // Drive the descriptor from a shader-readable scene depth
+                // whenever SSR/fog needs to sample it after the world pass.
                 descriptor.depthAttachment.texture = sceneDepth
                 descriptor.depthAttachment.loadAction = .clear
                 descriptor.depthAttachment.storeAction = .store
                 descriptor.depthAttachment.clearDepth = 1.0
             }
 
+            let rasterMix = Q3_RTMix()
+            let rasterSunShadowsOnly = rasterMix <= 0.001
+            // P0 (hard): raster-only gate for sun-shadow depth. When RT is
+            // active, we keep pass disabled and skip depth-caster work.
+            let rasterShadowCvarEnabled = (Q3_PBRSunShadows() != 0)
+            let shouldSubmitRasterShadows: Bool
+            var hasAuthorSunLight = false
+            if rasterSunShadowsOnly,
+               let device = view.device {
+                _ = ensureRTLightBuffer(device: device)
+                hasAuthorSunLight = rtLightCount > 0 && !rtLightsCPU.isEmpty && rtLightsCPU[0].dirType.w == 0
+            }
+            shouldSubmitRasterShadows = rasterSunShadowsOnly && rasterShadowCvarEnabled && hasAuthorSunLight
             var currentSunShadowTexture: MTLTexture? = nil
             var currentSunShadowMatrix = matrix_identity_float4x4
-            if let device = view.device,
+            if shouldSubmitRasterShadows,
+               let device = view.device,
                let sceneViewForShadow = Q3MetalRenderer_GetSceneView()?.pointee,
                let shadow = encodeSunShadowMap(commandBuffer: commandBuffer,
                                                device: device,
@@ -7595,12 +8779,29 @@ struct MetalView: UIViewRepresentable {
                 currentSunShadowTexture = shadow.texture
                 currentSunShadowMatrix = shadow.matrix
             }
+            if currentSunShadowTexture == nil,
+               let device = view.device,
+               let dummy = ensureSunShadowDummyTexture(device: device) {
+                currentSunShadowTexture = dummy
+            }
+            if !sunShadowModeDebugLogged {
+                if shouldSubmitRasterShadows {
+                    pbrLog("[Q3-SUNSHADOW] raster shadow pass active mix=\(rasterMix) sun=\(hasAuthorSunLight)")
+                } else if rasterSunShadowsOnly {
+                    pbrLog("[Q3-SUNSHADOW] raster shadow pass skipped mix=\(rasterMix) cvar=\(rasterShadowCvarEnabled) hasSun=\(hasAuthorSunLight)")
+                } else {
+                    pbrLog("[Q3-SUNSHADOW] shadow pass skipped in RT/mixed mode mix=\(rasterMix)")
+                }
+                sunShadowModeDebugLogged = true
+            }
 
             guard var encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
                 return
             }
             encoder.label = "Q3.render"
             var rtCompositeForUpscale: MTLTexture? = nil
+            var mainSceneViewProjectionForUpscale: simd_float4x4? = nil
+            let temporalRenderSize = SIMD2<Float>(Float(renderW), Float(renderH))
 
             // Viewport matches the actual render-target size (RT when
             // upscaling, drawable when native).
@@ -7618,8 +8819,26 @@ struct MetalView: UIViewRepresentable {
                let sceneView = Q3MetalRenderer_GetSceneView()?.pointee,
                let worldVertexBuffer = uploadWorldBuffers(device: view.device, generation: snapshot.worldGeneration),
                let worldIndexBuffer {
-                let viewProjection = makeWorldViewProjection(sceneView)
+                let viewProjection = makeWorldViewProjection(sceneView,
+                                                             jitterPixels: temporalCurrentJitterPixels,
+                                                             renderSize: temporalRenderSize)
+                mainSceneViewProjectionForUpscale = viewProjection
                 let cameraPos = SIMD3<Float>(sceneView.viewOrigin.0, sceneView.viewOrigin.1, sceneView.viewOrigin.2)
+                if upscaleActive && activeUpscaleBackend == .temporal {
+                    let cameraForwardNow = simd_normalize(SIMD3<Float>(sceneView.viewAxis.0,
+                                                                        sceneView.viewAxis.1,
+                                                                        sceneView.viewAxis.2))
+                    if let lastPos = temporalPreviousCameraPos,
+                       let lastForward = temporalPreviousCameraForward {
+                        let movedFar = simd_length(cameraPos - lastPos) > 384.0
+                        let turnedFar = simd_dot(cameraForwardNow, lastForward) < 0.35
+                        if movedFar || turnedFar {
+                            markTemporalReset(movedFar ? "large-camera-jump" : "large-camera-turn")
+                        }
+                    }
+                    temporalPreviousCameraPos = cameraPos
+                    temporalPreviousCameraForward = cameraForwardNow
+                }
                 /* sceneView.viewAxis is a row-major 3x3 in Q3 axis
                  * convention: axis[0]=forward, axis[1]=left,
                  * axis[2]=up. For a screen-right billboard basis we
@@ -7644,20 +8863,28 @@ struct MetalView: UIViewRepresentable {
                 // present (kernel contract). When map has no sun the array
                 // is empty or slot 0's dirType.w != 0 — we leave sunColor.w
                 // at the struct default 0 so MSL falls back to hardcoded dir.
-                _ = ensureRTLightBuffer(device: view.device!)
-                if rtLightCount > 0,
-                   let sun = rtLightsCPU.first,
-                   sun.dirType.w == 0 {
-                    worldUniforms.sunDir = SIMD3<Float>(sun.dirType.x, sun.dirType.y, sun.dirType.z)
-                    worldUniforms.sunIntensity = sun.colorIntensity.w
-                    worldUniforms.sunColor = SIMD4<Float>(sun.colorIntensity.x,
-                                                          sun.colorIntensity.y,
-                                                          sun.colorIntensity.z,
-                                                          1.0)
+                if rasterSunShadowsOnly,
+                   let device = view.device {
+                    _ = ensureRTLightBuffer(device: device)
+                    if rtLightCount > 0,
+                       let sun = rtLightsCPU.first,
+                       sun.dirType.w == 0 {
+                        worldUniforms.sunDir = SIMD3<Float>(sun.dirType.x, sun.dirType.y, sun.dirType.z)
+                        worldUniforms.sunIntensity = sun.colorIntensity.w
+                        worldUniforms.sunColor = SIMD4<Float>(sun.colorIntensity.x,
+                                                              sun.colorIntensity.y,
+                                                              sun.colorIntensity.z,
+                                                              1.0)
+                    }
                 }
-                if let shadowTexture = currentSunShadowTexture, worldUniforms.sunColor.w > 0.5 {
+                let doRasterSunShadows = shouldSubmitRasterShadows
+                if doRasterSunShadows,
+                   let shadowTexture = currentSunShadowTexture,
+                   worldUniforms.sunColor.w > 0.5 {
                     worldUniforms.sunShadowMatrix = currentSunShadowMatrix
-                    worldUniforms.sunShadowParams = SIMD4<Float>(0.0025, 0.32, 1.0 / Float(max(shadowTexture.width, 1)), 1.0)
+                    worldUniforms.sunShadowParams = SIMD4<Float>(0.0025, 0.32, 1.0 / Float(max(shadowTexture.width, 1)), Q3_PBRShadowPCFRadius())
+                } else {
+                    worldUniforms.sunShadowParams = SIMD4<Float>(0, 0, 0, 0)
                 }
                 encoder.setRenderPipelineState(worldPipelineState)
                 encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
@@ -7673,6 +8900,9 @@ struct MetalView: UIViewRepresentable {
                 // smear bands across the sky.
                 encoder.setFragmentBytes(&worldUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
                 encoder.setFragmentSamplerState(worldSamplerState, index: 0)
+                // Slot 8 is always bound to a defined texture; raster-only
+                // mode may use a real shadow depth texture, RT skips to the
+                // local dummy.
                 encoder.setFragmentTexture(currentSunShadowTexture, index: 8)
 
                 // Bind dlight block at fragment buffer(2). Shared across all
@@ -8017,6 +9247,7 @@ struct MetalView: UIViewRepresentable {
                         let worldEmissiveTex = pbrEmissiveTexture(for: worldSelection.materialHandle) ?? pbrEmissiveDefault()
                         encoder.setFragmentTexture(worldEmissiveTex, index: 6)
                         drawUniforms.emissiveParams = emissiveParamsForPBRMaterial(handle: worldSelection.materialHandle)
+                        let normalScale = worldSelection.useWorldPBR ? Q3_PBRNormalScale() : 0.0
                         // Height/parallax slot @ 7 — only active (scale > 0)
                         // when the material ships a real height DDS. Log both
                         // the active and fallthrough paths so q3_diag shows
@@ -8032,11 +9263,16 @@ struct MetalView: UIViewRepresentable {
                                         site: "primary")
                         if let heightTex {
                             encoder.setFragmentTexture(heightTex, index: 7)
-                            drawUniforms.parallaxParams = SIMD4<Float>(parallaxScale, 0, 0, parallaxTint)
+                            drawUniforms.parallaxParams = SIMD4<Float>(parallaxScale, normalScale, 0, parallaxTint)
                         } else {
                             encoder.setFragmentTexture(pbrEmissiveDefault(), index: 7)
-                            drawUniforms.parallaxParams = SIMD4<Float>(0, 0, 0, 0)
+                            drawUniforms.parallaxParams = SIMD4<Float>(0, normalScale, 0, 0)
                         }
+                        let ssrReflectivity = worldSSRReflectivity(handle: stage.textureHandle,
+                                                                       stage: stage,
+                                                                       selection: worldSelection)
+                        drawUniforms.parallaxParams.z = ssrReflectivity
+                        if ssrReflectivity > 0.0 { frameHasRasterSSRMask = true }
                         var pbrWorldParams = SIMD4<Float>(
                             (worldSelection.useWorldPBR && Q3_PBRWorldEnabled() != 0) ? 1.0 : 0.0,
                             Q3_PBRWorldAmbientBoost(),
@@ -8251,10 +9487,21 @@ struct MetalView: UIViewRepresentable {
                                 }
                                 encoder.setRenderPipelineState(pipeline)
                                 encoder.setDepthStencilState(skyDepthStencilState)
-                                // Sky shaders commonly specify 'cull disable'
-                                // to render the sky sphere inside-out; honour
-                                // per-stage cullMode just like world stages.
-                                encoder.setCullMode(Self.metalCullMode(for: stage.cullMode))
+                                // Sky BSP faces are screen masks for the Q3 sky
+                                // projection, not ordinary structural wall
+                                // polygons. Some stock skies (q3dm1 tim_hell)
+                                // do not spell out "cull disable"; honoring the
+                                // parsed default backface cull can clip the mask
+                                // and expose carrier/cut-through rectangles in
+                                // hybrid RT captures. Force sky masks two-sided;
+                                // skyDepthStencilState still keeps depth writes
+                                // off so the mask cannot occlude later geometry.
+                                let originalSkyCullMode = stage.cullMode
+                                encoder.setCullMode(.none)
+                                if !skyPolicyLogged {
+                                    skyPolicyLogged = true
+                                    print("[SKY-POLICY] forcedCull=none originalCull=\(originalSkyCullMode) depthWrite=0 flags=0x\(String(draw.flags, radix: 16)) stageCount=\(stageCount)")
+                                }
                                 let skyChain = Self.fillTcMods(stage)
                                 let (skyTV0, skyTV1) = Self.tcGenVectors(stage)
                                 // Sky never receives fog — fogColorDistance=0.
@@ -8663,6 +9910,7 @@ struct MetalView: UIViewRepresentable {
                             // primary non-batched site. Material-specific
                             // emissive when present, zero default otherwise.
                             setWorldFragmentTextureCached(pbrEmissiveTexture(for: worldSelection.materialHandle) ?? pbrEmissiveDefault(), index: 6)
+                            let normalScale = worldSelection.useWorldPBR ? Q3_PBRNormalScale() : 0.0
                             // Height/parallax @ 7 — mirror of the primary site.
                             let heightTex = worldSelection.useWorldPBR ? pbrHeightTexture(for: worldSelection.materialHandle) : nil
                             let parallaxScale: Float = (heightTex == nil) ? 0.0 : Q3_PBRParallaxScale()
@@ -8675,11 +9923,16 @@ struct MetalView: UIViewRepresentable {
                                             site: "cached")
                             if let heightTex {
                                 setWorldFragmentTextureCached(heightTex, index: 7)
-                                drawUniforms.parallaxParams = SIMD4<Float>(parallaxScale, 0, 0, parallaxTint)
+                                drawUniforms.parallaxParams = SIMD4<Float>(parallaxScale, normalScale, 0, parallaxTint)
                             } else {
                                 setWorldFragmentTextureCached(pbrEmissiveDefault(), index: 7)
-                                drawUniforms.parallaxParams = SIMD4<Float>(0, 0, 0, 0)
+                                drawUniforms.parallaxParams = SIMD4<Float>(0, normalScale, 0, 0)
                             }
+                            let ssrReflectivity = worldSSRReflectivity(handle: stage.textureHandle,
+                                                                           stage: stage,
+                                                                           selection: worldSelection)
+                            drawUniforms.parallaxParams.z = ssrReflectivity
+                            if ssrReflectivity > 0.0 { frameHasRasterSSRMask = true }
                             var pbrWorldParams = SIMD4<Float>(
                                 (worldSelection.useWorldPBR && Q3_PBRWorldEnabled() != 0) ? 1.0 : 0.0,
                                 Q3_PBRWorldAmbientBoost(),
@@ -8783,6 +10036,30 @@ struct MetalView: UIViewRepresentable {
                 }
             }
 
+            if wantsRasterSSR,
+               let sceneView = Q3MetalRenderer_GetSceneView()?.pointee,
+               let colorTexture = descriptor.colorAttachments[0].texture {
+                encoder.endEncoding()
+                encodeRasterSSR(commandBuffer: commandBuffer,
+                                colorTexture: colorTexture,
+                                depthTexture: descriptor.depthAttachment.texture,
+                                sceneView: sceneView)
+                let postSSRPass = makeLoadedRenderPassDescriptor(colorTexture: colorTexture,
+                                                                 depthTexture: descriptor.depthAttachment.texture)
+                guard let postSSREncoder = commandBuffer.makeRenderCommandEncoder(descriptor: postSSRPass) else {
+                    return
+                }
+                encoder = postSSREncoder
+                encoder.label = "Q3.render.postSSR"
+                encoder.setViewport(MTLViewport(originX: 0, originY: 0,
+                                                width: Double(renderW),
+                                                height: Double(renderH),
+                                                znear: 0.0,
+                                                zfar: 1.0))
+                encoder.setScissorRect(MTLScissorRect(x: 0, y: 0, width: renderW, height: renderH))
+            }
+
+
             /* RT world composite must happen before raster entities/HUD.
              * The trace replaces/blends only the already-rendered world color;
              * subsequent entity, flare, sub-scene, and UI passes draw over it.
@@ -8849,7 +10126,9 @@ struct MetalView: UIViewRepresentable {
                let sceneView = Q3MetalRenderer_GetSceneView()?.pointee,
                let entityVertexBuffer = uploadEntityBuffers(device: view.device),
                let entityIndexBuffer {
-                let entityViewProjection = makeWorldViewProjection(sceneView)
+                let entityViewProjection = makeWorldViewProjection(sceneView,
+                                                                   jitterPixels: temporalCurrentJitterPixels,
+                                                                   renderSize: temporalRenderSize)
                 let cameraPos = SIMD3<Float>(sceneView.viewOrigin.0, sceneView.viewOrigin.1, sceneView.viewOrigin.2)
                 let cameraForward = SIMD3<Float>(sceneView.viewAxis.0, sceneView.viewAxis.1, sceneView.viewAxis.2)
                 let entityTimeSeconds = Float(CACurrentMediaTime() - frameTimeOrigin)
@@ -9338,7 +10617,9 @@ struct MetalView: UIViewRepresentable {
                     encoder: encoder,
                     sceneView: sceneView,
                     snapshot: snapshot,
-                    device: view.device)
+                    device: view.device,
+                    jitterPixels: temporalCurrentJitterPixels,
+                    renderSize: temporalRenderSize)
             }
 
             if let sceneView = mainSceneViewForLatePasses,
@@ -9445,14 +10726,14 @@ struct MetalView: UIViewRepresentable {
                         let draw = allEntityDraws[drawIdx]
                         guard draw.indexCount > 0 else { continue }
                         guard let texture = texture(for: draw.textureHandle, device: view.device) else { continue }
-                        // PBR Phase 1 — entity sub-pass (HUD heads,
-                        // ammo rotations, scoreboard portraits). Keep classic
-                        // fallback here; PBR-only diagnostics are for 3D world/main
-                        // entity surfaces, not HUD/UI overlays.
+                        // HUD/scoreboard sub-scenes must stay in the classic
+                        // Q3 texture path. Remix/PBR name matches are valid
+                        // for 3D world/material draws, but applying them here
+                        // can replace menu portraits/ammo icons with unrelated
+                        // capture materials.
                         let q3Name = Q3MetalRenderer_GetTextureName(draw.textureHandle).map { String(cString: $0) } ?? "unknown"
                         let preferClassicFX = shouldPreferClassicTextureForAlphaFX(q3Name, isEntity: true)
-                        let pbrTex = preferClassicFX ? nil : pbrAlbedoTexture(for: draw.textureHandle)
-                        encoder.setFragmentTexture(pbrTex ?? texture, index: 0)
+                        encoder.setFragmentTexture(texture, index: 0)
                         // PBR Phase 2 — bind normal map to slot 1 if the
                         // material ships one. Nil bind leaves the slot
                         // unbound; q3_entity_fragment uses is_null_texture
@@ -9519,7 +10800,48 @@ struct MetalView: UIViewRepresentable {
                 _ = encodeMainFlarePass(encoder: encoder,
                                         sceneView: sceneView,
                                         snapshot: snapshot,
-                                        device: view.device)
+                                        device: view.device,
+                                        jitterPixels: temporalCurrentJitterPixels,
+                                        renderSize: temporalRenderSize)
+            }
+
+            if upscaleActive {
+                encoder.endEncoding()
+                if let colorRT = (rtCompositeForUpscale ?? upscaleColorTarget) {
+                    let resetTemporal = temporalHistoryResetPending || mainSceneViewProjectionForUpscale == nil
+                    encodeUpscaleToDrawable(commandBuffer: commandBuffer,
+                                            color: colorRT,
+                                            depth: upscaleDepthTarget ?? descriptor.depthAttachment.texture,
+                                            motion: motionVectorTexture,
+                                            output: drawable.texture,
+                                            currentViewProjection: mainSceneViewProjectionForUpscale,
+                                            reset: resetTemporal)
+                }
+
+                let uiPass = MTLRenderPassDescriptor()
+                uiPass.colorAttachments[0].texture = drawable.texture
+                uiPass.colorAttachments[0].loadAction = .load
+                uiPass.colorAttachments[0].storeAction = .store
+                if let drawableDepthTexture {
+                    uiPass.depthAttachment.texture = drawableDepthTexture
+                    uiPass.depthAttachment.loadAction = .clear
+                    uiPass.depthAttachment.storeAction = .dontCare
+                    uiPass.depthAttachment.clearDepth = 1.0
+                }
+                guard let uiEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: uiPass) else {
+                    return
+                }
+                encoder = uiEncoder
+                encoder.label = "Q3.render.nativeHUD"
+                encoder.setViewport(MTLViewport(originX: 0,
+                                                originY: 0,
+                                                width: Double(outputW),
+                                                height: Double(outputH),
+                                                znear: 0.0,
+                                                zfar: 1.0))
+                encoder.setScissorRect(MTLScissorRect(x: 0, y: 0,
+                                                       width: max(outputW, 1),
+                                                       height: max(outputH, 1)))
             }
 
             let vertexCount = Int(snapshot.vertexCount)
@@ -9562,11 +10884,12 @@ struct MetalView: UIViewRepresentable {
                             encoder.setRenderPipelineState(pipeline)
                         }
                         if let texture = texture(for: draw.textureHandle, device: view.device) {
-                            // PBR Phase 1 — final fallback / overlay path. Keep classic
-                            // fallback for UI overlays; PBR-only diagnostics are for
-                            // 3D world/main entity surfaces.
-                            let pbrTex = pbrAlbedoTexture(for: draw.textureHandle)
-                            encoder.setFragmentTexture(pbrTex ?? texture, index: 0)
+                            // Native HUD/UI overlay: always bind the original
+                            // Q3 texture. PBR material lookup is intentionally
+                            // skipped here; loading/menu icons can hash/name
+                            // match RTX capture materials that are unrelated
+                            // to the shipped 2D art.
+                            encoder.setFragmentTexture(texture, index: 0)
                             encoder.drawPrimitives(type: .triangle, vertexStart: Int(draw.firstVertex), vertexCount: Int(draw.vertexCount))
                         }
                     }
@@ -9575,11 +10898,7 @@ struct MetalView: UIViewRepresentable {
 
             encoder.endEncoding()
 
-            if upscaleActive, let colorRT = (rtCompositeForUpscale ?? upscaleColorTarget) {
-                encodeSpatialUpscale(commandBuffer: commandBuffer,
-                                     source: colorRT,
-                                     output: drawable.texture)
-            }
+            // Offscreen scene upscale is encoded before the native HUD/UI pass.
 
             // Final-image postprocess tone curve (port of Q2 MetalPostprocess).
             // Compute kernel does saturate(rgb*intensity); pow(rgb, gamma).
@@ -9596,6 +10915,7 @@ struct MetalView: UIViewRepresentable {
             let tex = drawable.texture
             commandBuffer.present(drawable)
             commandBuffer.commit()
+            noteGPUTraceCommandBufferCommitted()
 
             // Video/debug capture: when the engine is recording an AVI, read
             // the just-rendered drawable back to CPU and stash the BGRA
@@ -9642,6 +10962,12 @@ struct MetalView: UIViewRepresentable {
         private var debugCaptureStartFrame: UInt32 = 120
         private var debugCaptureStride: UInt32 = 60
         private var debugCaptureLastFrame: UInt32?
+        private var gpuTraceCaptureConfigured = false
+        private var gpuTraceCaptureRequestedFrames = 0
+        private var gpuTraceCaptureRemainingFrames = 0
+        private var gpuTraceCaptureStartFrame: UInt32 = 240
+        private var gpuTraceCaptureActive = false
+        private var gpuTraceCaptureOutputURL: URL?
 
         private func configureDebugFrameCaptureIfNeeded() {
             guard !debugCaptureConfigured else { return }
@@ -9705,6 +11031,83 @@ struct MetalView: UIViewRepresentable {
             }
         }
 
+        private func configureGPUTraceCaptureIfNeeded() {
+            guard !gpuTraceCaptureConfigured else { return }
+            gpuTraceCaptureConfigured = true
+            let env = ProcessInfo.processInfo.environment
+            let requested = Int(env["Q3_GPU_CAPTURE_FRAMES"] ?? "0") ?? 0
+            guard requested > 0 else { return }
+
+            let fileName = env["Q3_GPU_CAPTURE_NAME"].flatMap { raw -> String? in
+                let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            } ?? "q3_gpu_capture_\(Int(Date().timeIntervalSince1970)).gputrace"
+
+            let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+            guard let docs else {
+                print("[Q3-GPUTRACE] disabled: Documents directory unavailable")
+                pbrLog("[Q3-GPUTRACE] disabled: Documents directory unavailable")
+                return
+            }
+            gpuTraceCaptureOutputURL = docs.appendingPathComponent(fileName)
+            gpuTraceCaptureRequestedFrames = requested
+            gpuTraceCaptureRemainingFrames = requested
+            gpuTraceCaptureStartFrame = UInt32(max(0, Int(env["Q3_GPU_CAPTURE_START_FRAME"] ?? "240") ?? 240))
+        }
+
+        private func startGPUTraceCaptureIfNeeded(commandQueue: MTLCommandQueue) {
+            configureGPUTraceCaptureIfNeeded()
+            guard gpuTraceCaptureRemainingFrames > 0,
+                  debugFrameCounter >= gpuTraceCaptureStartFrame,
+                  !gpuTraceCaptureActive,
+                  let outputURL = gpuTraceCaptureOutputURL else { return }
+
+            let manager = MTLCaptureManager.shared()
+            guard manager.supportsDestination(.gpuTraceDocument) else {
+                gpuTraceCaptureRemainingFrames = 0
+                let msg = "[Q3-GPUTRACE] disabled: GPUTraceDocument destination unsupported"
+                print(msg)
+                pbrLog(msg)
+                return
+            }
+
+            do {
+                try FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(),
+                                                        withIntermediateDirectories: true)
+                if FileManager.default.fileExists(atPath: outputURL.path) {
+                    try FileManager.default.removeItem(at: outputURL)
+                }
+
+                let descriptor = MTLCaptureDescriptor()
+                descriptor.captureObject = commandQueue
+                descriptor.destination = .gpuTraceDocument
+                descriptor.outputURL = outputURL
+                try manager.startCapture(with: descriptor)
+                gpuTraceCaptureActive = true
+                let msg = "[Q3-GPUTRACE] started frame=\(debugFrameCounter) frames=\(gpuTraceCaptureRequestedFrames) output=\(outputURL.path)"
+                print(msg)
+                pbrLog(msg)
+            } catch {
+                gpuTraceCaptureRemainingFrames = 0
+                let msg = "[Q3-GPUTRACE] start failed output=\(outputURL.path) error=\(error)"
+                print(msg)
+                pbrLog(msg)
+            }
+        }
+
+        private func noteGPUTraceCommandBufferCommitted() {
+            guard gpuTraceCaptureActive else { return }
+            gpuTraceCaptureRemainingFrames -= 1
+            guard gpuTraceCaptureRemainingFrames <= 0 else { return }
+
+            MTLCaptureManager.shared().stopCapture()
+            gpuTraceCaptureActive = false
+            let path = gpuTraceCaptureOutputURL?.path ?? "(unknown)"
+            let msg = "[Q3-GPUTRACE] stopped output=\(path)"
+            print(msg)
+            pbrLog(msg)
+        }
+
         @MainActor
         private func configureRenderer(for view: MTKView) {
             guard let device = view.device else { return }
@@ -9727,6 +11130,9 @@ struct MetalView: UIViewRepresentable {
             view.framebufferOnly = false
 
             commandQueue = device.makeCommandQueue()
+
+            let scenePipelinePixelFormat: MTLPixelFormat = wantsUpscaleOffscreen ? sceneUpscalePixelFormat : view.colorPixelFormat
+            print("[Q3-METALFX] backendPreference=\(metalFXBackendPreference.rawValue) quality=\(upscaleQuality.rawValue) scenePipelineFormat=\(scenePipelinePixelFormat)")
 
             let library: MTLLibrary
             do {
@@ -9838,7 +11244,7 @@ struct MetalView: UIViewRepresentable {
             }
 
             let worldPipelineDescriptor = MTLRenderPipelineDescriptor()
-            worldPipelineDescriptor.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            worldPipelineDescriptor.colorAttachments[0].pixelFormat = scenePipelinePixelFormat
             worldPipelineDescriptor.depthAttachmentPixelFormat = view.depthStencilPixelFormat
             worldPipelineDescriptor.vertexFunction = library.makeFunction(name: "q3_world_vertex")
             worldPipelineDescriptor.fragmentFunction = library.makeFunction(name: "q3_world_fragment")
@@ -9866,6 +11272,8 @@ struct MetalView: UIViewRepresentable {
             Self.configureBlend(worldFilterPipelineDescriptor.colorAttachments[0],
                                 src: Q3GLBlendFactor.dstColor.rawValue,
                                 dst: Q3GLBlendFactor.zero.rawValue)
+            worldFilterPipelineDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .zero
+            worldFilterPipelineDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .one
             worldFilterPipelineDescriptor.label = "Q3.world.filter"
             do {
                 worldFilterPipelineState = try device.makeRenderPipelineState(descriptor: worldFilterPipelineDescriptor)
@@ -9877,6 +11285,8 @@ struct MetalView: UIViewRepresentable {
             Self.configureBlend(worldAlphaPipelineDescriptor.colorAttachments[0],
                                 src: Q3GLBlendFactor.srcAlpha.rawValue,
                                 dst: Q3GLBlendFactor.oneMinusSrcAlpha.rawValue)
+            worldAlphaPipelineDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .zero
+            worldAlphaPipelineDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .one
             worldAlphaPipelineDescriptor.label = "Q3.world.alpha"
             do {
                 worldAlphaPipelineState = try device.makeRenderPipelineState(descriptor: worldAlphaPipelineDescriptor)
@@ -9885,7 +11295,7 @@ struct MetalView: UIViewRepresentable {
             }
 
             let fogVolumePipelineDescriptor = MTLRenderPipelineDescriptor()
-            fogVolumePipelineDescriptor.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            fogVolumePipelineDescriptor.colorAttachments[0].pixelFormat = scenePipelinePixelFormat
             /* The ray-box fog pass samples the scene depth texture but does
              * not bind a depth attachment.  Leaving a depth pixel format here
              * trips Metal validation on Simulator/debug devices:
@@ -9913,6 +11323,8 @@ struct MetalView: UIViewRepresentable {
             Self.configureBlend(worldAdditivePipelineDescriptor.colorAttachments[0],
                                 src: Q3GLBlendFactor.srcAlpha.rawValue,
                                 dst: Q3GLBlendFactor.one.rawValue)
+            worldAdditivePipelineDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .zero
+            worldAdditivePipelineDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .one
             worldAdditivePipelineDescriptor.label = "Q3.world.additive"
             do {
                 worldAdditivePipelineState = try device.makeRenderPipelineState(descriptor: worldAdditivePipelineDescriptor)
@@ -9926,6 +11338,8 @@ struct MetalView: UIViewRepresentable {
             Self.configureBlend(worldAdditiveFullDescriptor.colorAttachments[0],
                                 src: Q3GLBlendFactor.one.rawValue,
                                 dst: Q3GLBlendFactor.one.rawValue)
+            worldAdditiveFullDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .zero
+            worldAdditiveFullDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .one
             worldAdditiveFullDescriptor.label = "Q3.world.additiveFull"
             do {
                 worldAdditiveFullPipelineState = try device.makeRenderPipelineState(descriptor: worldAdditiveFullDescriptor)
@@ -9938,7 +11352,7 @@ struct MetalView: UIViewRepresentable {
             // draws over sky it occludes correctly — but sky vertex shader
             // pushes z=w so sky is always at the far plane).
             let skyPipelineDescriptor = MTLRenderPipelineDescriptor()
-            skyPipelineDescriptor.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            skyPipelineDescriptor.colorAttachments[0].pixelFormat = scenePipelinePixelFormat
             skyPipelineDescriptor.depthAttachmentPixelFormat = view.depthStencilPixelFormat
             skyPipelineDescriptor.vertexFunction = library.makeFunction(name: "q3_sky_vertex")
             skyPipelineDescriptor.fragmentFunction = library.makeFunction(name: "q3_sky_fragment")
@@ -9981,7 +11395,7 @@ struct MetalView: UIViewRepresentable {
             skyDepthStencilState = device.makeDepthStencilState(descriptor: skyDepthDescriptor)
 
             let entityPipelineDescriptor = MTLRenderPipelineDescriptor()
-            entityPipelineDescriptor.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            entityPipelineDescriptor.colorAttachments[0].pixelFormat = scenePipelinePixelFormat
             entityPipelineDescriptor.depthAttachmentPixelFormat = view.depthStencilPixelFormat
             entityPipelineDescriptor.vertexFunction = library.makeFunction(name: "q3_entity_vertex")
             entityPipelineDescriptor.fragmentFunction = library.makeFunction(name: "q3_entity_fragment")
@@ -9998,7 +11412,7 @@ struct MetalView: UIViewRepresentable {
              * attenuates the added colour so transparent texels don't
              * brighten the framebuffer. */
             let entityAdditiveDesc = MTLRenderPipelineDescriptor()
-            entityAdditiveDesc.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            entityAdditiveDesc.colorAttachments[0].pixelFormat = scenePipelinePixelFormat
             entityAdditiveDesc.colorAttachments[0].isBlendingEnabled = true
             entityAdditiveDesc.colorAttachments[0].writeMask = .all
             entityAdditiveDesc.colorAttachments[0].rgbBlendOperation = .add
@@ -10024,7 +11438,7 @@ struct MetalView: UIViewRepresentable {
              * the alpha-modulated additive pipeline above per task spec:
              * "NO FALLBACK / NO MERGE / NO SHARING". */
             let entityAdditiveFullDesc = MTLRenderPipelineDescriptor()
-            entityAdditiveFullDesc.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            entityAdditiveFullDesc.colorAttachments[0].pixelFormat = scenePipelinePixelFormat
             entityAdditiveFullDesc.colorAttachments[0].isBlendingEnabled = true
             entityAdditiveFullDesc.colorAttachments[0].writeMask = .all
             entityAdditiveFullDesc.colorAttachments[0].rgbBlendOperation = .add
@@ -10044,7 +11458,7 @@ struct MetalView: UIViewRepresentable {
             }
 
             let entityAlphaDesc = MTLRenderPipelineDescriptor()
-            entityAlphaDesc.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            entityAlphaDesc.colorAttachments[0].pixelFormat = scenePipelinePixelFormat
             entityAlphaDesc.colorAttachments[0].isBlendingEnabled = true
             entityAlphaDesc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
             entityAlphaDesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
@@ -10061,7 +11475,7 @@ struct MetalView: UIViewRepresentable {
             }
 
             let entityFilterDesc = MTLRenderPipelineDescriptor()
-            entityFilterDesc.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            entityFilterDesc.colorAttachments[0].pixelFormat = scenePipelinePixelFormat
             entityFilterDesc.colorAttachments[0].isBlendingEnabled = true
             entityFilterDesc.colorAttachments[0].writeMask = .all
             entityFilterDesc.colorAttachments[0].rgbBlendOperation = .add
@@ -10087,7 +11501,7 @@ struct MetalView: UIViewRepresentable {
             // falling through to additive which made them invisible
             // against lit stone/metal surfaces.
             let entitySubtractDesc = MTLRenderPipelineDescriptor()
-            entitySubtractDesc.colorAttachments[0].pixelFormat = view.colorPixelFormat
+            entitySubtractDesc.colorAttachments[0].pixelFormat = scenePipelinePixelFormat
             entitySubtractDesc.colorAttachments[0].isBlendingEnabled = true
             entitySubtractDesc.colorAttachments[0].writeMask = .all
             entitySubtractDesc.colorAttachments[0].rgbBlendOperation = .add
@@ -10313,6 +11727,8 @@ struct MetalView: UIViewRepresentable {
             textureCache.removeAll(keepingCapacity: false)
             rtASVertexBuffer = nil
             rtASIndexBuffer = nil
+            rtASCompactDrawFirstTri.removeAll(keepingCapacity: false)
+            rtASPrimitiveCount = 0
             return worldVertexBuffer
         }
 
@@ -10481,11 +11897,33 @@ struct MetalView: UIViewRepresentable {
             return tex
         }
 
+        private func ensureSunShadowDummyTexture(device: MTLDevice) -> MTLTexture? {
+            if let tex = sunShadowDummyTexture { return tex }
+            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float,
+                                                                width: 1,
+                                                                height: 1,
+                                                                mipmapped: false)
+            desc.usage = .shaderRead
+            desc.storageMode = .shared
+            guard let tex = device.makeTexture(descriptor: desc) else { return nil }
+            var one: Float = 1.0
+            withUnsafeBytes(of: &one) { bytes in
+                tex.replace(region: MTLRegionMake2D(0, 0, 1, 1),
+                            mipmapLevel: 0,
+                            withBytes: bytes.baseAddress!,
+                            bytesPerRow: 4)
+            }
+            tex.label = "Q3.sun.shadow.depth.dummy"
+            sunShadowDummyTexture = tex
+            return tex
+        }
+
         private func encodeSunShadowMap(commandBuffer: MTLCommandBuffer,
                                         device: MTLDevice,
                                         snapshot: Q3MetalFrameSnapshot,
                                         sceneView: Q3MetalSceneView) -> (texture: MTLTexture, matrix: simd_float4x4)? {
             guard Q3_PBRSunShadows() != 0,
+                  Q3_RTMix() <= 0.001,
                   snapshot.worldCommandCount > 0,
                   let pipeline = sunShadowPipelineState,
                   let depthState = sunShadowDepthStencilState,
@@ -10604,7 +12042,7 @@ struct MetalView: UIViewRepresentable {
             enc.endEncoding()
             let mapKey = rtLightMapName.isEmpty ? "<unknown>" : rtLightMapName
             if sunShadowLoggedMaps.insert(mapKey).inserted {
-                pbrLog("[Q3-SUNSHADOW] map='\(mapKey)' size=\(shadowTexture.width)x\(shadowTexture.height) casters=\(castDraws) sunDir=(\(sunDir.x),\(sunDir.y),\(sunDir.z))")
+                pbrLog("[Q3-SUNSHADOW] map='\(mapKey)' size=\(shadowTexture.width)x\(shadowTexture.height) casters=\(castDraws) pcf=\(Q3_PBRShadowPCFRadius()) sunDir=(\(sunDir.x),\(sunDir.y),\(sunDir.z))")
             }
             return (shadowTexture, shadowMatrix)
         }
@@ -10619,7 +12057,9 @@ struct MetalView: UIViewRepresentable {
         private func encodeMainFlarePass(encoder: MTLRenderCommandEncoder,
                                          sceneView: Q3MetalSceneView,
                                          snapshot: Q3MetalFrameSnapshot,
-                                         device: MTLDevice?) -> Bool {
+                                         device: MTLDevice?,
+                                         jitterPixels: SIMD2<Float> = SIMD2<Float>(0, 0),
+                                         renderSize: SIMD2<Float>? = nil) -> Bool {
             guard Q3MetalRenderer_GetFlareCount() > 0,
                   Q3MetalRenderer_GetFlareTextureHandle() != 0,
                   let flarePipeline = entityAdditivePipelineState,
@@ -10628,7 +12068,9 @@ struct MetalView: UIViewRepresentable {
                 return false
             }
 
-            let flareViewProjection = makeWorldViewProjection(sceneView)
+            let flareViewProjection = makeWorldViewProjection(sceneView,
+                                                             jitterPixels: jitterPixels,
+                                                             renderSize: renderSize)
             var flareUniforms = EntityUniforms(viewProjection: flareViewProjection)
             flareUniforms.cameraPos = SIMD3<Float>(sceneView.viewOrigin.0,
                                                    sceneView.viewOrigin.1,
@@ -10736,7 +12178,9 @@ struct MetalView: UIViewRepresentable {
             )
         }
 
-        private func makeWorldViewProjection(_ sceneView: Q3MetalSceneView) -> simd_float4x4 {
+        private func makeWorldViewProjection(_ sceneView: Q3MetalSceneView,
+                                             jitterPixels: SIMD2<Float> = SIMD2<Float>(0, 0),
+                                             renderSize: SIMD2<Float>? = nil) -> simd_float4x4 {
             let origin = SIMD3<Float>(sceneView.viewOrigin.0, sceneView.viewOrigin.1, sceneView.viewOrigin.2)
             let axis0 = SIMD3<Float>(sceneView.viewAxis.0, sceneView.viewAxis.1, sceneView.viewAxis.2)
             let axis1 = SIMD3<Float>(sceneView.viewAxis.3, sceneView.viewAxis.4, sceneView.viewAxis.5)
@@ -10777,7 +12221,26 @@ struct MetalView: UIViewRepresentable {
                 SIMD4<Float>(0, 0, 0.5, 1)
             ))
 
-            return openGLToMetalClip * quakeProjection * flip * viewer
+            var viewProjection = openGLToMetalClip * quakeProjection * flip * viewer
+            if let renderSize,
+               renderSize.x > 0,
+               renderSize.y > 0,
+               (jitterPixels.x != 0 || jitterPixels.y != 0) {
+                let jitterNDC = SIMD2<Float>(2.0 * jitterPixels.x / renderSize.x,
+                                             -2.0 * jitterPixels.y / renderSize.y)
+                // Add jitter after perspective by applying it to clip.xy as
+                // jitterNDC * clip.w. Matrix columns are column-major, so add
+                // the existing w row into the x/y rows.
+                viewProjection.columns.0.x += jitterNDC.x * viewProjection.columns.0.w
+                viewProjection.columns.1.x += jitterNDC.x * viewProjection.columns.1.w
+                viewProjection.columns.2.x += jitterNDC.x * viewProjection.columns.2.w
+                viewProjection.columns.3.x += jitterNDC.x * viewProjection.columns.3.w
+                viewProjection.columns.0.y += jitterNDC.y * viewProjection.columns.0.w
+                viewProjection.columns.1.y += jitterNDC.y * viewProjection.columns.1.w
+                viewProjection.columns.2.y += jitterNDC.y * viewProjection.columns.2.w
+                viewProjection.columns.3.y += jitterNDC.y * viewProjection.columns.3.w
+            }
+            return viewProjection
         }
 
         private func formatVector(_ vector: SIMD3<Float>) -> String {

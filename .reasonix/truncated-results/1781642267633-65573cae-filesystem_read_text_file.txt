@@ -1,0 +1,560 @@
+Q3_METAL_ENTITY_DRAWFLAG_NOCULL,
+                                              qfalse);
+                    EmitMetalEntityStageAuditForHandle(
+                        (qhandle_t)sceneEntity->entity.customShader,
+                        "rail_rings");
+                    SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity,
+                                       (qhandle_t)sceneEntity->entity.customShader);
+                    entityDrawCursor += 1;
+                    continue;
+                }
+
+                model = FindModelByHandle(sceneEntity->entity.hModel);
+                if (MetalInlineBrushModelValid(model)) {
+                    MetalEmitInlineBrushModel(sceneEntity, model,
+                                              &entityVertexCursor,
+                                              &entityIndexCursor,
+                                              &entityDrawCursor);
+                    continue;
+                }
+                if (model == NULL || model->md3 == NULL) {
+                    continue;
+                }
+
+                /* Q3 renderfx visibility filtering.
+                 * RF_THIRD_PERSON: body parts of local player — skip in
+                 *   first-person view (render only in mirrors / third-
+                 *   person cameras). Fixes "looking down shows own body".
+                 * No need for RF_FIRST_PERSON whitelist: stock cgame
+                 *   flags the viewmodel with RF_FIRST_PERSON|RF_DEPTHHACK;
+                 *   we already handle DEPTHHACK and we want it to render
+                 *   in our (first-person) view so don't skip it. */
+                if (sceneEntity->entity.renderfx & RF_THIRD_PERSON) {
+                    continue;
+                }
+
+                header = model->md3;
+                frameIndex = sceneEntity->entity.frame;
+                oldFrameIndex = sceneEntity->entity.oldframe;
+                if (header->numFrames <= 0) {
+                    continue;
+                }
+                if (frameIndex < 0 || frameIndex >= header->numFrames) {
+                    frameIndex = 0;
+                }
+                if (oldFrameIndex < 0 || oldFrameIndex >= header->numFrames) {
+                    oldFrameIndex = frameIndex;
+                }
+
+                backlerp = sceneEntity->entity.backlerp;
+                if (backlerp < 0.0f) {
+                    backlerp = 0.0f;
+                } else if (backlerp > 1.0f) {
+                    backlerp = 1.0f;
+                }
+                frontlerp = 1.0f - backlerp;
+
+                if (sceneEntity->entity.shader.rgba[3] == 0) {
+                    entityColor[0] = 1.0f;
+                    entityColor[1] = 1.0f;
+                    entityColor[2] = 1.0f;
+                    entityColor[3] = 1.0f;
+                } else {
+                    entityColor[0] = (float)sceneEntity->entity.shader.rgba[0] / 255.0f;
+                    entityColor[1] = (float)sceneEntity->entity.shader.rgba[1] / 255.0f;
+                    entityColor[2] = (float)sceneEntity->entity.shader.rgba[2] / 255.0f;
+                    entityColor[3] = (float)sceneEntity->entity.shader.rgba[3] / 255.0f;
+                }
+
+                /* Sample BSP lightgrid at the entity's lighting origin.
+                 * Ambient + directed are 0..1; lightDir is a unit vec.
+                 * Applied per-vertex in the inner loop as Lambert diffuse. */
+                vec3_t entityAmbient, entityDirected, entityLightDir;
+                SetupEntityLighting(&sceneEntity->entity, entityAmbient, entityDirected, entityLightDir);
+
+                /* Use the entity transform as submitted by cgame. */
+                VectorCopy(sceneEntity->entity.origin, effectiveOrigin);
+                VectorCopy(sceneEntity->entity.axis[0], effectiveAxis[0]);
+                VectorCopy(sceneEntity->entity.axis[1], effectiveAxis[1]);
+                VectorCopy(sceneEntity->entity.axis[2], effectiveAxis[2]);
+
+                surface = (const md3Surface_t *)((const byte *)header + header->ofsSurfaces);
+                for (surfaceIndex = 0; surfaceIndex < header->numSurfaces; ++surfaceIndex) {
+                    const md3Triangle_t *triangles = (const md3Triangle_t *)((const byte *)surface + surface->ofsTriangles);
+                    const md3St_t *st = (const md3St_t *)((const byte *)surface + surface->ofsSt);
+                    const md3XyzNormal_t *currentFrameVerts = (const md3XyzNormal_t *)((const byte *)surface + surface->ofsXyzNormals) + frameIndex * surface->numVerts;
+                    const md3XyzNormal_t *oldFrameVerts = (const md3XyzNormal_t *)((const byte *)surface + surface->ofsXyzNormals) + oldFrameIndex * surface->numVerts;
+                    qhandle_t textureHandle = EnsureWhiteTexture();
+                    const char *shaderNameForStages = NULL;
+                    uint32_t drawFlags = Q3_METAL_ENTITY_DRAWFLAG_NOCULL;
+                    uint32_t baseDrawFlags;
+                    uint32_t baseVertex = entityVertexCursor;
+                    uint32_t firstIndex = entityIndexCursor;
+                    int vertexIndex;
+                    int triangleIndex;
+
+                    if (sceneEntity->entity.customShader != 0) {
+                        textureHandle = sceneEntity->entity.customShader;
+                    } else if (sceneEntity->entity.customSkin != 0) {
+                        qhandle_t skinTex = LookupSkinSurfaceTexture(
+                            sceneEntity->entity.customSkin, surface->name);
+                        if (skinTex == (qhandle_t)-1) {
+                            /* Skin explicitly hides this surface. */
+                            surface = (const md3Surface_t *)((const byte *)surface + surface->ofsEnd);
+                            continue;
+                        }
+                        if (skinTex != 0) {
+                            textureHandle = skinTex;
+                        } else if (surface->numShaders > 0) {
+                            const md3Shader_t *shader = (const md3Shader_t *)((const byte *)surface + surface->ofsShaders);
+                            textureHandle = RegisterTexture(shader[0].name);
+                        }
+                    } else if (surface->numShaders > 0) {
+                        const md3Shader_t *shader = (const md3Shader_t *)((const byte *)surface + surface->ofsShaders);
+                        int shaderSlot = sceneEntity->entity.skinNum % surface->numShaders;
+                        if (shaderSlot < 0) {
+                            shaderSlot = 0;
+                        }
+                        shaderNameForStages = shader[shaderSlot].name;
+                        textureHandle = RegisterTexture(shader[shaderSlot].name);
+                    }
+
+                    if (sceneEntity->entity.renderfx & RF_DEPTHHACK) {
+                        drawFlags |= Q3_METAL_ENTITY_DRAWFLAG_DEPTHHACK;
+                    }
+                    baseDrawFlags = drawFlags;
+                    qboolean surfaceExplicitIdentityFullbright =
+                        EntityTextureWantsExplicitIdentityFullbright(textureHandle, shaderNameForStages);
+                    {
+                        drawFlags = EntityFlagsForTexture(textureHandle, drawFlags, qtrue);
+                        if (surfaceExplicitIdentityFullbright) {
+                            EmitEntityFullbrightAudit(shaderNameForStages, textureHandle);
+                        }
+                        /* === [QUAD-EMIT] runtime trace for chrome-shell draws ===
+                         * When the entity uses a customShader whose texture name
+                         * contains "quad" (powerups/quadWeapon for the viewmodel
+                         * chrome shell), log everything the entity draw cmd will
+                         * carry so we can diff what cgame emitted vs what reached
+                         * the Swift entity loop. Logged to the same Documents/
+                         * baseq3/metalshader.log file as [METAL-SHADER] dumps so
+                         * one devicectl pull captures both. */
+                        if (sceneEntity->entity.customShader != 0) {
+                            const metalTexture_t *tex = FindTextureByHandle(textureHandle);
+                            const char *texName = (tex != NULL) ? tex->name : "(no-tex)";
+                            if (Q_stristr(texName, "quad") || Q_stristr(texName, "powerup") ||
+                                Q_stristr(texName, "battle") || Q_stristr(texName, "regen")) {
+                                static FILE *s_quadEmitFP = NULL;
+                                if (s_quadEmitFP == NULL) {
+                                    const char *home = getenv("HOME");
+                                    if (home != NULL && home[0]) {
+                                        char path[1024];
+                                        Com_sprintf(path, sizeof(path),
+                                                    "%s/Documents/baseq3/metalshader.log", home);
+                                        s_quadEmitFP = fopen(path, "a");
+                                    }
+                                }
+                                if (s_quadEmitFP != NULL) {
+                                    static int s_quadEmitCount = 0;
+                                    if (s_quadEmitCount < 20) {
+                                        fprintf(s_quadEmitFP,
+                                            "[QUAD-EMIT] tex='%s' handle=%u customShader=%d "
+                                            "blendMode=%d tcModCount=%d "
+                                            "tcGenEnv=%d deformWaveFunc=%d deformWaveBase=%.3f "
+                                            "baseFlags=0x%x finalFlags=0x%x renderfx=0x%x\n",
+                                            texName, textureHandle, sceneEntity->entity.customShader,
+                                            tex ? tex->blendMode : -1,
+                                            tex ? (int)tex->tcModCount : -1,
+                                            tex ? tex->tcGenEnv : -1,
+                                            tex ? (int)tex->deformWaveFunc : -1,
+                                            tex ? tex->deformWaveBase : 0.0f,
+                                            baseDrawFlags, drawFlags,
+                                            sceneEntity->entity.renderfx);
+                                        fflush(s_quadEmitFP);
+                                        s_quadEmitCount++;
+                                    }
+                                }
+                            }
+                        }
+                        /* === end [QUAD-EMIT] runtime trace ====================== */
+                        if (shaderNameForStages != NULL) {
+                            EmitMetalEntityStageAudit(shaderNameForStages, "model");
+                        } else {
+                            EmitMetalEntityStageAuditForHandle(textureHandle, "model");
+                        }
+                        if (MetalVerboseAuditEnabled() && MetalRenderAuditEnabled()) {
+                            const metalTexture_t *tex = FindTextureByHandle(textureHandle);
+                            static int s_entityBlendLog = 0;
+                            if (s_entityBlendLog < 5 && tex != NULL) {
+                                ri.Printf(PRINT_DEVELOPER, "Metal entity blend: tex='%s' bm=%d flags=0x%x\n",
+                                          tex->name, tex->blendMode, drawFlags);
+                                s_entityBlendLog++;
+                            }
+                        }
+                    }
+
+                    for (vertexIndex = 0; vertexIndex < surface->numVerts; ++vertexIndex) {
+                        vec3_t localPosition;
+                        vec3_t worldPosition;
+                        const md3XyzNormal_t *currentVertex = &currentFrameVerts[vertexIndex];
+                        const md3XyzNormal_t *oldVertex = &oldFrameVerts[vertexIndex];
+                        Q3MetalEntityVertex *outVertex = &s_entityVertices[entityVertexCursor++];
+
+                        localPosition[0] = (frontlerp * currentVertex->xyz[0] + backlerp * oldVertex->xyz[0]) * MD3_XYZ_SCALE;
+                        localPosition[1] = (frontlerp * currentVertex->xyz[1] + backlerp * oldVertex->xyz[1]) * MD3_XYZ_SCALE;
+                        localPosition[2] = (frontlerp * currentVertex->xyz[2] + backlerp * oldVertex->xyz[2]) * MD3_XYZ_SCALE;
+
+                        worldPosition[0] = effectiveOrigin[0]
+                            + effectiveAxis[0][0] * localPosition[0]
+                            + effectiveAxis[1][0] * localPosition[1]
+                            + effectiveAxis[2][0] * localPosition[2];
+                        worldPosition[1] = effectiveOrigin[1]
+                            + effectiveAxis[0][1] * localPosition[0]
+                            + effectiveAxis[1][1] * localPosition[1]
+                            + effectiveAxis[2][1] * localPosition[2];
+                        worldPosition[2] = effectiveOrigin[2]
+                            + effectiveAxis[0][2] * localPosition[0]
+                            + effectiveAxis[1][2] * localPosition[1]
+                            + effectiveAxis[2][2] * localPosition[2];
+
+                        outVertex->position[0] = worldPosition[0];
+                        outVertex->position[1] = worldPosition[1];
+                        outVertex->position[2] = worldPosition[2];
+                        outVertex->texCoord[0] = st[vertexIndex].st[0];
+                        outVertex->texCoord[1] = st[vertexIndex].st[1];
+
+                        /* Per-vertex Lambert diffuse from BSP lightgrid.
+                         * 1. Decode MD3 lat/long normal (2 bytes packed).
+                         *    `currentVertex->normal` is stored as
+                         *    high=lat, low=long in Q3's short format.
+                         * 2. Rotate to world space by entity axis.
+                         * 3. Lambert: N·L clamped to 0.
+                         * 4. diffuse = ambient + directed * NdotL,
+                         *    modulated by shaderRGBA (entityColor). */
+                        {
+                            int latByte = (currentVertex->normal >> 8) & 0xff;
+                            int lngByte = currentVertex->normal & 0xff;
+                            float latRad = latByte * ((float)M_PI * 2.0f / 255.0f);
+                            float lngRad = lngByte * ((float)M_PI * 2.0f / 255.0f);
+                            vec3_t localN, worldN;
+                            float ndotl, rgb0, rgb1, rgb2;
+
+                            localN[0] = cosf(latRad) * sinf(lngRad);
+                            localN[1] = sinf(latRad) * sinf(lngRad);
+                            localN[2] = cosf(lngRad);
+
+                            worldN[0] = effectiveAxis[0][0] * localN[0]
+                                      + effectiveAxis[1][0] * localN[1]
+                                      + effectiveAxis[2][0] * localN[2];
+                            worldN[1] = effectiveAxis[0][1] * localN[0]
+                                      + effectiveAxis[1][1] * localN[1]
+                                      + effectiveAxis[2][1] * localN[2];
+                            worldN[2] = effectiveAxis[0][2] * localN[0]
+                                      + effectiveAxis[1][2] * localN[1]
+                                      + effectiveAxis[2][2] * localN[2];
+
+                            /* Defensive normalize. localN is unit by
+                             * construction (sin²+cos²=1), but cgame's
+                             * entity.axis can drift out of orthonormality
+                             * over time — the rotated worldN ends up
+                             * slightly >1 or <1 and Lambert's N·L
+                             * produces clamped/bogus values on those
+                             * entities. VectorNormalize returns early
+                             * on zero-length vectors so it's safe. */
+                            VectorNormalize(worldN);
+
+                            /* Pass the normalized world-space normal down
+                             * to the shader so tcGen environment can use
+                             * smooth per-vertex normals instead of flat
+                             * faceted dfdx/dfdy derivatives on quad-shell
+                             * / regen / battlesuit reflections. */
+                            outVertex->normal[0] = worldN[0];
+                            outVertex->normal[1] = worldN[1];
+                            outVertex->normal[2] = worldN[2];
+
+                            ndotl = worldN[0] * entityLightDir[0]
+                                  + worldN[1] * entityLightDir[1]
+                                  + worldN[2] * entityLightDir[2];
+                            if (ndotl < 0.0f) ndotl = 0.0f;
+
+                            if (surfaceExplicitIdentityFullbright) {
+                                rgb0 = entityColor[0];
+                                rgb1 = entityColor[1];
+                                rgb2 = entityColor[2];
+                            } else {
+                                rgb0 = (entityAmbient[0] + entityDirected[0] * ndotl) * entityColor[0];
+                                rgb1 = (entityAmbient[1] + entityDirected[1] * ndotl) * entityColor[1];
+                                rgb2 = (entityAmbient[2] + entityDirected[2] * ndotl) * entityColor[2];
+                                if (rgb0 > 1.0f) rgb0 = 1.0f;
+                                if (rgb1 > 1.0f) rgb1 = 1.0f;
+                                if (rgb2 > 1.0f) rgb2 = 1.0f;
+                            }
+
+                            outVertex->color[0] = rgb0;
+                            outVertex->color[1] = rgb1;
+                            outVertex->color[2] = rgb2;
+                            outVertex->color[3] = entityColor[3];
+                        }
+                    }
+
+                    for (triangleIndex = 0; triangleIndex < surface->numTriangles; ++triangleIndex) {
+                        if (sceneEntity->mirrored) {
+                            s_entityIndices[entityIndexCursor++] = baseVertex + triangles[triangleIndex].indexes[0];
+                            s_entityIndices[entityIndexCursor++] = baseVertex + triangles[triangleIndex].indexes[2];
+                            s_entityIndices[entityIndexCursor++] = baseVertex + triangles[triangleIndex].indexes[1];
+                        } else {
+                            s_entityIndices[entityIndexCursor++] = baseVertex + triangles[triangleIndex].indexes[0];
+                            s_entityIndices[entityIndexCursor++] = baseVertex + triangles[triangleIndex].indexes[1];
+                            s_entityIndices[entityIndexCursor++] = baseVertex + triangles[triangleIndex].indexes[2];
+                        }
+                    }
+
+                    if (shaderNameForStages != NULL &&
+                        EntityPickupStageDrawCount(shaderNameForStages) > 0) {
+                        const metalShaderMap_t *entry = ShaderMap_LookupEntry(shaderNameForStages);
+                        int si;
+                        for (si = 0; entry != NULL && si < entry->stageCount; ++si) {
+                            qhandle_t stageHandle = RegisterEntityStageTexture(shaderNameForStages, si);
+                            if (stageHandle == 0) continue;
+                            s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
+                            s_entityDraws[entityDrawCursor].indexCount = entityIndexCursor - firstIndex;
+                            s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)stageHandle;
+                            s_entityDraws[entityDrawCursor].flags =
+                                EntityFlagsForTexture(stageHandle, baseDrawFlags, qfalse);
+                            SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity, stageHandle);
+                            entityDrawCursor += 1;
+                        }
+                    } else {
+                        s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
+                        s_entityDraws[entityDrawCursor].indexCount = entityIndexCursor - firstIndex;
+                        s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)textureHandle;
+                        s_entityDraws[entityDrawCursor].flags = drawFlags;
+                        SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity, textureHandle);
+                        entityDrawCursor += 1;
+                    }
+
+                    surface = (const md3Surface_t *)((const byte *)surface + surface->ofsEnd);
+                }
+            }
+
+            /* Scene polys: triangle-fan emission. Each poly's vertices
+             * are already in world space. We fan from vertex 0: triangles
+             * (0,1,2), (0,2,3), (0,3,4)... — (numVerts-2) triangles. Blend
+             * follows the shader's blendMode like sprites. Alpha for
+             * transparency (typical for shadow blobs, bullet marks) and
+             * additive for muzzle-flare polys all fall out of the
+             * blendMode lookup on the poly's shader. */
+            {
+                int polyOut;
+                for (polyOut = 0; polyOut < s_scenePolyCount; ++polyOut) {
+                    const metalScenePoly_t *poly = &s_scenePolys[polyOut];
+                    int nv = poly->numVerts;
+                    uint32_t baseVertex;
+                    uint32_t firstIndex;
+                    int vi, ti;
+                    const metalTexture_t *ptex;
+                    uint32_t polyFlags = 0;
+
+                    if (nv < 3) continue;
+                    baseVertex = entityVertexCursor;
+                    firstIndex = entityIndexCursor;
+
+                    for (vi = 0; vi < nv; ++vi) {
+                        const polyVert_t *src = &s_scenePolyVerts[poly->firstVert + vi];
+                        Q3MetalEntityVertex *dst = &s_entityVertices[baseVertex + vi];
+                        dst->position[0] = src->xyz[0];
+                        dst->position[1] = src->xyz[1];
+                        dst->position[2] = src->xyz[2];
+                        dst->texCoord[0] = src->st[0];
+                        dst->texCoord[1] = src->st[1];
+                        dst->color[0] = (float)src->modulate.rgba[0] / 255.0f;
+                        dst->color[1] = (float)src->modulate.rgba[1] / 255.0f;
+                        dst->color[2] = (float)src->modulate.rgba[2] / 255.0f;
+                        dst->color[3] = (float)src->modulate.rgba[3] / 255.0f;
+                        dst->normal[0] = 0.0f;
+                        dst->normal[1] = 0.0f;
+                        dst->normal[2] = 0.0f;
+                    }
+                    for (ti = 0; ti < nv - 2; ++ti) {
+                        s_entityIndices[entityIndexCursor + ti * 3 + 0] = baseVertex;
+                        s_entityIndices[entityIndexCursor + ti * 3 + 1] = baseVertex + ti + 1;
+                        s_entityIndices[entityIndexCursor + ti * 3 + 2] = baseVertex + ti + 2;
+                    }
+
+                    /* Tag scene-poly draws so Swift entity pass can apply
+                     * scene-poly-specific state (no dlight amplification,
+                     * no ndotl lighting — cgame has already computed the
+                     * vertex modulate). No rgbGen/alphaGen overrides:
+                     * the shader's resolved genMode flows through verbatim
+                     * per TASK PART 3 "use EXACT data from cgame." */
+                    polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_SCENE_POLY;
+
+                    ptex = FindTextureByHandle(poly->shader);
+                    if (ptex != NULL) {
+                        if (ptex->blendMode == 1) polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
+                        else if (ptex->blendMode == 2) polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_ALPHA;
+                        else if (ptex->blendMode == 3) polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_FILTER;
+                        else if (ptex->blendMode == 4) polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_SUBTRACT;
+                        else if (ptex->blendMode == 5) polyFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE_FULL;
+                        /* Unresolved blend = upstream default shader = OPAQUE
+                         * (GL_ONE/GL_ZERO). No flag set → opaque pipeline. */
+                    }
+                    EmitMetalEntityStageAuditForHandle((qhandle_t)poly->shader, "poly");
+
+                    /* One-shot audit: log the first time each distinct
+                     * poly shader routes through here. Grep the capture
+                     * log for '[decal-audit]' to confirm blood vs
+                     * bullet-mark vs markShadow land on the expected
+                     * blendMode + drawflag combination. */
+                    {
+                        static qhandle_t s_auditSeen[64];
+                        static int s_auditCount = 0;
+                        qboolean isNew = qtrue;
+                        for (int i = 0; i < s_auditCount; i++) {
+                            if (s_auditSeen[i] == poly->shader) { isNew = qfalse; break; }
+                        }
+                        if (MetalVerboseAuditEnabled() && isNew && s_auditCount < 64) {
+                            s_auditSeen[s_auditCount++] = poly->shader;
+                            ri.Printf(PRINT_ALL,
+                                "[decal-audit] shader=%d name='%s' blendMode=%d rgbGen=%d polyFlags=0x%X\n",
+                                (int)poly->shader,
+                                ptex ? ptex->name : "(no-tex)",
+                                ptex ? (int)ptex->blendMode : -1,
+                                ptex ? (int)ptex->rgbGen    : -1,
+                                (unsigned)polyFlags);
+                        }
+                    }
+
+                    s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
+                    s_entityDraws[entityDrawCursor].indexCount = (uint32_t)((nv - 2) * 3);
+                    s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)poly->shader;
+                    s_entityDraws[entityDrawCursor].flags = polyFlags;
+                    s_entityDraws[entityDrawCursor].fogIndex = poly->fogIndex;
+                    /* Scene polys (RE_AddPolyToScene) carry per-vertex
+                     * polyVert_t.modulate already; rgbGen=entity isn't a
+                     * concept here. Default the per-draw entityColor to
+                     * white so any oneMinusEntity/entity stage on the
+                     * shader returns identity. */
+                    SetEntityDrawColor(entityDrawCursor, NULL, (qhandle_t)poly->shader);
+
+                    entityVertexCursor += (uint32_t)nv;
+                    entityIndexCursor += (uint32_t)((nv - 2) * 3);
+                    entityDrawCursor += 1;
+                }
+            }
+
+            s_entityVertexCount = entityVertexCursor;
+            s_entityIndexCount = entityIndexCursor;
+            s_entityDrawCount = entityDrawCursor;
+        }
+    }
+
+    /* Append the intake lights for this scene to the per-frame light
+     * pool so Swift can bind [lightFirst .. lightFirst+lightCount]
+     * per scene. The intake buffer s_sceneLights resets on next
+     * ClearScene; the per-frame pool does not until RE_BeginFrame. */
+    if (s_sceneLightCount > 0 &&
+        s_frameLightCount + s_sceneLightCount <= Q3_METAL_MAX_LIGHTS * Q3_METAL_MAX_SCENES) {
+        Com_Memcpy(&s_frameLights[s_frameLightCount],
+                   s_sceneLights,
+                   sizeof(Q3MetalLight) * s_sceneLightCount);
+        s_frameLightCount += s_sceneLightCount;
+    }
+
+    /* Push the scene snapshot. Viewport is verbatim from fd — cgame
+     * already called CG_AdjustFrom640 in CG_Draw3DModel to scale into
+     * pixel coords. Swift clamps to drawable bounds. Overflow past
+     * Q3_METAL_MAX_SCENES is a hard drop; log once and move on. */
+    if (s_sceneSnapshotCount < Q3_METAL_MAX_SCENES) {
+        Q3MetalSceneSnapshot *scene = &s_sceneSnapshots[s_sceneSnapshotCount];
+        scene->viewportX = (uint32_t)(fd->x < 0 ? 0 : fd->x);
+        scene->viewportY = (uint32_t)(fd->y < 0 ? 0 : fd->y);
+        scene->viewportWidth = (uint32_t)(fd->width < 0 ? 0 : fd->width);
+        scene->viewportHeight = (uint32_t)(fd->height < 0 ? 0 : fd->height);
+        scene->viewOrigin[0] = vieworg[0];
+        scene->viewOrigin[1] = vieworg[1];
+        scene->viewOrigin[2] = vieworg[2];
+        scene->viewAxis[0] = axis0[0]; scene->viewAxis[1] = axis0[1]; scene->viewAxis[2] = axis0[2];
+        scene->viewAxis[3] = axis1[0]; scene->viewAxis[4] = axis1[1]; scene->viewAxis[5] = axis1[2];
+        scene->viewAxis[6] = axis2[0]; scene->viewAxis[7] = axis2[1]; scene->viewAxis[8] = axis2[2];
+        scene->fovX = fovX;
+        scene->fovY = fovY;
+        scene->rdflags = (uint32_t)fd->rdflags;
+        scene->entityCommandFirst = sceneEntityCommandFirst;
+        scene->entityCommandCount = s_entityDrawCount - sceneEntityCommandFirst;
+        scene->lightFirst = sceneLightFirst;
+        scene->lightCount = s_sceneLightCount;
+        /* clearColor only matters for scene 0; sub-scenes use loadAction=.load */
+        scene->clearColor[0] = s_frameSnapshot.clearColor[0];
+        scene->clearColor[1] = s_frameSnapshot.clearColor[1];
+        scene->clearColor[2] = s_frameSnapshot.clearColor[2];
+        scene->clearColor[3] = s_frameSnapshot.clearColor[3];
+        s_sceneSnapshotCount += 1;
+    }
+
+    s_frameSnapshot.entityVertexCount = s_entityVertexCount;
+    s_frameSnapshot.entityIndexCount = s_entityIndexCount;
+    s_frameSnapshot.entityCommandCount = s_entityDrawCount;
+    s_frameSnapshot.lightCount = s_frameLightCount;
+    s_frameSnapshot.sceneCount = s_sceneSnapshotCount;
+    if (MetalRenderAuditEnabled() && (s_sceneLogCounter % 60) == 0) {
+        uint32_t i;
+        ri.Printf(PRINT_ALL,
+            "Metal scene frame: scenes=%u totalEntCmds=%u totalLights=%u\n",
+            s_sceneSnapshotCount, s_entityDrawCount, s_frameLightCount);
+        for (i = 0; i < s_sceneSnapshotCount; ++i) {
+            const Q3MetalSceneSnapshot *s = &s_sceneSnapshots[i];
+            ri.Printf(PRINT_ALL,
+                "  scene[%u]: rdflags=0x%x viewport=%ux%u@%u,%u fov=%.1fx%.1f ents=%u lights=%u\n",
+                i, s->rdflags, s->viewportWidth, s->viewportHeight,
+                s->viewportX, s->viewportY, s->fovX, s->fovY,
+                s->entityCommandCount, s->lightCount);
+        }
+    }
+}
+
+static void RE_SetColor(const float *rgba) {
+    if (rgba == NULL) {
+        s_currentColor[0] = 1.0f;
+        s_currentColor[1] = 1.0f;
+        s_currentColor[2] = 1.0f;
+        s_currentColor[3] = 1.0f;
+        return;
+    }
+
+    CopyColor(s_currentColor, rgba);
+}
+
+static void RE_StretchPic(float x, float y, float w, float h, float s1, float t1, float s2, float t2, 
+
+[…truncated 59274 chars — raise BridgeOptions.maxResultChars, or call the tool with a narrower scope (filter, head, pagination)…]
+
+ene;
+    re.AddAdditiveLightToScene = RE_AddAdditiveLightToScene;
+    re.AddLinearLightToScene = RE_AddLinearLightToScene;
+    re.RenderScene = RE_RenderScene;
+    re.SetColor = RE_SetColor;
+    re.DrawStretchPic = RE_StretchPic;
+    re.DrawStretchRaw = RE_StretchRaw;
+    re.UploadCinematic = RE_UploadCinematic;
+    re.RegisterFont = RE_RegisterFont;
+    re.RemapShader = RE_RemapShader;
+    re.GetEntityToken = RE_GetEntityToken;
+    re.inPVS = R_inPVS;
+    re.TakeVideoFrame = RE_TakeVideoFrame;
+    re.SetColorMappings = R_SetColorMappings;
+    re.ThrottleBackend = RE_ThrottleBackend;
+    re.FinishBloom = RE_FinishBloom;
+    re.CanMinimize = RE_CanMinimize;
+    re.GetConfig = RE_GetConfig;
+    re.VertexLighting = RE_VertexLighting;
+    re.SyncRender = RE_SyncRender;
+
+    ri.Printf(PRINT_ALL, "=== Metal Stub Renderer Initialized ===\n");
+    return &re;
+}
+
+/* STANDALONE stub — CD key not used on iOS */
+#ifdef STANDALONE
+#include "../qcommon/q_shared.h"
+qboolean UI_usesUniqueCDKey(void) { return qfalse; }
+#endif

@@ -1,0 +1,765 @@
+outInfo->alphaWaveFreq  = texture->alphaWaveFreq;
+    outInfo->rgbConstColor[0] = texture->rgbConstColor[0];
+    outInfo->rgbConstColor[1] = texture->rgbConstColor[1];
+    outInfo->rgbConstColor[2] = texture->rgbConstColor[2];
+    outInfo->alphaConst = texture->alphaConst;
+    outInfo->deformWaveFunc  = (uint32_t)texture->deformWaveFunc;
+    outInfo->deformWaveDiv   = texture->deformWaveDiv;
+    outInfo->deformWaveBase  = texture->deformWaveBase;
+    outInfo->deformWaveAmp   = texture->deformWaveAmp;
+    outInfo->deformWavePhase = texture->deformWavePhase;
+    outInfo->deformWaveFreq  = texture->deformWaveFreq;
+    return 1;
+}
+
+const char *Q3MetalRenderer_GetTextureName(uint32_t textureHandle) {
+    metalTexture_t *texture = FindTextureByHandle((qhandle_t)textureHandle);
+    if (texture == NULL) {
+        return NULL;
+    }
+    return texture->name;
+}
+
+/* Final-image postprocess tone curve — port of Q2's MetalPostprocess.
+ *
+ * Compute kernel applied in-place on the drawable after all renderer
+ * encoders complete and before commandBuffer.present(). Two ops, in order:
+ *     rgb = saturate(rgb * intensity);
+ *     rgb = pow(rgb, gamma);
+ *
+ * Defaults tuned for OLED iPhone after the lightmap pre-shift was raised
+ * to ×4 (r_mapOverBrightBits 3). intensity 1.5 lifts midtones a further
+ * ~15% perceived without doubling up on the lightmap. gamma 0.95 = mild
+ * brighten in the shoulder, leaves blacks alone.
+ *
+ * These three accessors are idempotent: ri.Cvar_Get registers on first
+ * call, returns the existing cvar on subsequent calls. Range clamps are
+ * defensive — keeps a user dialing extreme values from blowing out or
+ * crushing the image entirely.
+ *
+ * NULL-guard for early call: Swift `drawFrame` can fire during the
+ * `[Q3-BOOT] yielding 200ms for LoadingOverlay paint` window, BEFORE
+ * GetRefAPI populates the static `ri` refimport_t (file-scope zero-init
+ * until GetRefAPI runs). Calling `ri.Cvar_Get` then dereferences a NULL
+ * function pointer → EXC_BAD_ACCESS at address 0x0. Returning the
+ * cvar-default value when `ri.Cvar_Get == NULL` lets the postprocess
+ * pipeline lazy-init harmlessly on the first real frame; once GetRefAPI
+ * runs, subsequent calls register the cvar and read its live value. */
+int Q3_PostprocessEnabled(void) {
+    if (ri.Cvar_Get == NULL) return 1;
+    cvar_t *cv = ri.Cvar_Get("r_postprocess", "1", CVAR_ARCHIVE);
+    return cv ? cv->integer : 1;
+}
+
+/* Helper: free old string, strdup new value (or NULL). Used so the
+ * static Q3PBRMaterialPaths owns its own string copies and survives
+ * q3_pbr_free_table() across vid_restart cycles — without this,
+ * s_paths.albedo etc. point into freed material-table memory and
+ * Swift's String(cString:) crashes with EXC_BAD_ACCESS. */
+static void UpdatePathField(const char **field, const char *src) {
+    free((void *)*field);
+    *field = src ? strdup(src) : NULL;
+}
+
+/* Swift bridge for PBR material paths. Backs onto the
+ * metalTexture_t.pbrMaterial pointer the texture register hook
+ * stamped at load time. Returns a static-storage Q3PBRMaterialPaths
+ * mirror per query — Swift treats the pointer as immutable for the
+ * duration of the call site. */
+const Q3PBRMaterialPaths *Q3MetalRenderer_GetPBRMaterial(unsigned int textureHandle) {
+    static Q3PBRMaterialPaths s_paths;  /* not thread-safe; Swift renderer is single-threaded */
+    if (textureHandle == 0) return NULL;
+    const metalTexture_t *tex = FindTextureByHandle((qhandle_t)textureHandle);
+    if (tex == NULL) return NULL;
+    const q3_pbr_material_t *m = (const q3_pbr_material_t *)tex->pbrMaterial;
+    /* Composite-handle fallback. Entity per-stage handles register with
+     * composite names like "*entity-stage:N:models/.../plasammo.tga"
+     * (created at line 2198) and do NOT bind a pbrMaterial at registration.
+     * Without this fallback, the Swift PBR getters (pbrAlbedoTexture,
+     * pbrNormalTexture, etc.) early-bail and the authored RTX Remix maps
+     * (e.g. plasammo hash 18180F4164BB190D albedo + 426C8DBA4F14F12C normal
+     * + height) never load — even though they're in materials_by_name. Re-
+     * resolve via the name table by stripping the "*entity-stage:N:" prefix
+     * so authored materials reach the entity draw path. */
+    if (m == NULL && tex->name[0] != '\0') {
+        const char *resolve = tex->name;
+        if (resolve[0] == '*') {
+            const char *firstColon = strchr(resolve + 1, ':');
+            if (firstColon) {
+                const char *secondColon = strchr(firstColon + 1, ':');
+                if (secondColon && secondColon[1]) resolve = secondColon + 1;
+            }
+        }
+        m = q3_pbr_lookup_by_name(resolve);
+    }
+    if (m == NULL) return NULL;
+    UpdatePathField(&s_paths.albedo,    m->albedo);
+    UpdatePathField(&s_paths.normal,    m->normal);
+    UpdatePathField(&s_paths.roughness, m->roughness);
+    UpdatePathField(&s_paths.metallic,  m->metallic);
+    UpdatePathField(&s_paths.emissive,  m->emissive);
+    UpdatePathField(&s_paths.height,    m->height);
+    s_paths.emissive_intensity = m->emissive_intensity;
+    s_paths.emissive_color_r   = m->emissive_color_r;
+    s_paths.emissive_color_g   = m->emissive_color_g;
+    s_paths.emissive_color_b   = m->emissive_color_b;
+    s_paths.has_emissive_color = m->has_emissive_color;
+    s_paths.roughness_constant = m->roughness_constant;
+    s_paths.metallic_constant = m->metallic_constant;
+    s_paths.sprite_cols = m->sprite_cols;
+    s_paths.sprite_rows = m->sprite_rows;
+    s_paths.sprite_fps  = m->sprite_fps;
+    return &s_paths;
+}
+
+/* Name-based PBR material lookup for indirect-name cases (entity envmap
+ * stages bound under the shader name like models/powerups/health/yellow
+ * but whose atlas metadata is keyed in materials.json by the underlying
+ * envmap source path like textures/effects/envmapyel). Mirrors the
+ * handle-based getter; consumers use this when the handle lookup yields
+ * no sprite_sheet data. */
+const Q3PBRMaterialPaths *Q3MetalRenderer_GetPBRMaterialByName(const char *name) {
+    static Q3PBRMaterialPaths s_paths;
+    if (name == NULL || name[0] == '\0') return NULL;
+    const q3_pbr_material_t *m = q3_pbr_lookup_by_name(name);
+    if (m == NULL) return NULL;
+    UpdatePathField(&s_paths.albedo,    m->albedo);
+    UpdatePathField(&s_paths.normal,    m->normal);
+    UpdatePathField(&s_paths.roughness, m->roughness);
+    UpdatePathField(&s_paths.metallic,  m->metallic);
+    UpdatePathField(&s_paths.emissive,  m->emissive);
+    UpdatePathField(&s_paths.height,    m->height);
+    s_paths.emissive_intensity = m->emissive_intensity;
+    s_paths.emissive_color_r   = m->emissive_color_r;
+    s_paths.emissive_color_g   = m->emissive_color_g;
+    s_paths.emissive_color_b   = m->emissive_color_b;
+    s_paths.has_emissive_color = m->has_emissive_color;
+    s_paths.roughness_constant = m->roughness_constant;
+    s_paths.metallic_constant = m->metallic_constant;
+    s_paths.sprite_cols = m->sprite_cols;
+    s_paths.sprite_rows = m->sprite_rows;
+    s_paths.sprite_fps  = m->sprite_fps;
+    return &s_paths;
+}
+
+/* PBR materials cvar accessor — referenced by code/ios/q3_pbr.c.
+ * Default OFF until the asset pipeline + DDS decoder are wired up;
+ * shipping it default-on with no replacement DDS files in the bundle
+ * would just degrade to "no-op + extra hashing CPU per texture load". */
+int q3_pbr_cvar_enabled(void) {
+    if (ri.Cvar_Get == NULL) return 0;
+    /* Default ON now that the bundle-path fallback ships the curated
+     * subset under <bundle>/baseq3/pbr/ — no env vars required. */
+    cvar_t *cv = ri.Cvar_Get("r_pbrMaterials", "1", CVAR_ARCHIVE);
+    return cv ? cv->integer : 0;
+}
+
+float Q3_PostprocessIntensity(void) {
+    if (ri.Cvar_Get == NULL) return 1.5f;
+    cvar_t *cv = ri.Cvar_Get("r_postprocess_intensity", "1.5", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 1.5f;
+    if (v < 0.5f) v = 0.5f;
+    if (v > 3.0f) v = 3.0f;
+    return v;
+}
+
+float Q3_PostprocessGamma(void) {
+    if (ri.Cvar_Get == NULL) return 0.95f;
+    cvar_t *cv = ri.Cvar_Get("r_postprocess_gamma", "0.95", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.95f;
+    if (v < 0.5f) v = 0.5f;
+    if (v > 2.5f) v = 2.5f;
+    return v;
+}
+
+/* PBR Phase 4 runtime tunables. Defaults match the hardcoded values from
+ * b2b6f0c v6. Range-clamped so a misconfigured value can't blow out the
+ * highlight or make it invisible. */
+float Q3_PBRRimIntensity(void) {
+    if (ri.Cvar_Get == NULL) return 0.55f;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_rim_intensity", "0.55", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.55f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.5f) v = 1.5f;
+    return v;
+}
+
+float Q3_PBRRimFalloff(void) {
+    if (ri.Cvar_Get == NULL) return 2.5f;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_rim_falloff", "2.5", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 2.5f;
+    if (v < 1.0f) v = 1.0f;
+    if (v > 5.0f) v = 5.0f;
+    return v;
+}
+
+/* PBR Phase 6 IBL gate. Default "1" — the procedural sky-gradient cubemap
+ * is built once at first entity draw and shared across all weapon viewmodel
+ * draws. Set "0" to A/B against Phase 5 (flat 0.35 ambient floor). */
+int Q3_PBRIBLEnabled(void) {
+    if (ri.Cvar_Get == NULL) return 1;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_ibl", "1", CVAR_ARCHIVE);
+    return cv ? cv->integer : 1;
+}
+
+/* PBR Phase 5 gate. Default "1" — enables the Cook-Torrance + Burley
+ * direct-sun lighting block inside the hasFullPBR branch. Set "0" to A/B
+ * against Phase 4 v6 (Fresnel rim only, no GGX peak). Used for the user's
+ * "decide if Phase 5 should remain default" comparison. */
+int Q3_PBRPhase5Enabled(void) {
+    if (ri.Cvar_Get == NULL) return 1;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_phase5", "1", CVAR_ARCHIVE);
+    return cv ? cv->integer : 1;
+}
+
+/* PBR Phase 8 — world-surface PBR shading.
+ *
+ * Augments the existing Phase 3 Mikkelsen normal-map block in
+ * q3_world_fragment with a Cook-Torrance + IBL composition. Synthetic
+ * defaults (0.55 roughness / 0.50 metallic) for all world surfaces —
+ * Q3 stock textures don't ship authored rough/metal, and the RTX Remix
+ * mod's 2,804 hex-hashed DDS pool is unreachable until the hash algo
+ * is cracked. Visible effect: walls show IBL chrome cue, soft sky-cube
+ * reflection on metal-leaning surfaces, brighter shadow side (no GI
+ * compensation).
+ *
+ *   r_pbr_world_textures      gate, default "1"
+ *   r_pbr_world_ambient_boost [0..1.5] additive diffuse-IBL fraction,
+ *                             default "0.42" — light shadow-side fill.
+ *                             Tune upward at runtime via console if RT
+ *                             scenes still read too dark; common bump:
+ *                             `r_pbr_world_ambient_boost 0.6`.
+ *   r_pbr_world_spec_boost    [0..2] specular IBL highlight intensity,
+ *                             default "1.05" — chrome cue strength.
+ *                             Tune via `r_pbr_world_spec_boost <v>` if
+ *                             highlights become too hot post-neutral-cube. */
+int   Q3_PBRWorldEnabled(void) {
+    if (ri.Cvar_Get == NULL) return 1;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_world_textures", "1", CVAR_ARCHIVE);
+    return cv ? cv->integer : 1;
+}
+float Q3_PBRWorldAmbientBoost(void) {
+    if (ri.Cvar_Get == NULL) return 0.42f;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_world_ambient_boost", "0.42", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.42f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.5f) v = 1.5f;
+    return v;
+}
+float Q3_PBRWorldSpecBoost(void) {
+    if (ri.Cvar_Get == NULL) return 1.05f;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_world_spec_boost", "1.05", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 1.05f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 2.0f) v = 2.0f;
+    return v;
+}
+float Q3_PBRNormalScale(void) {
+    if (ri.Cvar_Get == NULL) return 1.5f;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_normal_scale", "1.5", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 1.5f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 4.0f) v = 4.0f;
+    return v;
+}
+/* r_pbr_viewmodel_floor (default 0.35) — viewmodel-only PBR base-color
+ * floor. Most weapon viewmodels are authored metallic=1.0; with our
+ * neutral 0.08 procedural envCube an IBL-only metal surface comes out
+ * near-black regardless of orientation. The floor clamps `base.rgb` to
+ * `max(base.rgb, texel.rgb * floor)` ONLY for RF_DEPTHHACK draws in
+ * `q3_entity_fragment`. World, entity-pickup, and HUD paths are unchanged.
+ * 0.0 = off (pure PBR look). 0.25/0.35/0.45 are the suggested test sweep.
+ * Range-clamped 0..1 to avoid blown-out viewmodels at silly values. */
+/* r_pbr_envcube_grey (default 0.08, CVAR_ARCHIVE, clamped 0..1) — the
+ * uniform linear grey value used to fill every face of the procedural
+ * fallback envCube in `ensurePBREnvCube()`. Defaults match indoor /
+ * dungeon maps; tune at runtime per scene mood:
+ *   r_pbr_envcube_grey 0.02   - space / void (q3dm17 family)
+ *   r_pbr_envcube_grey 0.08   - default (q3dm6 / q3dm10 / q3dm11 / indoor)
+ *   r_pbr_envcube_grey 0.15   - brighter outdoor fill
+ *   r_pbr_envcube_grey 0      - pure black (extreme test)
+ * Swift caches the value used for the last-built procedural cube and
+ * invalidates when the cvar moves, so a console set takes effect on
+ * the next draw without an app relaunch. */
+/* Production effective minimum for the procedural envCube grey. Below
+ * this value, full-metal world entities (chrome pickups, dropped
+ * weapons) render pure-black because their IBL specular sample IS the
+ * cube — viewmodel weapons are saved by `r_pbr_viewmodel_floor` but
+ * non-RF_DEPTHHACK entities have no equivalent floor and crater visibly.
+ * Sweep across {0.50, 0.12, 0.08, 0.02, 0.00} showed the artifact
+ * appears reliably below ~0.04. Keep the raw cvar tunable for tooling
+ * but clamp the effective value to this minimum for normal gameplay. */
+#define Q3_PBR_ENVCUBE_GREY_MIN 0.04f
+
+/* Returns the cvar value verbatim (no production floor). Used by the
+ * diagnostic log to surface requested-vs-effective in `[Q3-PBR-IBL]
+ * procedural envCube ready ... requestedGrey=X effectiveGrey=Y`. */
+float Q3_PBREnvCubeGreyRequested(void) {
+    if (ri.Cvar_Get == NULL) return 0.08f;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_envcube_grey", "0.08", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.08f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    return v;
+}
+
+float Q3_PBREnvCubeGrey(void) {
+    float requested = Q3_PBREnvCubeGreyRequested();
+    if (ri.Cvar_Get == NULL) return requested;
+    /* Debug-only bypass for capturing the true cvar value (e.g. taking
+     * pure-PBR reference screenshots for the docs). When set != 0 the
+     * production floor is skipped — DON'T leave this on for gameplay
+     * unless you accept the black-pickup artifact. */
+    cvar_t *dbg = ri.Cvar_Get("r_pbr_envcube_grey_debug", "0", CVAR_ARCHIVE);
+    int bypassFloor = dbg ? dbg->integer : 0;
+    if (bypassFloor) return requested;
+    return (requested > Q3_PBR_ENVCUBE_GREY_MIN) ? requested : Q3_PBR_ENVCUBE_GREY_MIN;
+}
+
+/* r_pbr_emissive_intensity_max (default 3.0, CVAR_ARCHIVE, clamped
+ * 0..16) — emissive intensity ceiling used by `emissiveParamsForPBRMaterial`
+ * to cap `materials.json::emissive_intensity` values before they reach
+ * the GPU. MSL gate adds `eSample * tint * intensity` to the per-pixel
+ * colour; with the BGRA8 backbuffer the result clips to white above
+ * ~1.0 luminance. Historical default of 4.0 was set when entity emissive
+ * was silently broken (`emissiveParams` mutation happened post-encoder-
+ * upload, so the GPU never saw it). Once the 2026-06-10 ordering fix
+ * wired entity emissive correctly, the 4.0 ceiling exposed itself as
+ * white blobs on chrome/envmap entities (quad shell, health/armor
+ * pickups, viewmodel hot-bits). Catalyst q3dm17 sweeps on 2026-06-14
+ * showed 3.0 restores the authored RTX Remix-style space-map emissive
+ * punch while staying below the old all-white 4.0/8.0 look. */
+float Q3_PBREmissiveIntensityMax(void) {
+    if (ri.Cvar_Get == NULL) return 3.0f;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_emissive_intensity_max", "3.0", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 3.0f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 16.0f) v = 16.0f;
+    return v;
+}
+
+float Q3_PBRViewmodelFloor(void) {
+    if (ri.Cvar_Get == NULL) return 0.35f;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_viewmodel_floor", "0.35", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.35f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    return v;
+}
+
+/* r_world_debug_mode — runtime swap for what was a compile-time constant
+ * (MetalView.swift Coordinator.worldDebugMode). Drives the world fragment
+ * shader's debug-mode branch:
+ *   0 = normal (default), 1 = base texture only, 2 = lightmap only,
+ *   3 = UV1 visualization, 4 = vertex color only.
+ * Not archived: this is a developer diag toggle; we don't want it sticking
+ * across sessions if someone forgets it on. Clamped to [0..4]. */
+int Q3_WorldDebugMode(void) {
+    if (ri.Cvar_Get == NULL) return 0;
+    cvar_t *cv = ri.Cvar_Get("r_world_debug_mode", "0", 0);
+    int v = cv ? cv->integer : 0;
+    if (v < 0) v = 0;
+    if (v > 4) v = 4;
+    return v;
+}
+
+int Q3_PBRWorldClassMatchEnabled(void) {
+    if (ri.Cvar_Get == NULL) return 1;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_world_class_match", "1", CVAR_ARCHIVE);
+    return cv ? cv->integer : 1;
+}
+
+int Q3_PBRBakedLightmaps(void) {
+    if (ri.Cvar_Get == NULL) return 0;
+    /* Diagnostic parity toggle: when enabled, Swift suppresses Q3 tcMod
+     * chains on world surfaces that have authored Remix/PBR materials,
+     * approximating RTX Remix baked-lightmap/static-surface behavior.
+     * Not archived: this is a test switch, not a user preference. */
+    cvar_t *cv = ri.Cvar_Get("r_pbr_baked_lightmaps", "0", 0);
+    return (cv && cv->integer != 0) ? 1 : 0;
+}
+
+int Q3_PBRSunShadows(void) {
+    if (ri.Cvar_Get == NULL) return 1;
+    /* Raster-path DistantLight PCF shadow map. Not archived: test/tuning switch. */
+    cvar_t *cv = ri.Cvar_Get("r_pbr_sun_shadows", "1", 0);
+    return (cv && cv->integer != 0) ? 1 : 0;
+}
+
+float Q3_PBRShadowPCFRadius(void) {
+    if (ri.Cvar_Get == NULL) return 2.0f;
+    /* Raster sun-shadow PCF tuning. Not archived: capture/tuning switch. */
+    cvar_t *cv = ri.Cvar_Get("r_pbr_shadow_pcf_radius", "2", 0);
+    float v = cv ? cv->value : 2.0f;
+    if (v < 1.0f) v = 1.0f;
+    if (v > 4.0f) v = 4.0f;
+    return v;
+}
+
+int Q3_PBRSSREnabled(void) {
+    if (ri.Cvar_Get == NULL) return 0;
+    /* Raster-only screen-space reflection test switch. Not archived. */
+    cvar_t *cv = ri.Cvar_Get("r_pbr_ssr", "0", 0);
+    return (cv && cv->integer != 0) ? 1 : 0;
+}
+
+int Q3_PBROnlyTextures(void) {
+    if (ri.Cvar_Get == NULL) return 1;
+    /* Diagnostics: when enabled, Swift binds a visible placeholder instead
+     * of falling back to the original pak0/classic texture on missing PBR. */
+    cvar_t *cv = ri.Cvar_Get("r_pbr_only_textures", "1", CVAR_ARCHIVE);
+    return cv ? cv->integer : 1;
+}
+
+float Q3_RTMix(void) {
+    if (ri.Cvar_Get == NULL) return 0.0f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_mix", "0", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.0f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    return v;
+}
+
+float Q3_SetRTMix(float mix) {
+    if (mix < 0.0f) mix = 0.0f;
+    if (mix > 1.0f) mix = 1.0f;
+    if (ri.Cvar_Get == NULL) return mix;
+    ri.Cvar_Get("r_rt_mix", "0", CVAR_ARCHIVE);
+    if (ri.Cvar_SetValue != NULL) {
+        ri.Cvar_SetValue("r_rt_mix", mix);
+    } else if (ri.Cvar_Set != NULL) {
+        char buf[32];
+        Com_sprintf(buf, sizeof(buf), "%g", mix);
+        ri.Cvar_Set("r_rt_mix", buf);
+    }
+    return Q3_RTMix();
+}
+
+float Q3_RTExposure(void) {
+    if (ri.Cvar_Get == NULL) return 0.65f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_exposure", "0.65", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.65f;
+    if (v < 0.05f) v = 0.05f;
+    if (v > 4.0f) v = 4.0f;
+    return v;
+}
+
+float Q3_RTGamma(void) {
+    if (ri.Cvar_Get == NULL) return 1.15f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_gamma", "1.15", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 1.15f;
+    if (v < 0.25f) v = 0.25f;
+    if (v > 3.0f) v = 3.0f;
+    return v;
+}
+
+float Q3_RTAmbient(void) {
+    if (ri.Cvar_Get == NULL) return 0.08f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_ambient", "0.08", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.08f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    return v;
+}
+
+float Q3_RTNormalMix(void) {
+    if (ri.Cvar_Get == NULL) return 0.06f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_normal_mix", "0.06", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.06f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    return v;
+}
+
+float Q3_RTResolutionScale(void) {
+    if (ri.Cvar_Get == NULL) return 0.5f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_resolution_scale", "0.5", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.5f;
+    if (v < 0.25f) v = 0.25f;
+    if (v > 1.0f) v = 1.0f;
+    return v;
+}
+
+float Q3_RTBounces(void) {
+    if (ri.Cvar_Get == NULL) return 1.0f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_bounces", "1", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 1.0f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 2.0f) v = 2.0f;
+    return v;
+}
+
+float Q3_RTTAA(void) {
+    if (ri.Cvar_Get == NULL) return 0.0f;
+    // Default OFF until motion vectors / robust reprojection exist.
+    // The old default accumulated stale history while moving and produced
+    // the reported fever-dream smear. Users can still opt in with r_rt_taa 1.
+    cvar_t *cv = ri.Cvar_Get("r_rt_taa", "0", CVAR_ARCHIVE);
+    return (cv && cv->integer == 0) ? 0.0f : 1.0f;
+}
+
+float Q3_RTTAAAlpha(void) {
+    if (ri.Cvar_Get == NULL) return 0.10f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_taa_alpha", "0.10", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.10f;
+    if (v < 0.02f) v = 0.02f;
+    if (v > 1.0f) v = 1.0f;
+    return v;
+}
+
+int Q3_RTEntities(void) {
+    if (ri.Cvar_Get == NULL) return 0;
+    /* Default OFF: raster draws weapons/items/HUD on top already. The RT
+     * entity AS currently shades entities as debug grey and causes white
+     * halos/ghost silhouettes around weapons and pickups when composited.
+     * Keep a cvar for A/B testing once real entity RT materials land. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_entities", "0", CVAR_ARCHIVE);
+    return (cv && cv->integer != 0) ? 1 : 0;
+}
+
+int Q3_RTPreserveEntities(void) {
+    if (ri.Cvar_Get == NULL) return 1;
+    /* 1 (default): RT composite is encoded BEFORE the raster entity/HUD
+     * passes (MetalView.swift "RT world composite must happen before
+     * raster entities/HUD" block), so the viewmodel/pickups always draw
+     * on top of the traced world. 0: legacy A/B mode — the composite is
+     * deferred until AFTER the main entity pass, reproducing the old
+     * "RT world overwrites the gun" behavior for comparison captures.
+     * P0.2 of docs/2026-06-10-rt-gap-analysis-vs-rtx-remix.md. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_preserve_entities", "1", CVAR_ARCHIVE);
+    return (cv && cv->integer != 0) ? 1 : 0;
+}
+
+float Q3_PBRParallaxScale(void) {
+    if (ri.Cvar_Get == NULL) return 0.02f;
+    /* Height-map parallax strength for world surfaces that ship a
+     * *_height.h.rtex.dds. 0 disables. Default 0.02 is subtle; allow
+     * larger diagnostic sweeps so r_pbr_parallax_tint/scale tests can
+     * prove whether the MSL UV offset actually changes the image. */
+    cvar_t *cv = ri.Cvar_Get("r_pbr_parallax_scale", "0.02", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.02f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 2.0f) v = 2.0f;
+    return v;
+}
+
+int Q3_PBRParallaxTint(void) {
+    if (ri.Cvar_Get == NULL) return 0;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_parallax_tint", "0", 0);
+    return (cv && cv->integer != 0) ? 1 : 0;
+}
+
+int Q3_RTLights(void) {
+    if (ri.Cvar_Get == NULL) return 1;
+    /* P1: gates the NEE direct-light + shadow-ray block in rtKernel.
+     * Light data is the RTX Remix authored per-map light set baked into
+     * Resources/baseq3/pbr/lights/<map>.json. Default ON in RT mode. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_lights", "1", CVAR_ARCHIVE);
+    return (cv && cv->integer != 0) ? 1 : 0;
+}
+
+float Q3_RTLightScale(void) {
+    if (ri.Cvar_Get == NULL) return 1.0f;
+    /* Global multiplier mapping Remix-authored intensities (USDA units,
+     * up to several hundred) onto our LDR composite. Tune on device. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_light_scale", "1.0", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 1.0f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 100.0f) v = 100.0f;
+    return v;
+}
+
+int Q3_RTReflections(void) {
+    if (ri.Cvar_Get == NULL) return 1;
+    /* P3: gates the one-level specular reflect ray in rtKernel. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_reflections", "1", CVAR_ARCHIVE);
+    return (cv && cv->integer != 0) ? 1 : 0;
+}
+
+float Q3_RTReflRoughnessMax(void) {
+    if (ri.Cvar_Get == NULL) return 0.45f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_refl_roughness_max", "0.45", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.45f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    return v;
+}
+
+int Q3_RTHDR(void) {
+    if (ri.Cvar_Get == NULL) return 1;
+    /* P2: keep RT trace/accum in rgba16Float so authored lights/emissives
+     * can bloom before final LDR composite. 0 = legacy rgba8 clamp path. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_hdr", "1", CVAR_ARCHIVE);
+    return (cv && cv->integer == 0) ? 0 : 1;
+}
+
+float Q3_RTBloom(void) {
+    if (ri.Cvar_Get == NULL) return 0.35f;
+    /* P2 quick bloom intensity. This is intentionally modest; use
+     * r_rt_light_scale for source strength and this for glow spread. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_bloom", "0.35", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.35f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 3.0f) v = 3.0f;
+    return v;
+}
+
+float Q3_RTBloomThreshold(void) {
+    if (ri.Cvar_Get == NULL) return 0.85f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_bloom_threshold", "0.85", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.85f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 8.0f) v = 8.0f;
+    return v;
+}
+
+float Q3_RTBloomRadius(void) {
+    if (ri.Cvar_Get == NULL) return 3.0f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_bloom_radius", "3.0", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 3.0f;
+    if (v < 0.5f) v = 0.5f;
+    if (v > 12.0f) v = 12.0f;
+    return v;
+}
+
+int Q3_RTDebugEntityMask(void) {
+    if (ri.Cvar_Get == NULL) return 0;
+    /* Debug view: main-scene entity fragments output solid white,
+     * visualizing exactly which pixels the raster entity pass covers —
+     * i.e. what survives on top of the RT composite under
+     * r_rt_preserve_entities 1. Not archived; debug only. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_debug_entity_mask", "0", 0);
+    return (cv && cv->integer != 0) ? 1 : 0;
+}
+
+/* PBR Phase 6 v2 — map-specific skybox IBL source.
+ *
+ * r_pbr_ibl_skybox: stem (no _ft/_bk/etc suffix, no .tga extension) of the
+ * 6-face Q3 skybox TGAs Swift should load from the pak filesystem to build
+ * the IBL environment cubemap. e.g. "env/space1" → loads env/space1_ft.tga,
+ * env/space1_bk.tga, env/space1_lf.tga, env/space1_rt.tga, env/space1_up.tga,
+ * env/space1_dn.tga. When the cvar is empty OR any of the 6 files cannot
+ * be read, Swift falls back to the procedural sky-gradient cube.
+ *
+ * Default "env/space1" — Q3 stock skybox used in nv15demo's q3dm17 + many
+ * DM maps; widest visual coverage for first-run experience.
+ *
+ * Q3_PBRIBLSkyboxName(out, max_len): writes the current cvar value to `out`
+ * (null-terminated). Returns 1 if non-empty, 0 if empty/missing/no ri yet. */
+int Q3_PBRIBLSkyboxName(char *out, int max_len) {
+    if (out == NULL || max_len <= 0) return 0;
+    out[0] = '\0';
+    if (ri.Cvar_Get == NULL) {
+        Q_strncpyz(out, "env/space1", max_len);
+        return 1;
+    }
+    cvar_t *cv = ri.Cvar_Get("r_pbr_ibl_skybox", "env/space1", CVAR_ARCHIVE);
+    if (cv == NULL || cv->string == NULL || cv->string[0] == '\0') return 0;
+    Q_strncpyz(out, cv->string, max_len);
+    return out[0] != '\0' ? 1 : 0;
+}
+
+/* PBR Phase 6 v2 — engine FS bridge for Swift TGA reads.
+ *
+ * Swift can't read pk3-packed files directly via Bundle paths; this routes
+ * through the Q3 engine FS so pak0.pk3 / pak1.pk3 / etc are searched. Mirrors
+ * the ri.FS_ReadFile / ri.FS_FreeFile pattern used elsewhere in this TU.
+ * Caller MUST call Q3MetalRenderer_FSFreeFile on the returned pointer.
+ *
+ * Returns: 1 on success with *out_buf set + *out_size populated; 0 on failure
+ *   (nothing to free). Thread safety: Q3 engine FS is single-threaded; call
+ *   from Swift main thread only (same context where Q3 renderer runs). */
+int Q3MetalRenderer_FSReadFile(const char *path, const unsigned char **out_buf, int *out_size) {
+    if (out_buf == NULL || out_size == NULL) return 0;
+    *out_buf = NULL;
+    *out_size = 0;
+    if (path == NULL || path[0] == '\0' || ri.FS_ReadFile == NULL) return 0;
+    void *fileBuffer = NULL;
+    int sz = ri.FS_ReadFile((char *)path, &fileBuffer);
+    if (sz <= 0 || fileBuffer == NULL) {
+        if (fileBuffer != NULL && ri.FS_FreeFile != NULL) ri.FS_FreeFile(fileBuffer);
+        return 0;
+    }
+    *out_buf = (const unsigned char *)fileBuffer;
+    *out_size = sz;
+    return 1;
+}
+
+void Q3MetalRenderer_FSFreeFile(const unsigned char *buf) {
+    if (buf == NULL || ri.FS_FreeFile == NULL) return;
+    ri.FS_FreeFile((void *)buf);
+}
+
+refexport_t *GetRefAPI(int apiVersion, refimport_t *rimp) {
+    static refexport_t re;
+
+    ri = *rimp;
+
+    if (apiVersion != REF_API_VERSION) {
+        ri.Printf(PRINT_ALL, "Mismatched REF_API_VERSION: expected %d, got %d\n", REF_API_VERSION, apiVersion);
+        return NULL;
+    }
+
+    Com_Memset(&re, 0, sizeof(re));
+
+    /* PBR Phase 1 boot: load the RTX Remix material table (one-shot
+     * per process). JSON via Q3_PBR_JSON; assets-root via Q3_PBR_ASSETS.
+     * Failure is silent — q3_pbr_lookup returns NULL, render path
+     * falls through to existing Lambert. */
+    q3_pbr_set_log(Q3PBRLogf);
+    {
+        const char *json = getenv("Q3_PBR_JSON");
+        const char *root = getenv("Q3_PBR_ASSETS");
+        char bundleJson[1024] = {0};
+        char bundleRoot[1024] = {0};
+
+        /* Env-var path takes precedence (debug / dev). Otherwise fall
+         * back to the bundled subset under
+         * <Bundle.main.resourcePath>/baseq3/pbr/ that
+         * scripts/pbr_stage_named_assets.py staged into source baseq3.
+         * If neither path resolves, q3_pbr_table_load is skipped and
+         * the renderer behaves as if r_pbrMaterials was off. */
+        if (!(json && root && json[0] && root[0])) {
+            extern const char *Sys_DefaultBasePath(void);  /* ios_main.m */
+            const char *base = Sys_DefaultBasePath();
+            if (base && base[0]) {
+                Q_strncpyz(bundleJson, base, sizeof(bundleJson));
+                Q_strcat(bundleJson, sizeof(bundleJson),
+                         "/baseq3/pbr/materials.json");
+                Q_strncpyz(bundleRoot, base, sizeof(bundleRoot));
+                Q_strcat(bundleRoot, sizeof(bundleRoot),
+                         "/baseq3/pbr");
+            
+
+[…truncated 1515 chars — raise BridgeOptions.maxResultChars, or call the tool with a narrower scope (filter, head, pagination)…]
+
+ene;
+    re.AddAdditiveLightToScene = RE_AddAdditiveLightToScene;
+    re.AddLinearLightToScene = RE_AddLinearLightToScene;
+    re.RenderScene = RE_RenderScene;
+    re.SetColor = RE_SetColor;
+    re.DrawStretchPic = RE_StretchPic;
+    re.DrawStretchRaw = RE_StretchRaw;
+    re.UploadCinematic = RE_UploadCinematic;
+    re.RegisterFont = RE_RegisterFont;
+    re.RemapShader = RE_RemapShader;
+    re.GetEntityToken = RE_GetEntityToken;
+    re.inPVS = R_inPVS;
+    re.TakeVideoFrame = RE_TakeVideoFrame;
+    re.SetColorMappings = R_SetColorMappings;
+    re.ThrottleBackend = RE_ThrottleBackend;
+    re.FinishBloom = RE_FinishBloom;
+    re.CanMinimize = RE_CanMinimize;
+    re.GetConfig = RE_GetConfig;
+    re.VertexLighting = RE_VertexLighting;
+    re.SyncRender = RE_SyncRender;
+
+    ri.Printf(PRINT_ALL, "=== Metal Stub Renderer Initialized ===\n");
+    return &re;
+}
+
+/* STANDALONE stub — CD key not used on iOS */
+#ifdef STANDALONE
+#include "../qcommon/q_shared.h"
+qboolean UI_usesUniqueCDKey(void) { return qfalse; }
+#endif

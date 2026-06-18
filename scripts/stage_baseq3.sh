@@ -3,6 +3,22 @@ set -eu
 
 APP_RESOURCES="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"
 DEST="${APP_RESOURCES}/baseq3"
+STAMP="${DERIVED_FILE_DIR:-/tmp}/.stage_baseq3.stamp"
+
+# Device-dev fast path:
+#   Q3_SKIP_BUNDLED_BASEQ3=1 xcodebuild ...
+# skips copying bulky pak/PBR data into the .app. The app then reads
+# persistent assets from Documents/baseq3, seeded by scripts/q3push_baseq3.sh
+# or scripts/q3dev_run.sh. Default stays bundled so fresh installs and Mac
+# Catalyst builds keep working without extra setup.
+if [ "${Q3_SKIP_BUNDLED_BASEQ3:-0}" = "1" ]; then
+  echo "[stage_baseq3] Q3_SKIP_BUNDLED_BASEQ3=1; removing bundled baseq3 from app product"
+  /bin/rm -rf "$DEST"
+  mkdir -p "$(dirname "$STAMP")"
+  touch "$STAMP"
+  exit 0
+fi
+
 mkdir -p "$DEST"
 
 copy_baseq3() {
@@ -46,3 +62,7 @@ if [ -d "$DEST/demos" ]; then
   DEMO_COUNT=$(/usr/bin/find "$DEST/demos" -maxdepth 1 -type f -name '*.dm_*' | /usr/bin/wc -l | /usr/bin/tr -d ' ')
 fi
 echo "[stage_baseq3] done: pk3=$PK3_COUNT demos=$DEMO_COUNT dest=$DEST"
+
+# Sentinel stamp for Xcode dependency tracking.
+mkdir -p "$(dirname "$STAMP")"
+touch "$STAMP"
