@@ -407,6 +407,7 @@ Con_SetPos_f
 */
 static void Con_SetPos_f( void ) {
 	vec3_t pos;
+	int i;
 
 	if ( Cmd_Argc() != 4 ) {
 		Com_Printf( "Usage: setpos <x> <y> <z>\n" );
@@ -423,6 +424,12 @@ static void Con_SetPos_f( void ) {
 	pos[2] = atof( Cmd_Argv( 3 ) );
 
 	VectorCopy( pos, cl.snap.ps.origin );
+
+	/* Zero velocity to prevent momentum carryover */
+	for ( i = 0; i < 3; i++ ) {
+		cl.snap.ps.velocity[i] = 0;
+	}
+
 	Com_Printf( "Position set to %.0f %.0f %.0f\n", pos[0], pos[1], pos[2] );
 }
 
