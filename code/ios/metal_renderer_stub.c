@@ -104,16 +104,7 @@ static void Q3_FileLogf(const char *fmt, ...) {
  * avoid realloc plumbing touching every accessor; revisit if a future map
  * exceeds this. */
 #define Q3_METAL_MAX_DRAWS 65536
-/*
- * Keep enough texture records for long Mac Catalyst validation runs that
- * cycle through many maps in one process. 1024 is too low for stock Q3 map
- * sweeps once shader-map fallbacks, animated stages, sky faces, item models,
- * and PBR sidecar ownership probes have all registered unique handles; the
- * registry then starts returning the white texture and produces false texture
- * failures after ~half the core maps. This is still a fixed-size table (same
- * lifetime model as before), just aligned with ioq3-scale content.
- */
-#define Q3_METAL_MAX_TEXTURES 4096
+#define Q3_METAL_MAX_TEXTURES 1024
 #define Q3_METAL_MAX_MODELS 1024
 #define Q3_METAL_MAX_REFENTITIES 1024
 
@@ -287,7 +278,6 @@ static float s_currentColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
 static metalTexture_t s_textures[Q3_METAL_MAX_TEXTURES];
 static qhandle_t s_nextTextureHandle = 1;
 static qhandle_t s_whiteTextureHandle;
-static qhandle_t s_transparentTextureHandle;
 static qhandle_t s_skyTextureHandle;
 static qhandle_t s_timHellBaseTextureHandle;
 static qhandle_t s_timHellAddTextureHandle;
@@ -658,13 +648,6 @@ typedef struct {
      * appear as translucent grey cones, opaque utility planes covering
      * the sky, and gray "carrier rectangles" co-located with torches. */
     qboolean isNoDraw;
-    /* Light source geometry: shader name starts with "lights/". Light
-     * volumes are BSP brushes that define lighting only and should never
-     * be visually rendered. When inside a light cone, light geometry
-     * renders as bright white/overexposed areas. Skipping these surfaces
-     * prevents light-source geometry from appearing visually while
-     * preserving their lighting contribution to adjacent surfaces. */
-    qboolean isLight;
     Q3MetalStage stages[Q3_MAX_STAGES];
     int stageCount;
     q3_pbr_world_mat_t pbrMatClass;
@@ -1042,8 +1025,6 @@ static void MetalTcModsToString(const Q3MetalWorldStage *stage, char *out, size_
     }
 }
 
-static qboolean MetalTextureForcesClassicPBRPath(const char *name);
-
 static float MetalSurfaceProbeParallaxScale(void) {
     cvar_t *cv;
     if (ri.Cvar_Get == NULL) {
@@ -1132,8 +1113,7 @@ static void EmitQ3SurfaceProbe(const char *mapName,
                 mat = (const q3_pbr_material_t *)matTex->pbrMaterial;
                 if (mat != NULL) {
                     materialSource = "hash";
-                } else if (matTex->name[0] != '\0' &&
-                           !MetalTextureForcesClassicPBRPath(matTex->name)) {
+                } else if (matTex->name[0] != '\0') {
                     mat = q3_pbr_lookup_by_name(matTex->name);
                     if (mat != NULL) {
                         materialSource = "name-fallback";
@@ -1288,33 +1268,6 @@ static qhandle_t EnsureWhiteTexture(void) {
     return s_whiteTextureHandle;
 }
 
-static qhandle_t EnsureTransparentTexture(void) {
-    metalTexture_t *texture;
-    byte *rgba;
-
-    if (s_transparentTextureHandle != 0) {
-        return s_transparentTextureHandle;
-    }
-
-    texture = AllocTextureSlot();
-    if (texture == NULL) {
-        return EnsureWhiteTexture();
-    }
-
-    rgba = ri.Malloc(4);
-    rgba[0] = 0;
-    rgba[1] = 0;
-    rgba[2] = 0;
-    rgba[3] = 0;
-
-    texture->width = 1;
-    texture->height = 1;
-    texture->rgbaBytes = rgba;
-    Q_strncpyz(texture->name, "*transparent_branding", sizeof(texture->name));
-    s_transparentTextureHandle = texture->handle;
-    return s_transparentTextureHandle;
-}
-
 static qhandle_t RegisterRawTexture(const char *name, byte *rgba, int width, int height) {
     metalTexture_t *texture;
 
@@ -1381,35 +1334,6 @@ static qhandle_t GetSkyFaceTextureForSurface(const char *shaderName,
  * file. IsSkyShaderName is called during BSP load, well after
  * LoadAllShaders has populated the map, so the lookup always resolves. */
 static const metalShaderMap_t *ShaderMap_LookupEntry(const char *name);
-
-static qboolean MetalPathMatchesImageBase(const char *name, const char *base) {
-    size_t len;
-    char c;
-
-    if (name == NULL || base == NULL) {
-        return qfalse;
-    }
-    len = strlen(base);
-    if (Q_stricmpn(name, base, (int)len)) {
-        return qfalse;
-    }
-    c = name[len];
-    return (c == '\0' || c == '.');
-}
-
-static qboolean IsBrandingTextureName(const char *name) {
-    if (MetalPathMatchesImageBase(name, "textures/nvidia/geforce_banner")) return qtrue;
-    if (MetalPathMatchesImageBase(name, "textures/nvidia/logo1alpha")) return qtrue;
-    if (MetalPathMatchesImageBase(name, "textures/nvidia/logo1small")) return qtrue;
-    return qfalse;
-}
-
-static qboolean IsBrandingWorldShaderName(const char *name) {
-    if (MetalPathMatchesImageBase(name, "textures/nvidia/geforce_banner")) return qtrue;
-    if (MetalPathMatchesImageBase(name, "textures/nvidia/logo_alpha")) return qtrue;
-    if (MetalPathMatchesImageBase(name, "textures/nvidia/nvidia_screen")) return qtrue;
-    return qfalse;
-}
 
 static qboolean IsSkyShaderName(const char *name) {
     const metalShaderMap_t *entry;
@@ -1839,7 +1763,6 @@ static qboolean PathHasFXNameMarker(const char *path) {
     if (Q_stristr(base, "_fx")    != NULL) return qtrue;
     if (Q_stristr(base, "fx_")    != NULL) return qtrue;
     if (Q_stristr(base, "_flare") != NULL) return qtrue;
-    if (Q_stristr(base, "flare")  != NULL) return qtrue;
     if (Q_stristr(base, "_flame") != NULL) return qtrue;
     if (Q_stristr(base, "_glass") != NULL) return qtrue;
     if (Q_stristr(base, "_trail") != NULL) return qtrue;
@@ -1887,8 +1810,6 @@ static qboolean TextureNeedsLuminanceAlpha(const char *path) {
     if (!Q_stricmpn(path, "models/powerups/", 16)) return PathHasFXNameMarker(path);
     if (!Q_stricmpn(path, "models/ammo/", 12))     return PathHasFXNameMarker(path);
     if (!Q_stricmpn(path, "models/weapons2/", 16)) return PathHasFXNameMarker(path);
-    if (!Q_stricmpn(path, "models/mapobjects/lamps/", 24)) return PathHasFXNameMarker(path);
-    if (!Q_stricmpn(path, "models/mapobjects/spotlamp/", 27)) return PathHasFXNameMarker(path);
     if (!Q_stricmpn(path, "textures/sfx/", 13)) return qtrue;
     if (!Q_stricmpn(path, "textures/effects/", 17)) return qtrue;
     if (!Q_stricmpn(path, "gfx/damage/", 11)) return qtrue;
@@ -2057,54 +1978,6 @@ static qboolean TryLoadImageRGBA(const char *name, byte **rgba, int *width, int 
         }
     }
 
-    /* (4) Known custom-pack typo/short-name aliases. q3wpak maps request
-     * `textures/ssctf/s_scan` / `textures/ssctf2/s_scan`, while the
-     * shipped asset is the matching `s_scancode.tga`. Resolve the real packaged texture
-     * instead of drawing the shared white fallback on those surfaces. */
-    if (!Q_stricmp(base, "textures/ssctf/s_scan") ||
-        !Q_stricmp(base, "textures/ssctf2/s_scan")) {
-        char scanCodeBase[MAX_QPATH];
-        Q_strncpyz(scanCodeBase, base, sizeof(scanCodeBase));
-        Q_strncpyz(scanCodeBase + strlen(scanCodeBase) - strlen("s_scan"),
-                   "s_scancode",
-                   sizeof(scanCodeBase) - (strlen(scanCodeBase) - strlen("s_scan")));
-        if (TryLoadExtChain(name, scanCodeBase,
-                            rgba, width, height,
-                            resolvedName, resolvedNameSize)) {
-            return qtrue;
-        }
-    }
-
-    /* q3wcp6 references GtkRadiant's editor placeholder
-     * `textures/radiant/notex`, but none of the shipped pk3s include that
-     * texture. Treat it as a handled map-pack placeholder rather than a
-     * generic missing asset: use a small deterministic neutral checker so
-     * the surface is visibly intentional and does not enter the white
-     * fallback / [asset-miss] path. */
-    if (!Q_stricmp(base, "textures/radiant/notex")) {
-        const int side = 16;
-        int x, y;
-        byte *checker = ri.Malloc(side * side * 4);
-        if (checker == NULL) {
-            return qfalse;
-        }
-        for (y = 0; y < side; ++y) {
-            for (x = 0; x < side; ++x) {
-                const qboolean bright = (((x >> 2) ^ (y >> 2)) & 1) ? qtrue : qfalse;
-                byte *p = checker + ((y * side + x) * 4);
-                p[0] = bright ? 96 : 32;
-                p[1] = bright ? 80 : 28;
-                p[2] = bright ? 48 : 20;
-                p[3] = 255;
-            }
-        }
-        *rgba = checker;
-        *width = side;
-        *height = side;
-        Q_strncpyz(resolvedName, "*generated:textures/radiant/notex", resolvedNameSize);
-        return qtrue;
-    }
-
     return qfalse;
 }
 
@@ -2131,32 +2004,6 @@ static float s_pendingScrollS;
 static float s_pendingScrollT;
 static int s_pendingBlendMode;
 static int s_pendingAlphaFunc;
-
-static qboolean MetalTextureForcesClassicPBRPath(const char *name) {
-    const char *n = name;
-    if (n == NULL || n[0] == '\0') return qfalse;
-
-    /* Sky / portal / FX / mask-critical textures must remain on the
-     * classic Q3 texture path. Some Remix captures contain hash/name
-     * entries for these images (q3dm1 killsky_1 is the concrete case),
-     * but those assets are masks, animated overlays, or emissive sprites
-     * whose correctness depends on Q3 blend/cull/depth/rgbGen semantics.
-     * Binding a PBR material here makes diagnostics report them as
-     * PBR-promoted and lets later paths accidentally sample sidecars or
-     * atlas carrier pixels. Keep them hash-dumped for tooling, but do
-     * not attach pbrMaterial to the live texture slot. */
-    if (!Q_stricmpn(n, "textures/skies/", 15)) return qtrue;
-    if (!Q_stricmpn(n, "env/", 4)) return qtrue;
-    if (!Q_stricmpn(n, "textures/sfx/", 13)) return qtrue;
-    if (!Q_stricmpn(n, "textures/effects/", 17)) return qtrue;
-    if (!Q_stricmpn(n, "textures/liquids/", 17)) return qtrue;
-    if (!Q_stricmpn(n, "sprites/", 8)) return qtrue;
-    if (!Q_stricmpn(n, "gfx/", 4)) return qtrue;
-    if (!Q_stricmpn(n, "models/weaphits/", 16)) return qtrue;
-    if (!Q_stricmpn(n, "textures/base_light/", 20)) return qtrue;
-    if (!Q_stricmpn(n, "textures/gothic_light/", 22)) return qtrue;
-    return qfalse;
-}
 
 static qhandle_t RegisterTexture(const char *name) {
     metalTexture_t *existing;
@@ -2210,23 +2057,6 @@ static qhandle_t RegisterTexture(const char *name) {
         !Q_stricmp(name, "*whiteimage") ||
         !Q_stricmp(name, "*default")) {
         return EnsureWhiteTexture();
-    }
-    if (IsBrandingTextureName(name)) {
-        static char s_brandTextureSeen[8][MAX_QPATH];
-        static int s_brandTextureSeenCount = 0;
-        int bi;
-        qboolean seen = qfalse;
-        for (bi = 0; bi < s_brandTextureSeenCount; ++bi) {
-            if (!Q_stricmp(s_brandTextureSeen[bi], name)) { seen = qtrue; break; }
-        }
-        if (!seen) {
-            if (s_brandTextureSeenCount < (int)(sizeof(s_brandTextureSeen) / sizeof(s_brandTextureSeen[0]))) {
-                Q_strncpyz(s_brandTextureSeen[s_brandTextureSeenCount++], name, MAX_QPATH);
-            }
-            MetalTelemetryPrintf("metal_branding", PRINT_ALL,
-                "[Q3-BRANDING] transparent texture '%s'\n", name);
-        }
-        return EnsureTransparentTexture();
     }
 
     {
@@ -2443,60 +2273,31 @@ static qhandle_t RegisterTexture(const char *name) {
         uint64_t h = q3_pbr_hash_rgba(rgba, width, height);
         texture->pbrContentHash = h;
         q3_pbr_stats_inc_hashes_seen();
-        /* Asset-workstream hash dump: emit q3_name -> engine-computed RTX
-         * hash for EVERY registered texture, regardless of materials.json
-         * hit/miss. Offline tooling cross-references the dump against the
-         * RTX Remix capture_materials_report.csv to bridge the
-         * Q3-name -> hash gap (see scripts/q3_to_rtx_hash_bridge.py).
-         * Dedup is automatic — RegisterTexture's FindTextureByName
-         * early-return guards above guarantee one call per unique name. */
-        MetalTelemetryPrintf("q3_hash_dump", PRINT_DEVELOPER,
-            "[Q3-HASH-DUMP] hash=%016llX w=%d h=%d name=%s\n",
-            (unsigned long long)h, width, height, name);
-        if (!MetalTextureForcesClassicPBRPath(name)) {
-            const q3_pbr_material_t *m = q3_pbr_lookup(h);
-            if (m != NULL) {
-                texture->pbrMaterial = m;
+        const q3_pbr_material_t *m = q3_pbr_lookup(h);
+        if (m != NULL) {
+            texture->pbrMaterial = m;
+            q3_pbr_stats_inc_hashes_matched();
+            MetalTelemetryPrintf("metal_pbr_hit", PRINT_ALL,
+                "[Q3-PBR] hash-match name='%s' hash=%016llX albedo=%s normal=%s\n",
+                name, (unsigned long long)h,
+                m->albedo ? "yes" : "-",
+                m->normal ? "yes" : "-");
+        } else {
+            /* Phase 1 Path A: hash didn't match (RTX Remix hash
+             * algorithm is undetermined — see PBR-PHASE-1-HASH-STATUS.md).
+             * Fall back to descriptive-name match against the small
+             * `materials_by_name` table extracted from mod.usda. Hit
+             * rate ~20 materials covering weapon ammo box pickups +
+             * FX assets. */
+            const q3_pbr_material_t *mn = q3_pbr_lookup_by_name(name);
+            if (mn != NULL) {
+                texture->pbrMaterial = mn;
                 q3_pbr_stats_inc_hashes_matched();
                 MetalTelemetryPrintf("metal_pbr_hit", PRINT_ALL,
-                    "[Q3-PBR] hash-match name='%s' hash=%016llX albedo=%s normal=%s\n",
-                    name, (unsigned long long)h,
-                    m->albedo ? "yes" : "-",
-                    m->normal ? "yes" : "-");
-            } else {
-                /* Phase 1 Path A: hash didn't match (RTX Remix hash
-                 * algorithm is undetermined — see PBR-PHASE-1-HASH-STATUS.md).
-                 * Fall back to descriptive-name match against the small
-                 * `materials_by_name` table extracted from mod.usda. */
-                const q3_pbr_material_t *mn = q3_pbr_lookup_by_name(name);
-                if (mn != NULL) {
-                    texture->pbrMaterial = mn;
-                    q3_pbr_stats_inc_hashes_matched();
-                    MetalTelemetryPrintf("metal_pbr_hit", PRINT_ALL,
-                        "[Q3-PBR] name-match shader='%s' albedo=%s normal=%s\n",
-                        name,
-                        mn->albedo ? "yes" : "-",
-                        mn->normal ? "yes" : "-");
-                }
-            }
-        } else {
-            static char s_classicPBRSkipSeen[32][MAX_QPATH];
-            static int s_classicPBRSkipSeenCount = 0;
-            int si;
-            qboolean seen = qfalse;
-            for (si = 0; si < s_classicPBRSkipSeenCount; ++si) {
-                if (!Q_stricmp(s_classicPBRSkipSeen[si], name)) {
-                    seen = qtrue;
-                    break;
-                }
-            }
-            if (!seen) {
-                if (s_classicPBRSkipSeenCount < (int)(sizeof(s_classicPBRSkipSeen) / sizeof(s_classicPBRSkipSeen[0]))) {
-                    Q_strncpyz(s_classicPBRSkipSeen[s_classicPBRSkipSeenCount++], name, MAX_QPATH);
-                }
-                MetalTelemetryPrintf("metal_pbr_classic_skip", PRINT_ALL,
-                    "[Q3-PBR] classic-mask skip name='%s' hash=%016llX\n",
-                    name, (unsigned long long)h);
+                    "[Q3-PBR] name-match shader='%s' albedo=%s normal=%s\n",
+                    name,
+                    mn->albedo ? "yes" : "-",
+                    mn->normal ? "yes" : "-");
             }
         }
     }
@@ -5749,24 +5550,6 @@ static void MetalWorldEmitSurfaceStages(const char *shaderName,
         return;
     }
 
-    if (IsBrandingWorldShaderName(shaderName)) {
-        static char s_brandShaderSeen[8][MAX_QPATH];
-        static int s_brandShaderSeenCount = 0;
-        int bi;
-        qboolean seen = qfalse;
-        for (bi = 0; bi < s_brandShaderSeenCount; ++bi) {
-            if (!Q_stricmp(s_brandShaderSeen[bi], shaderName)) { seen = qtrue; break; }
-        }
-        if (!seen) {
-            if (s_brandShaderSeenCount < (int)(sizeof(s_brandShaderSeen) / sizeof(s_brandShaderSeen[0]))) {
-                Q_strncpyz(s_brandShaderSeen[s_brandShaderSeenCount++], shaderName, MAX_QPATH);
-            }
-            MetalTelemetryPrintf("metal_branding", PRINT_ALL,
-                "[Q3-BRANDING] skipped world shader '%s'\n", shaderName);
-        }
-        return;
-    }
-
     _e = ShaderMap_LookupEntry(shaderName);
     _emitted = 0;
     _combinedLightmapBaseStage = MetalShaderCombinedLightmapBaseStage(_e, hasLightmap, lightmapHandle);
@@ -5809,16 +5592,6 @@ static void MetalWorldEmitSurfaceStages(const char *shaderName,
         return;
     }
 
-    /* Light source geometry: shaders starting with "lights/" are BSP
-     * brushes that define lighting only. They should never be visually
-     * rendered. When the player is inside a light volume, the light
-     * geometry renders as bright white/overexposed areas. Skipping these
-     * surfaces (like nodraw) preserves lighting contribution while
-     * preventing the visual geometry from appearing. */
-    if (_e != NULL && _e->isLight) {
-        return;
-    }
-
     if (_e != NULL && _e->stageCount > 0) {
         _pbrOwnerTex = WorldShaderOwnerPBRHandle(_e);
         for (_s = 0; _s < _e->stageCount; ++_s) {
@@ -5836,41 +5609,6 @@ static void MetalWorldEmitSurfaceStages(const char *shaderName,
                 _drawStage.blendMode = 0;
                 RawBlendFromMode(_drawStage.blendMode, &_drawStage.rawSrcBlend, &_drawStage.rawDstBlend);
                 _drawStage.depthWrite = 1;
-            }
-            /* Remix/PBR owner routing: several stock Q3 world shaders put an
-             * animated `textures/sfx/` layer first (often GL_ONE/GL_ZERO),
-             * followed by the concrete wall/floor material that Remix keyed
-             * PBR sidecars to. Emitting that FX layer as its own opaque pass
-             * makes firegorre/fireswirl2 become a depth-writing base surface
-             * before Swift/RT ever sees the draw list. When we have a concrete
-             * owner stage for this shader, suppress the classic FX split draw
-             * and let the structural owner stage carry the surface material. */
-            if (_pbrOwnerTex != 0 &&
-                _st->useLightmap == 0 &&
-                WorldMapPathIsClassicEffectLayer(_st->mapPath)) {
-                if (s_worldMapAuditActive) {
-                    static char s_skipFXSeen[32][MAX_QPATH];
-                    static int s_skipFXSeenCount = 0;
-                    qboolean seen = qfalse;
-                    int si;
-                    for (si = 0; si < s_skipFXSeenCount; ++si) {
-                        if (!Q_stricmp(s_skipFXSeen[si], shaderName)) { seen = qtrue; break; }
-                    }
-                    if (!seen) {
-                        const metalTexture_t *ownerTex = FindTextureByHandle(_pbrOwnerTex);
-                        if (s_skipFXSeenCount < (int)(sizeof(s_skipFXSeen) / sizeof(s_skipFXSeen[0]))) {
-                            Q_strncpyz(s_skipFXSeen[s_skipFXSeenCount++], shaderName, MAX_QPATH);
-                        }
-                        MetalTelemetryPrintf("metal_draw_plan", PRINT_ALL,
-                            "[metal-draw-plan] skip classic FX underlay shader=%s stage=%d texture=%s ownerHandle=%u owner=%s reason=structural-owner\n",
-                            shaderName,
-                            _s,
-                            _st->mapPath,
-                            (unsigned)_pbrOwnerTex,
-                            ownerTex ? ownerTex->name : "(unknown)");
-                    }
-                }
-                continue;
             }
             if (_st->animFrameCount > 0) {
                 int _idx;
@@ -6931,54 +6669,6 @@ static int ShaderMap_FindAnimatedSlot(const char *name) {
     return -1;
 }
 
-/* Cheap existence probe for image stems. Used before skybox-face
- * RegisterTexture() calls so stock shaders like `skyparms full ...` do not
- * manufacture full_ft/full_bk asset-miss warnings when the pk3 does not ship
- * a matching cubemap. Missing cubemaps should fall back to the shader's
- * classic sky stages, not a white/purple registered placeholder. */
-static qboolean MetalImageStemExists(const char *stem) {
-    static const char *extensions[] = { ".tga", ".jpg", ".jpeg" };
-    int i;
-    if (stem == NULL || stem[0] == '\0') return qfalse;
-    for (i = 0; i < (int)ARRAY_LEN(extensions); ++i) {
-        char candidate[MAX_QPATH];
-        void *buf = NULL;
-        int len;
-        Com_sprintf(candidate, sizeof(candidate), "%s%s", stem, extensions[i]);
-        len = ri.FS_ReadFile(candidate, &buf);
-        if (buf != NULL) {
-            ri.FS_FreeFile(buf);
-        }
-        if (len > 0) {
-            return qtrue;
-        }
-    }
-    return qfalse;
-}
-
-static void ReportMissingSkyBoxFaceOnce(const char *shaderName,
-                                        const char *skyBoxBase,
-                                        const char *faceStem) {
-    enum { MAX_REPORTED_MISSING_SKYBOXES = 32 };
-    static char reported[MAX_REPORTED_MISSING_SKYBOXES][MAX_QPATH];
-    static int reportedCount = 0;
-    int i;
-    if (skyBoxBase == NULL || skyBoxBase[0] == '\0') return;
-    for (i = 0; i < reportedCount; ++i) {
-        if (!Q_stricmp(reported[i], skyBoxBase)) {
-            return;
-        }
-    }
-    if (reportedCount < MAX_REPORTED_MISSING_SKYBOXES) {
-        Q_strncpyz(reported[reportedCount++], skyBoxBase, MAX_QPATH);
-    }
-    MetalTelemetryPrintf("metal_pbr_ibl", PRINT_ALL,
-        "[Q3-SKYBOX] shader='%s' skyBoxBase='%s' missing face stem='%s'; using classic shader sky stages\n",
-        shaderName ? shaderName : "<null>",
-        skyBoxBase,
-        faceStem ? faceStem : "<null>");
-}
-
 /* Returns the tcMod scroll (s, t) values parsed from the first stage
  * of the named shader, or (0, 0) if unknown / absent. */
 /* Q3 skybox support. Resolves one of six face textures for a sky
@@ -7012,6 +6702,29 @@ static qhandle_t GetSkyFaceTextureForSurface(const char *shaderName,
         return 0;
     }
 
+    /* PBR Phase 6 v3 — auto-publish active map's sky stem to r_pbr_ibl_skybox.
+     *
+     * Every visible sky surface hits this fn each frame with its parent shader
+     * name; the matched entry's skyBoxBase IS the map's authored sky stem
+     * (parsed at .shader load time, line ~6336). Copying to the cvar lets the
+     * Swift IBL builder source from the right env path on every map load
+     * with zero engine plumbing — and Swift's per-frame cvar-string compare picks
+     * the change up within one frame and invalidates the cached cubemap.
+     *
+     * Compare-then-set so we don't spam Cvar_Set every frame; only fires the
+     * write when the active sky genuinely changes (i.e. once per map load
+     * unless the user manually overrides the cvar). */
+    if (entry->skyBoxBase[0] != '\0' &&
+        ri.Cvar_Set != NULL && ri.Cvar_VariableString != NULL) {
+        const char *cur = ri.Cvar_VariableString("r_pbr_ibl_skybox");
+        if (cur == NULL || Q_stricmp(cur, entry->skyBoxBase) != 0) {
+            MetalTelemetryPrintf("metal_pbr_ibl", PRINT_ALL,
+                "[Q3-PBR-IBL] auto-detect: shader='%s' sky stem='%s' (was '%s')\n",
+                shaderName, entry->skyBoxBase, cur ? cur : "<null>");
+            ri.Cvar_Set("r_pbr_ibl_skybox", entry->skyBoxBase);
+        }
+    }
+
     ax = fabsf(nx); ay = fabsf(ny); az = fabsf(nz);
     if (az >= ax && az >= ay) {
         faceIdx = (nz >= 0.0f) ? 0 /*up*/ : 1 /*dn*/;
@@ -7025,36 +6738,6 @@ static qhandle_t GetSkyFaceTextureForSurface(const char *shaderName,
         return entry->skyFaceTextures[faceIdx];
     }
     Com_sprintf(path, sizeof(path), "%s%s", entry->skyBoxBase, kSuffixes[faceIdx]);
-
-    if (!MetalImageStemExists(path)) {
-        ReportMissingSkyBoxFaceOnce(shaderName, entry->skyBoxBase, path);
-        if (ri.Cvar_Set != NULL && ri.Cvar_VariableString != NULL) {
-            const char *cur = ri.Cvar_VariableString("r_pbr_ibl_skybox");
-            if (cur != NULL && !Q_stricmp(cur, entry->skyBoxBase)) {
-                MetalTelemetryPrintf("metal_pbr_ibl", PRINT_ALL,
-                    "[Q3-PBR-IBL] invalid sky stem '%s' cleared to env/space1\n",
-                    entry->skyBoxBase);
-                ri.Cvar_Set("r_pbr_ibl_skybox", "env/space1");
-            }
-        }
-        return 0;
-    }
-
-    /* PBR Phase 6 v3 — auto-publish active map's sky stem to
-     * r_pbr_ibl_skybox, but only after proving at least the requested face
-     * exists. Otherwise stock placeholder stems such as `full` poison Swift's
-     * IBL loader with repeated full_rt/env/full_rt FS misses. */
-    if (entry->skyBoxBase[0] != '\0' &&
-        ri.Cvar_Set != NULL && ri.Cvar_VariableString != NULL) {
-        const char *cur = ri.Cvar_VariableString("r_pbr_ibl_skybox");
-        if (cur == NULL || Q_stricmp(cur, entry->skyBoxBase) != 0) {
-            MetalTelemetryPrintf("metal_pbr_ibl", PRINT_ALL,
-                "[Q3-PBR-IBL] auto-detect: shader='%s' sky stem='%s' (was '%s')\n",
-                shaderName, entry->skyBoxBase, cur ? cur : "<null>");
-            ri.Cvar_Set("r_pbr_ibl_skybox", entry->skyBoxBase);
-        }
-    }
-
     entry->skyFaceTextures[faceIdx] = RegisterTexture(path);
     return entry->skyFaceTextures[faceIdx];
 }
@@ -7585,7 +7268,6 @@ static void ParseShaderText(const char *text) {
         qboolean gotFlare;
         qboolean gotSky;
         qboolean gotNoDraw;   /* surfaceparm nodraw — skip surface entirely */
-        qboolean gotLight;    /* shader name starts with "lights/" — light source geometry */
         float fogColor[3];
         float fogDistance;
         Q3MetalStage cur;
@@ -7632,7 +7314,6 @@ static void ParseShaderText(const char *text) {
         gotFlare = qfalse;
         gotSky = qfalse;
         gotNoDraw = qfalse;
-        gotLight = (Q_strncmp(shaderName, "lights/", 7) == 0) ? qtrue : qfalse;
         fogColor[0] = fogColor[1] = fogColor[2] = 0.0f;
         fogDistance = 0.0f;
         Com_Memset(&cur, 0, sizeof(cur));
@@ -8445,7 +8126,6 @@ static void ParseShaderText(const char *text) {
                 last->hasFlare = gotFlare;
                 last->isSky = gotSky;
                 last->isNoDraw = gotNoDraw;
-                last->isLight = gotLight;
                 /* === [METAL-SHADER] PC-port comparison instrumentation ====
                  * Mirrors the [QE-SHADER] dump baked into Quake3e's
                  * renderer/tr_shader.c FinishShader (see Q2_too_ios
@@ -8780,7 +8460,6 @@ static void RE_BeginRegistration(glconfig_t *config) {
     ri.Printf(PRINT_ALL, "RE_BeginRegistration: Metal stub\n");
     LoadAllShaders();
     EnsureWhiteTexture();
-    EnsureTransparentTexture();
     EnsureSkyTexture();
     EnsureTimHellBaseTexture();
     EnsureTimHellAddTexture();
@@ -9683,21 +9362,6 @@ static void RE_RenderScene(const refdef_t *fd) {
                     g = (float)sceneEntity->entity.shader.rgba[1] / 255.0f;
                     b = (float)sceneEntity->entity.shader.rgba[2] / 255.0f;
                     a = (float)sceneEntity->entity.shader.rgba[3] / 255.0f;
-                    /* CG_LightningBolt zero-inits refEntity_t and does not
-                     * author shaderRGBA. If the shader metadata lookup ever
-                     * misses (rgbGen falls back to identity), multiplying the
-                     * beam texture by vertex color black makes the bolt fully
-                     * invisible. Use white as the default tint for this
-                     * special beam path; parsed rgbGen wave still owns the
-                     * pulsing intensity when present. */
-                    if (r <= 0.0f && g <= 0.0f && b <= 0.0f) {
-                        r = 1.0f;
-                        g = 1.0f;
-                        b = 1.0f;
-                    }
-                    if (a <= 0.0f) {
-                        a = 1.0f;
-                    }
                     /* Emit 4 verts: BL, BR, TR, TL */
                     s_entityVertices[baseVertex + 0].position[0] = v0[0];
                     s_entityVertices[baseVertex + 0].position[1] = v0[1];
@@ -11328,16 +10992,6 @@ int Q3_PostprocessEnabled(void) {
     return cv ? cv->integer : 1;
 }
 
-/* Helper: free old string, strdup new value (or NULL). Used so the
- * static Q3PBRMaterialPaths owns its own string copies and survives
- * q3_pbr_free_table() across vid_restart cycles — without this,
- * s_paths.albedo etc. point into freed material-table memory and
- * Swift's String(cString:) crashes with EXC_BAD_ACCESS. */
-static void UpdatePathField(const char **field, const char *src) {
-    free((void *)*field);
-    *field = src ? strdup(src) : NULL;
-}
-
 /* Swift bridge for PBR material paths. Backs onto the
  * metalTexture_t.pbrMaterial pointer the texture register hook
  * stamped at load time. Returns a static-storage Q3PBRMaterialPaths
@@ -11367,17 +11021,15 @@ const Q3PBRMaterialPaths *Q3MetalRenderer_GetPBRMaterial(unsigned int textureHan
                 if (secondColon && secondColon[1]) resolve = secondColon + 1;
             }
         }
-        if (!MetalTextureForcesClassicPBRPath(resolve)) {
-            m = q3_pbr_lookup_by_name(resolve);
-        }
+        m = q3_pbr_lookup_by_name(resolve);
     }
     if (m == NULL) return NULL;
-    UpdatePathField(&s_paths.albedo,    m->albedo);
-    UpdatePathField(&s_paths.normal,    m->normal);
-    UpdatePathField(&s_paths.roughness, m->roughness);
-    UpdatePathField(&s_paths.metallic,  m->metallic);
-    UpdatePathField(&s_paths.emissive,  m->emissive);
-    UpdatePathField(&s_paths.height,    m->height);
+    s_paths.albedo    = m->albedo;
+    s_paths.normal    = m->normal;
+    s_paths.roughness = m->roughness;
+    s_paths.metallic  = m->metallic;
+    s_paths.emissive  = m->emissive;
+    s_paths.height    = m->height;
     s_paths.emissive_intensity = m->emissive_intensity;
     s_paths.emissive_color_r   = m->emissive_color_r;
     s_paths.emissive_color_g   = m->emissive_color_g;
@@ -11402,12 +11054,12 @@ const Q3PBRMaterialPaths *Q3MetalRenderer_GetPBRMaterialByName(const char *name)
     if (name == NULL || name[0] == '\0') return NULL;
     const q3_pbr_material_t *m = q3_pbr_lookup_by_name(name);
     if (m == NULL) return NULL;
-    UpdatePathField(&s_paths.albedo,    m->albedo);
-    UpdatePathField(&s_paths.normal,    m->normal);
-    UpdatePathField(&s_paths.roughness, m->roughness);
-    UpdatePathField(&s_paths.metallic,  m->metallic);
-    UpdatePathField(&s_paths.emissive,  m->emissive);
-    UpdatePathField(&s_paths.height,    m->height);
+    s_paths.albedo    = m->albedo;
+    s_paths.normal    = m->normal;
+    s_paths.roughness = m->roughness;
+    s_paths.metallic  = m->metallic;
+    s_paths.emissive  = m->emissive;
+    s_paths.height    = m->height;
     s_paths.emissive_intensity = m->emissive_intensity;
     s_paths.emissive_color_r   = m->emissive_color_r;
     s_paths.emissive_color_g   = m->emissive_color_g;
@@ -11533,14 +11185,6 @@ float Q3_PBRWorldSpecBoost(void) {
     if (v > 2.0f) v = 2.0f;
     return v;
 }
-float Q3_PBRNormalScale(void) {
-    if (ri.Cvar_Get == NULL) return 1.5f;
-    cvar_t *cv = ri.Cvar_Get("r_pbr_normal_scale", "1.5", CVAR_ARCHIVE);
-    float v = cv ? cv->value : 1.5f;
-    if (v < 0.0f) v = 0.0f;
-    if (v > 4.0f) v = 4.0f;
-    return v;
-}
 /* r_pbr_viewmodel_floor (default 0.35) — viewmodel-only PBR base-color
  * floor. Most weapon viewmodels are authored metallic=1.0; with our
  * neutral 0.08 procedural envCube an IBL-only metal surface comes out
@@ -11662,23 +11306,6 @@ int Q3_PBRSunShadows(void) {
     if (ri.Cvar_Get == NULL) return 1;
     /* Raster-path DistantLight PCF shadow map. Not archived: test/tuning switch. */
     cvar_t *cv = ri.Cvar_Get("r_pbr_sun_shadows", "1", 0);
-    return (cv && cv->integer != 0) ? 1 : 0;
-}
-
-float Q3_PBRShadowPCFRadius(void) {
-    if (ri.Cvar_Get == NULL) return 2.0f;
-    /* Raster sun-shadow PCF tuning. Not archived: capture/tuning switch. */
-    cvar_t *cv = ri.Cvar_Get("r_pbr_shadow_pcf_radius", "2", 0);
-    float v = cv ? cv->value : 2.0f;
-    if (v < 1.0f) v = 1.0f;
-    if (v > 4.0f) v = 4.0f;
-    return v;
-}
-
-int Q3_PBRSSREnabled(void) {
-    if (ri.Cvar_Get == NULL) return 0;
-    /* Raster-only screen-space reflection test switch. Not archived. */
-    cvar_t *cv = ri.Cvar_Get("r_pbr_ssr", "0", 0);
     return (cv && cv->integer != 0) ? 1 : 0;
 }
 
@@ -11989,8 +11616,6 @@ refexport_t *GetRefAPI(int apiVersion, refimport_t *rimp) {
     {
         const char *json = getenv("Q3_PBR_JSON");
         const char *root = getenv("Q3_PBR_ASSETS");
-        char docJson[1024] = {0};
-        char docRoot[1024] = {0};
         char bundleJson[1024] = {0};
         char bundleRoot[1024] = {0};
 
@@ -12001,28 +11626,6 @@ refexport_t *GetRefAPI(int apiVersion, refimport_t *rimp) {
          * If neither path resolves, q3_pbr_table_load is skipped and
          * the renderer behaves as if r_pbrMaterials was off. */
         if (!(json && root && json[0] && root[0])) {
-            struct stat st;
-            extern const char *Sys_DefaultHomePath(void);  /* ios_main.m */
-            extern const char *Sys_DefaultBasePath(void);  /* ios_main.m */
-            const char *home = Sys_DefaultHomePath();
-            if (home && home[0]) {
-                Q_strncpyz(docJson, home, sizeof(docJson));
-                Q_strcat(docJson, sizeof(docJson),
-                         "/baseq3/pbr/materials.json");
-                Q_strncpyz(docRoot, home, sizeof(docRoot));
-                Q_strcat(docRoot, sizeof(docRoot),
-                         "/baseq3/pbr");
-                /* Prefer persistent Documents/baseq3 so device dev builds can
-                 * skip bundling large PBR assets into every .app install. */
-                if (stat(docJson, &st) == 0 && st.st_size > 0) {
-                    json = docJson;
-                    root = docRoot;
-                }
-            }
-        }
-
-        if (!(json && root && json[0] && root[0])) {
-            struct stat st;
             extern const char *Sys_DefaultBasePath(void);  /* ios_main.m */
             const char *base = Sys_DefaultBasePath();
             if (base && base[0]) {
@@ -12033,6 +11636,7 @@ refexport_t *GetRefAPI(int apiVersion, refimport_t *rimp) {
                 Q_strcat(bundleRoot, sizeof(bundleRoot),
                          "/baseq3/pbr");
                 /* Probe with stat() — if the bundle copy is present, use it. */
+                struct stat st;
                 if (stat(bundleJson, &st) == 0 && st.st_size > 0) {
                     json = bundleJson;
                     root = bundleRoot;

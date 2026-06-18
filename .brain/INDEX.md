@@ -5,4 +5,4 @@
 - [errors/errors.json](errors/errors.json) — normalized error log (last 50)
 - [snippets/](snippets/) — reusable code snippets
 
-Last updated: 2026-06-15 — PBR SIGSEGV fix applied, vid_restart test pending
+Last updated: 2026-04-23

@@ -1,0 +1,7 @@
+anchor=four_frame_119
+type=ENTITY_LIGHTING
+demo=four
+frame_index=119
+ref_source=/Users/targus/Documents/Quake_IoS/reference/four/frames/frame_0119.png
+out_source=/Users/targus/Desktop/q3sim_sessions/2026-04-25_19-15-22__581d0e2_vulkan-parity-autorun_dev/frames_960x444/frame_0119.png
+captured_at=2026-04-25_19-15-22

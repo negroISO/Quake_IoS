@@ -1,18 +1,20 @@
 #!/usr/bin/env zsh
-# q3push_baseq3.sh — sync local baseq3 sources to every reachable iPhone/iPad.
+# q3push_baseq3.sh — sync Resources/baseq3/ to every reachable iPhone/iPad.
 #
-# Walks the same three source directories as scripts/stage_baseq3.sh,
-# in the same override order, and pushes each file to
-# Documents/baseq3/<relpath> on every paired+reachable device. Idempotent:
-# re-running overwrites in place.
+# Walks the local Resources/baseq3/ tree and pushes each file to
+# Documents/baseq3/<relpath> on every paired+reachable device (USB
+# "connected" or WiFi "available (paired)" per devicectl). Sub-folders
+# are preserved (so demos/foo.dm_73 lands at Documents/baseq3/demos/
+# foo.dm_73). Idempotent: re-running overwrites in place — drop a new
+# pk3 / .dm_* into Resources/baseq3/, run this script, both devices
+# get it.
 #
 # Usage:
-#   ./scripts/q3push_baseq3.sh                       # default Q3_RT bundle
+#   ./scripts/q3push_baseq3.sh                       # default bundle
 #   ./scripts/q3push_baseq3.sh --bundle <bundle.id>  # custom bundle
-#   ./scripts/q3push_baseq3.sh --device <UDID>       # one device only
 #
 # Examples:
-#   ./scripts/q3push_baseq3.sh --bundle com.quake3ios.rt              # our Metal build
+#   ./scripts/q3push_baseq3.sh --bundle com.quake3ios.app             # our Metal build
 #   ./scripts/q3push_baseq3.sh --bundle com.tomkiddcog.Quake3-iOS     # Tom Kidd's port
 #
 # Notes:
@@ -20,24 +22,18 @@
 #   is enabled in Xcode → Window → Devices and Simulators → check
 #   "Connect via network" once per device; thereafter the device is
 #   reachable whenever it's on the same network.
-# - Skips .DS_Store and *.bak. No delete is performed on-device.
-# - Default bundle is com.quake3ios.rt (current Q3_RT app target).
-#   Override with --bundle for any other Q3 iOS app installed on the
-#   same device.
+# - Skips .DS_Store. No other filtering — every other file under
+#   Resources/baseq3/ is pushed.
+# - Default bundle is com.quake3ios.app (our Metal renderer build,
+#   matches PRODUCT_BUNDLE_IDENTIFIER in project.yml). Override with
+#   --bundle for any other Q3 iOS app installed on the same device.
 
 set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"
 REPO_ROOT="${SCRIPT_DIR:h}"
-BUNDLE="com.quake3ios.rt"
-
-typeset -a SOURCES
-SOURCES=(
-  "$REPO_ROOT/baseq3"
-  "$REPO_ROOT/Quake3-iOS/baseq3"
-  "$REPO_ROOT/Resources/baseq3"
-)
-DEVICE_FILTER=""
+SRC="$REPO_ROOT/Resources/baseq3"
+BUNDLE="com.quake3ios.app"
 
 # --bundle <id> override
 while (( $# > 0 )); do
@@ -46,12 +42,6 @@ while (( $# > 0 )); do
       shift
       [[ -n "${1-}" ]] || { echo "ERROR: --bundle requires a bundle identifier" >&2; exit 2; }
       BUNDLE="$1"
-      shift
-      ;;
-    --device)
-      shift
-      [[ -n "${1-}" ]] || { echo "ERROR: --device requires a device UDID" >&2; exit 2; }
-      DEVICE_FILTER="$1"
       shift
       ;;
     -h|--help)
@@ -65,12 +55,8 @@ while (( $# > 0 )); do
   esac
 done
 
-typeset -i FOUND_SOURCE=0
-for src in "${SOURCES[@]}"; do
-  [[ -d "$src" ]] && FOUND_SOURCE=1
-done
-if (( FOUND_SOURCE == 0 )); then
-  echo "ERROR: no baseq3 source folders found under $REPO_ROOT" >&2
+if [[ ! -d "$SRC" ]]; then
+  echo "ERROR: source folder not found: $SRC" >&2
   exit 1
 fi
 
@@ -90,9 +76,6 @@ DEVICES=("${(@f)$(
 
 # Filter out empty entries (zsh quirks with grep producing nothing).
 DEVICES=("${(@)DEVICES:#}")
-if [[ -n "$DEVICE_FILTER" ]]; then
-  DEVICES=("${(@M)DEVICES:#$DEVICE_FILTER}")
-fi
 
 if (( ${#DEVICES} == 0 )); then
   cat >&2 <<EOF
@@ -115,50 +98,37 @@ while IFS= read -r line; do
   fi
 done < <(xcrun devicectl list devices 2>/dev/null)
 
-echo "Sources:"
-for src in "${SOURCES[@]}"; do
-  if [[ -d "$src" ]]; then
-    echo "  ✓ $src"
-  else
-    echo "  - $src (missing)"
-  fi
-done
+echo "Source: $SRC"
 echo "Bundle: $BUNDLE"
-[[ -n "$DEVICE_FILTER" ]] && echo "Device filter: $DEVICE_FILTER"
 echo "Reachable devices: ${#DEVICES}"
 for udid in "${DEVICES[@]}"; do
   printf "  • %s  [%s]\n" "${NAMES[$udid]:-<unnamed>}" "$udid"
 done
 echo ""
 
-# Push every file, preserving relative path under each baseq3 source.
-# Order matters and matches stage_baseq3.sh: later sources override earlier
-# files with the same relative path.
+# Push every file, preserving relative path under Resources/baseq3/.
 typeset -i PUSHED=0
 typeset -i FAILED=0
 
-for SRC in "${SOURCES[@]}"; do
-  [[ -d "$SRC" ]] || continue
-  while IFS= read -r FILE; do
-    REL="${FILE#$SRC/}"
-    DEST="Documents/baseq3/$REL"
-    for udid in "${DEVICES[@]}"; do
-      NAME="${NAMES[$udid]:-${udid:0:8}…}"
-      if xcrun devicectl device copy to \
-          --device "$udid" \
-          --domain-type appDataContainer \
-          --domain-identifier "$BUNDLE" \
-          --source "$FILE" \
-          --destination "$DEST" >/dev/null 2>&1; then
-        printf "  ✓ %-55s → %s\n" "$REL" "$NAME"
-        PUSHED=$((PUSHED + 1))
-      else
-        printf "  ✗ %-55s → %s (FAILED)\n" "$REL" "$NAME"
-        FAILED=$((FAILED + 1))
-      fi
-    done
-  done < <(find "$SRC" -type f -not -name ".DS_Store" -not -name "*.bak" | sort)
-done
+while IFS= read -r FILE; do
+  REL="${FILE#$SRC/}"
+  DEST="Documents/baseq3/$REL"
+  for udid in "${DEVICES[@]}"; do
+    NAME="${NAMES[$udid]:-${udid:0:8}…}"
+    if xcrun devicectl device copy to \
+        --device "$udid" \
+        --domain-type appDataContainer \
+        --domain-identifier "$BUNDLE" \
+        --source "$FILE" \
+        --destination "$DEST" >/dev/null 2>&1; then
+      printf "  ✓ %-55s → %s\n" "$REL" "$NAME"
+      PUSHED=$((PUSHED + 1))
+    else
+      printf "  ✗ %-55s → %s (FAILED)\n" "$REL" "$NAME"
+      FAILED=$((FAILED + 1))
+    fi
+  done
+done < <(find "$SRC" -type f -not -name ".DS_Store" | sort)
 
 echo ""
 printf "Done. Pushed: %d   Failed: %d\n" "$PUSHED" "$FAILED"

@@ -1,0 +1,10 @@
+# anchor=four_frame_119 type=ENTITY_LIGHTING
+ANCHOR: four_frame_119
+MATCH: FAIL
+DIFF_TYPE: BLEND
+OBSERVATIONS:
+- Entire scene is heavily tinted yellow/green
+- Explosions and effects are overblown and glowing
+- World geometry colors do not match reference
+ROOT_CAUSE: blendFunc
+CONFIDENCE: HIGH

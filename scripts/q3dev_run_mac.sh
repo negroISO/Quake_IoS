@@ -23,17 +23,6 @@ VIDEO_NAME="${VIDEO_NAME:-$DEMO}"
 LAUNCH_COMMAND="${LAUNCH_COMMAND:-demo $DEMO; wait 50; video $VIDEO_NAME; wait 1500; stopvideo; quit}"
 DERIVED="${DERIVED:-$HOME/Library/Developer/Xcode/DerivedData}"
 
-# Render-quality defaults — Codex's prior iteration ran at low (480p
-# upscale-source) which makes captures look pixelated even though
-# the drawable is native 3456×2234. medium (0.5×, ~1728×1117) keeps
-# perf reasonable AND gives real source detail. Override per-invocation
-# via env: Q3_UPSCALE_QUALITY=native (no upscale, ~14fps ceiling),
-# high (0.75×), medium (0.5×), low (480p).
-# r_rt_mix=pure (RT on) is the right default — this is the Q3RT
-# renderer, not the raster baseline.
-export Q3_UPSCALE_QUALITY="${Q3_UPSCALE_QUALITY:-medium}"
-export Q3_RT_MIX="${Q3_RT_MIX:-pure}"
-
 # Pick newest Debug-maccatalyst Q3_RT.app, filtered by CFBundleIdentifier.
 APP=$(/usr/bin/find "$DERIVED" -maxdepth 6 -type d \( -name "Q3_RT.app" -o -name "Quake3-iOS.app" \) \
         -path "*Debug-maccatalyst*" -not -path "*Index.noindex*" 2>/dev/null \
@@ -117,11 +106,6 @@ mkdir -p "$BASEQ3"
 cp -f "$AUTOEXEC" "$BASEQ3/autoexec.cfg" \
     && echo "→ cfg:     pushed autoexec.cfg → $BASEQ3/autoexec.cfg"
 [[ -n "$TMP_AUTOEXEC" ]] && rm -f "$TMP_AUTOEXEC"
-
-# Keep each Catalyst session self-contained. q3_diag.log lives outside
-# baseq3 and otherwise accumulates across maps/runs, which makes grep-based
-# acceptance checks report stale failures.
-rm -f "$DOCS/q3_diag.log" "$BASEQ3/qconsole.log"
 
 # Mirror demos into the Catalyst sandbox (.dm_68 + .dm_73) so playback
 # commands resolve identically to the device path.

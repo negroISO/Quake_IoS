@@ -1,0 +1,9 @@
+# anchor=four_frame_141 type=BLEND_DARKEN
+ANCHOR: four_frame_141
+MATCH: FAIL
+DIFF_TYPE: BLEND
+OBSERVATIONS:
+- Blood decals on walls and floor are missing in Metal output
+- Shell casings on floor are missing in Metal output
+ROOT_CAUSE: blendFunc
+CONFIDENCE: HIGH

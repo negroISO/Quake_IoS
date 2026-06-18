@@ -18,8 +18,6 @@
 # Override demo:    DEMO=q3dm4 q3dev_run.sh q3dm4-ipad
 # Override video:   VIDEO_NAME=q3dm4 q3dev_run.sh q3dm4-ipad
 # Override runtime: RUN_SECS=120 q3dev_run.sh
-# Seed assets:      Q3_SEED_BASEQ3=1 q3dev_run.sh   # force full baseq3 sync
-#                   Q3_SEED_BASEQ3=auto             # default; seed if pak0 missing
 
 set -euo pipefail
 
@@ -29,14 +27,6 @@ DEMO="${DEMO:-four}"
 VIDEO_NAME="${VIDEO_NAME:-$DEMO}"
 LAUNCH_COMMAND="${LAUNCH_COMMAND:-demo $DEMO; wait 50; video $VIDEO_NAME; wait 1500; stopvideo; quit}"
 DERIVED="${DERIVED:-$HOME/Library/Developer/Xcode/DerivedData}"
-Q3_SEED_BASEQ3="${Q3_SEED_BASEQ3:-auto}"
-
-# Render-quality defaults — medium upscale (0.5×) + RT mode by default
-# so iPad acceptance runs produce visually meaningful captures and
-# actually exercise the RT renderer. Override per-invocation via env:
-# Q3_UPSCALE_QUALITY=native|high|medium|low ; Q3_RT_MIX=pure|blend|off.
-Q3_UPSCALE_QUALITY="${Q3_UPSCALE_QUALITY:-medium}"
-Q3_RT_MIX="${Q3_RT_MIX:-pure}"
 # Multiple DerivedData hashes can coexist (one per Xcode-detected workspace
 # location); old ones don't get cleaned up. Picking the alphabetical first
 # match, like a naive `find … | head -1`, has bitten us with stale April-14
@@ -94,39 +84,6 @@ else
     xcrun devicectl device install app --device "$DEVICE" "$APP" >/dev/null 2>&1
     echo "→ installed"
 fi
-
-# Keep bulky game data persistent in the app data container. iOS preserves
-# Documents/baseq3 across install-over/rebuild for the same bundle id, so a
-# seeded device can run thin app bundles built with Q3_SKIP_BUNDLED_BASEQ3=1.
-# Uninstalling the app deletes the sandbox; auto mode reseeds when pak0.pk3
-# is missing.
-case "$Q3_SEED_BASEQ3" in
-    1|yes|true|force)
-        echo "→ baseq3: force sync to Documents/baseq3"
-        "$PWD/scripts/q3push_baseq3.sh" --bundle "$BUNDLE_ID" --device "$DEVICE"
-        ;;
-    auto)
-        TMP_PAK_CHECK=$(mktemp -d /tmp/q3_pak_check.XXXXXX)
-        if xcrun devicectl device copy from \
-            --device "$DEVICE" \
-            --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
-            --source "Documents/baseq3/pak0.pk3" \
-            --destination "$TMP_PAK_CHECK/pak0.pk3" >/dev/null 2>&1; then
-            echo "→ baseq3: already seeded (Documents/baseq3/pak0.pk3)"
-        else
-            echo "→ baseq3: pak0 missing; syncing full baseq3 once"
-            "$PWD/scripts/q3push_baseq3.sh" --bundle "$BUNDLE_ID" --device "$DEVICE"
-        fi
-        rm -rf "$TMP_PAK_CHECK"
-        ;;
-    0|no|false|skip)
-        echo "→ baseq3: seed skipped (Q3_SEED_BASEQ3=$Q3_SEED_BASEQ3)"
-        ;;
-    *)
-        echo "ERR: Q3_SEED_BASEQ3 must be auto, 1, or 0 (got '$Q3_SEED_BASEQ3')" >&2
-        exit 2
-        ;;
-esac
 
 # Push autoexec.cfg if present. Forces logfile=2/developer=1 so
 # qconsole.log captures the boot/shader trace for cross-engine diff

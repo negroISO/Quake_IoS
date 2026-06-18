@@ -141,12 +141,9 @@ void Q3MetalRenderer_FSFreeFile(const unsigned char *buf);
 int   Q3_PBRWorldEnabled(void);
 float Q3_PBRWorldAmbientBoost(void);
 float Q3_PBRWorldSpecBoost(void);
-float Q3_PBRNormalScale(void);
 int   Q3_PBRWorldClassMatchEnabled(void);
 int   Q3_PBRBakedLightmaps(void);
 int   Q3_PBRSunShadows(void);
-int   Q3_PBRSSREnabled(void);
-float Q3_PBRShadowPCFRadius(void);
 /* r_pbr_viewmodel_floor (default 0.35) — viewmodel-only PBR floor that
  * keeps fully-metallic first-person weapons readable under the neutral
  * low-energy procedural envCube. Applied per-fragment as

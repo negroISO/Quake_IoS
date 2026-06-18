@@ -98,7 +98,6 @@ struct Quake3_iOSApp: App {
                              * override (0,0) → engine uses the default
                              * native-target sizing path. */
                             let quality = Q3UpscaleQuality.current
-                            let metalFXBackend = Q3MetalFXBackendPreference.current
                             // Active UIKit screen pixels in landscape.
                             // Must match MetalView's drawable lock; using
                             // nativeBounds here but bounds/nativeScale in
@@ -107,12 +106,12 @@ struct Quake3_iOSApp: App {
                             let outputSize = Q3MetalOutputTargetSize()
                             let outputW = outputSize.width
                             let outputH = outputSize.height
-                            if quality != .native && metalFXBackend != .off {
+                            if quality != .native {
                                 let rs = quality.renderSize(forOutput: outputSize)
                                 let w = Int32(rs.width)
                                 let h = Int32(rs.height)
-                                NSLog("[Q3-BOOT] MetalFX quality=%@ backend=%@ render=%dx%d (output target %dx%d screen)",
-                                      quality.label, metalFXBackend.rawValue, w, h, Int32(outputW), Int32(outputH))
+                                NSLog("[Q3-BOOT] MetalFX quality=%@ render=%dx%d (output target %dx%d screen)",
+                                      quality.label, w, h, Int32(outputW), Int32(outputH))
                                 Q3_SetRenderResolution(w, h)
                             } else {
                                 // Native quality: render at true device
@@ -121,7 +120,7 @@ struct Quake3_iOSApp: App {
                                 // will also pin to native bounds.
                                 let w = Int32(outputW)
                                 let h = Int32(outputH)
-                                NSLog("[Q3-BOOT] MetalFX quality=%@ backend=%@ render=%dx%d (true native, no upscale)", quality.label, metalFXBackend.rawValue, w, h)
+                                NSLog("[Q3-BOOT] MetalFX quality=Native render=%dx%d (true native, no upscale)", w, h)
                                 Q3_SetRenderResolution(w, h)
                             }
 
