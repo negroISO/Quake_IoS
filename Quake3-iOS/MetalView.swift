@@ -3728,6 +3728,10 @@ struct MetalView: UIViewRepresentable {
 
         private var worldAccelerationStructure: MTLAccelerationStructure?
         private var rtPipelineState: MTLComputePipelineState?
+        // Step 2a: argument encoder for the rtKernel RTTexTable (buffer index 8).
+        // Cached at pipeline creation; used per-frame to encode albedo/lightmap
+        // textures into an argument buffer (lifts the 128 direct-binding cap).
+        private var rtTexArgEncoder: MTLArgumentEncoder?
         private var rtBlendPipelineState: MTLComputePipelineState?
         private var rtAccumPipelineState: MTLComputePipelineState?
         private var rtTexture: MTLTexture?
@@ -4199,6 +4203,15 @@ struct MetalView: UIViewRepresentable {
                 float4 rtPBRParams;  // x=parallaxScale, y=normalScale, z/w=pad
             };
 
+            // Step 2a: RT texture table moved into an argument buffer so the
+            // 128 direct-binding limit no longer caps the table (room for PBR
+            // sidecars later). albedo gets [[id(0..109)]], lightmap [[id(110..125)]].
+            // Swift mirrors this id layout when encoding (see encodeRTOverlay).
+            struct RTTexTable {
+                array<texture2d<float>, 110> albedo;
+                array<texture2d<float>, 16> lightmap;
+            };
+
             float2 rtApplyTcMod(float2 uv, float3 worldPos, int type, float4 params, float timeSeconds) {
                 if (type == 1) {
                     float2 adj = params.xy * timeSeconds;
@@ -4257,8 +4270,7 @@ struct MetalView: UIViewRepresentable {
 
             kernel void rtKernel(texture2d<float, access::write> output [[texture(0)]],
                                  texturecube<float> envCube [[texture(1)]],
-                                 array<texture2d<float>, 110> albedoTextures [[texture(2)]],
-                                 array<texture2d<float>, 16> lightmapTextures [[texture(112)]],
+                                 const device RTTexTable& texTable [[buffer(8)]],
                                  constant RayTracingUniforms &uniforms [[buffer(0)]],
                                  acceleration_structure<> worldAS [[buffer(1)]],
                                  const device uint *indices [[buffer(2)]],
@@ -4383,7 +4395,7 @@ struct MetalView: UIViewRepresentable {
                             uv = float2((localUV.x + col) / aCols,
                                         (localUV.y + row) / aRows);
                         }
-                        float4 albedoSample = albedoTextures[mat.albedoSlot].sample(repeatSampler, uv);
+                        float4 albedoSample = texTable.albedo[mat.albedoSlot].sample(repeatSampler, uv);
                         float blendMode = mat.materialParams.y;
                         bool additiveBlend = (abs(blendMode - 1.0) < 0.5 || abs(blendMode - 5.0) < 0.5);
                         bool alphaSensitive = (mat.materialFlags.z != 0 || mat.materialFlags.w != 0 || additiveBlend);
@@ -4420,7 +4432,7 @@ struct MetalView: UIViewRepresentable {
                             // alpha so the composite pass preserves raster behind/through them.
                             float3 lightmap = float3(1.0);
                             if (mat.lightmapSlot < 16) {
-                                lightmap = lightmapTextures[mat.lightmapSlot].sample(clampSampler, lmuv).rgb;
+                                lightmap = texTable.lightmap[mat.lightmapSlot].sample(clampSampler, lmuv).rgb;
                             }
                             float ambientFloor = uniforms.rtToneParams.z;
                             color = albedoSample.rgb * max(lightmap * 1.25, float3(ambientFloor));
@@ -4436,7 +4448,7 @@ struct MetalView: UIViewRepresentable {
                         } else {
                             float3 lightmap = float3(1.0);
                             if (mat.lightmapSlot < 16) {
-                                lightmap = lightmapTextures[mat.lightmapSlot].sample(clampSampler, lmuv).rgb;
+                                lightmap = texTable.lightmap[mat.lightmapSlot].sample(clampSampler, lmuv).rgb;
                             }
                             float ambientFloor = uniforms.rtToneParams.z;
                             color = albedoSample.rgb * max(lightmap * 1.25, float3(ambientFloor));
@@ -4466,7 +4478,7 @@ struct MetalView: UIViewRepresentable {
                                         float2 bb = bounceHit.triangle_barycentric_coord;
                                         float bw = 1.0 - bb.x - bb.y;
                                         float2 buv = vertices[bi0].texCoord * bw + vertices[bi1].texCoord * bb.x + vertices[bi2].texCoord * bb.y;
-                                        float3 emitAlbedo = albedoTextures[bounceMat.albedoSlot].sample(repeatSampler, buv).rgb;
+                                        float3 emitAlbedo = texTable.albedo[bounceMat.albedoSlot].sample(repeatSampler, buv).rgb;
                                         indirect = emitAlbedo * max(bounceMat.materialParams.x, 0.8) * 0.22;
                                     } else {
                                         indirect = float3(0.035);
@@ -4617,10 +4629,10 @@ struct MetalView: UIViewRepresentable {
                                                 ruv = float2((rLocalUV.x + rCol) / rCols,
                                                              (rLocalUV.y + rRow) / rRows);
                                             }
-                                            float3 ralb = albedoTextures[rmat.albedoSlot].sample(repeatSampler, ruv).rgb;
+                                            float3 ralb = texTable.albedo[rmat.albedoSlot].sample(repeatSampler, ruv).rgb;
                                             float3 rlight = float3(1.0);
                                             if (rmat.lightmapSlot < 16) {
-                                                rlight = lightmapTextures[rmat.lightmapSlot].sample(clampSampler, rlm).rgb;
+                                                rlight = texTable.lightmap[rmat.lightmapSlot].sample(clampSampler, rlm).rgb;
                                             }
                                             reflColor = ralb * max(rlight * 1.25, float3(uniforms.rtToneParams.z));
                                             if (rmat.materialFlags.y != 0) {
@@ -4762,7 +4774,13 @@ struct MetalView: UIViewRepresentable {
             guard let lib = makeRTLibrary(device: device), let fn = lib.makeFunction(name: "rtKernel") else {
                 print("[RT] failed to create rtKernel"); return nil
             }
-            do { let pso = try device.makeComputePipelineState(function: fn); rtPipelineState = pso; print("[RT] rtKernel pipeline ready"); return pso }
+            do {
+                let pso = try device.makeComputePipelineState(function: fn); rtPipelineState = pso
+                // Step 2a: build the argument encoder for the RTTexTable at buffer(8).
+                rtTexArgEncoder = fn.makeArgumentEncoder(bufferIndex: 8)
+                print("[RT] rtKernel pipeline ready (texArgEncoder len=\(rtTexArgEncoder?.encodedLength ?? 0))")
+                return pso
+            }
             catch { print("[RT] pipeline state error: \(error)"); return nil }
         }
 
@@ -5674,18 +5692,32 @@ struct MetalView: UIViewRepresentable {
                     rtHistoryValid = false
                 }
                 enc.setTexture(envCube, index: 1)
-                let fallbackTex = ensureRTWhiteTexture(device: device)
-                let emissiveFallbackTex = pbrEmissiveDefault() ?? fallbackTex
-                for i in 0..<rtMaxAlbedoSlots {
-                    let h = rtAlbedoHandles[i]
-                    if rtAlbedoSlotKinds[i] == 1 {
-                        enc.setTexture(pbrEmissiveTexture(for: h) ?? emissiveFallbackTex, index: 2 + i)
-                    } else {
-                        enc.setTexture(pbrAlbedoTexture(for: h) ?? texture(for: h, device: device) ?? fallbackTex, index: 2 + i)
+                // Step 2a: encode the RT texture table into an argument buffer
+                // (buffer 8) instead of 126 direct setTexture binds. Frees the
+                // 128-binding cap so PBR sidecars can be added later. The MSL
+                // RTTexTable lays out albedo at id 0..109, lightmap at id 110..125.
+                if let argEnc = rtTexArgEncoder, let fallbackTex = ensureRTWhiteTexture(device: device) {
+                    var rtTexResident: [MTLTexture] = []
+                    rtTexResident.reserveCapacity(rtMaxAlbedoSlots + rtMaxLightmapSlots)
+                    for i in 0..<rtMaxAlbedoSlots {
+                        let h = rtAlbedoHandles[i]
+                        rtTexResident.append(pbrAlbedoTexture(for: h) ?? texture(for: h, device: device) ?? fallbackTex)
                     }
-                }
-                for i in 0..<rtMaxLightmapSlots {
-                    enc.setTexture(texture(for: rtLightmapHandles[i], device: device) ?? fallbackTex, index: 112 + i)
+                    for i in 0..<rtMaxLightmapSlots {
+                        rtTexResident.append(texture(for: rtLightmapHandles[i], device: device) ?? fallbackTex)
+                    }
+                    // Fresh arg buffer each frame (avoids GPU-in-flight aliasing;
+                    // ~1 KB, cheap). Metal refcounts it until the dispatch drains.
+                    let argBuf = device.makeBuffer(length: argEnc.encodedLength, options: .storageModeShared)
+                    argBuf?.label = "Q3.RT.texTableArgBuffer"
+                    if let argBuf {
+                        argEnc.setArgumentBuffer(argBuf, offset: 0)
+                        for (i, t) in rtTexResident.enumerated() { argEnc.setTexture(t, index: i) }
+                        enc.setBuffer(argBuf, offset: 0, index: 8)
+                        // CRITICAL: every texture referenced by the arg buffer must be
+                        // made resident or the GPU faults/hangs on access.
+                        for t in rtTexResident { enc.useResource(t, usage: .read) }
+                    }
                 }
                 enc.setBytes(&uniforms, length: MemoryLayout<RayTracingUniforms>.stride, index: 0)
                 enc.setAccelerationStructure(worldAS, bufferIndex: 1)
