@@ -10827,15 +10827,72 @@ static qboolean R_inPVS(const vec3_t p1, const vec3_t p2) {
  * (code/client/cl_avi.c) expects.
  *
  * Single-producer (Swift main thread) / single-consumer (engine
- * thread) — the ready flag is fine as a plain int since misses just
- * result in the previous frame being reused, which is acceptable for
- * this diagnostic tool. */
+ * thread): if a frame is not ready yet or sizes mismatch for one tick,
+ * we still reuse the last captured frame (with conversion when needed)
+ * instead of emitting a black output frame. */
 #define Q3_METAL_VIDEO_MAX_DIM 8192
 static byte  *s_videoCaptureBgra;
 static size_t s_videoCaptureCapacity;
 static int    s_videoCaptureWidth;
 static int    s_videoCaptureHeight;
+static int    s_videoCaptureHasFrame;
 static int    s_videoCaptureReady;
+static uint64_t s_videoCaptureMissedFrames;
+
+/* Convert a BGRA frame to destination RGB while flipping Y. Supports
+ * same-size fast path and fallback nearest-neighbor scaling when sizes
+ * differ (e.g., capture path resize transitions).
+ * src is tightly packed BGRA bytes, dst is tightly packed RGB bytes.
+ * Dimensions must be valid and non-zero. */
+static void RE_ConvertVideoFrame(const byte *src, int srcW, int srcH,
+                                int dstW, int dstH, byte *dst) {
+    int x, y;
+    size_t row;
+    int sx, sy;
+    const byte *srcRow;
+    const byte *s;
+    byte *d;
+
+    if (src == NULL || dst == NULL) {
+        return;
+    }
+    if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) {
+        return;
+    }
+
+    if (srcW == dstW && srcH == dstH) {
+        for (y = 0; y < dstH; ++y) {
+            srcRow = &src[(size_t)(dstH - 1 - y) * (size_t)srcW * 4];
+            d = &dst[(size_t)y * (size_t)dstW * 3];
+            for (x = 0; x < dstW; ++x) {
+                d[0] = srcRow[2];
+                d[1] = srcRow[1];
+                d[2] = srcRow[0];
+                srcRow += 4;
+                d += 3;
+            }
+        }
+    } else {
+        for (y = 0; y < dstH; ++y) {
+            sy = (int)(((int64_t)y * srcH) / dstH);
+            if (sy < 0) sy = 0;
+            if (sy >= srcH) sy = srcH - 1;
+            srcRow = &src[(size_t)sy * (size_t)srcW * 4];
+            row = ((size_t)(dstH - 1 - y) * (size_t)dstW * 3);
+            d = &dst[row];
+            for (x = 0; x < dstW; ++x) {
+                sx = (int)(((int64_t)x * srcW) / dstW);
+                if (sx < 0) sx = 0;
+                if (sx >= srcW) sx = srcW - 1;
+                s = &srcRow[(size_t)sx * 4];
+                d[0] = s[2];
+                d[1] = s[1];
+                d[2] = s[0];
+                d += 3;
+            }
+        }
+    }
+}
 
 /* Called by Swift after each drawable readback. Bytes are BGRA (Metal
  * native). bytesPerRow == width*4 (no padding). */
@@ -10863,41 +10920,51 @@ void Q3MetalRenderer_StoreVideoFrame(const uint8_t *bgra, int width, int height)
     Com_Memcpy(s_videoCaptureBgra, bgra, n);
     s_videoCaptureWidth = width;
     s_videoCaptureHeight = height;
+    s_videoCaptureHasFrame = 1;
     s_videoCaptureReady = 1;
 }
 
 /* Called by the engine's CL_TakeVideoFrame path (cl_avi.c) once per
  * recorded frame. `w`×`h` is the AVI stream dimension (from r_custom*
  * or glconfig). captureBuffer receives tightly-packed RGB (no row
- * padding, no alpha). If our Swift-driven readback hasn't produced a
- * matching frame yet, we leave captureBuffer at zeros — ffprobe will
- * see a black frame for that entry but the AVI stays valid. */
+ * padding, no alpha). If readback is late, we fall back to the most
+ * recently stored frame instead of zeroing the capture buffer. */
 static void RE_TakeVideoFrame(int w, int h, byte *captureBuffer,
                               byte *encodeBuffer, qboolean motionJpeg) {
-    int x, y;
-    const byte *src;
-    byte *dst;
     size_t rgbSize;
-    if (captureBuffer == NULL || w <= 0 || h <= 0) return;
-    rgbSize = (size_t)w * (size_t)h * 3;
-    if (!s_videoCaptureReady ||
-        s_videoCaptureWidth != w || s_videoCaptureHeight != h) {
-        Com_Memset(captureBuffer, 0, rgbSize);
-    } else {
-        /* Metal textures are upside-down relative to what the AVI
-         * encoder expects (GL convention: origin at bottom-left,
-         * Metal: top-left). Flip Y while we walk the pixels. */
-        for (y = 0; y < h; ++y) {
-            src = &s_videoCaptureBgra[(size_t)(h - 1 - y) * (size_t)w * 4];
-            dst = &captureBuffer[(size_t)y * (size_t)w * 3];
-            for (x = 0; x < w; ++x, src += 4, dst += 3) {
-                dst[0] = src[2]; /* R = BGRA's B-slot (Metal native) */
-                dst[1] = src[1]; /* G */
-                dst[2] = src[0]; /* B = BGRA's R-slot */
-            }
-        }
-        s_videoCaptureReady = 0;
+
+    if (captureBuffer == NULL || w <= 0 || h <= 0) {
+        return;
     }
+
+    rgbSize = (size_t)w * (size_t)h * 3;
+
+    if (s_videoCaptureWidth <= 0 || s_videoCaptureHeight <= 0 ||
+        !s_videoCaptureHasFrame || s_videoCaptureBgra == NULL) {
+        Com_Memset(captureBuffer, 0, rgbSize);
+        return;
+    }
+
+    if (!s_videoCaptureReady) {
+        s_videoCaptureMissedFrames++;
+        if (s_videoCaptureMissedFrames <= 5 && ri.Printf) {
+            ri.Printf(PRINT_DEVELOPER,
+                      "[video-capture] readback miss/frame lag (%dx%d -> %dx%d), reusing buffered frame\n",
+                      s_videoCaptureWidth, s_videoCaptureHeight, w, h);
+        }
+    }
+
+    RE_ConvertVideoFrame(s_videoCaptureBgra, s_videoCaptureWidth,
+                        s_videoCaptureHeight, w, h, captureBuffer);
+    s_videoCaptureReady = 0;
+    s_videoCaptureHasFrame = 1;
+
+    if (ri.Printf && s_videoCaptureMissedFrames > 0 && s_videoCaptureMissedFrames <= 5) {
+        ri.Printf(PRINT_DEVELOPER,
+                  "[video-capture] wrote buffered frame after %llu missed readback(s)\n",
+                  (unsigned long long)s_videoCaptureMissedFrames);
+    }
+
     /* Upstream GL renderer uses a two-phase approach: RE_TakeVideoFrame
      * schedules, RB_TakeVideoFrameCmd writes. Our stub has no backend
      * phase — do the write synchronously. For motionJpeg we'd call
