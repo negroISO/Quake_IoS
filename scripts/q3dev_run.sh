@@ -172,9 +172,11 @@ fi
 
 # Pull the AVI out of the app sandbox via devicectl. Path is
 # Documents/baseq3/videos/<video>.avi inside appDataContainer.
-# Always try to pull and extract frames; stdout length is not a reliable
-# signal for video availability on physical devices.
-if xcrun devicectl device copy from \
+# We only pull when stdout shows a successful write; older runs may leave
+# stale files on-device, and older launch-command paths can silently avoid
+# recording. stdout is the only reliable signal for a fresh capture.
+if grep -qE "Wrote [0-9]+:[0-9]+ frames to videos/${VIDEO_NAME}\\.avi" "$OUTDIR/stdout.log"; then
+  if xcrun devicectl device copy from \
     --device "$DEVICE" \
     --domain-type appDataContainer --domain-identifier "$BUNDLE_ID" \
     --source "Documents/baseq3/videos/${VIDEO_NAME}.avi" \
@@ -190,6 +192,9 @@ if xcrun devicectl device copy from \
     else
         echo "→ frames: SKIPPED (ffmpeg not found)"
     fi
+  else
+    echo "→ avi:    FAILED to pull (could not copy ${VIDEO_NAME}.avi from device)"
+  fi
 else
-    echo "→ avi:    FAILED to pull (no ${VIDEO_NAME}.avi on device — video cbuf disabled?)"
+  echo "→ avi:    FAILED to pull (no fresh ${VIDEO_NAME}.avi recorded — 'video' likely not in active demo path)"
 fi
