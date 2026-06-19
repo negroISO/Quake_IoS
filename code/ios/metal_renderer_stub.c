@@ -11450,11 +11450,11 @@ float Q3_PBREnvCubeGrey(void) {
  * showed 3.0 restores the authored RTX Remix-style space-map emissive
  * punch while staying below the old all-white 4.0/8.0 look. */
 float Q3_PBREmissiveIntensityMax(void) {
-    if (ri.Cvar_Get == NULL) return 3.0f;
-    cvar_t *cv = ri.Cvar_Get("r_pbr_emissive_intensity_max", "3.0", CVAR_ARCHIVE);
+    if (ri.Cvar_Get == NULL) return 64.0f;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_emissive_intensity_max", "64.0", CVAR_ARCHIVE);
     float v = cv ? cv->value : 3.0f;
     if (v < 0.0f) v = 0.0f;
-    if (v > 16.0f) v = 16.0f;
+    if (v > 1024.0f) v = 1024.0f;
     return v;
 }
 

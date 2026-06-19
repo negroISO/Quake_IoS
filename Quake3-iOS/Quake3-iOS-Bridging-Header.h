@@ -172,16 +172,15 @@ int Q3_WorldDebugMode(void);
  * procedural cube when the EFFECTIVE value changes. */
 float Q3_PBREnvCubeGrey(void);
 float Q3_PBREnvCubeGreyRequested(void);
-/* r_pbr_emissive_intensity_max (default 1.5, archived, clamped 0..16) —
+/* r_pbr_emissive_intensity_max (default 64.0, archived, clamped 0..1024) —
  * hard ceiling on the per-material emissive intensity that
  * `emissiveParamsForPBRMaterial` writes into `EntityUniforms.emissive
  * Params.w` and `WorldDrawUniforms.emissiveParams.w`. materials.json
  * authors values up to 982 (RTX Remix HDR pipeline) and the historical
- * default was 4.0 — but after the 2026-06-10 entity-side emissive
- * ordering fix made emissive actually reach the GPU on entity draws,
- * 4.0 saturated the BGRA8 backbuffer to white on chrome/envmap entities
- * (quad shell, health/armor pickups, weapon hot-bits). 1.5 keeps a
- * slight HDR-style overshoot for bright highlights without clipping. */
+ * default was 4.0 — after HDR resolve now uses tone mapping so the clamp
+ * is permissive enough for 48/982 authored values and only guards absurd
+ * numeric values. 64.0 is practical for gameplay; 1024.0 is the hard
+ * guard. */
 float Q3_PBREmissiveIntensityMax(void);
 int   Q3_PBROnlyTextures(void);
 float Q3_RTMix(void);

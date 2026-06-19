@@ -3574,6 +3574,8 @@ struct MetalView: UIViewRepresentable {
          *     like before. spatialScaler is also nil — no MetalFX overhead. */
         private var upscaleQuality: Q3UpscaleQuality = Q3UpscaleQuality.current
         private var upscaleColorTarget: MTLTexture?
+        /// HDR linear-color resolve target at drawable size before final LDR postprocess.
+        private var upscaleResolvedColorTarget: MTLTexture?
         private var upscaleDepthTarget: MTLTexture?
         #if canImport(MetalFX)
         private var spatialScaler: MTLFXSpatialScaler?
@@ -3591,12 +3593,13 @@ struct MetalView: UIViewRepresentable {
                                                  inputW: Int, inputH: Int,
                                                  outputW: Int, outputH: Int) -> Bool {
             let key = (inputW, inputH, outputW, outputH)
-            if upscaleColorTarget != nil && upscaleDepthTarget != nil && spatialScalerKey == key { return true }
+            if upscaleColorTarget != nil && upscaleResolvedColorTarget != nil &&
+                upscaleDepthTarget != nil && spatialScalerKey == key { return true }
 
             // Color RT (.private, [renderTarget, shaderRead] — Q3 renders
-            // INTO this, MetalFX READS this).
+            // INTO this, compute scaler READS this.
             let colorDesc = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: .bgra8Unorm,
+                pixelFormat: .rgba16Float,
                 width: inputW, height: inputH, mipmapped: false)
             colorDesc.usage = [.renderTarget, .shaderRead]
             colorDesc.storageMode = .private
@@ -3607,6 +3610,19 @@ struct MetalView: UIViewRepresentable {
             }
             color.label = "Q3.upscale.color"
             upscaleColorTarget = color
+
+            let resolvedDesc = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .rgba16Float,
+                width: outputW, height: outputH, mipmapped: false)
+            resolvedDesc.usage = [.shaderRead, .shaderWrite]
+            resolvedDesc.storageMode = .private
+            resolvedDesc.textureType = .type2D
+            guard let resolved = device.makeTexture(descriptor: resolvedDesc) else {
+                print("[MetalFX] ensureSpatialUpscaleTargets: resolve RT alloc failed (\(outputW)×\(outputH))")
+                return false
+            }
+            resolved.label = "Q3.upscale.resolve"
+            upscaleResolvedColorTarget = resolved
 
             // Depth RT (.private, renderTarget) — same dims as color RT.
             let depthDesc = MTLTextureDescriptor.texture2DDescriptor(
@@ -3941,6 +3957,8 @@ struct MetalView: UIViewRepresentable {
         private struct PostprocessUniforms {
             var intensity: Float
             var gamma: Float
+            var applyToneMap: Float
+            var pad: Float
         }
 
         private struct RTBlendUniforms {
@@ -3960,29 +3978,50 @@ struct MetalView: UIViewRepresentable {
             struct PPUniforms {
                 float intensity;
                 float gamma;
+                float applyToneMap;
+                float pad;
             };
 
-            kernel void q3_postprocess(texture2d<float, access::read_write> drawable [[texture(0)]],
+            kernel void q3_postprocess(texture2d<float, access::read> source [[texture(0)]],
+                                       texture2d<float, access::write> target [[texture(1)]],
                                        constant PPUniforms &u [[buffer(0)]],
                                        uint2 tid [[thread_position_in_grid]]) {
-                uint w = drawable.get_width();
-                uint h = drawable.get_height();
+                uint w = target.get_width();
+                uint h = target.get_height();
                 if (tid.x >= w || tid.y >= h) return;
-                float4 c = drawable.read(tid);
-                float3 rgb = saturate(c.rgb * u.intensity);
-                rgb = pow(rgb, float3(u.gamma));
-                drawable.write(float4(rgb, c.a), tid);
+                float4 c = source.read(tid);
+                float3 rgb = max(c.rgb, float3(0.0));
+                if (u.applyToneMap > 0.5) {
+                    rgb = max(rgb * u.intensity, float3(0.0));
+                    // ACES-style tone mapping keeps sub-1 signal stable while
+                    // rolling high-emissive values into bloom-like highlights.
+                    rgb = (rgb * (2.51 * rgb + 0.03)) /
+                          (rgb * (2.43 * rgb + 0.59) + 0.14);
+                } else {
+                    rgb *= u.intensity;
+                }
+                rgb = pow(saturate(rgb), float3(u.gamma));
+                target.write(float4(rgb, c.a), tid);
             }
 
             kernel void q3_spatial_upscale(texture2d<float, access::sample> source [[texture(0)]],
                                            texture2d<float, access::write> output [[texture(1)]],
+                                           constant PPUniforms &u [[buffer(0)]],
                                            uint2 tid [[thread_position_in_grid]]) {
                 uint w = output.get_width();
                 uint h = output.get_height();
                 if (tid.x >= w || tid.y >= h) return;
                 constexpr sampler s(filter::linear, address::clamp_to_edge);
                 float2 uv = (float2(tid) + 0.5) / float2(max(w, 1u), max(h, 1u));
-                output.write(source.sample(s, uv), tid);
+                float4 c = source.sample(s, uv);
+                float3 rgb = max(c.rgb * u.intensity, float3(0.0));
+                if (u.applyToneMap > 0.5) {
+                    rgb = (rgb * (2.51 * rgb + 0.03)) /
+                          (rgb * (2.43 * rgb + 0.59) + 0.14);
+                } else {
+                    rgb *= u.intensity;
+                }
+                output.write(float4(saturate(rgb), c.a), tid);
             }
             """
             do {
@@ -4009,8 +4048,9 @@ struct MetalView: UIViewRepresentable {
 
         @MainActor
         private func encodePostprocess(commandBuffer: MTLCommandBuffer,
-                                       drawable: CAMetalDrawable) {
-            guard Q3_PostprocessEnabled() != 0 else { return }
+                                       sourceTexture: MTLTexture,
+                                       outputTexture: MTLTexture) {
+            if sourceTexture === outputTexture && Q3_PostprocessEnabled() == 0 { return }
             guard let device = commandBuffer.device as MTLDevice?,
                   let pso = ensurePostprocessPipeline(device: device),
                   let enc = commandBuffer.makeComputeCommandEncoder() else {
@@ -4018,12 +4058,19 @@ struct MetalView: UIViewRepresentable {
             }
             enc.label = "Q3.postprocess"
             enc.setComputePipelineState(pso)
-            enc.setTexture(drawable.texture, index: 0)
-            var u = PostprocessUniforms(intensity: Q3_PostprocessIntensity(),
-                                        gamma: Q3_PostprocessGamma())
+            enc.setTexture(sourceTexture, index: 0)
+            enc.setTexture(outputTexture, index: 1)
+            let processEnabled = Q3_PostprocessEnabled() != 0
+            let shouldToneMap = sourceTexture !== outputTexture || processEnabled
+            let intensity = Q3_PostprocessIntensity()
+            let gamma = Q3_PostprocessGamma()
+            var u = PostprocessUniforms(intensity: intensity,
+                                        gamma: gamma,
+                                        applyToneMap: shouldToneMap ? 1.0 : 0.0,
+                                        pad: 0.0)
             enc.setBytes(&u, length: MemoryLayout<PostprocessUniforms>.size, index: 0)
-            let w = drawable.texture.width
-            let h = drawable.texture.height
+            let w = outputTexture.width
+            let h = outputTexture.height
             let threadsPerThreadgroup = MTLSize(width: 8, height: 8, depth: 1)
             let threadgroups = MTLSize(width: (w + 7) / 8,
                                        height: (h + 7) / 8,
@@ -4032,7 +4079,7 @@ struct MetalView: UIViewRepresentable {
             enc.endEncoding()
             postprocessEncodeCount += 1
             if postprocessEncodeCount == 1 || postprocessEncodeCount % 120 == 0 {
-                print("[MTL_POSTPROC] encode #\(postprocessEncodeCount) intensity=\(u.intensity) gamma=\(u.gamma) size=\(w)x\(h)")
+                print("[MTL_POSTPROC] encode #\(postprocessEncodeCount) intensity=\(u.intensity) gamma=\(u.gamma) tonemap=\(u.applyToneMap) size=\(w)x\(h)")
             }
         }
 
@@ -4054,6 +4101,11 @@ struct MetalView: UIViewRepresentable {
             enc.setComputePipelineState(pso)
             enc.setTexture(source, index: 0)
             enc.setTexture(output, index: 1)
+            var u = PostprocessUniforms(intensity: Q3_PostprocessIntensity(),
+                                        gamma: Q3_PostprocessGamma(),
+                                        applyToneMap: 1.0,
+                                        pad: 0.0)
+            enc.setBytes(&u, length: MemoryLayout<PostprocessUniforms>.size, index: 0)
             let tg = MTLSize(width: 8, height: 8, depth: 1)
             let groups = MTLSize(width: (output.width + 7) / 8,
                                  height: (output.height + 7) / 8,
@@ -9707,18 +9759,24 @@ struct MetalView: UIViewRepresentable {
 
             encoder.endEncoding()
 
-            if upscaleActive, let colorRT = (rtCompositeForUpscale ?? upscaleColorTarget) {
+            if upscaleActive,
+               let colorRT = (rtCompositeForUpscale ?? upscaleColorTarget),
+               let resolveRT = upscaleResolvedColorTarget {
                 encodeSpatialUpscale(commandBuffer: commandBuffer,
                                      source: colorRT,
-                                     output: drawable.texture)
+                                     output: resolveRT)
+                encodePostprocess(commandBuffer: commandBuffer,
+                                  sourceTexture: resolveRT,
+                                  outputTexture: drawable.texture)
+            } else if upscaleActive {
+                encodePostprocess(commandBuffer: commandBuffer,
+                                  sourceTexture: drawable.texture,
+                                  outputTexture: drawable.texture)
+            } else {
+                encodePostprocess(commandBuffer: commandBuffer,
+                                  sourceTexture: drawable.texture,
+                                  outputTexture: drawable.texture)
             }
-
-            // Final-image postprocess tone curve (port of Q2 MetalPostprocess).
-            // Compute kernel does saturate(rgb*intensity); pow(rgb, gamma).
-            // Encoded after all render encoders + upscale, before present.
-            // Always runs on the drawable so the tone curve is applied at
-            // output resolution regardless of upscale state.
-            encodePostprocess(commandBuffer: commandBuffer, drawable: drawable)
             // Cache drawable.texture BEFORE present(). Reading
             // drawable.texture after commandBuffer.present(drawable)
             // logs "[CAMetalLayerDrawable texture] should not be called
