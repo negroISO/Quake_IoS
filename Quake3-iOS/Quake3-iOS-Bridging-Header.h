@@ -151,6 +151,12 @@ int   Q3_PBRSunShadows(void);
  * draws (viewmodel). World surfaces, entity pickups, and HUD draws are
  * unchanged. Test range 0.0..0.6. Range-clamped 0..1 in the accessor. */
 float Q3_PBRViewmodelFloor(void);
+/* r_pbr_entity_floor (default 0.40, archived) — readability floor for WORLD
+ * (non-viewmodel) entity pickups so full-metal items (RL/plasma/ammo/health,
+ * metallic=1.0) don't render as near-invisible black silhouettes under the
+ * dark IBL cube. Applied as base.rgb = max(base.rgb, texel.rgb * floor) when
+ * viewmodelParams.y <= 0.5. 0 = off (pure PBR). Range-clamped 0..1. */
+float Q3_PBREntityFloor(void);
 /* r_world_debug_mode (default 0, not archived) — runtime swap for what was
  * a compile-time `Coordinator.worldDebugMode` constant. Drives the world
  * fragment shader's debug-mode branch: 0=normal, 1=base only, 2=lightmap

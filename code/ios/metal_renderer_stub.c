@@ -11368,6 +11368,22 @@ float Q3_PBRViewmodelFloor(void) {
     return v;
 }
 
+/* r_pbr_entity_floor — readability floor for WORLD (non-viewmodel) entity
+ * pickups. Full-metal items (rocket launcher, plasma, ammo, health: authored
+ * metallic=1.0) have zero PBR diffuse and only reflect the IBL envcube; under
+ * the near-black procedural cube they render as near-invisible black
+ * silhouettes. q3_entity_fragment lifts world entities by their unlit albedo
+ * scaled by this value when viewmodelParams.y <= 0.5. 0 = off (pure PBR).
+ * Viewmodels use r_pbr_viewmodel_floor instead. */
+float Q3_PBREntityFloor(void) {
+    if (ri.Cvar_Get == NULL) return 0.40f;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_entity_floor", "0.40", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.40f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    return v;
+}
+
 /* r_world_debug_mode — runtime swap for what was a compile-time constant
  * (MetalView.swift Coordinator.worldDebugMode). Drives the world fragment
  * shader's debug-mode branch:
