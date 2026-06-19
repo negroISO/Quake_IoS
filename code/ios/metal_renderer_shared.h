@@ -477,6 +477,7 @@ typedef struct {
 } Q3MetalSceneView;
 
 void Q3MetalRenderer_UpdateDrawableSize(int width, int height);
+void Q3MetalRenderer_UpdateCaptureSize(int width, int height);
 const Q3MetalFrameSnapshot *Q3MetalRenderer_GetFrameSnapshot(void);
 const Q3MetalVertex *Q3MetalRenderer_GetVertices(void);
 const Q3MetalDrawCmd *Q3MetalRenderer_GetDrawCommands(void);

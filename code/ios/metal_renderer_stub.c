@@ -8571,10 +8571,11 @@ static void RE_BeginRegistration(glconfig_t *config) {
         s_glConfig.vidHeight = 1290;
     }
     s_glConfig.windowAspect = (float)s_glConfig.vidWidth / (float)s_glConfig.vidHeight;
-    /* Keep cls.captureWidth/captureHeight in sync with our drawable so
-     * the AVI video-capture path (cl_avi.c: afd.width = cls.captureWidth)
-     * opens files with a non-zero frame size. Without this the header
-     * records width=0 and no frames can be appended. */
+    /* Keep the renderer viewport dimensions in sync with the engine.
+     * Capture dimensions are set separately via
+     * Q3MetalRenderer_UpdateCaptureSize() so upscaling paths can
+     * render to a lower render target while AVI records the output
+     * framebuffer at a different size. */
     if (ri.CL_SetScaling) {
         ri.CL_SetScaling(1.0f, s_glConfig.vidWidth, s_glConfig.vidHeight);
     }
@@ -10934,6 +10935,20 @@ void Q3MetalRenderer_UpdateDrawableSize(int width, int height) {
     /* Re-sync the client-side capture size each time the drawable
      * moves. Matters specifically for the `video` command pipeline
      * (cl_avi.c) which snapshots cls.captureWidth at AVI-open time. */
+    if (ri.CL_SetScaling) {
+        ri.CL_SetScaling(1.0f, width, height);
+    }
+}
+
+/* Keep capture dimensions on the same coordinate path as what we
+ * actually hand to Q3MetalRenderer_StoreVideoFrame at render-time.
+ * This is intentionally distinct from render size updates above so
+ * upscaling paths can render at a smaller offscreen size but still
+ * capture the final displayed frames at output size. */
+void Q3MetalRenderer_UpdateCaptureSize(int width, int height) {
+    if (width <= 0 || height <= 0) {
+        return;
+    }
     if (ri.CL_SetScaling) {
         ri.CL_SetScaling(1.0f, width, height);
     }
