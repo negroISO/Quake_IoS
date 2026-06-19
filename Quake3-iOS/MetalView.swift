@@ -4208,8 +4208,13 @@ struct MetalView: UIViewRepresentable {
             // sidecars later). albedo gets [[id(0..109)]], lightmap [[id(110..125)]].
             // Swift mirrors this id layout when encoding (see encodeRTOverlay).
             struct RTTexTable {
-                array<texture2d<float>, 110> albedo;
-                array<texture2d<float>, 16> lightmap;
+                array<texture2d<float>, 110> albedo;    // id 0..109
+                array<texture2d<float>, 16> lightmap;   // id 110..125
+                // Step 2b: PBR sidecar tables, PARALLEL to albedo (normal[i]/height[i]
+                // correspond to the material at albedo slot i). Kernel does not read
+                // these yet (Step 2c/5 wire sampling). id 126..235 / 236..345.
+                array<texture2d<float>, 110> normal;    // id 126..235
+                array<texture2d<float>, 110> height;    // id 236..345
             };
 
             float2 rtApplyTcMod(float2 uv, float3 worldPos, int type, float4 params, float timeSeconds) {
@@ -5698,13 +5703,29 @@ struct MetalView: UIViewRepresentable {
                 // RTTexTable lays out albedo at id 0..109, lightmap at id 110..125.
                 if let argEnc = rtTexArgEncoder, let fallbackTex = ensureRTWhiteTexture(device: device) {
                     var rtTexResident: [MTLTexture] = []
-                    rtTexResident.reserveCapacity(rtMaxAlbedoSlots + rtMaxLightmapSlots)
+                    rtTexResident.reserveCapacity(rtMaxAlbedoSlots * 3 + rtMaxLightmapSlots)
+                    // Order MUST match RTTexTable id layout: albedo(0..109),
+                    // lightmap(110..125), normal(126..235), height(236..345).
                     for i in 0..<rtMaxAlbedoSlots {
                         let h = rtAlbedoHandles[i]
                         rtTexResident.append(pbrAlbedoTexture(for: h) ?? texture(for: h, device: device) ?? fallbackTex)
                     }
                     for i in 0..<rtMaxLightmapSlots {
                         rtTexResident.append(texture(for: rtLightmapHandles[i], device: device) ?? fallbackTex)
+                    }
+                    // Step 2b: PBR sidecars parallel to albedo. normal[i]/height[i]
+                    // resolve from the SAME handle as albedo[i]. Fallback to flat
+                    // normal / white when the material lacks that channel. Kernel
+                    // does not sample these yet — encoded now to verify the larger
+                    // arg buffer renders identically before Step 2c wires reads.
+                    let flatNormal = pbrFlatNormalDefault() ?? fallbackTex
+                    for i in 0..<rtMaxAlbedoSlots {
+                        let h = rtAlbedoHandles[i]
+                        rtTexResident.append(pbrNormalTexture(for: h, allowGenericFallback: false) ?? flatNormal)
+                    }
+                    for i in 0..<rtMaxAlbedoSlots {
+                        let h = rtAlbedoHandles[i]
+                        rtTexResident.append(pbrHeightTexture(for: h) ?? fallbackTex)
                     }
                     // Fresh arg buffer each frame (avoids GPU-in-flight aliasing;
                     // ~1 KB, cheap). Metal refcounts it until the dispatch drains.
