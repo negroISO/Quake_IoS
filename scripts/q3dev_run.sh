@@ -21,6 +21,19 @@
 
 set -euo pipefail
 
+# --- Catalyst-only guard (added by orchestrator 2026-06-18) ---------------
+# The repair loop is Mac Catalyst ONLY. This iPad/device runner kept getting
+# invoked by automation and launching on the OLED iPad, which is off-goal and
+# trips LaunchServicesDataMismatch. Refuse unless explicitly overridden.
+# To intentionally run on device: prefix the command with Q3_ALLOW_DEVICE=1.
+if [ "${Q3_ALLOW_DEVICE:-0}" != "1" ]; then
+  echo "ERROR: q3dev_run.sh (iPad/device runner) is DISABLED during the Catalyst repair loop." >&2
+  echo "       Use ./scripts/q3dev_run_mac.sh <slug>  (Mac Catalyst) instead." >&2
+  echo "       To force a real device run anyway: Q3_ALLOW_DEVICE=1 ./scripts/q3dev_run.sh <slug>" >&2
+  exit 2
+fi
+# -------------------------------------------------------------------------
+
 BUNDLE_ID="${BUNDLE_ID:-com.quake3ios.rt}"
 RUN_SECS="${RUN_SECS:-90}"
 DEMO="${DEMO:-four}"
