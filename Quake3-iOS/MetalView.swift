@@ -160,10 +160,27 @@ enum Q3RTMix: String, CaseIterable {
     static let userDefaultsKey = "q3_rt_mix"
 
     static var current: Q3RTMix {
-        if let envRaw = ProcessInfo.processInfo.environment["Q3_RT_MIX"],
-           let envQ = Q3RTMix(rawValue: envRaw) {
-            NSLog("[Q3-RT] using env var Q3_RT_MIX=%@", envRaw)
-            return envQ
+        if let envRaw = ProcessInfo.processInfo.environment["Q3_RT_MIX"]?.lowercased() {
+            if let envQ = Q3RTMix(rawValue: envRaw) {
+                NSLog("[Q3-RT] using env var Q3_RT_MIX=%@", envRaw)
+                return envQ
+            }
+            let envAlias: Q3RTMix?
+            switch envRaw {
+            case "off", "0", "zero", "raster", "raster-only", "false", "no":
+                envAlias = .off
+            case "blend", "0.5", "half", "mixed", "mixed-on", "intermediate":
+                envAlias = .blend
+            case "pure", "1", "true", "yes", "on", "rt":
+                envAlias = .pure
+            default:
+                envAlias = nil
+            }
+            if let envAlias {
+                NSLog("[Q3-RT] using env var Q3_RT_MIX=%@ (alias mapped)", envRaw)
+                return envAlias
+            }
+            NSLog("[Q3-RT] unrecognized Q3_RT_MIX=%@", envRaw)
         }
         let raw = UserDefaults.standard.string(forKey: userDefaultsKey) ?? "0"
         return Q3RTMix(rawValue: raw) ?? .off
