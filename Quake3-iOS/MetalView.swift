@@ -7720,6 +7720,7 @@ struct MetalView: UIViewRepresentable {
                 renderH = outputH
             }
             Q3MetalRenderer_UpdateDrawableSize(Int32(renderW), Int32(renderH))
+            Q3MetalRenderer_UpdateCaptureSize(Int32(outputW), Int32(outputH))
 
             /* Acquire the CAMetalLayer drawable before running the Q3
              * simulation/render build. On ProMotion hardware, waiting until

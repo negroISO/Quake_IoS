@@ -73,6 +73,7 @@ void Q3Sys_CharEvent(int ch);
  * drawable's BGRA bytes and hands them off via Q3MetalRenderer_StoreVideoFrame. */
 int CL_VideoRecording(void);
 void Q3MetalRenderer_StoreVideoFrame(const unsigned char *bgra, int width, int height);
+void Q3MetalRenderer_UpdateCaptureSize(int width, int height);
 
 /* Native C/Obj-C renderer telemetry bridge. Implemented in Swift by
  * DebugTelemetry.swift and callable from the Metal renderer. */
