@@ -394,6 +394,9 @@ Con_GetPos_f
 static void Con_GetPos_f( void ) {
 	if ( cl.snap.valid ) {
 		Com_Printf( "setpos %.0f %.0f %.0f\n", cl.snap.ps.origin[0], cl.snap.ps.origin[1], cl.snap.ps.origin[2] );
+		Com_Printf( "setviewpos %.0f %.0f %.0f %.0f\n",
+			cl.snap.ps.origin[0], cl.snap.ps.origin[1], cl.snap.ps.origin[2],
+			cl.snap.ps.viewangles[YAW] );
 	} else {
 		Com_Printf( "No valid player position (not in game)\n" );
 	}
@@ -407,15 +410,14 @@ Con_SetPos_f
 */
 static void Con_SetPos_f( void ) {
 	vec3_t pos;
-	int i;
 
 	if ( Cmd_Argc() != 4 ) {
 		Com_Printf( "Usage: setpos <x> <y> <z>\n" );
 		return;
 	}
 
-	if ( !cl.snap.valid ) {
-		Com_Printf( "Can't setpos - not in game\n" );
+	if ( clc.demoplaying || cls.state < CA_CONNECTED ) {
+		Com_Printf( "Can't setpos - not connected to a server\n" );
 		return;
 	}
 
@@ -423,14 +425,7 @@ static void Con_SetPos_f( void ) {
 	pos[1] = atof( Cmd_Argv( 2 ) );
 	pos[2] = atof( Cmd_Argv( 3 ) );
 
-	VectorCopy( pos, cl.snap.ps.origin );
-
-	/* Zero velocity to prevent momentum carryover */
-	for ( i = 0; i < 3; i++ ) {
-		cl.snap.ps.velocity[i] = 0;
-	}
-
-	Com_Printf( "Position set to %.0f %.0f %.0f\n", pos[0], pos[1], pos[2] );
+	CL_ForwardCommandToServer( va( "setpos %f %f %f", pos[0], pos[1], pos[2] ) );
 }
 
 

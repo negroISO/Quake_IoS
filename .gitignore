@@ -5,6 +5,7 @@
 # so q3dev_run.sh can seed them onto the device sandbox.
 baseq3/
 !Resources/baseq3/
+/Resources/baseq3/pbr/
 *.pk3
 
 # Xcode
@@ -15,6 +16,7 @@ DerivedData/
 
 # Build
 build/
+/build-*/
 
 # Local-only (never pushed)
 CLAUDE.md

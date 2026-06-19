@@ -1995,6 +1995,100 @@ static qboolean SV_FloodProtect( client_t *cl ) {
 
 /*
 ==================
+SV_DebugTeleportClientCommand
+
+Engine-side local debug teleport for iOS/device troubleshooting.
+The shipped baseq3 qagame runs as QVM on iOS, so changing code/game/g_cmds.c
+does not affect the running game module.  Intercept loopback client commands
+here and patch the authoritative playerState directly.
+==================
+*/
+static qboolean SV_DebugTeleportClientCommand( client_t *cl ) {
+	const char		*cmd;
+	int				clientNum;
+	playerState_t	*ps;
+	sharedEntity_t	*ent;
+	vec3_t			origin;
+	vec3_t			angles;
+	qboolean		setAngles;
+	int				i;
+
+	cmd = Cmd_Argv( 0 );
+	if ( Q_stricmp( cmd, "setpos" ) && Q_stricmp( cmd, "setviewpos" ) ) {
+		return qfalse;
+	}
+
+	if ( sv.state != SS_GAME || cl->state < CS_PRIMED || sv.gameClients == NULL ) {
+		SV_SendServerCommand( cl, "print \"Can't %s - not in game\n\"", cmd );
+		return qtrue;
+	}
+
+	if ( cl->netchan.remoteAddress.type != NA_LOOPBACK &&
+		 !Cvar_VariableIntegerValue( "sv_cheats" ) ) {
+		SV_SendServerCommand( cl, "print \"Cheats are not enabled on this server.\n\"" );
+		return qtrue;
+	}
+
+	setAngles = !Q_stricmp( cmd, "setviewpos" );
+	if ( ( setAngles && Cmd_Argc() != 5 ) || ( !setAngles && Cmd_Argc() != 4 ) ) {
+		SV_SendServerCommand( cl, "print \"usage: %s x y z%s\n\"",
+			cmd, setAngles ? " yaw" : "" );
+		return qtrue;
+	}
+
+	clientNum = cl - svs.clients;
+	ps = SV_GameClientNum( clientNum );
+	if ( ps == NULL ) {
+		SV_SendServerCommand( cl, "print \"Can't %s - no player state\n\"", cmd );
+		return qtrue;
+	}
+
+	if ( ps->stats[STAT_HEALTH] <= 0 ) {
+		SV_SendServerCommand( cl, "print \"You must be alive to use this command.\n\"" );
+		return qtrue;
+	}
+
+	for ( i = 0 ; i < 3 ; i++ ) {
+		origin[i] = atof( Cmd_Argv( i + 1 ) );
+	}
+
+	if ( setAngles ) {
+		VectorClear( angles );
+		angles[YAW] = atof( Cmd_Argv( 4 ) );
+		for ( i = 0 ; i < 3 ; i++ ) {
+			ps->delta_angles[i] = ANGLE2SHORT( angles[i] ) - cl->lastUsercmd.angles[i];
+		}
+		VectorCopy( angles, ps->viewangles );
+	} else {
+		VectorCopy( ps->viewangles, angles );
+	}
+
+	VectorCopy( origin, ps->origin );
+	VectorClear( ps->velocity );
+	ps->pm_time = 0;
+	ps->pm_flags &= ~PMF_TIME_KNOCKBACK;
+	ps->groundEntityNum = ENTITYNUM_NONE;
+	ps->eFlags ^= EF_TELEPORT_BIT;
+
+	ent = cl->gentity ? cl->gentity : SV_GentityNum( clientNum );
+	if ( ent != NULL ) {
+		if ( setAngles ) {
+			VectorCopy( angles, ent->r.currentAngles );
+		}
+		BG_PlayerStateToEntityState( ps, &ent->s, qtrue );
+		VectorCopy( ps->origin, ent->r.currentOrigin );
+		SV_LinkEntity( ent );
+	}
+
+	SV_SendServerCommand( cl, "print \"%s %.0f %.0f %.0f%s\n\"",
+		cmd, ps->origin[0], ps->origin[1], ps->origin[2],
+		setAngles ? va( " %.0f", angles[YAW] ) : "" );
+	return qtrue;
+}
+
+
+/*
+==================
 SV_ExecuteClientCommand
 
 Also called by bot code
@@ -2049,6 +2143,10 @@ qboolean SV_ExecuteClientCommand( client_t *cl, const char *s ) {
 		// ignore any other text messages from this client but let them keep playing
 		Com_DPrintf( "client text ignored for %s: %s\n", cl->name, Cmd_Argv(0) );
 	} else {
+		if ( SV_DebugTeleportClientCommand( cl ) ) {
+			return qtrue;
+		}
+
 		// pass unknown strings to the game
 		if ( !ucmd->name && sv.state == SS_GAME && cl->state >= CS_PRIMED ) {
 			if ( gvm->forceDataMask )
