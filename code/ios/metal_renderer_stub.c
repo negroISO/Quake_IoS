@@ -41,6 +41,7 @@ If a visual issue exists, fix the generic mismatch against ioq3/Kenny behavior.
 #include "q3_pbr.h"
 #include <os/log.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <errno.h>
 #include <sys/stat.h>   /* GetRefAPI PBR bundle-path probe */
 
@@ -10828,20 +10829,36 @@ static qboolean R_inPVS(const vec3_t p1, const vec3_t p2) {
  * thread) — the ready flag is fine as a plain int since misses just
  * result in the previous frame being reused, which is acceptable for
  * this diagnostic tool. */
-#define Q3_METAL_VIDEO_MAX_W 1920
-#define Q3_METAL_VIDEO_MAX_H 1080
-static byte  s_videoCaptureBgra[Q3_METAL_VIDEO_MAX_W * Q3_METAL_VIDEO_MAX_H * 4];
-static int   s_videoCaptureWidth;
-static int   s_videoCaptureHeight;
-static int   s_videoCaptureReady;
+#define Q3_METAL_VIDEO_MAX_DIM 8192
+static byte  *s_videoCaptureBgra;
+static size_t s_videoCaptureCapacity;
+static int    s_videoCaptureWidth;
+static int    s_videoCaptureHeight;
+static int    s_videoCaptureReady;
 
 /* Called by Swift after each drawable readback. Bytes are BGRA (Metal
  * native). bytesPerRow == width*4 (no padding). */
 void Q3MetalRenderer_StoreVideoFrame(const uint8_t *bgra, int width, int height) {
     size_t n;
+    byte *newBuffer;
+
     if (bgra == NULL || width <= 0 || height <= 0) return;
-    if (width > Q3_METAL_VIDEO_MAX_W || height > Q3_METAL_VIDEO_MAX_H) return;
-    n = (size_t)width * (size_t)height * 4;
+    if (width > Q3_METAL_VIDEO_MAX_DIM || height > Q3_METAL_VIDEO_MAX_DIM) return;
+    if ((size_t)width > ((size_t)-1) / (size_t)height / 4u) return;
+
+    n = (size_t)width * (size_t)height * 4u;
+    if (n > s_videoCaptureCapacity) {
+        newBuffer = (byte *)realloc(s_videoCaptureBgra, n);
+        if (newBuffer == NULL) {
+            s_videoCaptureReady = 0;
+            s_videoCaptureWidth = 0;
+            s_videoCaptureHeight = 0;
+            return;
+        }
+        s_videoCaptureBgra = newBuffer;
+        s_videoCaptureCapacity = n;
+    }
+
     Com_Memcpy(s_videoCaptureBgra, bgra, n);
     s_videoCaptureWidth = width;
     s_videoCaptureHeight = height;
