@@ -11283,13 +11283,13 @@ float Q3_PBRWorldSpecBoost(void) {
     if (v > 2.0f) v = 2.0f;
     return v;
 }
-/* r_pbr_viewmodel_floor (default 0.35) — viewmodel-only PBR base-color
+/* r_pbr_viewmodel_floor (default 0.65) — viewmodel-only PBR base-color
  * floor. Most weapon viewmodels are authored metallic=1.0; with our
  * neutral 0.08 procedural envCube an IBL-only metal surface comes out
  * near-black regardless of orientation. The floor clamps `base.rgb` to
  * `max(base.rgb, texel.rgb * floor)` ONLY for RF_DEPTHHACK draws in
  * `q3_entity_fragment`. World, entity-pickup, and HUD paths are unchanged.
- * 0.0 = off (pure PBR look). 0.25/0.35/0.45 are the suggested test sweep.
+ * 0.0 = off (pure PBR look). 0.35/0.50/0.65 are the suggested test sweep.
  * Range-clamped 0..1 to avoid blown-out viewmodels at silly values. */
 /* r_pbr_envcube_grey (default 0.08, CVAR_ARCHIVE, clamped 0..1) — the
  * uniform linear grey value used to fill every face of the procedural
@@ -11360,9 +11360,9 @@ float Q3_PBREmissiveIntensityMax(void) {
 }
 
 float Q3_PBRViewmodelFloor(void) {
-    if (ri.Cvar_Get == NULL) return 0.35f;
-    cvar_t *cv = ri.Cvar_Get("r_pbr_viewmodel_floor", "0.35", CVAR_ARCHIVE);
-    float v = cv ? cv->value : 0.35f;
+    if (ri.Cvar_Get == NULL) return 0.65f;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_viewmodel_floor", "0.65", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.65f;
     if (v < 0.0f) v = 0.0f;
     if (v > 1.0f) v = 1.0f;
     return v;

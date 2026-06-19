@@ -401,7 +401,7 @@ struct MetalView: UIViewRepresentable {
             var albedoSlot: UInt32
             var lightmapSlot: UInt32
             var tcModCount: UInt32
-            var _pad0: UInt32 = 0
+            var _pad0: UInt32 = UInt32.max // RT emissive texture slot, or invalid
             var alphaTcModControl: SIMD4<Float> // x=alphaTestThreshold
             var materialFlags: SIMD4<UInt32>    // x=isSky, y=isEmissive
             var materialParams: SIMD4<Float>    // x=emissiveIntensity
@@ -1296,7 +1296,7 @@ struct MetalView: UIViewRepresentable {
              * .w = intensity. (1,1,1,0) means "no emissive contribution". */
             var emissiveParams: SIMD4<Float> = SIMD4(1, 1, 1, 0)
             /* 2026-06-10: viewmodel-only PBR base floor.
-             *   .x = floor strength (from r_pbr_viewmodel_floor, default 0.35)
+             *   .x = floor strength (from r_pbr_viewmodel_floor, default 0.65)
              *   .y = viewmodel gate (1.0 when RF_DEPTHHACK draw, 0.0 otherwise)
              *   .z, .w = pad
              * MSL applies `base.rgb = max(base.rgb, texel.rgb * .x)` only
@@ -2042,7 +2042,7 @@ struct MetalView: UIViewRepresentable {
             // Same semantics as WorldDrawUniforms.emissiveParams.
             float4 emissiveParams;
             // 2026-06-10: viewmodel-only PBR base-color floor.
-            // .x = floor strength (r_pbr_viewmodel_floor, default 0.35)
+            // .x = floor strength (r_pbr_viewmodel_floor, default 0.65)
             // .y = viewmodel gate (1.0 for RF_DEPTHHACK, 0.0 otherwise)
             // .z, .w = pad. Fragment applies `base.rgb = max(base.rgb,
             // texel.rgb * .x)` only when `.y > 0.5`. Layout MUST match
@@ -3411,7 +3411,7 @@ struct MetalView: UIViewRepresentable {
             // 2026-06-10: viewmodel base-color floor. Applied BEFORE emissive
             // so glow ride-alongs are unaffected. Gate: `.y > 0.5` means
             // "this draw is RF_DEPTHHACK (first-person weapon)". Floor:
-            // `.x = r_pbr_viewmodel_floor` (default 0.35). Reads
+            // `.x = r_pbr_viewmodel_floor` (default 0.65). Reads
             // `texel.rgb` as the unlit albedo sample so the viewmodel always
             // shows its real material color through low-energy IBL — a
             // gameplay readability exception, not a PBR correctness fix.
@@ -3705,7 +3705,13 @@ struct MetalView: UIViewRepresentable {
         private var rtPrimitiveMaterialBufferCache: [UInt64: MTLBuffer] = [:]
         private let rtMaxAlbedoSlots = 110
         private let rtMaxLightmapSlots = 16
+        /* RT kernel uses Metal texture slots 2...111 for a single generic
+         * 110-texture table. Reserve the tail for emissive DDS maps so
+         * `r_rt_mix 1` can still show RTX/Remix emissive floors/arches/
+         * jump pads instead of the old albedo-only 0.8 fake glow. */
+        private let rtReservedEmissiveSlots = 18
         private var rtAlbedoHandles = [UInt32](repeating: 0, count: 110)
+        private var rtAlbedoSlotKinds = [UInt32](repeating: 0, count: 110) // 0=albedo/classic, 1=emissive DDS
         private var rtLightmapHandles = [UInt32](repeating: 0, count: 16)
         private var rtLogPrintedOnce = false
         private var rtOverlayLogPrintedOnce = false
@@ -4090,7 +4096,7 @@ struct MetalView: UIViewRepresentable {
                 uint albedoSlot;
                 uint lightmapSlot;
                 uint tcModCount;
-                uint _pad0;
+                uint emissiveSlot; // index into albedoTextures table, or 0xFFFFFFFF
                 float4 alphaTcModControl;
                 uint4 materialFlags;
                 float4 materialParams;
@@ -4312,7 +4318,11 @@ struct MetalView: UIViewRepresentable {
                             // alpha instead of turning RGB-only DDS effects into solid squares.
                             float intensity = max(mat.materialParams.x, 1.0);
                             float alphaForAdd = (abs(blendMode - 5.0) < 0.5) ? max(effectiveAlpha, 0.65) : effectiveAlpha;
-                            color = albedoSample.rgb * intensity * alphaForAdd;
+                            float3 emitSample = albedoSample.rgb;
+                            if (mat.emissiveSlot < 110) {
+                                emitSample = albedoTextures[mat.emissiveSlot].sample(repeatSampler, uv).rgb;
+                            }
+                            color = emitSample * intensity * alphaForAdd;
                             outputAlpha = clamp(alphaForAdd, 0.0, 0.85);
                         } else if (mat.materialFlags.w != 0) {
                             // First-pass translucency: shade blended surfaces but emit partial
@@ -4324,7 +4334,11 @@ struct MetalView: UIViewRepresentable {
                             float ambientFloor = uniforms.rtToneParams.z;
                             color = albedoSample.rgb * max(lightmap * 1.25, float3(ambientFloor));
                             if (mat.materialFlags.y != 0) {
-                                color += albedoSample.rgb * mat.materialParams.x * effectiveAlpha;
+                                float3 emitSample = albedoSample.rgb;
+                                if (mat.emissiveSlot < 110) {
+                                    emitSample = albedoTextures[mat.emissiveSlot].sample(repeatSampler, uv).rgb;
+                                }
+                                color += emitSample * mat.materialParams.x * effectiveAlpha;
                                 color = min(color, float3(2.0));
                             }
                             outputAlpha = clamp(effectiveAlpha, 0.0, 0.70);
@@ -4336,7 +4350,11 @@ struct MetalView: UIViewRepresentable {
                             float ambientFloor = uniforms.rtToneParams.z;
                             color = albedoSample.rgb * max(lightmap * 1.25, float3(ambientFloor));
                             if (mat.materialFlags.y != 0) {
-                                color += albedoSample.rgb * mat.materialParams.x;
+                                float3 emitSample = albedoSample.rgb;
+                                if (mat.emissiveSlot < 110) {
+                                    emitSample = albedoTextures[mat.emissiveSlot].sample(repeatSampler, uv).rgb;
+                                }
+                                color += emitSample * mat.materialParams.x;
                                 color = min(color, float3(2.0));
                             }
                             // First-pass one-bounce indirect: gated by r_rt_bounces.
@@ -4515,7 +4533,11 @@ struct MetalView: UIViewRepresentable {
                                             }
                                             reflColor = ralb * max(rlight * 1.25, float3(uniforms.rtToneParams.z));
                                             if (rmat.materialFlags.y != 0) {
-                                                reflColor += ralb * rmat.materialParams.x;
+                                                float3 remitSample = ralb;
+                                                if (rmat.emissiveSlot < 110) {
+                                                    remitSample = albedoTextures[rmat.emissiveSlot].sample(repeatSampler, ruv).rgb;
+                                                }
+                                                reflColor += remitSample * rmat.materialParams.x;
                                             }
                                         } else if (!is_null_texture(envCube)) {
                                             reflColor = envCube.sample(envSampler, R).rgb;
@@ -4681,7 +4703,7 @@ struct MetalView: UIViewRepresentable {
                 albedoSlot: invalid,
                 lightmapSlot: invalid,
                 tcModCount: 0,
-                _pad0: 0,
+                _pad0: invalid,
                 alphaTcModControl: SIMD4<Float>(0, 0, 0, 0),
                 materialFlags: SIMD4<UInt32>(0, 0, 0, 0),
                 materialParams: SIMD4<Float>(0, 0, 0, 0),
@@ -4692,6 +4714,7 @@ struct MetalView: UIViewRepresentable {
                 tcModParams3: SIMD4<Float>(0, 0, 0, 0),
                 spriteAtlasParams: SIMD4<Float>(0, 0, 0, 0))
             rtAlbedoHandles = [UInt32](repeating: 0, count: rtMaxAlbedoSlots)
+            rtAlbedoSlotKinds = [UInt32](repeating: 0, count: rtMaxAlbedoSlots)
             rtLightmapHandles = [UInt32](repeating: 0, count: rtMaxLightmapSlots)
 
             // 2026-06-10: prealloc strategy A — eliminate the 3.9 MB Swift
@@ -4739,6 +4762,7 @@ struct MetalView: UIViewRepresentable {
              * tiny early detail draws consumed slots. */
             var albedoWeights: [UInt32: Int] = [:]
             var lightmapWeights: [UInt32: Int] = [:]
+            var emissiveWeights: [UInt32: Int] = [:]
             let fogOnlyBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY)
 
             func rtRepresentativeStage(for draw: Q3MetalWorldDrawCmd) -> Q3MetalWorldStage? {
@@ -4773,6 +4797,11 @@ struct MetalView: UIViewRepresentable {
                 let materialHandle = Self.worldPBRMaterialHandle(for: stage)
                 if stage.useLightmap == 0 && stage.textureHandle != 0 {
                     albedoWeights[materialHandle, default: 0] += triCount
+                    if let mat = pbrMaterialInfo(for: materialHandle),
+                       mat.emissive != nil,
+                       mat.emissiveIntensity > 0.0 {
+                        emissiveWeights[materialHandle, default: 0] += triCount
+                    }
                 }
                 if draw.lightmapTextureHandle != 0 {
                     lightmapWeights[draw.lightmapTextureHandle, default: 0] += triCount
@@ -4786,17 +4815,31 @@ struct MetalView: UIViewRepresentable {
                 }.prefix(limit).map { $0.key })
             }
 
-            let topAlbedos = topHandles(albedoWeights, limit: rtMaxAlbedoSlots)
+            let emissiveReserve = min(rtReservedEmissiveSlots, rtMaxAlbedoSlots / 3)
+            let topAlbedos = topHandles(albedoWeights, limit: max(1, rtMaxAlbedoSlots - emissiveReserve))
+            let topEmissives = topHandles(emissiveWeights, limit: emissiveReserve)
             let topLightmaps = topHandles(lightmapWeights, limit: rtMaxLightmapSlots)
             for (i, h) in topAlbedos.enumerated() {
                 rtAlbedoHandles[i] = h
+                rtAlbedoSlotKinds[i] = 0
                 _ = texture(for: h, device: device)
+            }
+            let emissiveSlotBase = topAlbedos.count
+            for (i, h) in topEmissives.enumerated() where emissiveSlotBase + i < rtMaxAlbedoSlots {
+                rtAlbedoHandles[emissiveSlotBase + i] = h
+                rtAlbedoSlotKinds[emissiveSlotBase + i] = 1
+                _ = pbrEmissiveTexture(for: h)
             }
             for (i, h) in topLightmaps.enumerated() {
                 rtLightmapHandles[i] = h
                 _ = texture(for: h, device: device)
             }
             let albedoSlots = Dictionary(uniqueKeysWithValues: topAlbedos.enumerated().map { (UInt32($0.offset), $0.element) }.map { ($0.1, $0.0) })
+            let emissiveSlots = Dictionary(uniqueKeysWithValues: topEmissives.enumerated().compactMap { pair -> (UInt32, UInt32)? in
+                let slot = emissiveSlotBase + pair.offset
+                guard slot < rtMaxAlbedoSlots else { return nil }
+                return (pair.element, UInt32(slot))
+            })
             let lightmapSlots = Dictionary(uniqueKeysWithValues: topLightmaps.enumerated().map { (UInt32($0.offset), $0.element) }.map { ($0.1, $0.0) })
 
             var assigned = 0
@@ -4819,7 +4862,9 @@ struct MetalView: UIViewRepresentable {
                 let aSlot = aSlotOptional ?? 0
                 let lSlot = lSlotOptional ?? invalid
                 let blendMode = Self.worldBlendClass(for: stage)
-                let isEmissive = (blendMode == 1 || blendMode == 5)
+                var isEmissive = (blendMode == 1 || blendMode == 5)
+                var rtEmissiveIntensity: Float = isEmissive ? 0.8 : 0.0
+                let emissiveSlot = emissiveSlots[materialHandle] ?? invalid
                 // P3: per-material roughness/metallic for the kernel's
                 // reflection gate. PBR constants when authored; otherwise a
                 // matte dielectric default so reflections stay off.
@@ -4829,10 +4874,14 @@ struct MetalView: UIViewRepresentable {
                 // draw and was poisoning the one-shot world-atlas log with
                 // atlasTime=0.000 entries (dedup set is shared).
                 let rtAtlasParams = pbrSpriteAtlasParams(for: materialHandle, atlasTime: 0, logEnabled: false)
-                if let matPtr = Q3MetalRenderer_GetPBRMaterial(materialHandle) {
-                    let m = matPtr.pointee
-                    if m.roughness_constant >= 0 { rtRough = m.roughness_constant }
-                    if m.metallic_constant >= 0 { rtMetal = m.metallic_constant }
+                if let mat = pbrMaterialInfo(for: materialHandle) {
+                    if mat.roughnessConstant >= 0 { rtRough = mat.roughnessConstant }
+                    if mat.metallicConstant >= 0 { rtMetal = mat.metallicConstant }
+                    if mat.emissive != nil && mat.emissiveIntensity > 0.0 {
+                        isEmissive = true
+                        rtEmissiveIntensity = max(rtEmissiveIntensity,
+                                                  min(mat.emissiveIntensity, Q3_PBREmissiveIntensityMax()))
+                    }
                 }
                 let firstTri = Int(draw.firstIndex / 3)
                 let triCount = Int(draw.indexCount / 3)
@@ -4852,7 +4901,7 @@ struct MetalView: UIViewRepresentable {
                             albedoSlot: aSlot,
                             lightmapSlot: lSlot,
                             tcModCount: tcCount,
-                            _pad0: 0,
+                            _pad0: emissiveSlot,
                             alphaTcModControl: SIMD4<Float>(alphaThreshold, Float(tcCount), 0, 0),
                             // flags: x=sky, y=emissive, z=alpha-test, w=blended/translucent.
                             // RT shades blended/translucent world surfaces with partial alpha
@@ -4862,7 +4911,7 @@ struct MetalView: UIViewRepresentable {
                                                          alphaThreshold != 0 ? 1 : 0,
                                                          blendMode != 0 ? 1 : 0),
                             // .z = roughness, .w = metallic (P3 reflections).
-                            materialParams: SIMD4<Float>(isEmissive ? 0.8 : 0.0, Float(blendMode), rtRough, rtMetal),
+                            materialParams: SIMD4<Float>(rtEmissiveIntensity, Float(blendMode), rtRough, rtMetal),
                             tcModTypes: tcTypes,
                             tcModParams0: chain.p0,
                             tcModParams1: chain.p1,
@@ -4900,6 +4949,7 @@ struct MetalView: UIViewRepresentable {
                 h ^= v
                 h = h &* 0x100000001b3
             }
+            mix(UInt64(max(0, min(16000, Int((Q3_PBREmissiveIntensityMax() * 1000.0).rounded())))))
             for draw in draws where draw.indexCount >= 3 {
                 let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
                 guard stageCount > 0 else { continue }
@@ -5528,9 +5578,14 @@ struct MetalView: UIViewRepresentable {
                 }
                 enc.setTexture(envCube, index: 1)
                 let fallbackTex = ensureRTWhiteTexture(device: device)
+                let emissiveFallbackTex = pbrEmissiveDefault() ?? fallbackTex
                 for i in 0..<rtMaxAlbedoSlots {
                     let h = rtAlbedoHandles[i]
-                    enc.setTexture(pbrAlbedoTexture(for: h) ?? texture(for: h, device: device) ?? fallbackTex, index: 2 + i)
+                    if rtAlbedoSlotKinds[i] == 1 {
+                        enc.setTexture(pbrEmissiveTexture(for: h) ?? emissiveFallbackTex, index: 2 + i)
+                    } else {
+                        enc.setTexture(pbrAlbedoTexture(for: h) ?? texture(for: h, device: device) ?? fallbackTex, index: 2 + i)
+                    }
                 }
                 for i in 0..<rtMaxLightmapSlots {
                     enc.setTexture(texture(for: rtLightmapHandles[i], device: device) ?? fallbackTex, index: 112 + i)
@@ -9132,7 +9187,7 @@ struct MetalView: UIViewRepresentable {
                         entityUniforms.emissiveParams = emissiveParamsForPBRMaterial(handle: draw.textureHandle)
                         // 2026-06-10: viewmodel-only base-color floor. .x is
                         // the floor strength from `r_pbr_viewmodel_floor`
-                        // (CVAR_ARCHIVE, default 0.35). .y is the gate flag
+                        // (CVAR_ARCHIVE, default 0.65). .y is the gate flag
                         // (1.0 for RF_DEPTHHACK, 0.0 for world entities) so
                         // the MSL `if (.y > 0.5)` runs only on first-person
                         // weapons. World pickups, scene polys, and HUD heads

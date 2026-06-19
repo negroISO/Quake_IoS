@@ -144,12 +144,12 @@ float Q3_PBRWorldSpecBoost(void);
 int   Q3_PBRWorldClassMatchEnabled(void);
 int   Q3_PBRBakedLightmaps(void);
 int   Q3_PBRSunShadows(void);
-/* r_pbr_viewmodel_floor (default 0.35) — viewmodel-only PBR floor that
+/* r_pbr_viewmodel_floor (default 0.65) — viewmodel-only PBR floor that
  * keeps fully-metallic first-person weapons readable under the neutral
  * low-energy procedural envCube. Applied per-fragment as
  * `base.rgb = max(base.rgb, texel.rgb * floor)` ONLY for RF_DEPTHHACK
  * draws (viewmodel). World surfaces, entity pickups, and HUD draws are
- * unchanged. Test range 0.0..0.6. Range-clamped 0..1 in the accessor. */
+ * unchanged. Test range 0.35..0.75. Range-clamped 0..1 in the accessor. */
 float Q3_PBRViewmodelFloor(void);
 /* r_world_debug_mode (default 0, not archived) — runtime swap for what was
  * a compile-time `Coordinator.worldDebugMode` constant. Drives the world
