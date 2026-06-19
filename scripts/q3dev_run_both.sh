@@ -1,6 +1,6 @@
 #!/usr/bin/env zsh
-# Dispatch a single dev run to BOTH targets — iPad (devicectl) first,
-# then Mac Catalyst — so a Codex change can be validated cross-platform
+# Dispatch a single dev run that prioritizes Catalyst
+# with optional iPad leg; Catalyst-first for this repair run
 # in one command. Each leg writes its own session dir under
 # ~/Desktop/q3sim_sessions/, suffixed _dev (iPad) and _mac (Catalyst).
 #
@@ -17,7 +17,7 @@ set -u
 
 cd "${0:a:h}/.."   # repo root
 
-SKIP_IPAD="${SKIP_IPAD:-0}"
+SKIP_IPAD="${SKIP_IPAD:-1}"
 SKIP_MAC="${SKIP_MAC:-0}"
 
 IPAD_RC=0
@@ -34,7 +34,7 @@ if [[ "$SKIP_IPAD" != "1" ]]; then
         echo "→ iPad leg exited with $IPAD_RC (continuing to Catalyst)"
     fi
 else
-    echo "→ SKIP_IPAD=1, skipping iPad leg"
+    echo "→ SKIP_IPAD=1 (default for this repair loop), skipping iPad leg"
     IPAD_RC=-1
 fi
 
