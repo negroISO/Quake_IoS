@@ -80,6 +80,7 @@ SLUG="${1:-$(echo "$SUBJECT" \
                 | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g' \
                 | cut -c1-40)}"
 STAMP=$(date +%Y-%m-%d_%H-%M-%S)
+RUN_START_EPOCH=$(date +%s)
 OUTDIR="$HOME/Desktop/q3sim_sessions/${STAMP}__${SHA}_${SLUG}_mac"
 mkdir -p "$OUTDIR"
 echo "→ app:     $APP"
@@ -172,17 +173,22 @@ fi
 # Pull the recorded AVI + slice frames at 10fps (parity with iPad path).
 AVI="$BASEQ3/videos/${VIDEO_NAME}.avi"
 if [[ -f "$AVI" ]]; then
-    cp -f "$AVI" "$OUTDIR/${VIDEO_NAME}.avi"
-    AVI_SIZE=$(/usr/bin/stat -f '%z' "$OUTDIR/${VIDEO_NAME}.avi")
-    AVI_MB=$((AVI_SIZE / 1024 / 1024))
-    echo "→ avi:     $OUTDIR/${VIDEO_NAME}.avi (${AVI_MB} MB)"
-    if command -v ffmpeg >/dev/null 2>&1; then
-        mkdir -p "$OUTDIR/frames"
-        ffmpeg -y -i "$OUTDIR/${VIDEO_NAME}.avi" \
-            -vf fps=10 "$OUTDIR/frames/frame_%04d.png" >/dev/null 2>&1 \
-            && echo "→ frames:  $OUTDIR/frames"
+    AVI_MTIME=$(/usr/bin/stat -f '%m' "$AVI")
+    if (( AVI_MTIME < RUN_START_EPOCH )); then
+        echo "→ avi:     SKIPPED stale file (mtime $AVI_MTIME < run start $RUN_START_EPOCH)"
     else
-        echo "→ frames:  SKIPPED (ffmpeg not found)"
+        cp -f "$AVI" "$OUTDIR/${VIDEO_NAME}.avi"
+        AVI_SIZE=$(/usr/bin/stat -f '%z' "$OUTDIR/${VIDEO_NAME}.avi")
+        AVI_MB=$((AVI_SIZE / 1024 / 1024))
+        echo "→ avi:     $OUTDIR/${VIDEO_NAME}.avi (${AVI_MB} MB)"
+        if command -v ffmpeg >/dev/null 2>&1; then
+            mkdir -p "$OUTDIR/frames"
+            ffmpeg -y -i "$OUTDIR/${VIDEO_NAME}.avi" \
+                -vf fps=10 "$OUTDIR/frames/frame_%04d.png" >/dev/null 2>&1 \
+                && echo "→ frames:  $OUTDIR/frames"
+        else
+            echo "→ frames:  SKIPPED (ffmpeg not found)"
+        fi
     fi
 else
     echo "→ avi:     FAILED to find $AVI (no recording — video cbuf disabled?)"
