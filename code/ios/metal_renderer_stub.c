@@ -11160,10 +11160,10 @@ const char *Q3MetalRenderer_GetTextureName(uint32_t textureHandle) {
  *     rgb = saturate(rgb * intensity);
  *     rgb = pow(rgb, gamma);
  *
- * Defaults tuned for OLED iPhone after the lightmap pre-shift was raised
- * to ×4 (r_mapOverBrightBits 3). intensity 1.5 lifts midtones a further
- * ~15% perceived without doubling up on the lightmap. gamma 0.95 = mild
- * brighten in the shoulder, leaves blacks alone.
+ * Default intensity was tuned to match Catalyst+RT lighting at medium upscale.
+ * We use this as a scene-wide exposure lift for RTX parity work: baseline
+ * 2.5 raises mid-tones compared to 1.5 while preserving ACES shoulder control
+ * via gamma. Raise/lower at runtime with the existing cvars if needed.
  *
  * These three accessors are idempotent: ri.Cvar_Get registers on first
  * call, returns the existing cvar on subsequent calls. Range clamps are
@@ -11283,11 +11283,11 @@ int q3_pbr_cvar_enabled(void) {
 }
 
 float Q3_PostprocessIntensity(void) {
-    if (ri.Cvar_Get == NULL) return 1.5f;
-    cvar_t *cv = ri.Cvar_Get("r_postprocess_intensity", "1.5", CVAR_ARCHIVE);
-    float v = cv ? cv->value : 1.5f;
+    if (ri.Cvar_Get == NULL) return 2.5f;
+    cvar_t *cv = ri.Cvar_Get("r_postprocess_intensity", "2.5", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 2.5f;
     if (v < 0.5f) v = 0.5f;
-    if (v > 3.0f) v = 3.0f;
+    if (v > 4.0f) v = 4.0f;
     return v;
 }
 

@@ -85,7 +85,7 @@ void Q3DebugTelemetry_Log(const char *type, const char *message);
  * OLED tuning; matches the policy that put TAA / sky-stable-proj /
  * underwater wiggle / async textures default-on, since iPhone has no
  * in-game console keyboard to toggle).
- * r_postprocess_intensity (default 1.5, range [0.5, 3.0]) and
+ * r_postprocess_intensity (default 2.5, range [0.5, 4.0]) and
  * r_postprocess_gamma (default 0.95, range [0.5, 2.5]) control the curve.
  * Encoded after world+entity+UI passes; skipped when disabled. */
 int Q3_PostprocessEnabled(void);
