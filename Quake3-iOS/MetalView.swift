@@ -3708,8 +3708,10 @@ struct MetalView: UIViewRepresentable {
         /* RT kernel uses Metal texture slots 2...111 for a single generic
          * 110-texture table. Reserve the tail for emissive DDS maps so
          * `r_rt_mix 1` can still show RTX/Remix emissive floors/arches/
-         * jump pads instead of the old albedo-only 0.8 fake glow. */
-        private let rtReservedEmissiveSlots = 18
+         * jump pads instead of the old albedo-only 0.8 fake glow.
+         * Kept small (6) to avoid starving albedo slots for weapons/items
+         * — maps with many unique textures need the full table. */
+        private let rtReservedEmissiveSlots = 6
         private var rtAlbedoHandles = [UInt32](repeating: 0, count: 110)
         private var rtAlbedoSlotKinds = [UInt32](repeating: 0, count: 110) // 0=albedo/classic, 1=emissive DDS
         private var rtLightmapHandles = [UInt32](repeating: 0, count: 16)
@@ -4877,7 +4879,13 @@ struct MetalView: UIViewRepresentable {
                 if let mat = pbrMaterialInfo(for: materialHandle) {
                     if mat.roughnessConstant >= 0 { rtRough = mat.roughnessConstant }
                     if mat.metallicConstant >= 0 { rtMetal = mat.metallicConstant }
-                    if mat.emissive != nil && mat.emissiveIntensity > 0.0 {
+                    // Gate emissive promotion behind a meaningful intensity
+                    // threshold (0.5) so default/black emissive maps on
+                    // regular walls don't force the RT kernel into the
+                    // additive/translucent emissive path and make opaque
+                    // surfaces see-through. True emissive surfaces (lights,
+                    // jump pads, glow plates) ship with intensity >= 1.0.
+                    if mat.emissive != nil && mat.emissiveIntensity >= 0.5 {
                         isEmissive = true
                         rtEmissiveIntensity = max(rtEmissiveIntensity,
                                                   min(mat.emissiveIntensity, Q3_PBREmissiveIntensityMax()))
