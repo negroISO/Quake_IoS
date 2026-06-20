@@ -3977,6 +3977,7 @@ struct MetalView: UIViewRepresentable {
         private struct PostprocessUniforms {
             var intensity: Float
             var gamma: Float
+            var tonemap: Float   // >0.5 = ACES filmic roll-off; else hard saturate clip
         }
 
         private struct RTBlendUniforms {
@@ -3996,6 +3997,7 @@ struct MetalView: UIViewRepresentable {
             struct PPUniforms {
                 float intensity;
                 float gamma;
+                float tonemap;
             };
 
             kernel void q3_postprocess(texture2d<float, access::read_write> drawable [[texture(0)]],
@@ -4005,8 +4007,23 @@ struct MetalView: UIViewRepresentable {
                 uint h = drawable.get_height();
                 if (tid.x >= w || tid.y >= h) return;
                 float4 c = drawable.read(tid);
-                float3 rgb = saturate(c.rgb * u.intensity);
-                rgb = pow(rgb, float3(u.gamma));
+                // Pre-exposure first so the ACES curve has HDR-ish values to
+                // roll off. With the old hard `saturate(c.rgb * intensity)`,
+                // any intensity > 1 clipped lit walls to flat white; the ACES
+                // filmic curve instead lifts mid-tones and rolls highlights
+                // smoothly back into [0,1], so exposure can be raised toward
+                // the RTX reference brightness without blowout. (T3 exposure
+                // parity — the postprocess input is the composited drawable,
+                // which is still LDR-ish, so this reshapes tone rather than
+                // recovering truly-clipped emissive; the HDR backbuffer is the
+                // separate T2 follow-up for true highlight recovery.)
+                float3 rgb = max(c.rgb * u.intensity, float3(0.0));
+                if (u.tonemap > 0.5) {
+                    // ACES filmic fit (Narkowicz) — same curve as the RT blendRT path.
+                    rgb = (rgb * (2.51 * rgb + 0.03)) /
+                          (rgb * (2.43 * rgb + 0.59) + 0.14);
+                }
+                rgb = pow(saturate(rgb), float3(u.gamma));
                 drawable.write(float4(rgb, c.a), tid);
             }
 
@@ -4056,7 +4073,8 @@ struct MetalView: UIViewRepresentable {
             enc.setComputePipelineState(pso)
             enc.setTexture(drawable.texture, index: 0)
             var u = PostprocessUniforms(intensity: Q3_PostprocessIntensity(),
-                                        gamma: Q3_PostprocessGamma())
+                                        gamma: Q3_PostprocessGamma(),
+                                        tonemap: Float(Q3_PostprocessTonemap()))
             enc.setBytes(&u, length: MemoryLayout<PostprocessUniforms>.size, index: 0)
             let w = drawable.texture.width
             let h = drawable.texture.height
@@ -4943,6 +4961,15 @@ struct MetalView: UIViewRepresentable {
                 // matte dielectric default so reflections stay off.
                 var rtRough: Float = 0.85
                 var rtMetal: Float = 0.0
+                // Increment 1 (HDR emissive): feed AUTHORED emissive intensity
+                // into the RT HDR color when r_rt_emissive > 0. Legacy default
+                // (cvar 0) keeps the additive-stage albedo*0.8 fake. The kernel
+                // already does `color += albedoSample.rgb * materialParams.x` on
+                // materialFlags.y surfaces, so the existing ACES tonemap + bloom
+                // glow these once the intensity crosses the bloom threshold.
+                let rtEmissiveScale = Q3_RTEmissive()
+                var rtEmissiveActive = isEmissive
+                var rtEmissiveIntensity: Float = isEmissive ? 0.8 : 0.0
                 // logEnabled: false — this 30 Hz RT prepass runs before any
                 // draw and was poisoning the one-shot world-atlas log with
                 // atlasTime=0.000 entries (dedup set is shared).
@@ -4951,6 +4978,16 @@ struct MetalView: UIViewRepresentable {
                     let m = matPtr.pointee
                     if m.roughness_constant >= 0 { rtRough = m.roughness_constant }
                     if m.metallic_constant >= 0 { rtMetal = m.metallic_constant }
+                    if rtEmissiveScale > 0 {
+                        let authored = m.emissive_intensity
+                        if authored > 0 || m.emissive != nil {
+                            rtEmissiveActive = true
+                            // /16 clamp tames RTX's huge HDR values (up to 982);
+                            // the master scale + r_rt_exposure/r_rt_bloom tune the
+                            // final on-screen brightness through the ACES tonemap.
+                            rtEmissiveIntensity = min(max(authored, 1.0), 16.0) * rtEmissiveScale
+                        }
+                    }
                 }
                 let firstTri = Int(draw.firstIndex / 3)
                 let triCount = Int(draw.indexCount / 3)
@@ -4976,11 +5013,11 @@ struct MetalView: UIViewRepresentable {
                             // RT shades blended/translucent world surfaces with partial alpha
                             // so grates/flames/portals preserve raster behind them.
                             materialFlags: SIMD4<UInt32>(isSkyDraw ? 1 : 0,
-                                                         isEmissive ? 1 : 0,
+                                                         rtEmissiveActive ? 1 : 0,
                                                          alphaThreshold != 0 ? 1 : 0,
                                                          blendMode != 0 ? 1 : 0),
                             // .z = roughness, .w = metallic (P3 reflections).
-                            materialParams: SIMD4<Float>(isEmissive ? 0.8 : 0.0, Float(blendMode), rtRough, rtMetal),
+                            materialParams: SIMD4<Float>(rtEmissiveIntensity, Float(blendMode), rtRough, rtMetal),
                             tcModTypes: tcTypes,
                             tcModParams0: chain.p0,
                             tcModParams1: chain.p1,
