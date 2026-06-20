@@ -395,6 +395,9 @@ struct MetalView: UIViewRepresentable {
             // RT atmosphere / miss-fill (must mirror MSL):
             // x=density, y=grey, z=sky/miss alpha, w=max fog factor.
             var rtAtmosphereParams: SIMD4<Float> = SIMD4(0, 0.22, 0, 0.85)
+            // Step 2c: global RT PBR params (must mirror MSL append-only tail).
+            // x = r_rt_normal_scale (0 = off), y = parallax scale (Step 5), z/w pad.
+            var rtPBRGlobal: SIMD4<Float> = SIMD4(0, 0, 0, 0)
         }
 
         struct RTPrimitiveMaterial {
@@ -4084,6 +4087,8 @@ struct MetalView: UIViewRepresentable {
                 // x = atmosphere density, y = neutral grey color,
                 // z = sky/miss alpha override, w = max surface fog factor.
                 float4 rtAtmosphereParams;
+                // Step 2c: x = r_rt_normal_scale (0 = off), y = parallax (Step 5), z/w pad.
+                float4 rtPBRGlobal;
             };
 
             // P1: RTX Remix authored per-map light (baked from
@@ -4324,6 +4329,33 @@ struct MetalView: UIViewRepresentable {
                                         (localUV.y + row) / aRows);
                         }
                         float4 albedoSample = texTable.albedo[mat.albedoSlot].sample(repeatSampler, uv);
+                        // Step 2c: RT normal mapping. Gated by r_rt_normal_scale
+                        // (rtPBRGlobal.x); 0 = exact no-op. Samples the per-material
+                        // normal DDS (parallel to albedo), builds an analytic TBN from
+                        // the hit triangle's positions + base UVs, and perturbs N. The
+                        // existing NEE sun/light dot(N,L) terms then pick up the bump.
+                        if (uniforms.rtPBRGlobal.x > 0.0) {
+                            float3 p0n = float3(vertices[i0].position);
+                            float3 p1n = float3(vertices[i1].position);
+                            float3 p2n = float3(vertices[i2].position);
+                            float3 e1 = p1n - p0n;
+                            float3 e2 = p2n - p0n;
+                            float2 du1 = uv1 - uv0;
+                            float2 du2 = uv2 - uv0;
+                            float det = du1.x * du2.y - du2.x * du1.y;
+                            if (abs(det) > 1.0e-8) {
+                                float3 T = (e1 * du2.y - e2 * du1.y) / det;
+                                T = T - N * dot(N, T);            // Gram-Schmidt orthonormalize
+                                if (dot(T, T) > 1.0e-8) {
+                                    T = normalize(T);
+                                    float3 Bn = cross(N, T);
+                                    float3 nTan = texTable.normal[mat.albedoSlot].sample(repeatSampler, uv).rgb * 2.0 - 1.0;
+                                    nTan.xy *= uniforms.rtPBRGlobal.x;
+                                    float3 pN = T * nTan.x + Bn * nTan.y + N * nTan.z;
+                                    if (dot(pN, pN) > 1.0e-8) { N = normalize(pN); }
+                                }
+                            }
+                        }
                         float blendMode = mat.materialParams.y;
                         bool additiveBlend = (abs(blendMode - 1.0) < 0.5 || abs(blendMode - 5.0) < 0.5);
                         bool alphaSensitive = (mat.materialFlags.z != 0 || mat.materialFlags.w != 0 || additiveBlend);
@@ -5543,6 +5575,9 @@ struct MetalView: UIViewRepresentable {
                 Q3_RTAtmosphereGrey(),
                 Q3_RTAtmosphereSkyAlpha(),
                 Q3_RTAtmosphereMax())
+            // Step 2c: RT normal-map perturbation strength (r_rt_normal_scale,
+            // default 0 = off). Kernel builds analytic TBN + perturbs N when > 0.
+            uniforms.rtPBRGlobal = SIMD4<Float>(Q3_RTNormalScale(), 0, 0, 0)
             if !rtOverlayLogPrintedOnce {
                 print("[RT] overlay active mix=\(mixValue) trace=\(traceW)x\(traceH) scale=\(rtResolutionScale) bounces=\(rtBounceCount) taa=\(rtTAAEnabled ? 1 : 0) composite=\(renderW)x\(renderH) camera=\(cameraPos)")
                 rtOverlayLogPrintedOnce = true

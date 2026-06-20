@@ -11491,6 +11491,21 @@ float Q3_RTNormalMix(void) {
     return v;
 }
 
+/* r_rt_normal_scale (default 0.0 = OFF) — RT PBR normal-map perturbation
+ * strength (Step 2c). When > 0, rtKernel samples the per-material normal DDS
+ * from the RTTexTable sidecar (parallel to albedo), builds an analytic TBN from
+ * the hit triangle's positions+UVs, and perturbs the shading normal N before the
+ * NEE sun/light N·L terms. 0 = exact no-op (tangent XY scaled to zero → flat).
+ * Tune live: r_rt_normal_scale 1 (authored strength), up to 4 for emphasis. */
+float Q3_RTNormalScale(void) {
+    if (ri.Cvar_Get == NULL) return 0.0f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_normal_scale", "0.0", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.0f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 4.0f) v = 4.0f;
+    return v;
+}
+
 float Q3_RTResolutionScale(void) {
     if (ri.Cvar_Get == NULL) return 0.5f;
     cvar_t *cv = ri.Cvar_Get("r_rt_resolution_scale", "0.5", CVAR_ARCHIVE);
