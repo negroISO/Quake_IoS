@@ -197,6 +197,10 @@ float Q3_RTNormalScale(void);
  * (sun+local NEE). Lower lightmap + higher direct → RTX-Remix-like look. */
 float Q3_RTLightmapScale(void);
 float Q3_RTDirectScale(void);
+/* Per-channel brightness cap for additive/additive-full ENTITY stages — tames
+ * chrome envmap / explosion FX that bleed bright through dark RT walls. Default
+ * 2.0, set high to disable. */
+float Q3_RTEntityAdditiveMax(void);
 float Q3_RTResolutionScale(void);
 float Q3_RTBounces(void);
 float Q3_RTTAA(void);
