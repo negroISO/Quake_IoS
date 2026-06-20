@@ -189,6 +189,9 @@ float Q3_RTExposure(void);
 float Q3_RTGamma(void);
 float Q3_RTAmbient(void);
 float Q3_RTNormalMix(void);
+/* r_rt_normal_scale (default 0.0 = OFF) — RT normal-map perturbation strength
+ * (Step 2c). 0 = no-op; tune up to 4 live to dial in RT bump mapping. */
+float Q3_RTNormalScale(void);
 float Q3_RTResolutionScale(void);
 float Q3_RTBounces(void);
 float Q3_RTTAA(void);
