@@ -433,6 +433,13 @@ struct MetalView: UIViewRepresentable {
             // RT-only mirror of WorldDrawUniforms.spriteAtlasParams for PBR animation atlases.
             // x=cols, y=rows, z=fps, w=padding. 0 cols disables remap.
             var spriteAtlasParams: SIMD4<Float> = SIMD4(0, 0, 0, 0)
+            // Step 1 (RT PBR sidecars) — packed as a single uint4 (16-byte aligned,
+            // unambiguous Swift/MSL layout). x=normal, y=roughness, z=metallic, w=height
+            // texture-table slot index; UInt32.max = no sidecar for that channel.
+            // Kernel ignores these until Step 4; defaults make this a no-op layout change.
+            var pbrSlots: SIMD4<UInt32> = SIMD4(UInt32.max, UInt32.max, UInt32.max, UInt32.max)
+            // x = parallax scale (r_rt_parallax), y = normal scale, z/w = pad.
+            var rtPBRParams: SIMD4<Float> = SIMD4(0, 1, 0, 0)
         }
 
         struct WorldDrawUniforms {
@@ -3438,7 +3445,35 @@ struct MetalView: UIViewRepresentable {
             // World, entity pickup, and HUD sub-pass draws keep the default
             // (0,0,0,0) which makes the gate false and the floor a no-op.
             if (uniforms.viewmodelParams.y > 0.5) {
-                base.rgb = max(base.rgb, texel.rgb * uniforms.viewmodelParams.x);
+                // 2026-06-19: albedo-PROPORTIONAL floor fails for dark-albedo
+                // metal weapons. The rocket launcher (metallic=1.0, dark RTX
+                // albedo) has zero PBR diffuse and reflects only the ~0.08
+                // grey env cube, so the lit result is ~0.05; the proportional
+                // lift `dark_albedo * 0.65` is still near-black. Add an
+                // ABSOLUTE minimum (`floor * 0.25`) so even a near-black
+                // albedo gets a readable grey silhouette, while bright-albedo
+                // weapons (machinegun) still take the larger proportional
+                // term and look unchanged. floor=0 → both terms 0 → no-op.
+                float vmFloor = uniforms.viewmodelParams.x;
+                float3 vmFloorTerm = max(texel.rgb * vmFloor, float3(vmFloor * 0.25));
+                base.rgb = max(base.rgb, vmFloorTerm);
+            }
+            // World-entity readability floor (non-viewmodel pickups). Full-metal
+            // items (rocket launcher, plasma, ammo, health: metallic=1.0) have
+            // zero PBR diffuse and only reflect the IBL cube; under the near-black
+            // procedural envcube they go near-invisible (black silhouette / faint
+            // Fresnel edge). Lift world entities by their unlit albedo so pickups
+            // stay visible. Gate `.y <= 0.5` = NOT a viewmodel; `.w` =
+            // r_pbr_entity_floor strength (0 = off). `.z` is the RT debug mask.
+            if (uniforms.viewmodelParams.y <= 0.5 && uniforms.viewmodelParams.w > 0.0) {
+                // 2026-06-19: same absolute-minimum hybrid as the viewmodel
+                // floor above. Dark-albedo metal PICKUPS (rocket launcher on
+                // the ground) need a guaranteed minimum, not just albedo*floor
+                // — otherwise they read as black silhouettes against the dark
+                // env-cube reflection.
+                float entFloor = uniforms.viewmodelParams.w;
+                float3 entFloorTerm = max(texel.rgb * entFloor, float3(entFloor * 0.25));
+                base.rgb = max(base.rgb, entFloorTerm);
             }
             // Emissive accumulation. Same pattern as q3_world_fragment;
             // gated on intensity > 0 so the default zero-emission path
@@ -4186,6 +4221,9 @@ struct MetalView: UIViewRepresentable {
                 float4 tcModParams2;
                 float4 tcModParams3;
                 float4 spriteAtlasParams; // x=cols, y=rows, z=fps, w=pad; 0 cols = not an atlas
+                // Step 1 (RT PBR sidecars) — must mirror the Swift struct exactly.
+                uint4 pbrSlots;      // x=normal y=roughness z=metallic w=height slot; 0xFFFFFFFF = none
+                float4 rtPBRParams;  // x=parallaxScale, y=normalScale, z/w=pad
             };
 
             // Step 2a: RT texture table moved into an argument buffer so the
@@ -9377,7 +9415,11 @@ struct MetalView: UIViewRepresentable {
                             vmFloor,
                             wantsDepthHack ? 1.0 : 0.0,
                             rtDebugEntityMaskActive ? 1.0 : 0.0,
-                            0)
+                            // .w = world-entity readability floor (non-viewmodel
+                            // pickups) so full-metal items (RL/plasma/ammo/health,
+                            // metallic=1.0) don't go near-invisible under the dark
+                            // IBL cube. Viewmodels use .x instead.
+                            wantsDepthHack ? 0.0 : Q3_PBREntityFloor())
                         if wantsDepthHack && !loggedViewmodelFloorOnce && vmFloor > 0.0 {
                             loggedViewmodelFloorOnce = true
                             pbrLog("[Q3-PBR-ENTITY] viewmodel floor enabled strength=\(String(format: "%.3f", vmFloor))")
