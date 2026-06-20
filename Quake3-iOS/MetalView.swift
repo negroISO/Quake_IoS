@@ -1336,6 +1336,14 @@ struct MetalView: UIViewRepresentable {
             var sunDir: SIMD3<Float> = SIMD3<Float>(0.3, 0.5, 0.7)
             var sunIntensity: Float = 0
             var sunColor: SIMD4<Float> = SIMD4<Float>(1, 1, 1, 0)
+            /* 2026-06-19: additive-stage brightness cap (append-only tail,
+             * mirrored at the end of MSL EntityUniforms). .x = max per-channel
+             * output for additive/additive-full entity stages (from
+             * r_rt_entity_additive_max). Non-additive draws set .x to a huge
+             * value so the MSL `min()` is a no-op. Tames blown-out chrome
+             * envmap / explosion FX that bleed bright through dark RT walls.
+             * .y/.z/.w pad. Default (1e9, 0, 0, 0) = no clamp. */
+            var additiveClampParams: SIMD4<Float> = SIMD4<Float>(1e9, 0, 0, 0)
         }
 
         /* Fragment-side dlight block bound at buffer(2) for both world and
@@ -2082,6 +2090,9 @@ struct MetalView: UIViewRepresentable {
             packed_float3 sunDir;
             float sunIntensity;
             float4 sunColor;
+            // 2026-06-19: additive-stage brightness cap. .x = max per-channel
+            // output for additive entity stages (no-op when .x is huge).
+            float4 additiveClampParams;
         };
 
         float q3EntityFogFactor(float3 worldPos,
@@ -3483,6 +3494,14 @@ struct MetalView: UIViewRepresentable {
                 float3 eSample = emissiveTexture.sample(textureSampler, in.texCoord).rgb;
                 base.rgb += eSample * uniforms.emissiveParams.xyz * uniforms.emissiveParams.w;
             }
+            // 2026-06-19: additive-stage brightness cap. Additive/additive-full
+            // entity stages pass `additiveClampParams.x = r_rt_entity_additive_max`
+            // here; their bright chrome-envmap / explosion specular otherwise
+            // blooms and reads through dark RT walls even though the .lessEqual
+            // depth test passed. Non-additive draws pass a huge .x so this is a
+            // no-op. Applied AFTER emissive so the cap bounds the full additive
+            // contribution this draw blends onto the destination.
+            base.rgb = min(base.rgb, float3(uniforms.additiveClampParams.x));
             return base;
         }
 
@@ -9424,6 +9443,18 @@ struct MetalView: UIViewRepresentable {
                             loggedViewmodelFloorOnce = true
                             pbrLog("[Q3-PBR-ENTITY] viewmodel floor enabled strength=\(String(format: "%.3f", vmFloor))")
                         }
+                        // 2026-06-19: additive-stage brightness cap (RT mode only).
+                        // Chrome-envmap / explosion additive stages pass the
+                        // .lessEqual depth test (they ARE in front) but their bright
+                        // additive specular blooms and reads through dark RT walls.
+                        // Cap the per-fragment output for additive/additive-full
+                        // stages; non-additive draws and raster mode get a huge
+                        // value so the MSL `min()` is a no-op. Set explicitly every
+                        // draw so no stale cap bleeds into the next entity.
+                        let entityAdditiveStage = isEntityAdditive || isEntityAdditiveFull
+                        entityUniforms.additiveClampParams = SIMD4<Float>(
+                            (Q3_RTMix() > 0 && entityAdditiveStage) ? Q3_RTEntityAdditiveMax() : 1e9,
+                            0, 0, 0)
                         encoder.setVertexBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
                         encoder.setFragmentBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
                         if (preferClassicFX || (draw.flags & aTestGT0Bit) != 0),
