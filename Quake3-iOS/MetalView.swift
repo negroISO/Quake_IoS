@@ -4472,7 +4472,9 @@ struct MetalView: UIViewRepresentable {
                                 lightmap = texTable.lightmap[mat.lightmapSlot].sample(clampSampler, lmuv).rgb;
                             }
                             float ambientFloor = uniforms.rtToneParams.z;
-                            color = albedoSample.rgb * max(lightmap * 1.25, float3(ambientFloor));
+                            // RT lighting rebalance: rtPBRGlobal.z dims the baked
+                            // lightmap (toward RT-direct/RTX look); ambient floor preserved.
+                            color = albedoSample.rgb * max(lightmap * 1.25 * uniforms.rtPBRGlobal.z, float3(ambientFloor));
                             if (mat.materialFlags.y != 0) {
                                 float3 emitSample = albedoSample.rgb;
                                 if (mat.emissiveSlot < 110) {
@@ -4488,7 +4490,9 @@ struct MetalView: UIViewRepresentable {
                                 lightmap = texTable.lightmap[mat.lightmapSlot].sample(clampSampler, lmuv).rgb;
                             }
                             float ambientFloor = uniforms.rtToneParams.z;
-                            color = albedoSample.rgb * max(lightmap * 1.25, float3(ambientFloor));
+                            // RT lighting rebalance: rtPBRGlobal.z dims the baked
+                            // lightmap (toward RT-direct/RTX look); ambient floor preserved.
+                            color = albedoSample.rgb * max(lightmap * 1.25 * uniforms.rtPBRGlobal.z, float3(ambientFloor));
                             if (mat.materialFlags.y != 0) {
                                 float3 emitSample = albedoSample.rgb;
                                 if (mat.emissiveSlot < 110) {
@@ -4605,7 +4609,9 @@ struct MetalView: UIViewRepresentable {
                                         }
                                     }
                                 }
-                                color += albedoSample.rgb * direct;
+                                // RT lighting rebalance: rtPBRGlobal.w boosts the
+                                // ray-traced direct (sun + local NEE, shadowed) term.
+                                color += albedoSample.rgb * direct * uniforms.rtPBRGlobal.w;
                             }
                             /* P3 — one-level specular reflection. Gated on
                              * material roughness/metallic from the PBR table
@@ -5702,9 +5708,10 @@ struct MetalView: UIViewRepresentable {
                 Q3_RTAtmosphereGrey(),
                 Q3_RTAtmosphereSkyAlpha(),
                 Q3_RTAtmosphereMax())
-            // Step 2c: RT normal-map perturbation strength (r_rt_normal_scale,
-            // default 0 = off). Kernel builds analytic TBN + perturbs N when > 0.
-            uniforms.rtPBRGlobal = SIMD4<Float>(Q3_RTNormalScale(), 0, 0, 0)
+            // rtPBRGlobal: x=normal scale (Step 2c), y=parallax (Step 5, reserved),
+            // z=lightmap scale, w=direct-light scale (RT lighting rebalance; both 1=current).
+            uniforms.rtPBRGlobal = SIMD4<Float>(Q3_RTNormalScale(), 0,
+                                                Q3_RTLightmapScale(), Q3_RTDirectScale())
             if !rtOverlayLogPrintedOnce {
                 print("[RT] overlay active mix=\(mixValue) trace=\(traceW)x\(traceH) scale=\(rtResolutionScale) bounces=\(rtBounceCount) taa=\(rtTAAEnabled ? 1 : 0) composite=\(renderW)x\(renderH) camera=\(cameraPos)")
                 rtOverlayLogPrintedOnce = true
@@ -11545,13 +11552,21 @@ final class Q3InputView: MTKView {
             // value / player-name fields receive actual text. Use
             // `characters` (NOT charactersIgnoringModifiers) so shift
             // produces capitals and shifted symbols ("A", "!", "@", …).
-            // ASCII printable range only; arrows/F-keys/modifiers
-            // produce empty or non-printable .characters and are
-            // skipped by the bounds check.
-            for ch in key.characters.unicodeScalars {
-                let v = ch.value
-                if v >= 32 && v < 127 {
-                    Q3Sys_CharEvent(Int32(v))
+            //
+            // CRITICAL: only single-character keys produce text. Arrow keys,
+            // F-keys, etc. report a MULTI-CHARACTER marker string in
+            // `key.characters` (e.g. up-arrow = "UIInputUpArrow") whose letters
+            // all pass the printable bounds check — so without the count==1
+            // guard, pressing Up typed "UIInputUpArrow" into the console and
+            // swallowed K_UPARROW history recall (forcing manual delete spam).
+            // Single-char guard lets real text through while the navigation key
+            // event above (e.g. K_UPARROW=132) drives console history.
+            if key.characters.count == 1 {
+                for ch in key.characters.unicodeScalars {
+                    let v = ch.value
+                    if v >= 32 && v < 127 {
+                        Q3Sys_CharEvent(Int32(v))
+                    }
                 }
             }
         }
