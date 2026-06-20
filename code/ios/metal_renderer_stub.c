@@ -11589,6 +11589,32 @@ float Q3_RTNormalScale(void) {
     return v;
 }
 
+/* RT lighting rebalance (lightmap-dominant → RT-direct-dominant, toward the
+ * RTX-Remix look which uses no Q3 lightmaps). Both default 1.0 = current look.
+ * r_rt_lightmap_scale: multiplies the baked-lightmap base term (lower = dim the
+ *   lightmap so RT direct + PBR detail reads). Clamp [0..1].
+ * r_rt_direct_scale: multiplies the RT direct (sun + local NEE, shadowed) term
+ *   (higher = stronger ray-traced direct lighting). Clamp [0..8].
+ * Tune live: e.g. r_rt_lightmap_scale 0.35 ; r_rt_direct_scale 3. The ambient
+ * floor (rtToneParams.z) keeps shadowed areas from cratering to black. */
+float Q3_RTLightmapScale(void) {
+    if (ri.Cvar_Get == NULL) return 1.0f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_lightmap_scale", "1.0", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 1.0f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    return v;
+}
+
+float Q3_RTDirectScale(void) {
+    if (ri.Cvar_Get == NULL) return 1.0f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_direct_scale", "1.0", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 1.0f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 8.0f) v = 8.0f;
+    return v;
+}
+
 float Q3_RTResolutionScale(void) {
     if (ri.Cvar_Get == NULL) return 0.5f;
     cvar_t *cv = ri.Cvar_Get("r_rt_resolution_scale", "0.5", CVAR_ARCHIVE);

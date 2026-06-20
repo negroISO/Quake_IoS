@@ -192,6 +192,11 @@ float Q3_RTNormalMix(void);
 /* r_rt_normal_scale (default 0.0 = OFF) — RT normal-map perturbation strength
  * (Step 2c). 0 = no-op; tune up to 4 live to dial in RT bump mapping. */
 float Q3_RTNormalScale(void);
+/* RT lighting rebalance (both default 1.0 = current look). r_rt_lightmap_scale
+ * [0..1] dims the baked-lightmap base; r_rt_direct_scale [0..8] boosts RT direct
+ * (sun+local NEE). Lower lightmap + higher direct → RTX-Remix-like look. */
+float Q3_RTLightmapScale(void);
+float Q3_RTDirectScale(void);
 float Q3_RTResolutionScale(void);
 float Q3_RTBounces(void);
 float Q3_RTTAA(void);
