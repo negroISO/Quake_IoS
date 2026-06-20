@@ -11532,6 +11532,21 @@ float Q3_RTDirectScale(void) {
     return v;
 }
 
+/* r_rt_entity_additive_max: per-channel brightness cap applied to ADDITIVE and
+ * additive-full entity stages in q3_entity_fragment. Chrome envmap / explosion
+ * FX stages pass the .lessEqual depth test (they are in front) but their bright
+ * additive specular blooms and reads through dark RT walls. Capping the
+ * per-fragment additive output tames the blowout. Non-additive entity draws are
+ * passed a huge value (no clamp). Default 2.0. Set high (e.g. 64) to disable. */
+float Q3_RTEntityAdditiveMax(void) {
+    if (ri.Cvar_Get == NULL) return 2.0f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_entity_additive_max", "2.0", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 2.0f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 256.0f) v = 256.0f;
+    return v;
+}
+
 float Q3_RTResolutionScale(void) {
     if (ri.Cvar_Get == NULL) return 0.5f;
     cvar_t *cv = ri.Cvar_Get("r_rt_resolution_scale", "0.5", CVAR_ARCHIVE);
