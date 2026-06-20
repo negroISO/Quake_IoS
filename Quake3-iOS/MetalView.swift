@@ -3428,7 +3428,18 @@ struct MetalView: UIViewRepresentable {
             // World, entity pickup, and HUD sub-pass draws keep the default
             // (0,0,0,0) which makes the gate false and the floor a no-op.
             if (uniforms.viewmodelParams.y > 0.5) {
-                base.rgb = max(base.rgb, texel.rgb * uniforms.viewmodelParams.x);
+                // 2026-06-19: albedo-PROPORTIONAL floor fails for dark-albedo
+                // metal weapons. The rocket launcher (metallic=1.0, dark RTX
+                // albedo) has zero PBR diffuse and reflects only the ~0.08
+                // grey env cube, so the lit result is ~0.05; the proportional
+                // lift `dark_albedo * 0.65` is still near-black. Add an
+                // ABSOLUTE minimum (`floor * 0.25`) so even a near-black
+                // albedo gets a readable grey silhouette, while bright-albedo
+                // weapons (machinegun) still take the larger proportional
+                // term and look unchanged. floor=0 → both terms 0 → no-op.
+                float vmFloor = uniforms.viewmodelParams.x;
+                float3 vmFloorTerm = max(texel.rgb * vmFloor, float3(vmFloor * 0.25));
+                base.rgb = max(base.rgb, vmFloorTerm);
             }
             // World-entity readability floor (non-viewmodel pickups). Full-metal
             // items (rocket launcher, plasma, ammo, health: metallic=1.0) have
@@ -3438,7 +3449,14 @@ struct MetalView: UIViewRepresentable {
             // stay visible. Gate `.y <= 0.5` = NOT a viewmodel; `.w` =
             // r_pbr_entity_floor strength (0 = off). `.z` is the RT debug mask.
             if (uniforms.viewmodelParams.y <= 0.5 && uniforms.viewmodelParams.w > 0.0) {
-                base.rgb = max(base.rgb, texel.rgb * uniforms.viewmodelParams.w);
+                // 2026-06-19: same absolute-minimum hybrid as the viewmodel
+                // floor above. Dark-albedo metal PICKUPS (rocket launcher on
+                // the ground) need a guaranteed minimum, not just albedo*floor
+                // — otherwise they read as black silhouettes against the dark
+                // env-cube reflection.
+                float entFloor = uniforms.viewmodelParams.w;
+                float3 entFloorTerm = max(texel.rgb * entFloor, float3(entFloor * 0.25));
+                base.rgb = max(base.rgb, entFloorTerm);
             }
             // Emissive accumulation. Same pattern as q3_world_fragment;
             // gated on intensity > 0 so the default zero-emission path
