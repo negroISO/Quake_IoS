@@ -91,6 +91,8 @@ void Q3DebugTelemetry_Log(const char *type, const char *message);
 int Q3_PostprocessEnabled(void);
 float Q3_PostprocessIntensity(void);
 float Q3_PostprocessGamma(void);
+/* T3 exposure parity: ACES filmic tonemap in q3_postprocess (1 = on). */
+int Q3_PostprocessTonemap(void);
 
 /* Audio backend (ios_main.m SNDDMA + ring buffer). Set the rate BEFORE
  * Quake3_Init so SNDDMA_Init allocates correctly. Pull is called from
@@ -235,6 +237,10 @@ int   Q3_RTHDR(void);
 float Q3_RTBloom(void);
 float Q3_RTBloomThreshold(void);
 float Q3_RTBloomRadius(void);
+/* Master scale for authored emissive (materials.json emissive_intensity) fed
+ * into the RT HDR color. 0 = legacy albedo*0.8 fake; >0 = authored intensity
+ * (clamped /16) * scale, so emissive surfaces cross the bloom threshold. */
+float Q3_RTEmissive(void);
 /* RT atmosphere/miss-fill tuning. Defaults off: density=0 keeps the
  * historic raster-sky-preserve alpha path. When density > 0, the RT trace
  * applies neutral-grey distance fog and can alpha-fill AS misses via

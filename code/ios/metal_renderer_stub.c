@@ -11283,12 +11283,28 @@ int q3_pbr_cvar_enabled(void) {
 }
 
 float Q3_PostprocessIntensity(void) {
-    if (ri.Cvar_Get == NULL) return 2.5f;
-    cvar_t *cv = ri.Cvar_Get("r_postprocess_intensity", "2.5", CVAR_ARCHIVE);
-    float v = cv ? cv->value : 2.5f;
+    if (ri.Cvar_Get == NULL) return 2.2f;
+    /* T3 exposure parity: default raised 1.5 -> 2.2 now that q3_postprocess
+     * applies an ACES filmic roll-off (r_postprocess_tonemap) instead of a hard
+     * saturate clip, so the extra pre-exposure lifts q3dm1 mid-tones toward the
+     * RTX reference without blowing lit walls to flat white. Ceiling raised to
+     * 4.0 for further live tuning. NOTE: CVAR_ARCHIVE — a device that persisted
+     * an older value in q3config.cfg keeps that value; reset with
+     * `r_postprocess_intensity 2.2` (or `seta`) to pick up the new default. */
+    cvar_t *cv = ri.Cvar_Get("r_postprocess_intensity", "2.2", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 2.2f;
     if (v < 0.5f) v = 0.5f;
     if (v > 4.0f) v = 4.0f;
     return v;
+}
+
+/* r_postprocess_tonemap (default 1 = ON): when set, q3_postprocess applies an
+ * ACES filmic tonemap after pre-exposure so raised exposure rolls highlights
+ * off smoothly instead of hard-clipping. 0 = legacy hard saturate clip. */
+int Q3_PostprocessTonemap(void) {
+    if (ri.Cvar_Get == NULL) return 1;
+    cvar_t *cv = ri.Cvar_Get("r_postprocess_tonemap", "1", CVAR_ARCHIVE);
+    return (cv && cv->value != 0.0f) ? 1 : 0;
 }
 
 float Q3_PostprocessGamma(void) {
@@ -11767,6 +11783,24 @@ float Q3_RTBloomThreshold(void) {
     if (ri.Cvar_Get == NULL) return 0.85f;
     cvar_t *cv = ri.Cvar_Get("r_rt_bloom_threshold", "0.85", CVAR_ARCHIVE);
     float v = cv ? cv->value : 0.85f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 8.0f) v = 8.0f;
+    return v;
+}
+
+/* r_rt_emissive: master scale for AUTHORED emissive (materials.json
+ * emissive_intensity) fed into the RT kernel's HDR color. Default 0.0 = OFF =
+ * legacy behavior (RT emissive faked as albedo*0.8 on additive stages only).
+ * When > 0, surfaces with an authored emissive (intensity > 0 or an emissive
+ * map) get materialParams.x = min(authored, 16) * r_rt_emissive, so the
+ * authored hot-bits / gothic emissives cross the bloom threshold and roll
+ * through the existing ACES tonemap instead of being crushed to 0.8. The /16
+ * clamp keeps RTX-Remix's huge HDR values (up to 982) from producing an absurd
+ * bloom; tune brightness with this scale + r_rt_exposure + r_rt_bloom. */
+float Q3_RTEmissive(void) {
+    if (ri.Cvar_Get == NULL) return 0.0f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_emissive", "0.0", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.0f;
     if (v < 0.0f) v = 0.0f;
     if (v > 8.0f) v = 8.0f;
     return v;
