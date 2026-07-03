@@ -5071,16 +5071,18 @@ struct MetalView: UIViewRepresentable {
 
         @MainActor
         private func encodeEntityAccelerationStructureBuild(device: MTLDevice,
-                                                            commandBuffer: MTLCommandBuffer) -> MTLAccelerationStructure? {
+                                                            commandBuffer: MTLCommandBuffer,
+                                                            slot: Int) -> MTLAccelerationStructure? {
             guard Q3_RTEntities() != 0 else {
                 entityAccelerationStructure = nil
                 entityASSize = 0
                 return nil
             }
+            let clampedSlot = max(0, min(slot, max(0, entityVertexBuffers.count - 1)))
             guard device.supportsRaytracing,
                   let snapshot = Q3MetalRenderer_GetFrameSnapshot()?.pointee,
-                  let vb = entityVertexBuffer,
-                  let ib = entityIndexBuffer else {
+                  let vb = entityVertexBuffers[clampedSlot],
+                  let ib = entityIndexBuffers[clampedSlot] else {
                 entityAccelerationStructure = nil
                 entityASSize = 0
                 return nil
@@ -7613,15 +7615,37 @@ struct MetalView: UIViewRepresentable {
             }
         }
 
-        private var vertexBuffer: MTLBuffer?
-        private var vertexBufferCapacity = 0
+        private let maxInflightFrames = 3
+        private var frameSlotCursor = 0
+        private var frameSyncLogEmitted = false
+        private let frameInFlightSemaphore = DispatchSemaphore(value: 3)
+        private final class FrameSlotReleaseGuard: @unchecked Sendable {
+            private let semaphore: DispatchSemaphore
+            private let lock = NSLock()
+            private var released = false
+
+            init(_ semaphore: DispatchSemaphore) {
+                self.semaphore = semaphore
+            }
+
+            func release() {
+                lock.lock()
+                defer { lock.unlock() }
+                guard !released else { return }
+                released = true
+                semaphore.signal()
+            }
+        }
+
+        private var vertexBuffers: [MTLBuffer?] = Array(repeating: nil, count: 3)
+        private var vertexBufferCapacities: [Int] = Array(repeating: 0, count: 3)
         private var worldVertexBuffer: MTLBuffer?
         private var worldIndexBuffer: MTLBuffer?
         private var cachedWorldGeneration: UInt32 = 0
-        private var entityVertexBuffer: MTLBuffer?
-        private var entityVertexBufferCapacity = 0
-        private var entityIndexBuffer: MTLBuffer?
-        private var entityIndexBufferCapacity = 0
+        private var entityVertexBuffers: [MTLBuffer?] = Array(repeating: nil, count: 3)
+        private var entityVertexBufferCapacities: [Int] = Array(repeating: 0, count: 3)
+        private var entityIndexBuffers: [MTLBuffer?] = Array(repeating: nil, count: 3)
+        private var entityIndexBufferCapacities: [Int] = Array(repeating: 0, count: 3)
         private var debugFrameCounter: UInt32 = 0
         private var fogVolumeLogged = false
         private var fogOverlayInsideClipLogged: Set<Int> = []
@@ -7680,6 +7704,16 @@ struct MetalView: UIViewRepresentable {
             if commandQueue == nil {
                 configureRenderer(for: view)
             }
+            if !frameSyncLogEmitted {
+                frameSyncLogEmitted = true
+                print("[MTL_SYNC] maxInflight=\(maxInflightFrames)")
+            }
+
+            let frameSlot = frameSlotCursor
+            frameSlotCursor = (frameSlotCursor + 1) % maxInflightFrames
+            frameInFlightSemaphore.wait()
+            let frameReleaseGuard = FrameSlotReleaseGuard(frameInFlightSemaphore)
+            defer { frameReleaseGuard.release() }
 
             /* MetalFX upscale path: when upscaleQuality != .native, we
              * render the frame at a lower resolution (renderW × renderH)
@@ -7737,6 +7771,9 @@ struct MetalView: UIViewRepresentable {
                   let worldSamplerState,
                   let commandBuffer = commandQueue.makeCommandBuffer()
             else { return }
+            commandBuffer.addCompletedHandler { _ in
+                frameReleaseGuard.release()
+            }
             let drawableAcquireMs = (CACurrentMediaTime() - drawableAcquireStart) * 1000.0
             commandBuffer.label = "Q3.frame"
 
@@ -7993,7 +8030,7 @@ struct MetalView: UIViewRepresentable {
                        let device = view.device,
                        let batchBuffer = ensureWorldBatchIndexBuffer(device: device,
                                                                       indexCount: cBatchIndexCount,
-                                                                      slot: Int(debugFrameCounter % 3)) {
+                                                                      slot: frameSlot) {
                         let byteCount = cBatchIndexCount * MemoryLayout<UInt32>.stride
                         let batchCopyStart = CACurrentMediaTime()
                         memcpy(batchBuffer.contents(), cBatchIndexPointer, byteCount)
@@ -8354,8 +8391,8 @@ struct MetalView: UIViewRepresentable {
                             if !batches.isEmpty,
                                let device = view.device,
                                let batchedIndexBuffer = ensureWorldBatchIndexBuffer(device: device,
-                                                                                    indexCount: totalBatchIndexCount,
-                                                                                    slot: Int(debugFrameCounter % 3)) {
+                                                                                  indexCount: totalBatchIndexCount,
+                                                                                  slot: frameSlot) {
                                 var runningIndex = 0
                                 for batchIndex in batches.indices {
                                     batches[batchIndex].firstMergedIndex = runningIndex
@@ -9037,9 +9074,9 @@ struct MetalView: UIViewRepresentable {
                         print("[RT] preserve entities mask active size=\(renderW)x\(renderH) (composite-before-entities)")
                         pbrLog("[RT] preserve entities mask active size=\(renderW)x\(renderH) (composite-before-entities)")
                     }
-                    _ = uploadEntityBuffers(device: device)
+                    _ = uploadEntityBuffers(device: device, slot: frameSlot)
                     encoder.endEncoding()
-                    _ = encodeEntityAccelerationStructureBuild(device: device, commandBuffer: commandBuffer)
+                    _ = encodeEntityAccelerationStructureBuild(device: device, commandBuffer: commandBuffer, slot: frameSlot)
                     _ = encodeRTOverlay(commandBuffer: commandBuffer,
                                         rasterTexture: rtTargetTexture,
                                         outputDrawableTexture: rtTargetTexture,
@@ -9068,8 +9105,8 @@ struct MetalView: UIViewRepresentable {
             if snapshot.entityCommandCount > 0,
                let entityPipelineState,
                let sceneView = Q3MetalRenderer_GetSceneView()?.pointee,
-               let entityVertexBuffer = uploadEntityBuffers(device: view.device),
-               let entityIndexBuffer {
+               let entityVertexBuffer = uploadEntityBuffers(device: view.device, slot: frameSlot),
+               let entityIndexBuffer = entityIndexBuffers[frameSlot] {
                 let entityViewProjection = makeWorldViewProjection(sceneView)
                 let cameraPos = SIMD3<Float>(sceneView.viewOrigin.0, sceneView.viewOrigin.1, sceneView.viewOrigin.2)
                 let cameraForward = SIMD3<Float>(sceneView.viewAxis.0, sceneView.viewAxis.1, sceneView.viewAxis.2)
@@ -9560,9 +9597,9 @@ struct MetalView: UIViewRepresentable {
                 // Parity with the preserve path: ensure entity buffers are
                 // valid even when the entity pass above was skipped
                 // (entityCommandCount == 0) and r_rt_entities is enabled.
-                _ = uploadEntityBuffers(device: device)
+                _ = uploadEntityBuffers(device: device, slot: frameSlot)
                 encoder.endEncoding()
-                _ = encodeEntityAccelerationStructureBuild(device: device, commandBuffer: commandBuffer)
+                _ = encodeEntityAccelerationStructureBuild(device: device, commandBuffer: commandBuffer, slot: frameSlot)
                 _ = encodeRTOverlay(commandBuffer: commandBuffer,
                                     rasterTexture: rtTargetTexture,
                                     outputDrawableTexture: rtTargetTexture,
@@ -9648,8 +9685,8 @@ struct MetalView: UIViewRepresentable {
                let scenesPointer = Q3MetalRenderer_GetSceneSnapshots(),
                let entityDrawsPointer = Q3MetalRenderer_GetEntityDrawCommands(),
                let entityPipelineState,
-               let entityVertexBuffer = uploadEntityBuffers(device: view.device),
-               let entityIndexBuffer {
+               let entityVertexBuffer = uploadEntityBuffers(device: view.device, slot: frameSlot),
+               let entityIndexBuffer = entityIndexBuffers[frameSlot] {
                 let scenes = UnsafeBufferPointer(start: scenesPointer, count: Int(snapshot.sceneCount))
                 let allEntityDraws = UnsafeBufferPointer(start: entityDrawsPointer, count: Int(snapshot.entityCommandCount))
                 for sceneIdx in 1..<Int(snapshot.sceneCount) {
@@ -9786,7 +9823,7 @@ struct MetalView: UIViewRepresentable {
 
             let vertexCount = Int(snapshot.vertexCount)
             if vertexCount > 0, let verticesPointer = Q3MetalRenderer_GetVertices(),
-               let vertexBuffer = uploadVertices(UnsafeBufferPointer(start: verticesPointer, count: vertexCount), device: view.device) {
+               let vertexBuffer = uploadVertices(UnsafeBufferPointer(start: verticesPointer, count: vertexCount), device: view.device, slot: frameSlot) {
                 let vertices = UnsafeBufferPointer(start: verticesPointer, count: vertexCount)
                 let projection = makeOrthoProjection(width: max(Float(snapshot.drawableWidth), 1.0), height: max(Float(snapshot.drawableHeight), 1.0))
                 var uniforms = Uniforms(projection: projection)
@@ -10455,7 +10492,7 @@ struct MetalView: UIViewRepresentable {
             depthHackDepthStencilState = device.makeDepthStencilState(descriptor: depthHackDescriptor)
         }
 
-        private func uploadVertices(_ vertices: UnsafeBufferPointer<Q3MetalVertex>, device: MTLDevice?) -> MTLBuffer? {
+        private func uploadVertices(_ vertices: UnsafeBufferPointer<Q3MetalVertex>, device: MTLDevice?, slot: Int) -> MTLBuffer? {
             guard let device else { return nil }
 
             let requiredLength = vertices.count * MemoryLayout<GPUVertex>.stride
@@ -10463,14 +10500,17 @@ struct MetalView: UIViewRepresentable {
                 return nil
             }
 
-            if vertexBuffer == nil || requiredLength > vertexBufferCapacity {
-                let nextCapacity = max(requiredLength, max(vertexBufferCapacity * 2, 4096))
-                vertexBuffer = device.makeBuffer(length: nextCapacity, options: .storageModeShared)
-                vertexBuffer?.label = "Q3.vb.ui"
-                vertexBufferCapacity = nextCapacity
+            let clampedSlot = max(0, min(slot, max(0, vertexBuffers.count - 1)))
+            if vertexBuffers[clampedSlot] == nil || requiredLength > vertexBufferCapacities[clampedSlot] {
+                let currentCapacity = vertexBufferCapacities[clampedSlot]
+                let nextCapacity = max(requiredLength, max(currentCapacity * 2, 4096))
+                vertexBuffers[clampedSlot] = device.makeBuffer(length: nextCapacity, options: .storageModeShared)
+                vertexBuffers[clampedSlot]?.label = "Q3.vb.ui.\(clampedSlot)"
+                vertexBufferCapacities[clampedSlot] = nextCapacity
             }
 
-            guard let vertexBuffer, let rawPointer = vertexBuffer.contents().bindMemory(to: GPUVertex.self, capacity: vertices.count) as UnsafeMutablePointer<GPUVertex>? else {
+            guard let vertexBuffer = vertexBuffers[clampedSlot],
+                  let rawPointer = vertexBuffer.contents().bindMemory(to: GPUVertex.self, capacity: vertices.count) as UnsafeMutablePointer<GPUVertex>? else {
                 return nil
             }
 
@@ -10578,7 +10618,7 @@ struct MetalView: UIViewRepresentable {
             return worldVertexBuffer
         }
 
-        private func uploadEntityBuffers(device: MTLDevice?) -> MTLBuffer? {
+        private func uploadEntityBuffers(device: MTLDevice?, slot: Int) -> MTLBuffer? {
             guard let device,
                   let snapshot = Q3MetalRenderer_GetFrameSnapshot()?.pointee,
                   let verticesPointer = Q3MetalRenderer_GetEntityVertices(),
@@ -10590,14 +10630,16 @@ struct MetalView: UIViewRepresentable {
             guard vertexCount > 0, indexCount > 0 else { return nil }
 
             let vertexLength = vertexCount * MemoryLayout<GPUEntityVertex>.stride
-            if entityVertexBuffer == nil || vertexLength > entityVertexBufferCapacity {
-                let nextCapacity = max(vertexLength, max(entityVertexBufferCapacity * 2, 4096))
-                entityVertexBuffer = device.makeBuffer(length: nextCapacity, options: .storageModeShared)
-                entityVertexBuffer?.label = "Q3.vb.entity"
-                entityVertexBufferCapacity = nextCapacity
+            let clampedSlot = max(0, min(slot, max(0, entityVertexBuffers.count - 1)))
+            if entityVertexBuffers[clampedSlot] == nil || vertexLength > entityVertexBufferCapacities[clampedSlot] {
+                let currentCapacity = entityVertexBufferCapacities[clampedSlot]
+                let nextCapacity = max(vertexLength, max(currentCapacity * 2, 4096))
+                entityVertexBuffers[clampedSlot] = device.makeBuffer(length: nextCapacity, options: .storageModeShared)
+                entityVertexBuffers[clampedSlot]?.label = "Q3.vb.entity.\(clampedSlot)"
+                entityVertexBufferCapacities[clampedSlot] = nextCapacity
             }
 
-            guard let entityVertexBuffer,
+            guard let entityVertexBuffer = entityVertexBuffers[clampedSlot],
                   let rawVertexPointer = entityVertexBuffer.contents().bindMemory(to: GPUEntityVertex.self, capacity: vertexCount) as UnsafeMutablePointer<GPUEntityVertex>?
             else {
                 return nil
@@ -10615,14 +10657,15 @@ struct MetalView: UIViewRepresentable {
             }
 
             let indexLength = indexCount * MemoryLayout<UInt32>.stride
-            if entityIndexBuffer == nil || indexLength > entityIndexBufferCapacity {
-                let nextCapacity = max(indexLength, max(entityIndexBufferCapacity * 2, 4096))
-                entityIndexBuffer = device.makeBuffer(length: nextCapacity, options: .storageModeShared)
-                entityIndexBuffer?.label = "Q3.ib.entity"
-                entityIndexBufferCapacity = nextCapacity
+            if entityIndexBuffers[clampedSlot] == nil || indexLength > entityIndexBufferCapacities[clampedSlot] {
+                let currentCapacity = entityIndexBufferCapacities[clampedSlot]
+                let nextCapacity = max(indexLength, max(currentCapacity * 2, 4096))
+                entityIndexBuffers[clampedSlot] = device.makeBuffer(length: nextCapacity, options: .storageModeShared)
+                entityIndexBuffers[clampedSlot]?.label = "Q3.ib.entity.\(clampedSlot)"
+                entityIndexBufferCapacities[clampedSlot] = nextCapacity
             }
 
-            guard let entityIndexBuffer,
+            guard let entityIndexBuffer = entityIndexBuffers[clampedSlot],
                   let rawIndexPointer = entityIndexBuffer.contents().bindMemory(to: UInt32.self, capacity: indexCount) as UnsafeMutablePointer<UInt32>?
             else {
                 return nil
