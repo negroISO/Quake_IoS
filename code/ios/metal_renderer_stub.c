@@ -11483,6 +11483,15 @@ float Q3_PBRViewmodelFloor(void) {
     return v;
 }
 
+float Q3_PBREntityFloor(void) {
+    if (ri.Cvar_Get == NULL) return 0.40f;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_entity_floor", "0.40", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.40f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    return v;
+}
+
 /* r_world_debug_mode — runtime swap for what was a compile-time constant
  * (MetalView.swift Coordinator.worldDebugMode). Drives the world fragment
  * shader's debug-mode branch:
