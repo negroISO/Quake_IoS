@@ -4032,6 +4032,7 @@ struct MetalView: UIViewRepresentable {
         private var rtLastCameraPos: SIMD3<Float>?
         private var rtLastCameraForward: SIMD3<Float>?
         private var rtPrevViewProjection: simd_float4x4?
+        private var rtPrevViewProjectionWorldGeneration: UInt32?
         private var rtGBufferReadyLogPrinted = false
         private var rtGBufferPrevCurrentLogPrinted = false
         private var loggedPBROnlyWorldMisses: Set<UInt32> = []
@@ -5340,9 +5341,18 @@ struct MetalView: UIViewRepresentable {
         @MainActor
         private func buildWorldAccelerationStructure(device: MTLDevice) -> MTLAccelerationStructure? {
             guard device.supportsRaytracing, Q3MetalRenderer_IsWorldLoaded() != 0 else { return nil }
-            guard let ib = worldIndexBuffer else { return nil }
-            let vertexCount = Int(Q3MetalRenderer_GetWorldVertexCount())
-            let indexCount = Int(Q3MetalRenderer_GetWorldIndexCount())
+            guard let snapshot = Q3MetalRenderer_GetFrameSnapshot()?.pointee,
+                  uploadWorldBuffers(device: device, generation: snapshot.worldGeneration) != nil,
+                  cachedWorldGeneration == snapshot.worldGeneration,
+                  let ib = worldIndexBuffer else { return nil }
+            let vertexCount = Int(snapshot.worldVertexCount)
+            let indexCount = Int(snapshot.worldIndexCount)
+            guard ib.length >= indexCount * MemoryLayout<UInt32>.stride else {
+                print("[RT] AS build skipped: stale world index buffer generation=\(snapshot.worldGeneration) indices=\(indexCount) bytes=\(ib.length)")
+                worldASBuilt = false
+                worldASGeneration = 0
+                return nil
+            }
             guard vertexCount > 0, indexCount >= 3, let src = Q3MetalRenderer_GetWorldVertices() else { return nil }
 
             let verts = UnsafeBufferPointer(start: src, count: vertexCount)
@@ -5772,6 +5782,7 @@ struct MetalView: UIViewRepresentable {
                                      outputDrawableTexture: MTLTexture,
                                      device: MTLDevice,
                                      sceneView: Q3MetalSceneView,
+                                     worldGeneration: UInt32,
                                      renderW: Int,
                                      renderH: Int) -> MTLTexture? {
             let mixValue = Q3_RTMix()
@@ -5864,8 +5875,11 @@ struct MetalView: UIViewRepresentable {
             }
             rtLastCameraPos = cameraPos
             rtLastCameraForward = forwardNorm
+            let prevGeneration = rtPrevViewProjectionWorldGeneration
+            let generationChanged = prevGeneration.map { $0 != worldGeneration } ?? false
             let prevWasMissing = rtPrevViewProjection == nil
-            let prevViewProjectionForMV = (prevWasMissing || gbufferCut) ? viewProj : (rtPrevViewProjection ?? viewProj)
+            let forcePrevCurrentForMV = prevWasMissing || gbufferCut || generationChanged
+            let prevViewProjectionForMV = forcePrevCurrentForMV ? viewProj : (rtPrevViewProjection ?? viewProj)
 
             rtJitterFrame &+= 1
             let jitter = rtTAAEnabled
@@ -5902,9 +5916,14 @@ struct MetalView: UIViewRepresentable {
                                                 Q3_RTLightmapScale(), Q3_RTDirectScale())
             uniforms.prevViewProjection = prevViewProjectionForMV
             rtPrevViewProjection = viewProj
-            if (prevWasMissing || gbufferCut), !rtGBufferPrevCurrentLogPrinted {
-                let reason = prevWasMissing ? "first-frame" : "camera-cut"
-                print("[Q3-GBUFFER] prev=current (MV=0) reason=\(reason)")
+            rtPrevViewProjectionWorldGeneration = worldGeneration
+            if forcePrevCurrentForMV && (!rtGBufferPrevCurrentLogPrinted || generationChanged) {
+                let reason = generationChanged ? "map-generation-change" : (prevWasMissing ? "first-frame" : "camera-cut")
+                if generationChanged, let prevGeneration {
+                    print("[Q3-GBUFFER] prev=current (MV=0) reason=\(reason) generation=\(prevGeneration)->\(worldGeneration)")
+                } else {
+                    print("[Q3-GBUFFER] prev=current (MV=0) reason=\(reason)")
+                }
                 rtGBufferPrevCurrentLogPrinted = true
             }
             if !rtOverlayLogPrintedOnce {
@@ -9301,7 +9320,7 @@ struct MetalView: UIViewRepresentable {
                    worldVertexBuffer != nil, worldIndexBuffer != nil {
                     worldAccelerationStructure = buildWorldAccelerationStructure(device: device)
                     worldASBuilt = (worldAccelerationStructure != nil)
-                    worldASGeneration = worldASBuilt ? snapshot.worldGeneration : 0
+                    worldASGeneration = worldASBuilt ? cachedWorldGeneration : 0
                 }
                 let rtTargetTexture = (upscaleActive ? upscaleColorTarget : drawable.texture) ?? drawable.texture
                 // P0.2 (docs/2026-06-10-rt-gap-analysis-vs-rtx-remix.md):
@@ -9329,6 +9348,7 @@ struct MetalView: UIViewRepresentable {
                                         outputDrawableTexture: rtTargetTexture,
                                         device: device,
                                         sceneView: sceneView,
+                                        worldGeneration: snapshot.worldGeneration,
                                         renderW: renderW,
                                         renderH: renderH)
                     let postRTPass = makeLoadedRenderPassDescriptor(colorTexture: rtTargetTexture,
@@ -9853,6 +9873,7 @@ struct MetalView: UIViewRepresentable {
                                     outputDrawableTexture: rtTargetTexture,
                                     device: device,
                                     sceneView: sceneView,
+                                    worldGeneration: snapshot.worldGeneration,
                                     renderW: renderW,
                                     renderH: renderH)
                 let postRTPass = makeLoadedRenderPassDescriptor(colorTexture: rtTargetTexture,
