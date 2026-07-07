@@ -11798,18 +11798,19 @@ float Q3_RTBloomThreshold(void) {
 }
 
 /* r_rt_emissive: master scale for AUTHORED emissive (materials.json
- * emissive_intensity) fed into the RT kernel's HDR color. Default 0.0 = OFF =
- * legacy behavior (RT emissive faked as albedo*0.8 on additive stages only).
- * When > 0, surfaces with an authored emissive (intensity > 0 or an emissive
- * map) get materialParams.x = min(authored, 16) * r_rt_emissive, so the
- * authored hot-bits / gothic emissives cross the bloom threshold and roll
+ * emissive_intensity) fed into the RT kernel's HDR color. Default 1.0 = ON
+ * now that RT emissive slots bind the authored emissive-mask DDS instead of
+ * the albedo texture. Set 0 for legacy behavior (additive-stage albedo*0.8
+ * only). When > 0, surfaces with an authored emissive (intensity > 0 or an
+ * emissive map) get materialParams.x = min(authored, 16) * r_rt_emissive, so
+ * the authored hot-bits / gothic emissives cross the bloom threshold and roll
  * through the existing ACES tonemap instead of being crushed to 0.8. The /16
  * clamp keeps RTX-Remix's huge HDR values (up to 982) from producing an absurd
  * bloom; tune brightness with this scale + r_rt_exposure + r_rt_bloom. */
 float Q3_RTEmissive(void) {
-    if (ri.Cvar_Get == NULL) return 0.0f;
-    cvar_t *cv = ri.Cvar_Get("r_rt_emissive", "0.0", CVAR_ARCHIVE);
-    float v = cv ? cv->value : 0.0f;
+    if (ri.Cvar_Get == NULL) return 1.0f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_emissive", "1.0", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 1.0f;
     if (v < 0.0f) v = 0.0f;
     if (v > 8.0f) v = 8.0f;
     return v;

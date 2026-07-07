@@ -241,8 +241,9 @@ float Q3_RTBloom(void);
 float Q3_RTBloomThreshold(void);
 float Q3_RTBloomRadius(void);
 /* Master scale for authored emissive (materials.json emissive_intensity) fed
- * into the RT HDR color. 0 = legacy albedo*0.8 fake; >0 = authored intensity
- * (clamped /16) * scale, so emissive surfaces cross the bloom threshold. */
+ * into the RT HDR color. Default 1 = authored emissive-mask DDS active; 0 =
+ * legacy albedo*0.8 fake. Intensity is (clamped /16) * scale, so emissive
+ * surfaces cross the bloom threshold. */
 float Q3_RTEmissive(void);
 /* RT atmosphere/miss-fill tuning. Defaults off: density=0 keeps the
  * historic raster-sky-preserve alpha path. When density > 0, the RT trace

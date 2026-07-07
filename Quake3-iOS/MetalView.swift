@@ -5825,7 +5825,17 @@ struct MetalView: UIViewRepresentable {
                     // lightmap(110..125), normal(126..235), height(236..345).
                     for i in 0..<rtMaxAlbedoSlots {
                         let h = rtAlbedoHandles[i]
-                        rtTexResident.append(pbrAlbedoTexture(for: h) ?? texture(for: h, device: device) ?? fallbackTex)
+                        if rtAlbedoSlotKinds[i] == 1 {
+                            // Emissive slots share the RT albedo table so the
+                            // shader can sample authored *_emissive*.e.rtex.dds
+                            // masks without adding more argument-buffer arrays.
+                            // Do not fall back to white here: a missing emissive
+                            // DDS should contribute zero light, not make the
+                            // whole primitive emit as a white rectangle.
+                            rtTexResident.append(pbrEmissiveTexture(for: h) ?? pbrEmissiveDefault() ?? fallbackTex)
+                        } else {
+                            rtTexResident.append(pbrAlbedoTexture(for: h) ?? texture(for: h, device: device) ?? fallbackTex)
+                        }
                     }
                     for i in 0..<rtMaxLightmapSlots {
                         rtTexResident.append(texture(for: rtLightmapHandles[i], device: device) ?? fallbackTex)
