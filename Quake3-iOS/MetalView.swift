@@ -628,6 +628,30 @@ struct MetalView: UIViewRepresentable {
             (stage.pbrMaterialHandle != 0) ? stage.pbrMaterialHandle : stage.textureHandle
         }
 
+        private static func rtRepresentativeStage(for draw: Q3MetalWorldDrawCmd) -> Q3MetalWorldStage? {
+            let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+            guard stageCount > 0 else { return nil }
+
+            func candidates(_ predicate: (Q3MetalWorldStage) -> Bool) -> Q3MetalWorldStage? {
+                for i in 0..<stageCount {
+                    let s = Self.worldStage(draw, i)
+                    if s.useLightmap == 0 && s.textureHandle != 0 && predicate(s) { return s }
+                }
+                return nil
+            }
+
+            // RT has one material per primitive. Several stock Q3 shaders place
+            // envmap/chrome/lightmap overlay stages before the real base texture
+            // (q3tourney4: chrome_metal, pewter_shiney, etc.). Using stage 0 makes
+            // solid walls sample chrome/water-like FX. Prefer the first non-env
+            // opaque base stage, then any non-env base stage, and only fall back
+            // when no better albedo-bearing stage exists.
+            if let s = candidates({ $0.tcGen != 1 && Self.worldBlendClass(for: $0) == 0 }) { return s }
+            if let s = candidates({ $0.tcGen != 1 }) { return s }
+            if let s = candidates({ _ in true }) { return s }
+            return nil
+        }
+
         private struct WorldPassEntry {
             let drawIndex: Int
             /* -1 = sky draw (all sky stages), -2 = fog-only draw. */
@@ -4952,34 +4976,9 @@ struct MetalView: UIViewRepresentable {
             var emissiveWeights: [UInt32: Int] = [:]
             let fogOnlyBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY)
 
-            func rtRepresentativeStage(for draw: Q3MetalWorldDrawCmd) -> Q3MetalWorldStage? {
-                let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
-                guard stageCount > 0 else { return nil }
-
-                func candidates(_ predicate: (Q3MetalWorldStage) -> Bool) -> Q3MetalWorldStage? {
-                    for i in 0..<stageCount {
-                        let s = Self.worldStage(draw, i)
-                        if s.useLightmap == 0 && s.textureHandle != 0 && predicate(s) { return s }
-                    }
-                    return nil
-                }
-
-                // RT has one material per primitive. Several stock Q3 shaders
-                // place envmap/chrome/lightmap overlay stages before the real
-                // base texture (q3tourney4: chrome_metal, pewter_shiney, etc.).
-                // Using stage 0 makes solid walls sample chrome/water-like FX.
-                // Prefer the first non-env opaque base stage, then any non-env
-                // base stage, and only fall back to stage 0 when no better
-                // albedo-bearing stage exists.
-                if let s = candidates({ $0.tcGen != 1 && Self.worldBlendClass(for: $0) == 0 }) { return s }
-                if let s = candidates({ $0.tcGen != 1 }) { return s }
-                if let s = candidates({ _ in true }) { return s }
-                return nil
-            }
-
             for draw in draws where draw.indexCount >= 3 {
                 if (draw.flags & fogOnlyBit) != 0 { continue }
-                guard let stage = rtRepresentativeStage(for: draw) else { continue }
+                guard let stage = Self.rtRepresentativeStage(for: draw) else { continue }
                 let triCount = max(1, Int(draw.indexCount / 3))
                 let materialHandle = Self.worldPBRMaterialHandle(for: stage)
                 if stage.useLightmap == 0 && stage.textureHandle != 0 {
@@ -5033,7 +5032,7 @@ struct MetalView: UIViewRepresentable {
             var skippedOverwrite = 0
             for draw in draws where draw.indexCount >= 3 {
                 if (draw.flags & fogOnlyBit) != 0 { continue }
-                guard let stage = rtRepresentativeStage(for: draw) else { continue }
+                guard let stage = Self.rtRepresentativeStage(for: draw) else { continue }
                 let skyFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
                 let isSkyDraw = (draw.flags & skyFlagBit) != 0
                 let materialHandle = Self.worldPBRMaterialHandle(for: stage)
@@ -5150,17 +5149,48 @@ struct MetalView: UIViewRepresentable {
                 h ^= v
                 h = h &* 0x100000001b3
             }
-            mix(UInt64(max(0, min(16000, Int((Q3_PBREmissiveIntensityMax() * 1000.0).rounded())))))
+            func mixFloat(_ v: Float) {
+                mix(Self.floatBits(v))
+            }
+            func mixVec4(_ v: SIMD4<Float>) {
+                mixFloat(v.x); mixFloat(v.y); mixFloat(v.z); mixFloat(v.w)
+            }
+            func mixScaled(_ v: Float, scale: Float = 1000.0, clamp: Int = 1_000_000) {
+                mix(UInt64(max(0, min(clamp, Int((v * scale).rounded())))))
+            }
+            mixScaled(Q3_PBREmissiveIntensityMax(), clamp: 16_000)
+            mixScaled(Q3_RTEmissive(), clamp: 16_000)
+            mix(UInt64(Q3_PBRBakedLightmaps() != 0 ? 1 : 0))
+            let fogOnlyBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY)
+            let skyFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
             for draw in draws where draw.indexCount >= 3 {
-                let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
-                guard stageCount > 0 else { continue }
-                let stage = Self.worldStage(draw, 0)
-                mix(UInt64(stage.textureHandle))
-                mix(UInt64(draw.lightmapTextureHandle) << 1)
-                mix(UInt64(draw.flags) << 2)
-                mix(UInt64(stage.useLightmap) << 3)
-                mix(UInt64(stage.blendMode) << 4)
-                mix(UInt64(draw.indexCount) << 5)
+                if (draw.flags & fogOnlyBit) != 0 { continue }
+                guard let stage = Self.rtRepresentativeStage(for: draw) else { continue }
+                let materialHandle = Self.worldPBRMaterialHandle(for: stage)
+                let blendMode = Self.worldBlendClass(for: stage)
+                let alphaThreshold = Self.alphaTestThreshold(for: stage.alphaFunc)
+                let tcMods = [stage.tcMods.0, stage.tcMods.1, stage.tcMods.2, stage.tcMods.3]
+
+                mix(UInt64(draw.firstIndex))
+                mix(UInt64(draw.indexCount) << 1)
+                mix(UInt64(draw.lightmapTextureHandle) << 2)
+                mix(UInt64(draw.flags) << 3)
+                mix(UInt64((draw.flags & skyFlagBit) != 0 ? 1 : 0) << 4)
+                mix(UInt64(stage.textureHandle) << 5)
+                mix(UInt64(materialHandle) << 6)
+                mix(UInt64(stage.pbrMaterialHandle) << 7)
+                mix(UInt64(stage.useLightmap) << 8)
+                mix(UInt64(stage.srcBlend) << 9)
+                mix(UInt64(stage.dstBlend) << 10)
+                mix(UInt64(max(0, blendMode)) << 11)
+                mix(UInt64(stage.tcGen) << 12)
+                mix(UInt64(stage.alphaFunc) << 13)
+                mix(UInt64(stage.tcModCount) << 14)
+                mixFloat(alphaThreshold)
+                for mod in tcMods {
+                    mix(UInt64(mod.type))
+                    mixVec4(SIMD4<Float>(mod.params.0, mod.params.1, mod.params.2, mod.params.3))
+                }
             }
             return h
         }
