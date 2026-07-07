@@ -210,6 +210,9 @@ float Q3_RTResolutionScale(void);
 float Q3_RTBounces(void);
 float Q3_RTTAA(void);
 float Q3_RTTAAAlpha(void);
+/* Stage 17 RT G-buffer debug visualization. Session-only:
+ * 0=off, 1=motion, 2=normal, 3=depth. */
+int   Q3_RTDebugGBuffer(void);
 int   Q3_RTEntities(void);
 /* P0.2 — RT composite entity preservation (see
  * docs/2026-06-10-rt-gap-analysis-vs-rtx-remix.md).

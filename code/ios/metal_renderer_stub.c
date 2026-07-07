@@ -11691,6 +11691,18 @@ float Q3_RTTAAAlpha(void) {
     return v;
 }
 
+int Q3_RTDebugGBuffer(void) {
+    if (ri.Cvar_Get == NULL) return 0;
+    /* Stage 17 session-only debug view:
+     * 0 off, 1 motion, 2 normal, 3 depth. Do not archive — this is
+     * capture/validation infrastructure for denoise/FI inputs. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_debug_gbuffer", "0", 0);
+    int v = cv ? cv->integer : 0;
+    if (v < 0) v = 0;
+    if (v > 3) v = 3;
+    return v;
+}
+
 int Q3_RTEntities(void) {
     if (ri.Cvar_Get == NULL) return 0;
     /* Default OFF: raster draws weapons/items/HUD on top already. The RT

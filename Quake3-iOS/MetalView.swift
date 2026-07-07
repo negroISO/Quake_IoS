@@ -413,8 +413,14 @@ struct MetalView: UIViewRepresentable {
             // x=density, y=grey, z=sky/miss alpha, w=max fog factor.
             var rtAtmosphereParams: SIMD4<Float> = SIMD4(0, 0.22, 0, 0.85)
             // Step 2c: global RT PBR params (must mirror MSL append-only tail).
-            // x = r_rt_normal_scale (0 = off), y = parallax scale (Step 5), z/w pad.
+            // x = r_rt_normal_scale (0 = off), y = r_rt_debug_gbuffer
+            // (0=off, 1=motion, 2=normal, 3=depth), z=lightmap scale,
+            // w=direct-light scale. Reuses the old y pad to avoid a layout
+            // insert; prevViewProjection below is append-only for Stage 17.
             var rtPBRGlobal: SIMD4<Float> = SIMD4(0, 0, 0, 0)
+            // Stage 17: append-only tail field. Do not insert fields above this:
+            // Swift and MSL RayTracingUniforms are bound as raw bytes.
+            var prevViewProjection: simd_float4x4 = matrix_identity_float4x4
         }
 
         struct RTPrimitiveMaterial {
@@ -3802,6 +3808,10 @@ struct MetalView: UIViewRepresentable {
         private var rtAccumTexture: MTLTexture?
         private var rtHistoryTexture: MTLTexture?
         private var rtCompositeTexture: MTLTexture?
+        private var rtGNormalTexture: MTLTexture?
+        private var rtGDepthTexture: MTLTexture?
+        private var rtGAlbedoTexture: MTLTexture?
+        private var rtMotionTexture: MTLTexture?
         private var rtWhiteTexture: MTLTexture?
         private var pbrMissingTexture: MTLTexture?
         private var sunShadowPipelineState: MTLRenderPipelineState?
@@ -4021,6 +4031,9 @@ struct MetalView: UIViewRepresentable {
         private var rtLastMetricsLogTime: CFTimeInterval = 0
         private var rtLastCameraPos: SIMD3<Float>?
         private var rtLastCameraForward: SIMD3<Float>?
+        private var rtPrevViewProjection: simd_float4x4?
+        private var rtGBufferReadyLogPrinted = false
+        private var rtGBufferPrevCurrentLogPrinted = false
         private var loggedPBROnlyWorldMisses: Set<UInt32> = []
         private var loggedWorldOwnerMaterialRoutes: Set<UInt64> = []
         private var loggedPBROnlyEntityMisses: Set<UInt32> = []
@@ -4223,8 +4236,13 @@ struct MetalView: UIViewRepresentable {
                 // x = atmosphere density, y = neutral grey color,
                 // z = sky/miss alpha override, w = max surface fog factor.
                 float4 rtAtmosphereParams;
-                // Step 2c: x = r_rt_normal_scale (0 = off), y = parallax (Step 5), z/w pad.
+                // Step 2c/global controls. x = r_rt_normal_scale (0 = off),
+                // y = r_rt_debug_gbuffer (0 off / 1 motion / 2 normal / 3 depth),
+                // z = lightmap scale, w = direct light scale.
                 float4 rtPBRGlobal;
+                // Stage 17 append-only tail field. Do not insert fields above
+                // this; Swift and MSL structs are byte-bound.
+                float4x4 prevViewProjection;
             };
 
             // P1: RTX Remix authored per-map light (baked from
@@ -4339,6 +4357,10 @@ struct MetalView: UIViewRepresentable {
 
             kernel void rtKernel(texture2d<float, access::write> output [[texture(0)]],
                                  texturecube<float> envCube [[texture(1)]],
+                                 texture2d<float, access::write> gNormal [[texture(2)]],
+                                 texture2d<float, access::write> gDepth [[texture(3)]],
+                                 texture2d<float, access::write> gAlbedo [[texture(4)]],
+                                 texture2d<float, access::write> gMotion [[texture(5)]],
                                  const device RTTexTable& texTable [[buffer(8)]],
                                  constant RayTracingUniforms &uniforms [[buffer(0)]],
                                  acceleration_structure<> worldAS [[buffer(1)]],
@@ -4350,8 +4372,8 @@ struct MetalView: UIViewRepresentable {
                                  device atomic_uint *rtShadowCounters [[buffer(7)]],
                                  uint2 tid [[thread_position_in_grid]]) {
                 if (tid.x >= output.get_width() || tid.y >= output.get_height()) return;
-                float2 uv = (float2(tid) + 0.5) / float2(output.get_width(), output.get_height());
-                uv += uniforms.jitterNearFar.xy;
+                float2 curUv = (float2(tid) + 0.5) / float2(output.get_width(), output.get_height());
+                float2 uv = curUv + uniforms.jitterNearFar.xy;
                 float2 ndc = uv * 2.0 - 1.0;
                 float4 farClip = float4(ndc.x, -ndc.y, 1.0, 1.0);
                 float4 farWorld = uniforms.invViewProjection * farClip;
@@ -4378,8 +4400,22 @@ struct MetalView: UIViewRepresentable {
                 float3 color;
                 float outputAlpha = 1.0;
                 float primaryDistance = uniforms.jitterNearFar.w;
+                float3 gNormalValue = float3(0.0, 0.0, 1.0);
+                float3 gAlbedoValue = float3(0.0);
+                float2 gMotionValue = float2(0.0);
+                bool gHasPrimaryHit = false;
                 if (useEntityHit) {
                     primaryDistance = entityHit.distance;
+                    float3 hitWorld = uniforms.cameraPos.xyz + rayDir * primaryDistance;
+                    float4 pc = uniforms.prevViewProjection * float4(hitWorld, 1.0);
+                    float2 pndc = pc.xy / max(pc.w, 1.0e-6);
+                    float2 pUv = float2(pndc.x, -pndc.y) * 0.5 + 0.5;
+                    // Stage 17 MV convention: UV-space, cur-prev, unjittered.
+                    // curUv is the pixel-center WITHOUT jitter; Stages 18/19
+                    // must consume the same sign/space.
+                    gMotionValue = curUv - pUv;
+                    gAlbedoValue = float3(0.65, 0.65, 0.68);
+                    gHasPrimaryHit = true;
                     float shade = 1.0 - saturate(entityHit.distance / uniforms.jitterNearFar.w);
                     color = mix(float3(0.35, 0.35, 0.38), float3(0.9, 0.9, 0.95), shade);
                 } else if (hit.type == intersection_type::triangle) {
@@ -4401,6 +4437,7 @@ struct MetalView: UIViewRepresentable {
                         N = cross(p1 - p0, p2 - p0);
                     }
                     N = normalize(N);
+                    gNormalValue = N;
                     float3 normalColor = N * 0.5 + 0.5;
 
                     RTPrimitiveMaterial mat = primitiveMaterials[tri];
@@ -4423,6 +4460,7 @@ struct MetalView: UIViewRepresentable {
                         outputAlpha = (uniforms.rtAtmosphereParams.x > 0.0)
                             ? saturate(uniforms.rtAtmosphereParams.z)
                             : 0.0;
+                        primaryDistance = uniforms.jitterNearFar.w;
                     } else if (mat.albedoSlot < 110) {
                         float2 uv0 = vertices[i0].texCoord;
                         float2 uv1 = vertices[i1].texCoord;
@@ -4431,6 +4469,13 @@ struct MetalView: UIViewRepresentable {
                         float2 lm1 = vertices[i1].lightmapTexCoord;
                         float2 lm2 = vertices[i2].lightmapTexCoord;
                         float3 hitPos = uniforms.cameraPos.xyz + rayDir * hit.distance;
+                        float4 pc = uniforms.prevViewProjection * float4(hitPos, 1.0);
+                        float2 pndc = pc.xy / max(pc.w, 1.0e-6);
+                        float2 pUv = float2(pndc.x, -pndc.y) * 0.5 + 0.5;
+                        // Stage 17 MV convention: UV-space, cur-prev,
+                        // unjittered. Jitter affects ray generation only.
+                        gMotionValue = curUv - pUv;
+                        gHasPrimaryHit = true;
                         float2 uv = uv0 * w + uv1 * bary.x + uv2 * bary.y;
                         float2 lmuv = lm0 * w + lm1 * bary.x + lm2 * bary.y;
                         uint tcCount = min(mat.tcModCount, 4u);
@@ -4465,6 +4510,7 @@ struct MetalView: UIViewRepresentable {
                                         (localUV.y + row) / aRows);
                         }
                         float4 albedoSample = texTable.albedo[mat.albedoSlot].sample(repeatSampler, uv);
+                        gAlbedoValue = albedoSample.rgb;
                         // Step 2c: RT normal mapping. Gated by r_rt_normal_scale
                         // (rtPBRGlobal.x); 0 = exact no-op. Samples the per-material
                         // normal DDS (parallel to albedo), builds an analytic TBN from
@@ -4786,6 +4832,38 @@ struct MetalView: UIViewRepresentable {
                     outputAlpha = (uniforms.rtAtmosphereParams.x > 0.0)
                         ? saturate(uniforms.rtAtmosphereParams.z)
                         : 0.0;
+                }
+                if (!gHasPrimaryHit) {
+                    primaryDistance = uniforms.jitterNearFar.w;
+                    gMotionValue = float2(0.0);
+                    gAlbedoValue = float3(0.0);
+                    gNormalValue = float3(0.0, 0.0, 1.0);
+                }
+                // Stage 17 trace-res G-buffer export. Motion is stored as raw
+                // UV-space cur-prev, unjittered; miss/sky pixels are MV=0 and
+                // depth=far so downstream denoise/FI can reject them cheaply.
+                gNormal.write(float4(gNormalValue, 1.0), tid);
+                gDepth.write(float4(primaryDistance, 0.0, 0.0, 1.0), tid);
+                gAlbedo.write(float4(gAlbedoValue, outputAlpha), tid);
+                gMotion.write(float4(gMotionValue, 0.0, 1.0), tid);
+
+                float debugMode = round(uniforms.rtPBRGlobal.y);
+                if (debugMode > 0.5) {
+                    float3 debugColor = float3(0.0);
+                    if (debugMode < 1.5) {
+                        // Motion debug: black = zero; red = +X, green = -X,
+                        // blue = |Y|. Stored texture remains raw RG cur-prev.
+                        float2 mv = gMotionValue * 64.0;
+                        debugColor = saturate(float3(max(mv.x, 0.0),
+                                                     max(-mv.x, 0.0),
+                                                     abs(mv.y)));
+                    } else if (debugMode < 2.5) {
+                        debugColor = gNormalValue * 0.5 + 0.5;
+                    } else {
+                        debugColor = float3(sqrt(saturate(primaryDistance / 2048.0)));
+                    }
+                    output.write(float4(debugColor, 1.0), tid);
+                    return;
                 }
                 if (uniforms.rtAtmosphereParams.x > 0.0) {
                     float density = max(uniforms.rtAtmosphereParams.x, 0.0);
@@ -5334,6 +5412,7 @@ struct MetalView: UIViewRepresentable {
             let cw = max(compositeWidth, 1), ch = max(compositeHeight, 1)
             let rtPixelFormat: MTLPixelFormat = (Q3_RTHDR() != 0) ? .rgba16Float : .rgba8Unorm
             if rtTexture != nil && rtAccumTexture != nil && rtHistoryTexture != nil && rtCompositeTexture != nil &&
+                rtGNormalTexture != nil && rtGDepthTexture != nil && rtGAlbedoTexture != nil && rtMotionTexture != nil &&
                 rtTextureSize.width == tw && rtTextureSize.height == th &&
                 rtCompositeTextureSize.width == cw && rtCompositeTextureSize.height == ch &&
                 rtTexturePixelFormat == rtPixelFormat {
@@ -5343,20 +5422,43 @@ struct MetalView: UIViewRepresentable {
             rtDesc.usage = [.shaderRead, .shaderWrite]; rtDesc.storageMode = .private
             let compDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: pixelFormat, width: cw, height: ch, mipmapped: false)
             compDesc.usage = [.shaderRead, .shaderWrite]; compDesc.storageMode = .private
+            let gNormalDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: tw, height: th, mipmapped: false)
+            gNormalDesc.usage = [.shaderRead, .shaderWrite]; gNormalDesc.storageMode = .private
+            let gDepthDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: tw, height: th, mipmapped: false)
+            gDepthDesc.usage = [.shaderRead, .shaderWrite]; gDepthDesc.storageMode = .private
+            let gAlbedoDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: tw, height: th, mipmapped: false)
+            gAlbedoDesc.usage = [.shaderRead, .shaderWrite]; gAlbedoDesc.storageMode = .private
+            let motionDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rg16Float, width: tw, height: th, mipmapped: false)
+            motionDesc.usage = [.shaderRead, .shaderWrite]; motionDesc.storageMode = .private
             rtTexture = device.makeTexture(descriptor: rtDesc)
             rtAccumTexture = device.makeTexture(descriptor: rtDesc)
             rtHistoryTexture = device.makeTexture(descriptor: rtDesc)
             rtCompositeTexture = device.makeTexture(descriptor: compDesc)
+            rtGNormalTexture = device.makeTexture(descriptor: gNormalDesc)
+            rtGDepthTexture = device.makeTexture(descriptor: gDepthDesc)
+            rtGAlbedoTexture = device.makeTexture(descriptor: gAlbedoDesc)
+            rtMotionTexture = device.makeTexture(descriptor: motionDesc)
             rtTexture?.label = "Q3.RT.output.halfres"
             rtAccumTexture?.label = "Q3.RT.accum.halfres"
             rtHistoryTexture?.label = "Q3.RT.history.halfres"
             rtCompositeTexture?.label = "Q3.RT.composite"
+            rtGNormalTexture?.label = "Q3.RT.gbuffer.normal"
+            rtGDepthTexture?.label = "Q3.RT.gbuffer.depth"
+            rtGAlbedoTexture?.label = "Q3.RT.gbuffer.albedo"
+            rtMotionTexture?.label = "Q3.RT.gbuffer.motion"
             rtTextureSize = MTLSize(width: tw, height: th, depth: 1)
             rtCompositeTextureSize = MTLSize(width: cw, height: ch, depth: 1)
             rtTexturePixelFormat = rtPixelFormat
             rtHistoryValid = false
+            rtPrevViewProjection = nil
+            rtGBufferPrevCurrentLogPrinted = false
             print("[RT] textures trace=\(tw)x\(th) format=\(rtPixelFormat) composite=\(cw)x\(ch) history=reset")
-            return rtTexture != nil && rtAccumTexture != nil && rtHistoryTexture != nil && rtCompositeTexture != nil
+            if !rtGBufferReadyLogPrinted {
+                print("[Q3-GBUFFER] ready trace=\(tw)x\(th) mv=rg16Float depth=r32Float")
+                rtGBufferReadyLogPrinted = true
+            }
+            return rtTexture != nil && rtAccumTexture != nil && rtHistoryTexture != nil && rtCompositeTexture != nil &&
+                rtGNormalTexture != nil && rtGDepthTexture != nil && rtGAlbedoTexture != nil && rtMotionTexture != nil
         }
 
 
@@ -5726,7 +5828,11 @@ struct MetalView: UIViewRepresentable {
                   let rtTex = rtTexture,
                   let accumTex = rtAccumTexture,
                   let historyTex = rtHistoryTexture,
-                  let compositeTex = rtCompositeTexture else { return nil }
+                  let compositeTex = rtCompositeTexture,
+                  let gNormalTex = rtGNormalTexture,
+                  let gDepthTex = rtGDepthTexture,
+                  let gAlbedoTex = rtGAlbedoTexture,
+                  let motionTex = rtMotionTexture else { return nil }
 
             func halton(_ index: UInt32, _ base: UInt32) -> Float {
                 var i = index
@@ -5746,13 +5852,20 @@ struct MetalView: UIViewRepresentable {
             let up = SIMD3<Float>(sceneView.viewAxis.6, sceneView.viewAxis.7, sceneView.viewAxis.8)
             let forwardLen = max(simd_length(forward), 0.0001)
             let forwardNorm = forward / forwardLen
+            var gbufferCut = false
             if let lastPos = rtLastCameraPos, let lastForward = rtLastCameraForward {
                 let moved = simd_length_squared(cameraPos - lastPos) > 0.25
                 let turned = simd_dot(forwardNorm, lastForward) < 0.9995
                 if moved || turned { rtHistoryValid = false }
+                // Stage 17 G-buffer MVs should persist through normal camera
+                // motion; only true cuts/teleports reset prev=current so MV=0.
+                gbufferCut = simd_length_squared(cameraPos - lastPos) > (256.0 * 256.0) ||
+                    simd_dot(forwardNorm, lastForward) < 0.5
             }
             rtLastCameraPos = cameraPos
             rtLastCameraForward = forwardNorm
+            let prevWasMissing = rtPrevViewProjection == nil
+            let prevViewProjectionForMV = (prevWasMissing || gbufferCut) ? viewProj : (rtPrevViewProjection ?? viewProj)
 
             rtJitterFrame &+= 1
             let jitter = rtTAAEnabled
@@ -5783,10 +5896,17 @@ struct MetalView: UIViewRepresentable {
                 Q3_RTAtmosphereGrey(),
                 Q3_RTAtmosphereSkyAlpha(),
                 Q3_RTAtmosphereMax())
-            // rtPBRGlobal: x=normal scale (Step 2c), y=parallax (Step 5, reserved),
+            // rtPBRGlobal: x=normal scale (Step 2c), y=r_rt_debug_gbuffer,
             // z=lightmap scale, w=direct-light scale (RT lighting rebalance; both 1=current).
-            uniforms.rtPBRGlobal = SIMD4<Float>(Q3_RTNormalScale(), 0,
+            uniforms.rtPBRGlobal = SIMD4<Float>(Q3_RTNormalScale(), Float(Q3_RTDebugGBuffer()),
                                                 Q3_RTLightmapScale(), Q3_RTDirectScale())
+            uniforms.prevViewProjection = prevViewProjectionForMV
+            rtPrevViewProjection = viewProj
+            if (prevWasMissing || gbufferCut), !rtGBufferPrevCurrentLogPrinted {
+                let reason = prevWasMissing ? "first-frame" : "camera-cut"
+                print("[Q3-GBUFFER] prev=current (MV=0) reason=\(reason)")
+                rtGBufferPrevCurrentLogPrinted = true
+            }
             if !rtOverlayLogPrintedOnce {
                 print("[RT] overlay active mix=\(mixValue) trace=\(traceW)x\(traceH) scale=\(rtResolutionScale) bounces=\(rtBounceCount) taa=\(rtTAAEnabled ? 1 : 0) composite=\(renderW)x\(renderH) camera=\(cameraPos)")
                 rtOverlayLogPrintedOnce = true
@@ -5807,6 +5927,10 @@ struct MetalView: UIViewRepresentable {
                 enc.setComputePipelineState(rtPSO)
                 enc.setTexture(rtTex, index: 0)
                 let envCube = ensurePBREnvCube()
+                enc.setTexture(gNormalTex, index: 2)
+                enc.setTexture(gDepthTex, index: 3)
+                enc.setTexture(gAlbedoTex, index: 4)
+                enc.setTexture(motionTex, index: 5)
                 let envLabel = envCube?.label ?? "<nil>"
                 if rtLastEnvCubeLabel != envLabel {
                     print("[RT] skybox env source=\(envLabel) stem=\(currentPBRSkyboxStem() ?? "<procedural>")")
