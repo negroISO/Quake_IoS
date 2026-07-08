@@ -210,6 +210,9 @@ float Q3_RTResolutionScale(void);
 float Q3_RTBounces(void);
 float Q3_RTTAA(void);
 float Q3_RTTAAAlpha(void);
+/* Stage 18 RT denoiser. 1 = MetalFX temporal denoised scaler path when
+ * available; 0 = exact pre-Stage18 RT accumulate/upscale behavior. */
+int   Q3_RTDenoise(void);
 /* Stage 17 RT G-buffer debug visualization. Session-only:
  * 0=off, 1=motion, 2=normal, 3=depth. */
 int   Q3_RTDebugGBuffer(void);

@@ -11691,6 +11691,14 @@ float Q3_RTTAAAlpha(void) {
     return v;
 }
 
+int Q3_RTDenoise(void) {
+    if (ri.Cvar_Get == NULL) return 1;
+    /* Stage 18: master denoiser toggle. 0 must preserve the pre-Stage18
+     * RT path exactly (raw trace or legacy r_rt_taa accumulator). */
+    cvar_t *cv = ri.Cvar_Get("r_rt_denoise", "1", CVAR_ARCHIVE);
+    return (cv && cv->integer == 0) ? 0 : 1;
+}
+
 int Q3_RTDebugGBuffer(void) {
     if (ri.Cvar_Get == NULL) return 0;
     /* Stage 17 session-only debug view:

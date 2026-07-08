@@ -3807,11 +3807,18 @@ struct MetalView: UIViewRepresentable {
         private var rtTexture: MTLTexture?
         private var rtAccumTexture: MTLTexture?
         private var rtHistoryTexture: MTLTexture?
+        private var rtDenoisedTexture: MTLTexture?
         private var rtCompositeTexture: MTLTexture?
         private var rtGNormalTexture: MTLTexture?
         private var rtGDepthTexture: MTLTexture?
         private var rtGAlbedoTexture: MTLTexture?
+        private var rtGRoughnessTexture: MTLTexture?
+        private var rtDenoiseMaskTexture: MTLTexture?
         private var rtMotionTexture: MTLTexture?
+        #if canImport(MetalFX) && !os(visionOS)
+        private var rtTemporalDenoisedScaler: MTLFXTemporalDenoisedScaler?
+        #endif
+        private var rtTemporalDenoisedScalerKey: (Int, Int, Int, Int, MTLPixelFormat) = (0, 0, 0, 0, .invalid)
         private var rtWhiteTexture: MTLTexture?
         private var pbrMissingTexture: MTLTexture?
         private var sunShadowPipelineState: MTLRenderPipelineState?
@@ -4029,6 +4036,8 @@ struct MetalView: UIViewRepresentable {
         private var rtJitterFrame: UInt32 = 0
         private var rtMetricsFrame: UInt64 = 0
         private var rtLastMetricsLogTime: CFTimeInterval = 0
+        private var rtDenoiseBackendLogPrinted = false
+        private var rtDenoiseFallbackLogPrinted = false
         private var rtLastCameraPos: SIMD3<Float>?
         private var rtLastCameraForward: SIMD3<Float>?
         private var rtPrevViewProjection: simd_float4x4?
@@ -4362,6 +4371,8 @@ struct MetalView: UIViewRepresentable {
                                  texture2d<float, access::write> gDepth [[texture(3)]],
                                  texture2d<float, access::write> gAlbedo [[texture(4)]],
                                  texture2d<float, access::write> gMotion [[texture(5)]],
+                                 texture2d<float, access::write> gRoughness [[texture(6)]],
+                                 texture2d<float, access::write> gDenoiseMask [[texture(7)]],
                                  const device RTTexTable& texTable [[buffer(8)]],
                                  constant RayTracingUniforms &uniforms [[buffer(0)]],
                                  acceleration_structure<> worldAS [[buffer(1)]],
@@ -4404,8 +4415,11 @@ struct MetalView: UIViewRepresentable {
                 float3 gNormalValue = float3(0.0, 0.0, 1.0);
                 float3 gAlbedoValue = float3(0.0);
                 float2 gMotionValue = float2(0.0);
+                float gRoughnessValue = 0.55;
+                float gDenoiseMaskValue = 0.0;
                 bool gHasPrimaryHit = false;
                 if (useEntityHit) {
+                    gDenoiseMaskValue = 1.0;
                     primaryDistance = entityHit.distance;
                     float3 hitWorld = uniforms.cameraPos.xyz + rayDir * primaryDistance;
                     float4 pc = uniforms.prevViewProjection * float4(hitWorld, 1.0);
@@ -4719,12 +4733,13 @@ struct MetalView: UIViewRepresentable {
                                 // ray-traced direct (sun + local NEE, shadowed) term.
                                 color += albedoSample.rgb * direct * uniforms.rtPBRGlobal.w;
                             }
+                            float rough = mat.materialParams.z;
+                            float metal = mat.materialParams.w;
+                            gRoughnessValue = clamp(rough, 0.0, 1.0);
                             /* P3 — one-level specular reflection. Gated on
                              * material roughness/metallic from the PBR table
                              * (materialParams.z = roughness, .w = metallic). */
                             if (uniforms.rtLightParams.z > 0.5) {
-                                float rough = mat.materialParams.z;
-                                float metal = mat.materialParams.w;
                                 if (metal > 0.5 || rough < uniforms.rtLightParams.w) {
                                     float3 V = -rayDir;
                                     float3 R = reflect(rayDir, N);
@@ -4839,6 +4854,11 @@ struct MetalView: UIViewRepresentable {
                     gMotionValue = float2(0.0);
                     gAlbedoValue = float3(0.0);
                     gNormalValue = float3(0.0, 0.0, 1.0);
+                    gRoughnessValue = 1.0;
+                    gDenoiseMaskValue = 1.0;
+                }
+                if (outputAlpha < 0.5) {
+                    gDenoiseMaskValue = 1.0;
                 }
                 // Stage 17 trace-res G-buffer export. Motion is stored as raw
                 // UV-space cur-prev, unjittered; miss/sky pixels are MV=0 and
@@ -4847,6 +4867,8 @@ struct MetalView: UIViewRepresentable {
                 gDepth.write(float4(primaryDistance, 0.0, 0.0, 1.0), tid);
                 gAlbedo.write(float4(gAlbedoValue, outputAlpha), tid);
                 gMotion.write(float4(gMotionValue, 0.0, 1.0), tid);
+                gRoughness.write(float4(gRoughnessValue, 0.0, 0.0, 1.0), tid);
+                gDenoiseMask.write(float4(gDenoiseMaskValue, 0.0, 0.0, 1.0), tid);
 
                 float debugMode = round(uniforms.rtPBRGlobal.y);
                 if (debugMode > 0.5) {
@@ -4900,6 +4922,7 @@ struct MetalView: UIViewRepresentable {
             kernel void blendRT(texture2d<float, access::sample> rt [[texture(0)]],
                                 texture2d<float, access::read> raster [[texture(1)]],
                                 texture2d<float, access::write> output [[texture(2)]],
+                                texture2d<float, access::sample> rtAlpha [[texture(3)]],
                                 constant float4 &blendParams [[buffer(0)]],
                                 uint2 tid [[thread_position_in_grid]]) {
                 if (tid.x >= output.get_width() || tid.y >= output.get_height()) return;
@@ -4934,7 +4957,7 @@ struct MetalView: UIViewRepresentable {
                 float3 rasterColor = saturate(raster.read(tid).rgb);
                 // RT alpha is a per-pixel preserve-raster mask used for alpha-test
                 // holes, blended world surfaces, and unmapped RT materials.
-                float effectiveMix = m * saturate(rtSample.a);
+                float effectiveMix = m * saturate(rtAlpha.sample(rtUpscaleSampler, uv).a);
                 float3 blended = mix(rasterColor, rtColor, effectiveMix);
                 output.write(float4(blended, 1.0), tid);
             }
@@ -5421,8 +5444,10 @@ struct MetalView: UIViewRepresentable {
             let tw = max(traceWidth, 1), th = max(traceHeight, 1)
             let cw = max(compositeWidth, 1), ch = max(compositeHeight, 1)
             let rtPixelFormat: MTLPixelFormat = (Q3_RTHDR() != 0) ? .rgba16Float : .rgba8Unorm
-            if rtTexture != nil && rtAccumTexture != nil && rtHistoryTexture != nil && rtCompositeTexture != nil &&
-                rtGNormalTexture != nil && rtGDepthTexture != nil && rtGAlbedoTexture != nil && rtMotionTexture != nil &&
+            if rtTexture != nil && rtAccumTexture != nil && rtHistoryTexture != nil && rtDenoisedTexture != nil &&
+                rtCompositeTexture != nil &&
+                rtGNormalTexture != nil && rtGDepthTexture != nil && rtGAlbedoTexture != nil &&
+                rtGRoughnessTexture != nil && rtDenoiseMaskTexture != nil && rtMotionTexture != nil &&
                 rtTextureSize.width == tw && rtTextureSize.height == th &&
                 rtCompositeTextureSize.width == cw && rtCompositeTextureSize.height == ch &&
                 rtTexturePixelFormat == rtPixelFormat {
@@ -5432,44 +5457,129 @@ struct MetalView: UIViewRepresentable {
             rtDesc.usage = [.shaderRead, .shaderWrite]; rtDesc.storageMode = .private
             let compDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: pixelFormat, width: cw, height: ch, mipmapped: false)
             compDesc.usage = [.shaderRead, .shaderWrite]; compDesc.storageMode = .private
+            let denoisedDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: rtPixelFormat, width: cw, height: ch, mipmapped: false)
+            denoisedDesc.usage = [.shaderRead, .shaderWrite]; denoisedDesc.storageMode = .private
             let gNormalDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: tw, height: th, mipmapped: false)
             gNormalDesc.usage = [.shaderRead, .shaderWrite]; gNormalDesc.storageMode = .private
             let gDepthDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: tw, height: th, mipmapped: false)
             gDepthDesc.usage = [.shaderRead, .shaderWrite]; gDepthDesc.storageMode = .private
             let gAlbedoDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: tw, height: th, mipmapped: false)
             gAlbedoDesc.usage = [.shaderRead, .shaderWrite]; gAlbedoDesc.storageMode = .private
+            let gRoughnessDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r16Float, width: tw, height: th, mipmapped: false)
+            gRoughnessDesc.usage = [.shaderRead, .shaderWrite]; gRoughnessDesc.storageMode = .private
+            let denoiseMaskDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r8Unorm, width: tw, height: th, mipmapped: false)
+            denoiseMaskDesc.usage = [.shaderRead, .shaderWrite]; denoiseMaskDesc.storageMode = .private
             let motionDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rg16Float, width: tw, height: th, mipmapped: false)
             motionDesc.usage = [.shaderRead, .shaderWrite]; motionDesc.storageMode = .private
             rtTexture = device.makeTexture(descriptor: rtDesc)
             rtAccumTexture = device.makeTexture(descriptor: rtDesc)
             rtHistoryTexture = device.makeTexture(descriptor: rtDesc)
+            rtDenoisedTexture = device.makeTexture(descriptor: denoisedDesc)
             rtCompositeTexture = device.makeTexture(descriptor: compDesc)
             rtGNormalTexture = device.makeTexture(descriptor: gNormalDesc)
             rtGDepthTexture = device.makeTexture(descriptor: gDepthDesc)
             rtGAlbedoTexture = device.makeTexture(descriptor: gAlbedoDesc)
+            rtGRoughnessTexture = device.makeTexture(descriptor: gRoughnessDesc)
+            rtDenoiseMaskTexture = device.makeTexture(descriptor: denoiseMaskDesc)
             rtMotionTexture = device.makeTexture(descriptor: motionDesc)
             rtTexture?.label = "Q3.RT.output.halfres"
             rtAccumTexture?.label = "Q3.RT.accum.halfres"
             rtHistoryTexture?.label = "Q3.RT.history.halfres"
+            rtDenoisedTexture?.label = "Q3.RT.denoised"
             rtCompositeTexture?.label = "Q3.RT.composite"
             rtGNormalTexture?.label = "Q3.RT.gbuffer.normal"
             rtGDepthTexture?.label = "Q3.RT.gbuffer.depth"
             rtGAlbedoTexture?.label = "Q3.RT.gbuffer.albedo"
+            rtGRoughnessTexture?.label = "Q3.RT.gbuffer.roughness"
+            rtDenoiseMaskTexture?.label = "Q3.RT.denoise.mask"
             rtMotionTexture?.label = "Q3.RT.gbuffer.motion"
             rtTextureSize = MTLSize(width: tw, height: th, depth: 1)
             rtCompositeTextureSize = MTLSize(width: cw, height: ch, depth: 1)
             rtTexturePixelFormat = rtPixelFormat
             rtHistoryValid = false
             rtPrevViewProjection = nil
+            rtTemporalDenoisedScalerKey = (0, 0, 0, 0, .invalid)
+            #if canImport(MetalFX) && !os(visionOS)
+            rtTemporalDenoisedScaler = nil
+            #endif
             rtGBufferPrevCurrentLogPrinted = false
-            print("[RT] textures trace=\(tw)x\(th) format=\(rtPixelFormat) composite=\(cw)x\(ch) history=reset")
+            print("[RT] textures trace=\(tw)x\(th) format=\(rtPixelFormat) composite=\(cw)x\(ch) denoised=\(cw)x\(ch) history=reset")
             if !rtGBufferReadyLogPrinted {
-                print("[Q3-GBUFFER] ready trace=\(tw)x\(th) mv=rg16Float depth=r32Float")
+                print("[Q3-GBUFFER] ready trace=\(tw)x\(th) mv=rg16Float depth=r32Float roughness=r16Float denoiseMask=r8Unorm")
                 rtGBufferReadyLogPrinted = true
             }
-            return rtTexture != nil && rtAccumTexture != nil && rtHistoryTexture != nil && rtCompositeTexture != nil &&
-                rtGNormalTexture != nil && rtGDepthTexture != nil && rtGAlbedoTexture != nil && rtMotionTexture != nil
+            return rtTexture != nil && rtAccumTexture != nil && rtHistoryTexture != nil && rtDenoisedTexture != nil &&
+                rtCompositeTexture != nil &&
+                rtGNormalTexture != nil && rtGDepthTexture != nil && rtGAlbedoTexture != nil &&
+                rtGRoughnessTexture != nil && rtDenoiseMaskTexture != nil && rtMotionTexture != nil
         }
+
+        #if canImport(MetalFX) && !os(visionOS)
+        @MainActor
+        private func ensureRTTemporalDenoisedScaler(device: MTLDevice,
+                                                    inputW: Int,
+                                                    inputH: Int,
+                                                    outputW: Int,
+                                                    outputH: Int,
+                                                    colorFormat: MTLPixelFormat) -> MTLFXTemporalDenoisedScaler? {
+            guard colorFormat == .rgba16Float else {
+                if !rtDenoiseFallbackLogPrinted {
+                    print("[RT-DENOISE] MetalFX disabled: requires HDR rgba16Float RT input, got \(colorFormat)")
+                    rtDenoiseFallbackLogPrinted = true
+                }
+                return nil
+            }
+            let key = (inputW, inputH, outputW, outputH, colorFormat)
+            if let rtTemporalDenoisedScaler, rtTemporalDenoisedScalerKey == key {
+                return rtTemporalDenoisedScaler
+            }
+            guard #available(iOS 26.0, macOS 26.0, *) else {
+                if !rtDenoiseFallbackLogPrinted {
+                    print("[RT-DENOISE] MetalFX TemporalDenoisedScaler unavailable on this OS")
+                    rtDenoiseFallbackLogPrinted = true
+                }
+                return nil
+            }
+            let desc = MTLFXTemporalDenoisedScalerDescriptor()
+            desc.colorTextureFormat = colorFormat
+            desc.depthTextureFormat = .r32Float
+            desc.motionTextureFormat = .rg16Float
+            desc.diffuseAlbedoTextureFormat = .rgba16Float
+            desc.specularAlbedoTextureFormat = .rgba16Float
+            desc.normalTextureFormat = .rgba16Float
+            desc.roughnessTextureFormat = .r16Float
+            desc.isSpecularHitDistanceTextureEnabled = false
+            desc.specularHitDistanceTextureFormat = .r16Float
+            desc.isDenoiseStrengthMaskTextureEnabled = true
+            desc.denoiseStrengthMaskTextureFormat = .r8Unorm
+            desc.isTransparencyOverlayTextureEnabled = false
+            desc.transparencyOverlayTextureFormat = .rgba16Float
+            desc.isReactiveMaskTextureEnabled = false
+            desc.reactiveMaskTextureFormat = .r8Unorm
+            desc.outputTextureFormat = colorFormat
+            desc.inputWidth = inputW
+            desc.inputHeight = inputH
+            desc.outputWidth = outputW
+            desc.outputHeight = outputH
+            desc.requiresSynchronousInitialization = false
+            desc.isAutoExposureEnabled = false
+            guard let scaler = desc.makeTemporalDenoisedScaler(device: device) else {
+                if !rtDenoiseFallbackLogPrinted {
+                    print("[RT-DENOISE] MetalFX makeTemporalDenoisedScaler returned nil input=\(inputW)x\(inputH) output=\(outputW)x\(outputH)")
+                    rtDenoiseFallbackLogPrinted = true
+                }
+                return nil
+            }
+            rtTemporalDenoisedScaler = scaler
+            rtTemporalDenoisedScalerKey = key
+            rtDenoiseFallbackLogPrinted = false
+            if !rtDenoiseBackendLogPrinted {
+                print("[RT-DENOISE] MetalFX TemporalDenoisedScaler ready input=\(inputW)x\(inputH) output=\(outputW)x\(outputH) motion=rg16Float depth=r32Float normal=rgba16Float roughness=r16Float mask=r8Unorm")
+                rtDenoiseBackendLogPrinted = true
+            }
+            return scaler
+        }
+        #endif
 
 
         @MainActor
@@ -5828,6 +5938,7 @@ struct MetalView: UIViewRepresentable {
             let rtBounceCount = Q3_RTBounces()
             let rtTAAEnabled = Q3_RTTAA() > 0.5
             let rtTAAAlpha = Q3_RTTAAAlpha()
+            let rtDenoiseEnabled = Q3_RTDenoise() != 0
             let traceW = max(1, Int((Float(renderW) * rtResolutionScale).rounded(.toNearestOrAwayFromZero)))
             let traceH = max(1, Int((Float(renderH) * rtResolutionScale).rounded(.toNearestOrAwayFromZero)))
             guard ensureRTTextures(device: device,
@@ -5839,10 +5950,13 @@ struct MetalView: UIViewRepresentable {
                   let rtTex = rtTexture,
                   let accumTex = rtAccumTexture,
                   let historyTex = rtHistoryTexture,
+                  let denoisedTex = rtDenoisedTexture,
                   let compositeTex = rtCompositeTexture,
                   let gNormalTex = rtGNormalTexture,
                   let gDepthTex = rtGDepthTexture,
                   let gAlbedoTex = rtGAlbedoTexture,
+                  let gRoughnessTex = rtGRoughnessTexture,
+                  let denoiseMaskTex = rtDenoiseMaskTexture,
                   let motionTex = rtMotionTexture else { return nil }
 
             func halton(_ index: UInt32, _ base: UInt32) -> Float {
@@ -5856,6 +5970,23 @@ struct MetalView: UIViewRepresentable {
                 }
                 return r
             }
+            #if canImport(MetalFX) && !os(visionOS)
+            let rtDenoiseScaler: MTLFXTemporalDenoisedScaler?
+            if rtDenoiseEnabled, #available(iOS 26.0, macOS 26.0, *) {
+                rtDenoiseScaler = ensureRTTemporalDenoisedScaler(device: device,
+                                                                 inputW: traceW,
+                                                                 inputH: traceH,
+                                                                 outputW: renderW,
+                                                                 outputH: renderH,
+                                                                 colorFormat: rtTex.pixelFormat)
+            } else {
+                rtDenoiseScaler = nil
+            }
+            let rtDenoiseActive = rtDenoiseScaler != nil
+            #else
+            let rtDenoiseActive = false
+            #endif
+
             let viewProj = makeWorldViewProjection(sceneView)
             let cameraPos = SIMD3<Float>(sceneView.viewOrigin.0, sceneView.viewOrigin.1, sceneView.viewOrigin.2)
             let forward = SIMD3<Float>(sceneView.viewAxis.0, sceneView.viewAxis.1, sceneView.viewAxis.2)
@@ -5867,7 +5998,7 @@ struct MetalView: UIViewRepresentable {
             if let lastPos = rtLastCameraPos, let lastForward = rtLastCameraForward {
                 let moved = simd_length_squared(cameraPos - lastPos) > 0.25
                 let turned = simd_dot(forwardNorm, lastForward) < 0.9995
-                if moved || turned { rtHistoryValid = false }
+                if !rtDenoiseActive && (moved || turned) { rtHistoryValid = false }
                 // Stage 17 G-buffer MVs should persist through normal camera
                 // motion; only true cuts/teleports reset prev=current so MV=0.
                 gbufferCut = simd_length_squared(cameraPos - lastPos) > (256.0 * 256.0) ||
@@ -5882,7 +6013,8 @@ struct MetalView: UIViewRepresentable {
             let prevViewProjectionForMV = forcePrevCurrentForMV ? viewProj : (rtPrevViewProjection ?? viewProj)
 
             rtJitterFrame &+= 1
-            let jitter = rtTAAEnabled
+            let temporalSamplingEnabled = rtDenoiseActive || rtTAAEnabled
+            let jitter = temporalSamplingEnabled
                 ? SIMD2<Float>((halton(rtJitterFrame, 2) - 0.5) / Float(max(traceW, 1)),
                                (halton(rtJitterFrame, 3) - 0.5) / Float(max(traceH, 1)))
                 : SIMD2<Float>(0, 0)
@@ -5895,7 +6027,7 @@ struct MetalView: UIViewRepresentable {
                                               jitterNearFar: SIMD4<Float>(jitter.x, jitter.y, 4.0, 8192.0),
                                               fovParams: SIMD4<Float>(tan(sceneView.fovX * .pi / 360.0), tan(sceneView.fovY * .pi / 360.0), Float(CACurrentMediaTime() - frameTimeOrigin), (entityAccelerationStructure == nil || Q3_RTEntities() == 0) ? 0 : 1),
                                               rtToneParams: SIMD4<Float>(Q3_RTExposure(), Q3_RTGamma(), Q3_RTAmbient(), Q3_RTNormalMix()),
-                                              rtControlParams: SIMD4<Float>(rtResolutionScale, rtBounceCount, rtTAAAlpha, rtTAAEnabled ? 1.0 : 0.0))
+                                              rtControlParams: SIMD4<Float>(rtResolutionScale, rtBounceCount, rtTAAAlpha, temporalSamplingEnabled ? 1.0 : 0.0))
             // P1/P3: per-map authored light set + reflection controls.
             // Light count is forced to 0 when the buffer alloc failed so
             // the kernel never reads an unbound/empty buffer(6).
@@ -5927,7 +6059,7 @@ struct MetalView: UIViewRepresentable {
                 rtGBufferPrevCurrentLogPrinted = true
             }
             if !rtOverlayLogPrintedOnce {
-                print("[RT] overlay active mix=\(mixValue) trace=\(traceW)x\(traceH) scale=\(rtResolutionScale) bounces=\(rtBounceCount) taa=\(rtTAAEnabled ? 1 : 0) composite=\(renderW)x\(renderH) camera=\(cameraPos)")
+                print("[RT] overlay active mix=\(mixValue) trace=\(traceW)x\(traceH) scale=\(rtResolutionScale) bounces=\(rtBounceCount) taa=\(rtTAAEnabled ? 1 : 0) denoise=\(rtDenoiseEnabled ? 1 : 0) composite=\(renderW)x\(renderH) camera=\(cameraPos)")
                 rtOverlayLogPrintedOnce = true
             }
             let tg = MTLSize(width: 16, height: 16, depth: 1)
@@ -5950,6 +6082,8 @@ struct MetalView: UIViewRepresentable {
                 enc.setTexture(gDepthTex, index: 3)
                 enc.setTexture(gAlbedoTex, index: 4)
                 enc.setTexture(motionTex, index: 5)
+                enc.setTexture(gRoughnessTex, index: 6)
+                enc.setTexture(denoiseMaskTex, index: 7)
                 let envLabel = envCube?.label ?? "<nil>"
                 if rtLastEnvCubeLabel != envLabel {
                     print("[RT] skybox env source=\(envLabel) stem=\(currentPBRSkyboxStem() ?? "<procedural>")")
@@ -6021,6 +6155,71 @@ struct MetalView: UIViewRepresentable {
                 enc.dispatchThreadgroups(traceGroups, threadsPerThreadgroup: tg)
                 enc.endEncoding()
             }
+            var rtColorForBlend: MTLTexture = accumTex
+            var rtAlphaForBlend: MTLTexture = accumTex
+            var rtDenoiseMode = "legacy"
+            let denoiseShouldResetHistory = forcePrevCurrentForMV || !rtHistoryValid
+            #if canImport(MetalFX) && !os(visionOS)
+            if rtDenoiseEnabled,
+               #available(iOS 26.0, macOS 26.0, *),
+               let scaler = rtDenoiseScaler {
+                scaler.colorTexture = rtTex
+                scaler.depthTexture = gDepthTex
+                scaler.motionTexture = motionTex
+                scaler.diffuseAlbedoTexture = gAlbedoTex
+                // Specular albedo is not exported as a separate Stage 17 target.
+                // Reuse the clean albedo guide rather than allocating a noisy
+                // placeholder; roughness still provides the specular edge hint.
+                scaler.specularAlbedoTexture = gAlbedoTex
+                scaler.normalTexture = gNormalTex
+                scaler.roughnessTexture = gRoughnessTex
+                scaler.specularHitDistanceTexture = nil
+                scaler.denoiseStrengthMaskTexture = denoiseMaskTex
+                scaler.transparencyOverlayTexture = nil
+                scaler.outputTexture = denoisedTex
+                scaler.exposureTexture = nil
+                scaler.preExposure = 1.0
+                scaler.reactiveMaskTexture = nil
+                scaler.jitterOffsetX = jitter.x * Float(max(traceW, 1))
+                scaler.jitterOffsetY = jitter.y * Float(max(traceH, 1))
+                // Stage 17 MV is UV-space cur-prev. MetalFX wants a vector
+                // from current pixel to the previous-frame pixel in pixel
+                // units, so multiply by -resolution.
+                scaler.motionVectorScaleX = -Float(max(traceW, 1))
+                scaler.motionVectorScaleY = -Float(max(traceH, 1))
+                scaler.shouldResetHistory = denoiseShouldResetHistory
+                scaler.isDepthReversed = false
+                scaler.worldToViewMatrix = matrix_identity_float4x4
+                scaler.viewToClipMatrix = viewProj
+                scaler.encode(commandBuffer: commandBuffer)
+                rtColorForBlend = denoisedTex
+                rtAlphaForBlend = rtTex
+                rtDenoiseMode = "metalfx"
+                rtHistoryValid = true
+            } else {
+                var accumAlpha: Float = (!rtTAAEnabled || !rtHistoryValid) ? 1.0 : rtTAAAlpha
+                if let enc = commandBuffer.makeComputeCommandEncoder() {
+                    enc.label = "Q3.RT.accumulate"
+                    enc.setComputePipelineState(accumPSO)
+                    enc.setTexture(rtTex, index: 0)
+                    enc.setTexture(historyTex, index: 1)
+                    enc.setTexture(accumTex, index: 2)
+                    enc.setBytes(&accumAlpha, length: MemoryLayout<Float>.stride, index: 0)
+                    enc.dispatchThreadgroups(traceGroups, threadsPerThreadgroup: tg)
+                    enc.endEncoding()
+                }
+                if rtTAAEnabled, let blit = commandBuffer.makeBlitCommandEncoder() {
+                    blit.label = "Q3.RT.copyAccumToHistory"
+                    blit.copy(from: accumTex, sourceSlice: 0, sourceLevel: 0,
+                              sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                              sourceSize: MTLSize(width: traceW, height: traceH, depth: 1),
+                              to: historyTex, destinationSlice: 0, destinationLevel: 0,
+                              destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+                    blit.endEncoding()
+                    rtHistoryValid = true
+                }
+            }
+            #else
             var accumAlpha: Float = (!rtTAAEnabled || !rtHistoryValid) ? 1.0 : rtTAAAlpha
             if let enc = commandBuffer.makeComputeCommandEncoder() {
                 enc.label = "Q3.RT.accumulate"
@@ -6032,19 +6231,6 @@ struct MetalView: UIViewRepresentable {
                 enc.dispatchThreadgroups(traceGroups, threadsPerThreadgroup: tg)
                 enc.endEncoding()
             }
-            // 2026-06-10: gate the history blit on `rtTAAEnabled`.
-            // When TAA is off, `accumAlpha` is forced to 1.0 above, which
-            // makes the accumulate kernel `mix(h, c, 1.0)` reduce to `c` —
-            // the next-frame read of `historyTex` is multiplied by zero, so
-            // this write is provably dead work. Xcode Insights flagged it
-            // as "Q3.RT.copyAccumToHistory unused resource" — 3.45 MiB +
-            // ~60 µs per frame. In TAA-on mode the write IS live (next
-            // frame's accumulate uses history with `alpha=rtTAAAlpha`), but
-            // Xcode's per-frame static analysis cannot see the cross-frame
-            // consumer so it still flags — accept that as a false positive
-            // when the cvar is actually on. Followup: when TAA is off, we
-            // could also skip the accumulate dispatch and bind `rtTex`
-            // directly to `blend`'s texture(0) — defer until measured.
             if rtTAAEnabled, let blit = commandBuffer.makeBlitCommandEncoder() {
                 blit.label = "Q3.RT.copyAccumToHistory"
                 blit.copy(from: accumTex, sourceSlice: 0, sourceLevel: 0,
@@ -6055,6 +6241,7 @@ struct MetalView: UIViewRepresentable {
                 blit.endEncoding()
                 rtHistoryValid = true
             }
+            #endif
             var blendUniforms = RTBlendUniforms(mixAmount: mixValue,
                                                 bloomIntensity: Q3_RTBloom(),
                                                 bloomThreshold: Q3_RTBloomThreshold(),
@@ -6062,9 +6249,10 @@ struct MetalView: UIViewRepresentable {
             if let enc = commandBuffer.makeComputeCommandEncoder() {
                 enc.label = "Q3.RT.blend"
                 enc.setComputePipelineState(blendPSO)
-                enc.setTexture(accumTex, index: 0)
+                enc.setTexture(rtColorForBlend, index: 0)
                 enc.setTexture(rasterTexture, index: 1)
                 enc.setTexture(compositeTex, index: 2)
+                enc.setTexture(rtAlphaForBlend, index: 3)
                 enc.setBytes(&blendUniforms, length: MemoryLayout<RTBlendUniforms>.stride, index: 0)
                 enc.dispatchThreadgroups(compositeGroups, threadsPerThreadgroup: tg)
                 enc.endEncoding()
@@ -6076,9 +6264,10 @@ struct MetalView: UIViewRepresentable {
                 let frameId = rtMetricsFrame
                 let scaleText = String(format: "%.2f", rtResolutionScale)
                 let taaText = rtTAAEnabled ? "1" : "0"
+                let denoiseText = rtDenoiseEnabled ? "1" : "0"
                 let alphaText = String(format: "%.2f", rtTAAAlpha)
                 let bloomText = String(format: "%.2f", blendUniforms.bloomIntensity)
-                print("[RT] metrics frame=\(frameId) trace=\(traceW)x\(traceH) composite=\(renderW)x\(renderH) scale=\(scaleText) bounces=\(Int(rtBounceCount)) taa=\(taaText) taaAlpha=\(alphaText) hdr=\(Q3_RTHDR()) bloom=\(bloomText) groups=\(traceGroups.width)x\(traceGroups.height)")
+                print("[RT] metrics frame=\(frameId) trace=\(traceW)x\(traceH) composite=\(renderW)x\(renderH) scale=\(scaleText) bounces=\(Int(rtBounceCount)) taa=\(taaText) denoise=\(denoiseText) denoiseMode=\(rtDenoiseMode) taaAlpha=\(alphaText) hdr=\(Q3_RTHDR()) bloom=\(bloomText) groups=\(traceGroups.width)x\(traceGroups.height)")
                 commandBuffer.addCompletedHandler { cb in
                     let gpuMs = (cb.gpuEndTime > cb.gpuStartTime) ? (cb.gpuEndTime - cb.gpuStartTime) * 1000.0 : 0.0
                     if gpuMs > 0.0 {
