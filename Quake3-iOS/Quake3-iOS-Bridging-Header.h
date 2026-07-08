@@ -163,6 +163,13 @@ float Q3_PBREntityFloor(void);
  * only, 3=UV1 viz, 4=vertex color only. Clamped to [0..4]. Not archived
  * so it doesn't stick across sessions. Use at the console: `r_world_debug_mode 2`. */
 int Q3_WorldDebugMode(void);
+/* Raster mirror/portal pass. r_portal_render (CVAR_ARCHIVE, default 1)
+ * controls whether Swift renders a one-per-frame reflected portal view.
+ * Q3MetalRenderer_GetPortalSurface returns 1 when the current world scene
+ * submitted an RT_PORTALSURFACE; outOrigin3 is xyz, outAxis9 is row-major
+ * axis[0..2][xyz] matching refEntity_t.axis. */
+int Q3_PortalRender(void);
+int Q3MetalRenderer_GetPortalSurface(float *outOrigin3, float *outAxis9);
 /* r_pbr_envcube_grey (default 0.08, archived, clamped 0..1) — uniform
  * grey value the procedural envCube fills its faces with. The CVAR is
  * stored verbatim (`Q3_PBREnvCubeGreyRequested()` returns the raw user

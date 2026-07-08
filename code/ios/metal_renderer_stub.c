@@ -456,6 +456,7 @@ typedef struct {
 } metalPortalSurface_t;
 
 static metalPortalSurface_t s_scenePortalSurface;
+static metalPortalSurface_t s_framePortalSurface;
 
 /* Audit: once-per-session dedup log for missing-feature tracking. Copies
  * the message string into owned storage so callers can safely pass stack
@@ -8861,12 +8862,11 @@ static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime
         s_entityRejectedNullThisFrame += 1;
         return;
     }
-    /* RT_PORTALSURFACE is metadata for mirror/portal surface matching in
-     * the stock renderer. It intentionally does not emit draw geometry.
-     * Accept it as a handled no-op so audits only report genuinely missing
-     * entity paths. */
+    /* RT_PORTALSURFACE is metadata for the Swift raster mirror/portal pass.
+     * It does not emit entity geometry here; MetalView reflects the camera
+     * across this origin/axis plane and samples that offscreen render on the
+     * portal-marked BSP draw. */
     if (re->reType == RT_PORTALSURFACE) {
-        AuditOnce("ENTITY:RT_PORTALSURFACE");
         s_scenePortalSurface.valid = qtrue;
         VectorCopy(re->origin, s_scenePortalSurface.origin);
         VectorCopy(re->axis[0], s_scenePortalSurface.axis[0]);
@@ -9145,6 +9145,9 @@ static void RE_RenderScene(const refdef_t *fd) {
 	     * their own view, projecting preserved world entity draws off-screen. */
 	    if (fd->rdflags == 0) {
         s_frameSnapshot.shaderTime = (float)fd->time * 0.001f;
+        if (s_scenePortalSurface.valid) {
+            s_framePortalSurface = s_scenePortalSurface;
+        }
         s_sceneView.fovX = fovX;
         s_sceneView.fovY = fovY;
         s_sceneView.viewOrigin[0] = vieworg[0];
@@ -10410,6 +10413,7 @@ static void RE_BeginFrame(stereoFrame_t stereoFrame) {
     s_frameSnapshot.sceneCount = 0;
     s_frameSnapshot.lightCount = 0;
     s_frameSnapshot.shaderTime = 0.0f;
+    Com_Memset(&s_framePortalSurface, 0, sizeof(s_framePortalSurface));
 }
 
 static void RE_EndFrame(int *frontEndMsec, int *backEndMsec) {
@@ -11100,6 +11104,20 @@ const Q3MetalSceneView *Q3MetalRenderer_GetSceneView(void) {
     return &s_sceneView;
 }
 
+int Q3MetalRenderer_GetPortalSurface(float *outOrigin3, float *outAxis9) {
+    int i, j;
+    if (!s_framePortalSurface.valid || outOrigin3 == NULL || outAxis9 == NULL) {
+        return 0;
+    }
+    for (i = 0; i < 3; ++i) {
+        outOrigin3[i] = s_framePortalSurface.origin[i];
+        for (j = 0; j < 3; ++j) {
+            outAxis9[i * 3 + j] = s_framePortalSurface.axis[i][j];
+        }
+    }
+    return 1;
+}
+
 int Q3MetalRenderer_GetTextureInfo(uint32_t textureHandle, Q3MetalTextureInfo *outInfo) {
     metalTexture_t *texture = FindTextureByHandle((qhandle_t)textureHandle);
     if (texture == NULL || outInfo == NULL || texture->rgbaBytes == NULL) {
@@ -11537,6 +11555,12 @@ int Q3_PBROnlyTextures(void) {
      * of falling back to the original pak0/classic texture on missing PBR. */
     cvar_t *cv = ri.Cvar_Get("r_pbr_only_textures", "1", CVAR_ARCHIVE);
     return cv ? cv->integer : 1;
+}
+
+int Q3_PortalRender(void) {
+    if (ri.Cvar_Get == NULL) return 1;
+    cvar_t *cv = ri.Cvar_Get("r_portal_render", "1", CVAR_ARCHIVE);
+    return (cv && cv->integer == 0) ? 0 : 1;
 }
 
 float Q3_RTMix(void) {

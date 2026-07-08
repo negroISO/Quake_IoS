@@ -565,6 +565,17 @@ struct MetalView: UIViewRepresentable {
             Q3MetalStateMap.cullMode(stageCullMode)
         }
 
+        private static func mirroredCullMode(for stageCullMode: UInt32) -> MTLCullMode {
+            switch Q3MetalStateMap.cullMode(stageCullMode) {
+            case .front:
+                return .back
+            case .back:
+                return .front
+            default:
+                return .none
+            }
+        }
+
         private static func blendClass(src: UInt32, dst: UInt32) -> Int {
             switch (src, dst) {
             case (Q3GLBlendFactor.one.rawValue, Q3GLBlendFactor.one.rawValue):
@@ -671,6 +682,22 @@ struct MetalView: UIViewRepresentable {
             let stageIndex: Int
             var firstMergedIndex: Int
             var indexCount: Int
+        }
+
+        private struct PortalSurface {
+            var origin: SIMD3<Float>
+            var axis0: SIMD3<Float>
+            var axis1: SIMD3<Float>
+            var axis2: SIMD3<Float>
+        }
+
+        private struct PortalCamera {
+            var fovX: Float
+            var fovY: Float
+            var origin: SIMD3<Float>
+            var axis0: SIMD3<Float>
+            var axis1: SIMD3<Float>
+            var axis2: SIMD3<Float>
         }
 
         private var worldBatchIndexScratch: [UInt32] = []
@@ -2380,6 +2407,7 @@ struct MetalView: UIViewRepresentable {
                                           texture2d<float> emissiveTexture [[texture(6)]],
                                           texture2d<float> heightMap [[texture(7)]],
                                           depth2d<float> sunShadowMap [[texture(8)]],
+                                          texture2d<float> portalTexture [[texture(9)]],
                                           sampler textureSampler [[sampler(0)]],
                                           sampler envSampler [[sampler(1)]]) {
             float2 texCoord = in.texCoord;
@@ -2387,6 +2415,12 @@ struct MetalView: UIViewRepresentable {
             int alphaGen = int(drawUniforms.alphaGen + 0.5);
             int blendMode = int(drawUniforms.blendMode + 0.5);
             bool additiveStage = (blendMode == 1 || blendMode == 5);
+            if (drawUniforms.forceWhiteVertColor > 0.5 && !is_null_texture(portalTexture)) {
+                float2 targetSize = max(drawUniforms.parallaxParams.yz, float2(1.0));
+                float2 portalUV = clamp(in.position.xy / targetSize, float2(0.0), float2(1.0));
+                float4 portal = portalTexture.sample(textureSampler, portalUV);
+                return float4(portal.rgb, 1.0);
+            }
             /* tcGen modes:
              *   0 (default) — base UVs, mesh ST as authored.
              *   1 (environment) — chrome/reflective surfaces. Compute
@@ -3648,6 +3682,10 @@ struct MetalView: UIViewRepresentable {
         """
 
         private var commandQueue: MTLCommandQueue?
+        private var portalColorTexture: MTLTexture?
+        private var portalDepthTexture: MTLTexture?
+        private var portalTextureSize = MTLSize(width: 0, height: 0, depth: 1)
+        private var portalActiveLogged = false
 
         /* MetalFX spatial upscale (Q3UpscaleQuality picker).
          *   - upscaleQuality is read once from UserDefaults at Coordinator
@@ -6556,6 +6594,485 @@ struct MetalView: UIViewRepresentable {
             return tex
         }
 
+        private func ensurePortalRenderTargets(device: MTLDevice,
+                                               pixelFormat: MTLPixelFormat,
+                                               width: Int,
+                                               height: Int) -> (color: MTLTexture, depth: MTLTexture)? {
+            let w = max(1, width)
+            let h = max(1, height)
+            if let portalColorTexture,
+               let portalDepthTexture,
+               portalTextureSize.width == w,
+               portalTextureSize.height == h {
+                return (portalColorTexture, portalDepthTexture)
+            }
+
+            let colorDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: pixelFormat,
+                                                                     width: w,
+                                                                     height: h,
+                                                                     mipmapped: false)
+            colorDesc.usage = [.renderTarget, .shaderRead]
+            colorDesc.storageMode = .private
+            guard let color = device.makeTexture(descriptor: colorDesc) else { return nil }
+            color.label = "Q3.portal.color"
+
+            let depthDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float,
+                                                                     width: w,
+                                                                     height: h,
+                                                                     mipmapped: false)
+            depthDesc.usage = [.renderTarget]
+            depthDesc.storageMode = .private
+            guard let depth = device.makeTexture(descriptor: depthDesc) else { return nil }
+            depth.label = "Q3.portal.depth"
+
+            portalColorTexture = color
+            portalDepthTexture = depth
+            portalTextureSize = MTLSize(width: w, height: h, depth: 1)
+            return (color, depth)
+        }
+
+        private func currentPortalSurface() -> PortalSurface? {
+            guard Q3_PortalRender() != 0 else { return nil }
+            var origin = [Float](repeating: 0, count: 3)
+            var axis = [Float](repeating: 0, count: 9)
+            let ok = origin.withUnsafeMutableBufferPointer { oBuf in
+                axis.withUnsafeMutableBufferPointer { aBuf in
+                    guard let oBase = oBuf.baseAddress,
+                          let aBase = aBuf.baseAddress else {
+                        return Int32(0)
+                    }
+                    return Q3MetalRenderer_GetPortalSurface(oBase, aBase)
+                }
+            }
+            guard ok != 0 else { return nil }
+            let n = SIMD3<Float>(axis[0], axis[1], axis[2])
+            guard simd_length_squared(n) > 1e-6 else { return nil }
+            return PortalSurface(origin: SIMD3<Float>(origin[0], origin[1], origin[2]),
+                                 axis0: simd_normalize(n),
+                                 axis1: SIMD3<Float>(axis[3], axis[4], axis[5]),
+                                 axis2: SIMD3<Float>(axis[6], axis[7], axis[8]))
+        }
+
+        private func mirroredCamera(sceneView: Q3MetalSceneView,
+                                    portal: PortalSurface) -> PortalCamera? {
+            let normalLen2 = simd_length_squared(portal.axis0)
+            guard normalLen2 > 1e-6 else { return nil }
+            let normal = simd_normalize(portal.axis0)
+            func reflectPoint(_ p: SIMD3<Float>) -> SIMD3<Float> {
+                p - 2.0 * simd_dot(p - portal.origin, normal) * normal
+            }
+            func reflectVector(_ v: SIMD3<Float>) -> SIMD3<Float> {
+                let r = v - 2.0 * simd_dot(v, normal) * normal
+                let len2 = simd_length_squared(r)
+                return len2 > 1e-6 ? simd_normalize(r) : r
+            }
+
+            let origin = SIMD3<Float>(sceneView.viewOrigin.0,
+                                      sceneView.viewOrigin.1,
+                                      sceneView.viewOrigin.2)
+            let axis0 = SIMD3<Float>(sceneView.viewAxis.0,
+                                     sceneView.viewAxis.1,
+                                     sceneView.viewAxis.2)
+            let axis1 = SIMD3<Float>(sceneView.viewAxis.3,
+                                     sceneView.viewAxis.4,
+                                     sceneView.viewAxis.5)
+            let axis2 = SIMD3<Float>(sceneView.viewAxis.6,
+                                     sceneView.viewAxis.7,
+                                     sceneView.viewAxis.8)
+            return PortalCamera(fovX: sceneView.fovX,
+                                fovY: sceneView.fovY,
+                                origin: reflectPoint(origin),
+                                axis0: reflectVector(axis0),
+                                axis1: reflectVector(axis1),
+                                axis2: reflectVector(axis2))
+        }
+
+        private func hasVisiblePortalDraw(snapshot: Q3MetalFrameSnapshot) -> Bool {
+            guard snapshot.worldCommandCount > 0,
+                  let worldDrawsPointer = Q3MetalRenderer_GetWorldDrawCommands() else {
+                return false
+            }
+            let portalBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_PORTAL)
+            let draws = UnsafeBufferPointer(start: worldDrawsPointer,
+                                            count: Int(snapshot.worldCommandCount))
+            return draws.contains { draw in
+                draw.indexCount > 0 && (draw.flags & portalBit) != 0
+            }
+        }
+
+        private func populateWorldSun(_ uniforms: inout WorldUniforms, device: MTLDevice?) {
+            guard let device else { return }
+            _ = ensureRTLightBuffer(device: device)
+            if rtLightCount > 0,
+               let sun = rtLightsCPU.first,
+               sun.dirType.w == 0 {
+                uniforms.sunDir = SIMD3<Float>(sun.dirType.x, sun.dirType.y, sun.dirType.z)
+                uniforms.sunIntensity = sun.colorIntensity.w
+                uniforms.sunColor = SIMD4<Float>(sun.colorIntensity.x,
+                                                  sun.colorIntensity.y,
+                                                  sun.colorIntensity.z,
+                                                  1.0)
+            }
+        }
+
+        private func makeWorldUniforms(camera: PortalCamera,
+                                       device: MTLDevice?) -> WorldUniforms {
+            var uniforms = WorldUniforms(
+                viewProjection: makeWorldViewProjection(origin: camera.origin,
+                                                        axis0: camera.axis0,
+                                                        axis1: camera.axis1,
+                                                        axis2: camera.axis2,
+                                                        fovX: camera.fovX,
+                                                        fovY: camera.fovY),
+                cameraPos: camera.origin,
+                cameraRight: -camera.axis1,
+                cameraUp: camera.axis2)
+            populateWorldSun(&uniforms, device: device)
+            return uniforms
+        }
+
+        private func makeWorldUniforms(sceneView: Q3MetalSceneView,
+                                       viewProjection: simd_float4x4,
+                                       device: MTLDevice?) -> WorldUniforms {
+            let cameraPos = SIMD3<Float>(sceneView.viewOrigin.0, sceneView.viewOrigin.1, sceneView.viewOrigin.2)
+            let camRight = SIMD3<Float>(
+                -sceneView.viewAxis.3,
+                -sceneView.viewAxis.4,
+                -sceneView.viewAxis.5)
+            let camUp = SIMD3<Float>(
+                sceneView.viewAxis.6,
+                sceneView.viewAxis.7,
+                sceneView.viewAxis.8)
+            var uniforms = WorldUniforms(viewProjection: viewProjection,
+                                         cameraPos: cameraPos,
+                                         cameraRight: camRight,
+                                         cameraUp: camUp)
+            populateWorldSun(&uniforms, device: device)
+            return uniforms
+        }
+
+        private func makeWorldDrawUniforms(draw: Q3MetalWorldDrawCmd,
+                                           stage: Q3MetalWorldStage,
+                                           timeSeconds: Float,
+                                           combinedLightmapBit: UInt32,
+                                           forcePortalSample: Bool,
+                                           renderSize: SIMD2<Float>) -> WorldDrawUniforms {
+            let chain = worldTcModChain(for: stage)
+            let blendMode = Self.worldBlendClass(for: stage)
+            let (tv0, tv1) = Self.tcGenVectors(stage)
+            var uniforms = WorldDrawUniforms(
+                tcGen: stage.useLightmap != 0 ? Float(4) : Float(stage.tcGen),
+                tcModCount: chain.count,
+                rgbGen: Float(stage.rgbGen),
+                alphaGen: Float(stage.alphaGen),
+                blendMode: Float(blendMode),
+                timeSeconds: timeSeconds,
+                rgbWaveFunc: stage.rgbWaveFunc,
+                alphaWaveFunc: stage.alphaWaveFunc,
+                tcModType: chain.types,
+                tcModParams0: chain.p0,
+                tcModParams1: chain.p1,
+                tcModParams2: chain.p2,
+                tcModParams3: chain.p3,
+                rgbWaveParams: SIMD4(stage.rgbWaveBase, stage.rgbWaveAmp, stage.rgbWavePhase, stage.rgbWaveFreq),
+                alphaWaveParams: SIMD4(stage.alphaWaveBase, stage.alphaWaveAmp, stage.alphaWavePhase, stage.alphaWaveFreq),
+                rgbConstColor: SIMD4(stage.rgbConstColor.0,
+                                     stage.rgbConstColor.1,
+                                     stage.rgbConstColor.2,
+                                     stage.alphaConst),
+                entityColor: SIMD4(1, 1, 1, 1),
+                fogColorDistance: SIMD4<Float>(0, 0, 0, 0),
+                fogParams: SIMD4<Float>(0, 0, 0, 0),
+                fogSurface: SIMD4<Float>(0, 0, 0, 0),
+                tcGenVec0: tv0,
+                tcGenVec1: tv1,
+                deformWaveFunc: stage.deformWaveFunc,
+                deformWaveDiv: stage.deformWaveDiv != 0 ? stage.deformWaveDiv : 1.0,
+                deformWaveBase: stage.deformWaveBase,
+                deformWaveAmp: stage.deformWaveAmp,
+                deformWavePhase: stage.deformWavePhase,
+                deformWaveFreq: stage.deformWaveFreq,
+                deformMoveFunc: stage.deformMoveFunc,
+                deformMoveVector: SIMD3(stage.deformMoveVector.0,
+                                        stage.deformMoveVector.1,
+                                        stage.deformMoveVector.2),
+                deformMoveBase: stage.deformMoveBase,
+                deformMoveAmp: stage.deformMoveAmp,
+                deformMovePhase: stage.deformMovePhase,
+                deformMoveFreq: stage.deformMoveFreq,
+                deformBulgeWidth: stage.deformBulgeWidth,
+                deformBulgeHeight: stage.deformBulgeHeight,
+                deformBulgeSpeed: stage.deformBulgeSpeed,
+                autospriteMode: stage.autospriteMode,
+                debugMode: forcePortalSample ? 0 : Float(Q3_WorldDebugMode()),
+                forceWhiteVertColor: forcePortalSample ? 1.0 : 0.0,
+                alphaTestThreshold: forcePortalSample ? 0.0 : Self.alphaTestThreshold(for: stage.alphaFunc),
+                fogOnly: 0,
+                stageUsesLightmap: stage.useLightmap != 0 ? 1.0 : 0.0,
+                drawHasLightmapStage: Self.worldDrawHasLightmapStage(draw) ? 1.0 : 0.0,
+                pbrRoughness: stage.pbrRoughness,
+                pbrMetallic: stage.pbrMetallic,
+                _pad0: (draw.flags & combinedLightmapBit) != 0 ? 1.0 : 0.0
+            )
+            if forcePortalSample {
+                uniforms.parallaxParams = SIMD4<Float>(0, renderSize.x, renderSize.y, 0)
+            }
+            return uniforms
+        }
+
+        private func encodePortalWorldPass(commandBuffer: MTLCommandBuffer,
+                                           device: MTLDevice,
+                                           snapshot: Q3MetalFrameSnapshot,
+                                           camera: PortalCamera,
+                                           colorTexture: MTLTexture,
+                                           depthTexture: MTLTexture,
+                                           worldVertexBuffer: MTLBuffer,
+                                           worldIndexBuffer: MTLBuffer,
+                                           sunShadowTexture: MTLTexture?,
+                                           sunShadowMatrix: simd_float4x4) -> Bool {
+            guard let worldPipelineState,
+                  let worldDrawsPointer = Q3MetalRenderer_GetWorldAllDrawCommands() else {
+                return false
+            }
+            let drawCount = Int(Q3MetalRenderer_GetWorldAllDrawCommandCount())
+            guard drawCount > 0 else { return false }
+
+            let passDescriptor = MTLRenderPassDescriptor()
+            passDescriptor.colorAttachments[0].texture = colorTexture
+            passDescriptor.colorAttachments[0].loadAction = .clear
+            passDescriptor.colorAttachments[0].storeAction = .store
+            passDescriptor.colorAttachments[0].clearColor = MTLClearColor(red: Double(snapshot.clearColor.0),
+                                                                           green: Double(snapshot.clearColor.1),
+                                                                           blue: Double(snapshot.clearColor.2),
+                                                                           alpha: Double(snapshot.clearColor.3))
+            passDescriptor.depthAttachment.texture = depthTexture
+            passDescriptor.depthAttachment.loadAction = .clear
+            passDescriptor.depthAttachment.storeAction = .store
+            passDescriptor.depthAttachment.clearDepth = 1.0
+
+            guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: passDescriptor) else {
+                return false
+            }
+            encoder.label = "Q3.portal.world"
+            encoder.setViewport(MTLViewport(originX: 0,
+                                            originY: 0,
+                                            width: Double(colorTexture.width),
+                                            height: Double(colorTexture.height),
+                                            znear: 0.0,
+                                            zfar: 1.0))
+            encoder.setScissorRect(MTLScissorRect(x: 0,
+                                                   y: 0,
+                                                   width: colorTexture.width,
+                                                   height: colorTexture.height))
+
+            var worldUniforms = makeWorldUniforms(camera: camera, device: device)
+            if let shadowTexture = sunShadowTexture, worldUniforms.sunColor.w > 0.5 {
+                worldUniforms.sunShadowMatrix = sunShadowMatrix
+                worldUniforms.sunShadowParams = SIMD4<Float>(0.0025,
+                                                             0.32,
+                                                             1.0 / Float(max(shadowTexture.width, 1)),
+                                                             1.0)
+            }
+            encoder.setRenderPipelineState(worldPipelineState)
+            encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: device))
+            encoder.setFrontFacing(.clockwise)
+            encoder.setCullMode(.back)
+            encoder.setVertexBuffer(worldVertexBuffer, offset: 0, index: 0)
+            encoder.setVertexBytes(&worldUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
+            encoder.setFragmentBytes(&worldUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
+            encoder.setFragmentSamplerState(worldSamplerState, index: 0)
+            encoder.setFragmentSamplerState(ensurePBREnvSampler(), index: 1)
+            encoder.setFragmentTexture(sunShadowTexture, index: 8)
+            encoder.setFragmentTexture(pbrEmissiveDefault(), index: 9)
+            Self.bindDlightBlock(snapshot: snapshot, encoder: encoder, device: device, index: 2, extra: currentBakedDlights())
+
+            let worldDraws = UnsafeBufferPointer(start: worldDrawsPointer, count: drawCount)
+            let skyFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
+            let fogOnlyBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY)
+            let portalBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_PORTAL)
+            let combinedLightmapBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_COMBINED_LIGHTMAP)
+            let timeSeconds = snapshot.shaderTime
+            var entriesByPass = Array(repeating: [WorldPassEntry](), count: 5)
+            for drawIndex in 0..<worldDraws.count {
+                let draw = worldDraws[drawIndex]
+                guard draw.indexCount > 0 else { continue }
+                if (draw.flags & (skyFlagBit | fogOnlyBit | portalBit)) != 0 { continue }
+                let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+                guard stageCount > 0 else { continue }
+                for stageIndex in 0..<stageCount {
+                    let stage = Self.worldStage(draw, stageIndex)
+                    let pass = Self.worldRenderPass(for: stage)
+                    if pass < entriesByPass.count {
+                        entriesByPass[pass].append(WorldPassEntry(drawIndex: drawIndex, stageIndex: stageIndex))
+                    }
+                }
+            }
+
+            var encoded = 0
+            let pbrOff = SIMD4<Float>(0, 0, 0, 0)
+            let passOrder = [0, 2, 3, 4, 1]
+            for pass in passOrder {
+                for entry in entriesByPass[pass] {
+                    let draw = worldDraws[entry.drawIndex]
+                    let stage = Self.worldStage(draw, entry.stageIndex)
+                    guard let baseTexture = texture(for: stage.textureHandle, device: device),
+                          let lightmapTexture = texture(for: draw.lightmapTextureHandle, device: device) else {
+                        continue
+                    }
+
+                    let blendedDepthState = (stage.useLightmap == 0 && stage.depthWrite != 0)
+                        ? depthStencilState
+                        : additiveDepthStencilState
+                    if pass == 4, let worldAdditiveFullPipelineState {
+                        encoder.setRenderPipelineState(worldAdditiveFullPipelineState)
+                        encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: device))
+                    } else if pass == 3, let worldAdditivePipelineState {
+                        encoder.setRenderPipelineState(worldAdditivePipelineState)
+                        encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: device))
+                    } else if pass == 2, let worldAlphaPipelineState {
+                        encoder.setRenderPipelineState(worldAlphaPipelineState)
+                        encoder.setDepthStencilState(ensuredDepthStencilState(blendedDepthState, device: device))
+                    } else if pass == 1, let worldFilterPipelineState {
+                        encoder.setRenderPipelineState(worldFilterPipelineState)
+                        encoder.setDepthStencilState(ensuredDepthStencilState(blendedDepthState, device: device))
+                    } else {
+                        encoder.setRenderPipelineState(worldPipelineState)
+                        encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: device))
+                    }
+                    encoder.setCullMode(Self.mirroredCullMode(for: stage.cullMode))
+                    encoder.setFragmentTexture(baseTexture, index: 0)
+                    encoder.setFragmentTexture(lightmapTexture, index: 1)
+                    encoder.setFragmentTexture(pbrFlatNormalDefault(), index: 2)
+                    encoder.setFragmentTexture(ensurePBREnvCube(), index: 3)
+                    encoder.setFragmentTexture(pbrRoughnessDefault(), index: 4)
+                    encoder.setFragmentTexture(pbrMetallicDefault(), index: 5)
+                    encoder.setFragmentTexture(pbrEmissiveDefault(), index: 6)
+                    encoder.setFragmentTexture(pbrEmissiveDefault(), index: 7)
+
+                    var drawUniforms = makeWorldDrawUniforms(draw: draw,
+                                                              stage: stage,
+                                                              timeSeconds: timeSeconds,
+                                                              combinedLightmapBit: combinedLightmapBit,
+                                                              forcePortalSample: false,
+                                                              renderSize: SIMD2<Float>(0, 0))
+                    encoder.setFragmentBytes(&drawUniforms,
+                                             length: MemoryLayout<WorldDrawUniforms>.stride,
+                                             index: 0)
+                    encoder.setVertexBytes(&drawUniforms,
+                                           length: MemoryLayout<WorldDrawUniforms>.stride,
+                                           index: 2)
+                    var pbrWorldParams = pbrOff
+                    encoder.setFragmentBytes(&pbrWorldParams, length: 16, index: 3)
+                    encoder.drawIndexedPrimitives(type: .triangle,
+                                                  indexCount: Int(draw.indexCount),
+                                                  indexType: .uint32,
+                                                  indexBuffer: worldIndexBuffer,
+                                                  indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride)
+                    encoded += 1
+                }
+            }
+            encoder.endEncoding()
+            return encoded > 0
+        }
+
+        private func encodePortalSurfaceOverlay(encoder: MTLRenderCommandEncoder,
+                                                device: MTLDevice,
+                                                snapshot: Q3MetalFrameSnapshot,
+                                                sceneView: Q3MetalSceneView,
+                                                portalTexture: MTLTexture,
+                                                worldVertexBuffer: MTLBuffer,
+                                                worldIndexBuffer: MTLBuffer,
+                                                renderW: Int,
+                                                renderH: Int,
+                                                sunShadowTexture: MTLTexture?,
+                                                sunShadowMatrix: simd_float4x4) -> Int {
+            guard let worldPipelineState,
+                  snapshot.worldCommandCount > 0,
+                  let worldDrawsPointer = Q3MetalRenderer_GetWorldDrawCommands() else {
+                return 0
+            }
+
+            let viewProjection = makeWorldViewProjection(sceneView)
+            var worldUniforms = makeWorldUniforms(sceneView: sceneView,
+                                                  viewProjection: viewProjection,
+                                                  device: device)
+            if let shadowTexture = sunShadowTexture, worldUniforms.sunColor.w > 0.5 {
+                worldUniforms.sunShadowMatrix = sunShadowMatrix
+                worldUniforms.sunShadowParams = SIMD4<Float>(0.0025,
+                                                             0.32,
+                                                             1.0 / Float(max(shadowTexture.width, 1)),
+                                                             1.0)
+            }
+            encoder.setRenderPipelineState(worldPipelineState)
+            encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: device))
+            encoder.setFrontFacing(.clockwise)
+            encoder.setVertexBuffer(worldVertexBuffer, offset: 0, index: 0)
+            encoder.setVertexBytes(&worldUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
+            encoder.setFragmentBytes(&worldUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
+            encoder.setFragmentSamplerState(worldSamplerState, index: 0)
+            encoder.setFragmentSamplerState(ensurePBREnvSampler(), index: 1)
+            encoder.setFragmentTexture(portalTexture, index: 9)
+            encoder.setFragmentTexture(sunShadowTexture, index: 8)
+            Self.bindDlightBlock(snapshot: snapshot, encoder: encoder, device: device, index: 2, extra: currentBakedDlights())
+
+            let worldDraws = UnsafeBufferPointer(start: worldDrawsPointer, count: Int(snapshot.worldCommandCount))
+            let portalBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_PORTAL)
+            let combinedLightmapBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_COMBINED_LIGHTMAP)
+            let timeSeconds = snapshot.shaderTime
+            var encoded = 0
+            for draw in worldDraws {
+                guard draw.indexCount > 0,
+                      (draw.flags & portalBit) != 0 else {
+                    continue
+                }
+                let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+                guard stageCount > 0 else { continue }
+                let preferredStageIndex = (0..<stageCount).first { idx in
+                    let s = Self.worldStage(draw, idx)
+                    return s.useLightmap == 0
+                } ?? 0
+                let stage = Self.worldStage(draw, preferredStageIndex)
+                guard let baseTexture = texture(for: stage.textureHandle, device: device),
+                      let lightmapTexture = texture(for: draw.lightmapTextureHandle, device: device) else {
+                    continue
+                }
+                encoder.setRenderPipelineState(worldPipelineState)
+                encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: device))
+                encoder.setCullMode(Self.metalCullMode(for: stage.cullMode))
+                encoder.setFragmentTexture(baseTexture, index: 0)
+                encoder.setFragmentTexture(lightmapTexture, index: 1)
+                encoder.setFragmentTexture(pbrFlatNormalDefault(), index: 2)
+                encoder.setFragmentTexture(ensurePBREnvCube(), index: 3)
+                encoder.setFragmentTexture(pbrRoughnessDefault(), index: 4)
+                encoder.setFragmentTexture(pbrMetallicDefault(), index: 5)
+                encoder.setFragmentTexture(pbrEmissiveDefault(), index: 6)
+                encoder.setFragmentTexture(pbrEmissiveDefault(), index: 7)
+                encoder.setFragmentTexture(portalTexture, index: 9)
+                var pbrWorldParams = SIMD4<Float>(0, 0, 0, 0)
+                encoder.setFragmentBytes(&pbrWorldParams, length: 16, index: 3)
+                var drawUniforms = makeWorldDrawUniforms(draw: draw,
+                                                          stage: stage,
+                                                          timeSeconds: timeSeconds,
+                                                          combinedLightmapBit: combinedLightmapBit,
+                                                          forcePortalSample: true,
+                                                          renderSize: SIMD2<Float>(Float(max(renderW, 1)),
+                                                                                   Float(max(renderH, 1))))
+                encoder.setFragmentBytes(&drawUniforms,
+                                         length: MemoryLayout<WorldDrawUniforms>.stride,
+                                         index: 0)
+                encoder.setVertexBytes(&drawUniforms,
+                                       length: MemoryLayout<WorldDrawUniforms>.stride,
+                                       index: 2)
+                encoder.drawIndexedPrimitives(type: .triangle,
+                                              indexCount: Int(draw.indexCount),
+                                              indexType: .uint32,
+                                              indexBuffer: worldIndexBuffer,
+                                              indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride)
+                encoded += 1
+            }
+            return encoded
+        }
+
         private func hasRenderableFogVolume() -> Bool {
             /* Stock Q3 fog is the BSP fog overlay plus per-surface fog pass.
              * The ray-box pass is only safe when the eye is actually inside a
@@ -8544,6 +9061,50 @@ struct MetalView: UIViewRepresentable {
                 currentSunShadowMatrix = shadow.matrix
             }
 
+            var portalRenderActive = false
+            var activePortalTexture: MTLTexture? = nil
+            if let device = view.device,
+               snapshot.worldCommandCount > 0,
+               let sceneViewForPortal = Q3MetalRenderer_GetSceneView()?.pointee,
+               let portalSurface = currentPortalSurface(),
+               hasVisiblePortalDraw(snapshot: snapshot),
+               let portalCamera = mirroredCamera(sceneView: sceneViewForPortal,
+                                                  portal: portalSurface),
+               let portalTargets = ensurePortalRenderTargets(device: device,
+                                                             pixelFormat: view.colorPixelFormat,
+                                                             width: max(1, renderW / 2),
+                                                             height: max(1, renderH / 2)),
+               let portalWorldVertexBuffer = uploadWorldBuffers(device: device,
+                                                                 generation: snapshot.worldGeneration),
+               let portalWorldIndexBuffer = worldIndexBuffer {
+                portalRenderActive = encodePortalWorldPass(commandBuffer: commandBuffer,
+                                                           device: device,
+                                                           snapshot: snapshot,
+                                                           camera: portalCamera,
+                                                           colorTexture: portalTargets.color,
+                                                           depthTexture: portalTargets.depth,
+                                                           worldVertexBuffer: portalWorldVertexBuffer,
+                                                           worldIndexBuffer: portalWorldIndexBuffer,
+                                                           sunShadowTexture: currentSunShadowTexture,
+                                                           sunShadowMatrix: currentSunShadowMatrix)
+                if portalRenderActive {
+                    activePortalTexture = portalTargets.color
+                    if !portalActiveLogged {
+                        portalActiveLogged = true
+                        let msg = String(format: "[Q3-PORTAL] portal view active plane=(origin %.1f %.1f %.1f normal %.3f %.3f %.3f) mirror=1 rt=%dx%d clip=none",
+                                         portalSurface.origin.x,
+                                         portalSurface.origin.y,
+                                         portalSurface.origin.z,
+                                         portalSurface.axis0.x,
+                                         portalSurface.axis0.y,
+                                         portalSurface.axis0.z,
+                                         portalTargets.color.width,
+                                         portalTargets.color.height)
+                        print(msg)
+                    }
+                }
+            }
+
             attachRTPerfSamples(to: descriptor, frame: rtPerfFrame, start: .rasterStart, end: .rasterEnd)
             guard var encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
                 return
@@ -8623,6 +9184,7 @@ struct MetalView: UIViewRepresentable {
                 encoder.setFragmentBytes(&worldUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
                 encoder.setFragmentSamplerState(worldSamplerState, index: 0)
                 encoder.setFragmentTexture(currentSunShadowTexture, index: 8)
+                encoder.setFragmentTexture(activePortalTexture ?? pbrEmissiveDefault(), index: 9)
 
                 // Bind dlight block at fragment buffer(2). Shared across all
                 // world draws in this scene — scene-constant, not per-draw.
@@ -8649,6 +9211,7 @@ struct MetalView: UIViewRepresentable {
                     let skyFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
                     let fogOverlayBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY)
                     let fogOnlyBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY)
+                    let portalBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_PORTAL)
                     let combinedLightmapBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_COMBINED_LIGHTMAP)
 
                     // Ordered world passes:
@@ -8670,6 +9233,7 @@ struct MetalView: UIViewRepresentable {
                     for drawIndex in 0..<worldDraws.count {
                         let draw = worldDraws[drawIndex]
                         guard draw.indexCount > 0 else { continue }
+                        if portalRenderActive && (draw.flags & portalBit) != 0 { continue }
 
                         if (draw.flags & fogOnlyBit) != 0 {
                             worldPassEntriesByPass[5].append(WorldPassEntry(drawIndex: drawIndex, stageIndex: -2))
@@ -8788,6 +9352,9 @@ struct MetalView: UIViewRepresentable {
                                                _ activeIndexBuffer: MTLBuffer,
                                                _ activeIndexOffset: Int,
                                                _ activeIndexCount: Int) -> Bool {
+                        if portalRenderActive && (draw.flags & portalBit) != 0 {
+                            return false
+                        }
                         guard let lightmapTexture = texture(for: draw.lightmapTextureHandle, device: view.device),
                               let baseTexture = texture(for: stage.textureHandle, device: view.device) else {
                             return false
@@ -9794,6 +10361,25 @@ struct MetalView: UIViewRepresentable {
                                                            width: renderW,
                                                            height: renderH))
                 }
+            }
+
+            if portalRenderActive,
+               let portalTexture = activePortalTexture,
+               let device = view.device,
+               let sceneView = Q3MetalRenderer_GetSceneView()?.pointee,
+               let worldVertexBuffer,
+               let worldIndexBuffer {
+                _ = encodePortalSurfaceOverlay(encoder: encoder,
+                                               device: device,
+                                               snapshot: snapshot,
+                                               sceneView: sceneView,
+                                               portalTexture: portalTexture,
+                                               worldVertexBuffer: worldVertexBuffer,
+                                               worldIndexBuffer: worldIndexBuffer,
+                                               renderW: renderW,
+                                               renderH: renderH,
+                                               sunShadowTexture: currentSunShadowTexture,
+                                               sunShadowMatrix: currentSunShadowMatrix)
             }
 
             if snapshot.entityCommandCount > 0,
@@ -11793,7 +12379,20 @@ struct MetalView: UIViewRepresentable {
             let axis0 = SIMD3<Float>(sceneView.viewAxis.0, sceneView.viewAxis.1, sceneView.viewAxis.2)
             let axis1 = SIMD3<Float>(sceneView.viewAxis.3, sceneView.viewAxis.4, sceneView.viewAxis.5)
             let axis2 = SIMD3<Float>(sceneView.viewAxis.6, sceneView.viewAxis.7, sceneView.viewAxis.8)
+            return makeWorldViewProjection(origin: origin,
+                                           axis0: axis0,
+                                           axis1: axis1,
+                                           axis2: axis2,
+                                           fovX: sceneView.fovX,
+                                           fovY: sceneView.fovY)
+        }
 
+        private func makeWorldViewProjection(origin: SIMD3<Float>,
+                                             axis0: SIMD3<Float>,
+                                             axis1: SIMD3<Float>,
+                                             axis2: SIMD3<Float>,
+                                             fovX: Float,
+                                             fovY: Float) -> simd_float4x4 {
             let viewer = simd_float4x4(columns: (
                 SIMD4<Float>(axis0.x, axis1.x, axis2.x, 0),
                 SIMD4<Float>(axis0.y, axis1.y, axis2.y, 0),
@@ -11810,8 +12409,8 @@ struct MetalView: UIViewRepresentable {
 
             let zNear: Float = 4.0
             let zFar: Float = 8192.0
-            let xScale = 1.0 / tan(sceneView.fovX * .pi / 360.0)
-            let yScale = 1.0 / tan(sceneView.fovY * .pi / 360.0)
+            let xScale = 1.0 / tan(fovX * .pi / 360.0)
+            let yScale = 1.0 / tan(fovY * .pi / 360.0)
             let depth = zFar - zNear
             let quakeProjection = simd_float4x4(columns: (
                 SIMD4<Float>(xScale, 0, 0, 0),
