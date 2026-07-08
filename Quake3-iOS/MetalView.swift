@@ -421,6 +421,8 @@ struct MetalView: UIViewRepresentable {
             // Stage 17: append-only tail field. Do not insert fields above this:
             // Swift and MSL RayTracingUniforms are bound as raw bytes.
             var prevViewProjection: simd_float4x4 = matrix_identity_float4x4
+            // Stage 19 append-only budget controls. x = r_rt_shadow_budget.
+            var rtBudgetParams: SIMD4<Float> = SIMD4(2, 0, 0, 0)
         }
 
         struct RTPrimitiveMaterial {
@@ -3874,6 +3876,223 @@ struct MetalView: UIViewRepresentable {
             var dirType: SIMD4<Float>
         }
 
+        private enum RTPerfSample: Int, CaseIterable {
+            case rasterStart = 0
+            case rasterEnd
+            case traceStart
+            case traceEnd
+            case denoiseStart
+            case denoiseEnd
+            case blendStart
+            case blendEnd
+            case entityStart
+            case entityEnd
+            case uiStart
+            case uiEnd
+            case postStart
+            case postEnd
+        }
+
+        private final class RTPerfFrame: @unchecked Sendable {
+            let sampleBuffer: MTLCounterSampleBuffer
+            let frameId: UInt64
+            let fpsEstimate: Double
+
+            init(sampleBuffer: MTLCounterSampleBuffer, frameId: UInt64, fpsEstimate: Double) {
+                self.sampleBuffer = sampleBuffer
+                self.frameId = frameId
+                self.fpsEstimate = fpsEstimate
+            }
+        }
+
+        private var rtPerfTimestampCounterSet: MTLCounterSet?
+        private var rtPerfMarkerBuffer: MTLBuffer?
+        private var rtPerfReadyLogPrinted = false
+        private var rtPerfEnabledFrameSerial: UInt64 = 0
+        private var rtPerfLastSampleSerial: UInt64 = 0
+        private var rtPerfLastSampleWallTime: CFTimeInterval = CACurrentMediaTime()
+        private let rtPerfLogIntervalFrames: UInt64 = 60
+
+        @MainActor
+        private func makeRTPerfFrame(device: MTLDevice) -> RTPerfFrame? {
+            guard Q3_RTPerfHUD() != 0, Q3_RTMix() > 0 else { return nil }
+            rtPerfEnabledFrameSerial &+= 1
+            let serial = rtPerfEnabledFrameSerial
+            let now = CACurrentMediaTime()
+            if rtPerfLastSampleSerial == 0 {
+                rtPerfLastSampleSerial = serial
+                rtPerfLastSampleWallTime = now
+            }
+            guard serial % rtPerfLogIntervalFrames == 0 else { return nil }
+            let framesSince = max(1, serial &- rtPerfLastSampleSerial)
+            let fpsEstimate = Double(framesSince) / max(now - rtPerfLastSampleWallTime, 0.0001)
+            rtPerfLastSampleSerial = serial
+            rtPerfLastSampleWallTime = now
+
+            guard #available(iOS 14.0, macOS 11.0, *) else { return nil }
+            guard device.supportsCounterSampling(.atStageBoundary) else {
+                if !rtPerfReadyLogPrinted {
+                    rtPerfReadyLogPrinted = true
+                    let msg = "[RT-PERF] instrumentation ready mode=cmdbuf-split unavailable=no-stage-boundary-counters"
+                    print(msg)
+                    pbrLog(msg)
+                }
+                return nil
+            }
+            if rtPerfTimestampCounterSet == nil {
+                rtPerfTimestampCounterSet = device.counterSets?.first {
+                    $0.name == MTLCommonCounterSet.timestamp.rawValue
+                }
+            }
+            guard let counterSet = rtPerfTimestampCounterSet else {
+                if !rtPerfReadyLogPrinted {
+                    rtPerfReadyLogPrinted = true
+                    let msg = "[RT-PERF] instrumentation ready mode=cmdbuf-split unavailable=no-timestamp-counter-set"
+                    print(msg)
+                    pbrLog(msg)
+                }
+                return nil
+            }
+            if rtPerfMarkerBuffer == nil {
+                rtPerfMarkerBuffer = device.makeBuffer(length: 4, options: .storageModePrivate)
+                rtPerfMarkerBuffer?.label = "Q3.RT.perf.marker"
+            }
+            let desc = MTLCounterSampleBufferDescriptor()
+            desc.counterSet = counterSet
+            desc.storageMode = .shared
+            desc.sampleCount = RTPerfSample.allCases.count
+            desc.label = "Q3.RT.perf.timestamps"
+            guard let sampleBuffer = try? device.makeCounterSampleBuffer(descriptor: desc) else {
+                if !rtPerfReadyLogPrinted {
+                    rtPerfReadyLogPrinted = true
+                    let msg = "[RT-PERF] instrumentation ready mode=cmdbuf-split unavailable=sample-buffer-create-failed"
+                    print(msg)
+                    pbrLog(msg)
+                }
+                return nil
+            }
+            if !rtPerfReadyLogPrinted {
+                rtPerfReadyLogPrinted = true
+                let msg = "[RT-PERF] instrumentation ready mode=counters"
+                print(msg)
+                pbrLog(msg)
+            }
+            return RTPerfFrame(sampleBuffer: sampleBuffer, frameId: serial, fpsEstimate: fpsEstimate)
+        }
+
+        private func attachRTPerfSamples(to descriptor: MTLRenderPassDescriptor,
+                                         frame: RTPerfFrame?,
+                                         start: RTPerfSample,
+                                         end: RTPerfSample) {
+            guard let frame else { return }
+            guard #available(iOS 14.0, macOS 11.0, *) else { return }
+            guard let attachment = descriptor.sampleBufferAttachments[0] else { return }
+            attachment.sampleBuffer = frame.sampleBuffer
+            attachment.startOfVertexSampleIndex = start.rawValue
+            attachment.endOfVertexSampleIndex = MTLCounterDontSample
+            attachment.startOfFragmentSampleIndex = MTLCounterDontSample
+            attachment.endOfFragmentSampleIndex = end.rawValue
+        }
+
+        @MainActor
+        private func makeRTPerfComputeEncoder(commandBuffer: MTLCommandBuffer,
+                                              frame: RTPerfFrame?,
+                                              start: RTPerfSample,
+                                              end: RTPerfSample,
+                                              label: String) -> MTLComputeCommandEncoder? {
+            guard let frame else {
+                let enc = commandBuffer.makeComputeCommandEncoder()
+                enc?.label = label
+                return enc
+            }
+            guard #available(iOS 14.0, macOS 11.0, *) else {
+                let enc = commandBuffer.makeComputeCommandEncoder()
+                enc?.label = label
+                return enc
+            }
+            let pass = MTLComputePassDescriptor()
+            guard let attachment = pass.sampleBufferAttachments[0] else { return nil }
+            attachment.sampleBuffer = frame.sampleBuffer
+            attachment.startOfEncoderSampleIndex = start.rawValue
+            attachment.endOfEncoderSampleIndex = end.rawValue
+            let enc = commandBuffer.makeComputeCommandEncoder(descriptor: pass)
+            enc?.label = label
+            return enc
+        }
+
+        @MainActor
+        private func encodeRTPerfPoint(commandBuffer: MTLCommandBuffer,
+                                       frame: RTPerfFrame?,
+                                       sample: RTPerfSample) {
+            guard let frame else { return }
+            guard #available(iOS 14.0, macOS 11.0, *) else { return }
+            guard let markerBuffer = rtPerfMarkerBuffer else { return }
+            let pass = MTLBlitPassDescriptor()
+            guard let attachment = pass.sampleBufferAttachments[0] else { return }
+            attachment.sampleBuffer = frame.sampleBuffer
+            attachment.startOfEncoderSampleIndex = MTLCounterDontSample
+            attachment.endOfEncoderSampleIndex = sample.rawValue
+            guard let enc = commandBuffer.makeBlitCommandEncoder(descriptor: pass) else { return }
+            enc.label = "Q3.RT.perf.\(sample)"
+            enc.fill(buffer: markerBuffer, range: 0..<4, value: 0)
+            enc.endEncoding()
+        }
+
+        private func attachRTPerfCompletion(commandBuffer: MTLCommandBuffer,
+                                            frame: RTPerfFrame?) {
+            guard let frame else { return }
+            let sampleCount = RTPerfSample.allCases.count
+            commandBuffer.addCompletedHandler { cb in
+                guard let data = try? frame.sampleBuffer.resolveCounterRange(0..<sampleCount) else {
+                    print("[RT-PERF] resolve failed frame=\(frame.frameId)")
+                    return
+                }
+                let stamps: [UInt64] = data.withUnsafeBytes { raw in
+                    let ptr = raw.bindMemory(to: MTLCounterResultTimestamp.self)
+                    return (0..<min(sampleCount, ptr.count)).map { ptr[$0].timestamp }
+                }
+                guard stamps.count == sampleCount else {
+                    print("[RT-PERF] resolve short frame=\(frame.frameId) count=\(stamps.count)")
+                    return
+                }
+                func deltaMs(_ start: RTPerfSample, _ end: RTPerfSample) -> Double {
+                    let s = stamps[start.rawValue]
+                    let e = stamps[end.rawValue]
+                    if s == MTLCounterErrorValue || e == MTLCounterErrorValue || e <= s { return 0.0 }
+                    return Double(e - s) / 1_000_000.0
+                }
+                let gpuTotal = (cb.gpuEndTime > cb.gpuStartTime) ? (cb.gpuEndTime - cb.gpuStartTime) * 1000.0 : 0.0
+                var total = deltaMs(.rasterStart, .postEnd)
+                if total <= 0.0 || (gpuTotal > 0.0 && total > gpuTotal * 1.5) {
+                    total = gpuTotal
+                }
+                func sane(_ value: Double, maxFraction: Double = 1.05) -> Double {
+                    guard value > 0.0 else { return 0.0 }
+                    guard total > 0.0 else { return value }
+                    return value <= total * maxFraction ? value : 0.0
+                }
+                let trace = sane(deltaMs(.traceStart, .traceEnd), maxFraction: 1.10)
+                var denoise = sane(deltaMs(.denoiseStart, .denoiseEnd), maxFraction: 0.60)
+                let blend = sane(deltaMs(.blendStart, .blendEnd), maxFraction: 0.35)
+                var raster = sane(deltaMs(.rasterStart, .rasterEnd), maxFraction: 0.90)
+                let entity = sane(deltaMs(.entityStart, .entityEnd), maxFraction: 0.45)
+                let ui = sane(deltaMs(.uiStart, .uiEnd), maxFraction: 0.45)
+                let post = sane(deltaMs(.postStart, .postEnd), maxFraction: 0.35)
+                if total > 0.0 {
+                    let withoutRaster = trace + denoise + blend + entity + ui + post
+                    if raster > 0.0, withoutRaster + raster > total * 1.10 {
+                        raster = max(0.0, total - withoutRaster)
+                    }
+                    if denoise > 0.0, trace + denoise + blend + raster + entity + ui + post > total * 1.10 {
+                        denoise = 0.0
+                    }
+                }
+                let fps = frame.fpsEstimate > 0.0 ? frame.fpsEstimate : (total > 0.0 ? 1000.0 / total : 0.0)
+                print(String(format: "[RT-PERF] trace=%.1fms denoise=%.1fms blend=%.1fms raster=%.1fms entity=%.1fms post=%.1fms ui=%.1fms total=%.1fms fps=%.0f frame=%llu",
+                             trace, denoise, blend, raster, entity, post, ui, total, fps, frame.frameId))
+            }
+        }
+
         /// Loads baseq3/pbr/lights/<map>.json (baked by
         /// scripts/rt_lights_from_usda.py from the RTX Remix per-map light
         /// authoring) into a GPU buffer. Distant lights are sorted to slot 0
@@ -4253,6 +4472,8 @@ struct MetalView: UIViewRepresentable {
                 // Stage 17 append-only tail field. Do not insert fields above
                 // this; Swift and MSL structs are byte-bound.
                 float4x4 prevViewProjection;
+                // Stage 19 append-only controls. x = local-light shadow budget.
+                float4 rtBudgetParams;
             };
 
             // P1: RTX Remix authored per-map light (baked from
@@ -4659,6 +4880,7 @@ struct MetalView: UIViewRepresentable {
                             uint lightCount = (uint)uniforms.rtLightParams.x;
                             if (lightCount > 0) {
                                 float lightScale = uniforms.rtLightParams.y;
+                                uint localShadowBudget = min((uint)max(uniforms.rtBudgetParams.x, 0.0), 2u);
                                 float3 direct = float3(0.0);
                                 uint firstLocal = 0;
                                 // Sun: always sampled when present (loader
@@ -4691,41 +4913,43 @@ struct MetalView: UIViewRepresentable {
                                  * picked 1 of N and multiplied by N, which
                                  * sparkled at N≈90). ~100 lights × ~15 flops
                                  * is far cheaper than one shadow ray. */
-                                uint bestIdx0 = 0xFFFFFFFFu, bestIdx1 = 0xFFFFFFFFu;
-                                float bestS0 = 0.0, bestS1 = 0.0;
-                                for (uint li = firstLocal; li < lightCount; ++li) {
-                                    float3 toL = rtLights[li].posRadius.xyz - hitPos;
-                                    float d2 = max(dot(toL, toL), 1.0);
-                                    float ndl = max(dot(N, toL * rsqrt(d2)), 0.0);
-                                    float r = rtLights[li].posRadius.w;
-                                    float s = rtLights[li].colorIntensity.w * ndl /
-                                              (d2 + r * r + 1.0);
-                                    if (s > bestS0) {
-                                        bestS1 = bestS0; bestIdx1 = bestIdx0;
-                                        bestS0 = s; bestIdx0 = li;
-                                    } else if (s > bestS1) {
-                                        bestS1 = s; bestIdx1 = li;
+                                if (localShadowBudget > 0) {
+                                    uint bestIdx0 = 0xFFFFFFFFu, bestIdx1 = 0xFFFFFFFFu;
+                                    float bestS0 = 0.0, bestS1 = 0.0;
+                                    for (uint li = firstLocal; li < lightCount; ++li) {
+                                        float3 toL = rtLights[li].posRadius.xyz - hitPos;
+                                        float d2 = max(dot(toL, toL), 1.0);
+                                        float ndl = max(dot(N, toL * rsqrt(d2)), 0.0);
+                                        float r = rtLights[li].posRadius.w;
+                                        float s = rtLights[li].colorIntensity.w * ndl /
+                                                  (d2 + r * r + 1.0);
+                                        if (s > bestS0) {
+                                            bestS1 = bestS0; bestIdx1 = bestIdx0;
+                                            bestS0 = s; bestIdx0 = li;
+                                        } else if (s > bestS1) {
+                                            bestS1 = s; bestIdx1 = li;
+                                        }
                                     }
-                                }
-                                for (uint k = 0; k < 2; ++k) {
-                                    uint li = (k == 0) ? bestIdx0 : bestIdx1;
-                                    if (li == 0xFFFFFFFFu) { continue; }
-                                    RTLight Lgt = rtLights[li];
-                                    float3 toL = Lgt.posRadius.xyz - hitPos;
-                                    float d2 = max(dot(toL, toL), 1.0);
-                                    float dist = sqrt(d2);
-                                    float3 L = toL / dist;
-                                    float ndl = max(dot(N, L), 0.0);
-                                    float r = Lgt.posRadius.w;
-                                    float E = Lgt.colorIntensity.w * 60.0 * lightScale /
-                                              (d2 + r * r + 1.0);
-                                    if (ndl > 0.0 && E * ndl > 0.004) {
-                                        ray sray(hitPos + N * 0.75, L, 0.1, max(dist - r - 1.0, 0.2));
-                                        auto sh = i.intersect(sray, worldAS);
-                                        bool shadowBlocked = sh.type == intersection_type::triangle &&
-                                                             primitiveMaterials[sh.primitive_id].materialFlags.x == 0;
-                                        if (!shadowBlocked) {
-                                            direct += Lgt.colorIntensity.rgb * min(E * ndl, 3.0);
+                                    for (uint k = 0; k < localShadowBudget; ++k) {
+                                        uint li = (k == 0) ? bestIdx0 : bestIdx1;
+                                        if (li == 0xFFFFFFFFu) { continue; }
+                                        RTLight Lgt = rtLights[li];
+                                        float3 toL = Lgt.posRadius.xyz - hitPos;
+                                        float d2 = max(dot(toL, toL), 1.0);
+                                        float dist = sqrt(d2);
+                                        float3 L = toL / dist;
+                                        float ndl = max(dot(N, L), 0.0);
+                                        float r = Lgt.posRadius.w;
+                                        float E = Lgt.colorIntensity.w * 60.0 * lightScale /
+                                                  (d2 + r * r + 1.0);
+                                        if (ndl > 0.0 && E * ndl > 0.004) {
+                                            ray sray(hitPos + N * 0.75, L, 0.1, max(dist - r - 1.0, 0.2));
+                                            auto sh = i.intersect(sray, worldAS);
+                                            bool shadowBlocked = sh.type == intersection_type::triangle &&
+                                                                 primitiveMaterials[sh.primitive_id].materialFlags.x == 0;
+                                            if (!shadowBlocked) {
+                                                direct += Lgt.colorIntensity.rgb * min(E * ndl, 3.0);
+                                            }
                                         }
                                     }
                                 }
@@ -5894,7 +6118,8 @@ struct MetalView: UIViewRepresentable {
                                      sceneView: Q3MetalSceneView,
                                      worldGeneration: UInt32,
                                      renderW: Int,
-                                     renderH: Int) -> MTLTexture? {
+                                     renderH: Int,
+                                     perfFrame: RTPerfFrame? = nil) -> MTLTexture? {
             let mixValue = Q3_RTMix()
             guard mixValue > 0 else { return nil }
             guard device.supportsRaytracing else {
@@ -5934,7 +6159,7 @@ struct MetalView: UIViewRepresentable {
             guard let rtPSO = ensureRTPipeline(device: device),
                   let accumPSO = ensureRTAccumPipeline(device: device),
                   let blendPSO = ensureRTBlendPipeline(device: device) else { return nil }
-            let rtResolutionScale = Q3_RTResolutionScale()
+            let rtResolutionScale = Q3_RTTraceScale()
             let rtBounceCount = Q3_RTBounces()
             let rtTAAEnabled = Q3_RTTAA() > 0.5
             let rtTAAAlpha = Q3_RTTAAAlpha()
@@ -6047,6 +6272,7 @@ struct MetalView: UIViewRepresentable {
             uniforms.rtPBRGlobal = SIMD4<Float>(Q3_RTNormalScale(), Float(Q3_RTDebugGBuffer()),
                                                 Q3_RTLightmapScale(), Q3_RTDirectScale())
             uniforms.prevViewProjection = prevViewProjectionForMV
+            uniforms.rtBudgetParams = SIMD4<Float>(Float(Q3_RTShadowBudget()), 0, 0, 0)
             rtPrevViewProjection = viewProj
             rtPrevViewProjectionWorldGeneration = worldGeneration
             if forcePrevCurrentForMV && (!rtGBufferPrevCurrentLogPrinted || generationChanged) {
@@ -6073,8 +6299,11 @@ struct MetalView: UIViewRepresentable {
                           value: 0)
                 blit.endEncoding()
             }
-            if let enc = commandBuffer.makeComputeCommandEncoder() {
-                enc.label = "Q3.RT.trace"
+            if let enc = makeRTPerfComputeEncoder(commandBuffer: commandBuffer,
+                                                  frame: perfFrame,
+                                                  start: .traceStart,
+                                                  end: .traceEnd,
+                                                  label: "Q3.RT.trace") {
                 enc.setComputePipelineState(rtPSO)
                 enc.setTexture(rtTex, index: 0)
                 let envCube = ensurePBREnvCube()
@@ -6159,6 +6388,7 @@ struct MetalView: UIViewRepresentable {
             var rtAlphaForBlend: MTLTexture = accumTex
             var rtDenoiseMode = "legacy"
             let denoiseShouldResetHistory = forcePrevCurrentForMV || !rtHistoryValid
+            encodeRTPerfPoint(commandBuffer: commandBuffer, frame: perfFrame, sample: .denoiseStart)
             #if canImport(MetalFX) && !os(visionOS)
             if rtDenoiseEnabled,
                #available(iOS 26.0, macOS 26.0, *),
@@ -6242,12 +6472,16 @@ struct MetalView: UIViewRepresentable {
                 rtHistoryValid = true
             }
             #endif
+            encodeRTPerfPoint(commandBuffer: commandBuffer, frame: perfFrame, sample: .denoiseEnd)
             var blendUniforms = RTBlendUniforms(mixAmount: mixValue,
                                                 bloomIntensity: Q3_RTBloom(),
                                                 bloomThreshold: Q3_RTBloomThreshold(),
                                                 bloomRadius: Q3_RTBloomRadius())
-            if let enc = commandBuffer.makeComputeCommandEncoder() {
-                enc.label = "Q3.RT.blend"
+            if let enc = makeRTPerfComputeEncoder(commandBuffer: commandBuffer,
+                                                  frame: perfFrame,
+                                                  start: .blendStart,
+                                                  end: .blendEnd,
+                                                  label: "Q3.RT.blend") {
                 enc.setComputePipelineState(blendPSO)
                 enc.setTexture(rtColorForBlend, index: 0)
                 enc.setTexture(rasterTexture, index: 1)
@@ -8169,7 +8403,7 @@ struct MetalView: UIViewRepresentable {
             // path; on current iOS/Xcode that path can assert inside
             // MetalFX with "Motion texture must not be nil" even though
             // frame interpolation is off. RT already has its own
-            // r_rt_resolution_scale knob, so do not require MetalFX here.
+            // r_rt_trace_scale knob, so do not require MetalFX here.
             let effectiveUpscaleQuality: Q3UpscaleQuality = upscaleQuality
             let upscaleActive: Bool
             let renderW: Int
@@ -8213,6 +8447,7 @@ struct MetalView: UIViewRepresentable {
             else { return }
             let drawableAcquireMs = (CACurrentMediaTime() - drawableAcquireStart) * 1000.0
             commandBuffer.label = "Q3.frame"
+            var rtPerfFrame: RTPerfFrame? = nil
 
             frameInflightSemaphore.wait()
             var frameSemaphoreNeedsSignal = true
@@ -8237,6 +8472,9 @@ struct MetalView: UIViewRepresentable {
             let q3FrameMs = (CACurrentMediaTime() - q3FrameStart) * 1000.0
 
             guard let snapshot = Q3MetalRenderer_GetFrameSnapshot()?.pointee else { return }
+            if Q3MetalRenderer_IsWorldLoaded() != 0 {
+                rtPerfFrame = view.device.flatMap { makeRTPerfFrame(device: $0) }
+            }
 
             descriptor.colorAttachments[0].clearColor = MTLClearColor(
                 red: Double(snapshot.clearColor.0),
@@ -8309,6 +8547,7 @@ struct MetalView: UIViewRepresentable {
                 currentSunShadowMatrix = shadow.matrix
             }
 
+            attachRTPerfSamples(to: descriptor, frame: rtPerfFrame, start: .rasterStart, end: .rasterEnd)
             guard var encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
                 return
             }
@@ -9539,9 +9778,11 @@ struct MetalView: UIViewRepresentable {
                                         sceneView: sceneView,
                                         worldGeneration: snapshot.worldGeneration,
                                         renderW: renderW,
-                                        renderH: renderH)
+                                        renderH: renderH,
+                                        perfFrame: rtPerfFrame)
                     let postRTPass = makeLoadedRenderPassDescriptor(colorTexture: rtTargetTexture,
                                                                     depthTexture: descriptor.depthAttachment.texture)
+                    attachRTPerfSamples(to: postRTPass, frame: rtPerfFrame, start: .entityStart, end: .entityEnd)
                     guard let postRTEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: postRTPass) else {
                         return
                     }
@@ -10034,6 +10275,27 @@ struct MetalView: UIViewRepresentable {
                 }
             }
 
+            if rtPerfFrame != nil, Q3_RTMix() > 0, Q3_RTPreserveEntities() != 0 {
+                encoder.endEncoding()
+                let rtTargetTexture = (upscaleActive ? upscaleColorTarget : drawable.texture) ?? drawable.texture
+                let postEntityPass = makeLoadedRenderPassDescriptor(colorTexture: rtTargetTexture,
+                                                                    depthTexture: descriptor.depthAttachment.texture)
+                attachRTPerfSamples(to: postEntityPass, frame: rtPerfFrame, start: .uiStart, end: .uiEnd)
+                guard let postEntityEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: postEntityPass) else {
+                    return
+                }
+                encoder = postEntityEncoder
+                encoder.label = "Q3.render.postEntityPerf"
+                encoder.setViewport(MTLViewport(originX: 0, originY: 0,
+                                                width: Double(renderW),
+                                                height: Double(renderH),
+                                                znear: 0.0,
+                                                zfar: 1.0))
+                encoder.setScissorRect(MTLScissorRect(x: 0, y: 0,
+                                                       width: renderW,
+                                                       height: renderH))
+            }
+
             /* P0.2 legacy A/B path — r_rt_preserve_entities 0: composite
              * the RT world AFTER the main entity pass. The RT primary ray
              * hits the world behind the viewmodel/pickups with alpha=1 and
@@ -10064,9 +10326,11 @@ struct MetalView: UIViewRepresentable {
                                     sceneView: sceneView,
                                     worldGeneration: snapshot.worldGeneration,
                                     renderW: renderW,
-                                    renderH: renderH)
+                                    renderH: renderH,
+                                    perfFrame: rtPerfFrame)
                 let postRTPass = makeLoadedRenderPassDescriptor(colorTexture: rtTargetTexture,
                                                                 depthTexture: descriptor.depthAttachment.texture)
+                attachRTPerfSamples(to: postRTPass, frame: rtPerfFrame, start: .entityStart, end: .entityEnd)
                 guard let postRTEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: postRTPass) else {
                     return
                 }
@@ -10332,6 +10596,7 @@ struct MetalView: UIViewRepresentable {
             }
 
             encoder.endEncoding()
+            encodeRTPerfPoint(commandBuffer: commandBuffer, frame: rtPerfFrame, sample: .postStart)
 
             if upscaleActive,
                let colorRT = (rtCompositeForUpscale ?? upscaleColorTarget),
@@ -10351,6 +10616,8 @@ struct MetalView: UIViewRepresentable {
                                   sourceTexture: drawable.texture,
                                   outputTexture: drawable.texture)
             }
+            encodeRTPerfPoint(commandBuffer: commandBuffer, frame: rtPerfFrame, sample: .postEnd)
+            attachRTPerfCompletion(commandBuffer: commandBuffer, frame: rtPerfFrame)
             // Cache drawable.texture BEFORE present(). Reading
             // drawable.texture after commandBuffer.present(drawable)
             // logs "[CAMetalLayerDrawable texture] should not be called

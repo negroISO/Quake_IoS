@@ -11655,19 +11655,29 @@ float Q3_RTEntityAdditiveMax(void) {
     return v;
 }
 
-float Q3_RTResolutionScale(void) {
-    if (ri.Cvar_Get == NULL) return 0.5f;
-    cvar_t *cv = ri.Cvar_Get("r_rt_resolution_scale", "0.5", CVAR_ARCHIVE);
-    float v = cv ? cv->value : 0.5f;
+float Q3_RTTraceScale(void) {
+    if (ri.Cvar_Get == NULL) return 0.34f;
+    /* Stage 19: trace resolution independent of the app's post/upscale
+     * quality. Default 0.34 is the Stage19 shipped MetalFX-compatible
+     * perf point; set 0.5
+     * to reproduce the Stage18 trace resolution. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_trace_scale", "0.34", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.34f;
     if (v < 0.25f) v = 0.25f;
     if (v > 1.0f) v = 1.0f;
     return v;
 }
 
+float Q3_RTResolutionScale(void) {
+    return Q3_RTTraceScale();
+}
+
 float Q3_RTBounces(void) {
-    if (ri.Cvar_Get == NULL) return 1.0f;
-    cvar_t *cv = ri.Cvar_Get("r_rt_bounces", "1", CVAR_ARCHIVE);
-    float v = cv ? cv->value : 1.0f;
+    if (ri.Cvar_Get == NULL) return 0.0f;
+    /* Stage 19: shipped perf default disables the one-bounce indirect path.
+     * Set 1 to reproduce Stage18's bounce/reflection behavior. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_bounces", "0", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.0f;
     if (v < 0.0f) v = 0.0f;
     if (v > 2.0f) v = 2.0f;
     return v;
@@ -11697,6 +11707,26 @@ int Q3_RTDenoise(void) {
      * RT path exactly (raw trace or legacy r_rt_taa accumulator). */
     cvar_t *cv = ri.Cvar_Get("r_rt_denoise", "1", CVAR_ARCHIVE);
     return (cv && cv->integer == 0) ? 0 : 1;
+}
+
+int Q3_RTPerfHUD(void) {
+    if (ri.Cvar_Get == NULL) return 0;
+    /* Stage 19: session-only GPU timing diagnostics. Do not archive; leaving
+     * counter sampling enabled across sessions would perturb perf captures. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_perf_hud", "0", 0);
+    return (cv && cv->integer != 0) ? 1 : 0;
+}
+
+int Q3_RTShadowBudget(void) {
+    if (ri.Cvar_Get == NULL) return 0;
+    /* Stage 19: local-light shadow-ray budget. 0=sun only, 1=sun+best local,
+     * 2=sun+top-2 locals. Default 0 is the Stage19 shipped perf point;
+     * set 2 to reproduce Stage18's deterministic top-2 local-light behavior. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_shadow_budget", "0", CVAR_ARCHIVE);
+    int v = cv ? cv->integer : 0;
+    if (v < 0) v = 0;
+    if (v > 2) v = 2;
+    return v;
 }
 
 int Q3_RTDebugGBuffer(void) {
@@ -11774,9 +11804,10 @@ float Q3_RTLightScale(void) {
 }
 
 int Q3_RTReflections(void) {
-    if (ri.Cvar_Get == NULL) return 1;
-    /* P3: gates the one-level specular reflect ray in rtKernel. */
-    cvar_t *cv = ri.Cvar_Get("r_rt_reflections", "1", CVAR_ARCHIVE);
+    if (ri.Cvar_Get == NULL) return 0;
+    /* Stage 19: shipped perf default disables the one-level specular reflect
+     * ray. Set 1 to reproduce Stage18's reflection behavior. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_reflections", "0", CVAR_ARCHIVE);
     return (cv && cv->integer != 0) ? 1 : 0;
 }
 

@@ -207,12 +207,17 @@ float Q3_RTDirectScale(void);
  * 2.0, set high to disable. */
 float Q3_RTEntityAdditiveMax(void);
 float Q3_RTResolutionScale(void);
+float Q3_RTTraceScale(void);
 float Q3_RTBounces(void);
 float Q3_RTTAA(void);
 float Q3_RTTAAAlpha(void);
 /* Stage 18 RT denoiser. 1 = MetalFX temporal denoised scaler path when
  * available; 0 = exact pre-Stage18 RT accumulate/upscale behavior. */
 int   Q3_RTDenoise(void);
+/* Stage 19 RT perf: r_rt_perf_hud is session-only instrumentation; shadow
+ * budget is archived and defaults to the shipped Stage19 sun-only budget. */
+int   Q3_RTPerfHUD(void);
+int   Q3_RTShadowBudget(void);
 /* Stage 17 RT G-buffer debug visualization. Session-only:
  * 0=off, 1=motion, 2=normal, 3=depth. */
 int   Q3_RTDebugGBuffer(void);
@@ -234,7 +239,7 @@ int   Q3_RTDebugEntityMask(void);
 const char *Q3MetalRenderer_GetWorldMapName(void);
 int   Q3_RTLights(void);
 float Q3_RTLightScale(void);
-/* P3 RT reflections. r_rt_reflections (default 1) gates the one-level
+/* P3 RT reflections. r_rt_reflections (Stage19 default 0) gates the one-level
  * specular reflect ray; r_rt_refl_roughness_max (default 0.45) is the
  * roughness ceiling above which no reflection ray is cast. */
 int   Q3_RTReflections(void);
