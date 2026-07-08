@@ -5171,10 +5171,7 @@ struct MetalView: UIViewRepresentable {
                     bloom += max(rt.sample(rtUpscaleSampler, uv + texel * float2( 1.5, -1.5)).rgb - float3(threshold), float3(0.0)) * 0.08;
                     bloom += max(rt.sample(rtUpscaleSampler, uv + texel * float2(-1.5, -1.5)).rgb - float3(threshold), float3(0.0)) * 0.08;
                     rtColor += bloom * bloomIntensity;
-                    // ACES-fit tonemap keeps sub-1 values stable while
-                    // rolling HDR lights/emissives into visible glow.
-                    rtColor = saturate((rtColor * (2.51 * rtColor + 0.03)) /
-                                       (rtColor * (2.43 * rtColor + 0.59) + 0.14));
+                    rtColor = saturate(rtColor);
                 } else {
                     rtColor = saturate(rtColor);
                 }
