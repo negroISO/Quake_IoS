@@ -4288,6 +4288,7 @@ struct MetalView: UIViewRepresentable {
         }
         private var rtLastMaterialRefreshTime: Float = 0
         private var rtLastMaterialSignature: UInt64 = 0
+        private var rtPortalMaterialExclusionActive = false
         private var rtLastEnvCubeLabel: String?
         private var rtHistoryValid = false
         private var rtJitterFrame: UInt32 = 0
@@ -5336,9 +5337,12 @@ struct MetalView: UIViewRepresentable {
             var lightmapWeights: [UInt32: Int] = [:]
             var emissiveWeights: [UInt32: Int] = [:]
             let fogOnlyBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY)
+            let portalBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_PORTAL)
+            let skipPortalDraws = rtPortalMaterialExclusionActive
 
             for draw in draws where draw.indexCount >= 3 {
                 if (draw.flags & fogOnlyBit) != 0 { continue }
+                if skipPortalDraws && (draw.flags & portalBit) != 0 { continue }
                 guard let stage = Self.rtRepresentativeStage(for: draw) else { continue }
                 let triCount = max(1, Int(draw.indexCount / 3))
                 let materialHandle = Self.worldPBRMaterialHandle(for: stage)
@@ -5393,6 +5397,7 @@ struct MetalView: UIViewRepresentable {
             var skippedOverwrite = 0
             for draw in draws where draw.indexCount >= 3 {
                 if (draw.flags & fogOnlyBit) != 0 { continue }
+                if skipPortalDraws && (draw.flags & portalBit) != 0 { continue }
                 guard let stage = Self.rtRepresentativeStage(for: draw) else { continue }
                 let skyFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
                 let isSkyDraw = (draw.flags & skyFlagBit) != 0
@@ -5501,6 +5506,11 @@ struct MetalView: UIViewRepresentable {
 
         @MainActor
         private func rtWorldMaterialSignature() -> UInt64 {
+            /* Portal mirrors are a raster side-pass. When active, key RT's
+             * material-refresh gate on the same static world-material table
+             * and ignore portal-marked surfaces; the reflected portal pass may
+             * touch animated/off-main materials, but those must not churn the
+             * RT primitive-material cache. */
             guard let drawsPtr = Q3MetalRenderer_GetWorldAllDrawCommands() else { return 0 }
             let drawCount = Int(Q3MetalRenderer_GetWorldAllDrawCommandCount())
             guard drawCount > 0 else { return 0 }
@@ -5524,8 +5534,12 @@ struct MetalView: UIViewRepresentable {
             mix(UInt64(Q3_PBRBakedLightmaps() != 0 ? 1 : 0))
             let fogOnlyBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY)
             let skyFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
+            let portalBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_PORTAL)
+            let skipPortalDraws = rtPortalMaterialExclusionActive
+            mix(skipPortalDraws ? UInt64(0x706f7274616c2d31) : UInt64(0x706f7274616c2d30))
             for draw in draws where draw.indexCount >= 3 {
                 if (draw.flags & fogOnlyBit) != 0 { continue }
+                if skipPortalDraws && (draw.flags & portalBit) != 0 { continue }
                 guard let stage = Self.rtRepresentativeStage(for: draw) else { continue }
                 let materialHandle = Self.worldPBRMaterialHandle(for: stage)
                 let blendMode = Self.worldBlendClass(for: stage)
@@ -5537,7 +5551,13 @@ struct MetalView: UIViewRepresentable {
                 mix(UInt64(draw.lightmapTextureHandle) << 2)
                 mix(UInt64(draw.flags) << 3)
                 mix(UInt64((draw.flags & skyFlagBit) != 0 ? 1 : 0) << 4)
-                mix(UInt64(stage.textureHandle) << 5)
+                // `stage.textureHandle` is retargeted every frame for Q3
+                // animMap stages. RT materials are keyed by the stable parent
+                // material handle, so hashing the live frame handle here made
+                // animated off-main/portal-view surfaces rebuild the whole RT
+                // primitive-material table even though the RT material did not
+                // actually change.
+                mix(UInt64(materialHandle != 0 ? materialHandle : stage.textureHandle) << 5)
                 mix(UInt64(materialHandle) << 6)
                 mix(UInt64(stage.pbrMaterialHandle) << 7)
                 mix(UInt64(stage.useLightmap) << 8)
@@ -9063,6 +9083,7 @@ struct MetalView: UIViewRepresentable {
 
             var portalRenderActive = false
             var activePortalTexture: MTLTexture? = nil
+            rtPortalMaterialExclusionActive = false
             if let device = view.device,
                snapshot.worldCommandCount > 0,
                let sceneViewForPortal = Q3MetalRenderer_GetSceneView()?.pointee,
@@ -9074,17 +9095,16 @@ struct MetalView: UIViewRepresentable {
                                                              pixelFormat: view.colorPixelFormat,
                                                              width: max(1, renderW / 2),
                                                              height: max(1, renderH / 2)),
-               let portalWorldVertexBuffer = uploadWorldBuffers(device: device,
-                                                                 generation: snapshot.worldGeneration),
-               let portalWorldIndexBuffer = worldIndexBuffer {
+               let portalWorldBuffers = cachedWorldBuffersForPortal(snapshot: snapshot,
+                                                                     generation: snapshot.worldGeneration) {
                 portalRenderActive = encodePortalWorldPass(commandBuffer: commandBuffer,
                                                            device: device,
                                                            snapshot: snapshot,
                                                            camera: portalCamera,
                                                            colorTexture: portalTargets.color,
                                                            depthTexture: portalTargets.depth,
-                                                           worldVertexBuffer: portalWorldVertexBuffer,
-                                                           worldIndexBuffer: portalWorldIndexBuffer,
+                                                           worldVertexBuffer: portalWorldBuffers.vertexBuffer,
+                                                           worldIndexBuffer: portalWorldBuffers.indexBuffer,
                                                            sunShadowTexture: currentSunShadowTexture,
                                                            sunShadowMatrix: currentSunShadowMatrix)
                 if portalRenderActive {
@@ -9104,6 +9124,7 @@ struct MetalView: UIViewRepresentable {
                     }
                 }
             }
+            rtPortalMaterialExclusionActive = portalRenderActive
 
             attachRTPerfSamples(to: descriptor, frame: rtPerfFrame, start: .rasterStart, end: .rasterEnd)
             guard var encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
@@ -10247,6 +10268,9 @@ struct MetalView: UIViewRepresentable {
                     }
                         if useCWorldBatchesForPass, let batchIndexBuffer = cWorldBatchIndexBuffer {
                             for batch in cWorldBatches where Int(batch.renderPass) == worldPass && batch.indexCount > 0 {
+                                if portalRenderActive && (batch.draw.flags & portalBit) != 0 {
+                                    continue
+                                }
                                 let stageIndex = Int(batch.stageIndex)
                                 guard stageIndex >= 0 && stageIndex < min(Int(batch.draw.stageCount), Int(Q3_METAL_MAX_STAGES)) else {
                                     continue
@@ -11935,6 +11959,23 @@ struct MetalView: UIViewRepresentable {
             rtASVertexBuffer = nil
             rtASIndexBuffer = nil
             return worldVertexBuffer
+        }
+
+        private func cachedWorldBuffersForPortal(snapshot: Q3MetalFrameSnapshot,
+                                                 generation: UInt32) -> (vertexBuffer: MTLBuffer, indexBuffer: MTLBuffer)? {
+            // Portal pre-pass must be RT-invisible: never call
+            // uploadWorldBuffers here, because its miss path invalidates
+            // world AS state and PBR/material caches for real map changes.
+            guard cachedWorldGeneration == generation,
+                  let vertexBuffer = worldVertexBuffer,
+                  let indexBuffer = worldIndexBuffer else {
+                return nil
+            }
+            let neededIndexBytes = Int(snapshot.worldIndexCount) * MemoryLayout<UInt32>.stride
+            guard indexBuffer.length >= neededIndexBytes else {
+                return nil
+            }
+            return (vertexBuffer, indexBuffer)
         }
 
         private func uploadEntityBuffers(device: MTLDevice?, slot: Int) -> (vertexBuffer: MTLBuffer, indexBuffer: MTLBuffer)? {
