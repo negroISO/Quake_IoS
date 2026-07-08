@@ -100,17 +100,10 @@ enum Q3UpscaleQuality: String, CaseIterable {
     }
 }
 
-/// MetalFX frame interpolation toggle. When .on, the renderer creates an
-/// MTLFXFrameInterpolator (iOS 18+) and emits one synthesized in-between
-/// frame between each pair of rendered frames — perceived framerate ~2×.
-///
-/// CAVEAT: the MetalFX frame interpolator wants per-pixel motion vectors
-/// to keep moving objects sharp. Q3 doesn't emit motion vectors yet
-/// (would require per-frame world+entity reprojection like the Q2
-/// MetalTAA path). Without them, the interpolated frame is just an
-/// optical-flow guess from color/depth alone — produces visible ghosting
-/// on fast camera motion. Useful for smooth UI / slow-pan scenes,
-/// distracting in deathmatch. Off by default until motion vectors land.
+/// MetalFX frame interpolation toggle. When .on, Stage23 creates an
+/// MTLFXFrameInterpolator for the RT/native path, inserts one synthesized
+/// frame between real rendered 3D frames, then draws HUD/UI normally over
+/// every presented frame. Off by default.
 enum Q3FrameInterpolation: String, CaseIterable {
     case off = "off"
     case on  = "on"
@@ -142,7 +135,7 @@ enum Q3FrameInterpolation: String, CaseIterable {
     var subtitle: String {
         switch self {
         case .off: return "Engine fps presented as-is"
-        case .on:  return "MetalFX inserts synthesized frames · expect ghosting on fast motion"
+        case .on:  return "MetalFX inserts RT scene frames · HUD/UI stays raster"
         }
     }
 }
@@ -3704,6 +3697,7 @@ struct MetalView: UIViewRepresentable {
          *   - When .native: the RT is nil and we render direct to drawable
          *     like before. spatialScaler is also nil — no MetalFX overhead. */
         private var upscaleQuality: Q3UpscaleQuality = Q3UpscaleQuality.current
+        private var frameInterpolation: Q3FrameInterpolation = Q3FrameInterpolation.current
         private var upscaleColorTarget: MTLTexture?
         /// HDR linear-color resolve target at drawable size before final LDR postprocess.
         private var upscaleResolvedColorTarget: MTLTexture?
@@ -3715,6 +3709,34 @@ struct MetalView: UIViewRepresentable {
         /// Cached (inputW, inputH, outputW, outputH) the scaler was built
         /// for; rebuild lazily on any change (drawable resize, quality flip).
         private var spatialScalerKey: (Int, Int, Int, Int) = (0, 0, 0, 0)
+
+        /* MetalFX frame interpolation (Q3FrameInterpolation). Stage23 keeps
+         * this RT/native-only: Stage17 exports motion/depth only from the RT
+         * path, and native output avoids mixing FI with the older spatial
+         * upscale path. The scene color textures contain 3D only; HUD/UI is
+         * drawn afterward into the drawable for both generated and real frames. */
+        private let fiSceneRingCount = Coordinator.maxInflightFrames + 1
+        private let fiOutputRingCount = Coordinator.maxInflightFrames + 1
+        private var fiSceneColorTargets: [MTLTexture?] = Array(repeating: nil, count: Coordinator.maxInflightFrames + 1)
+        private var fiOutputTargets: [MTLTexture?] = Array(repeating: nil, count: Coordinator.maxInflightFrames + 1)
+        private var fiTextureKey: (Int, Int, MTLPixelFormat) = (0, 0, .invalid)
+        private var fiNextSceneSlot = 0
+        private var fiNextOutputSlot = 0
+        private var fiPreviousSceneSlot: Int?
+        private var fiPendingDisplayTexture: MTLTexture?
+        private var fiPendingDisplaySlot: Int?
+        private var fiLoggedReady = false
+        private var fiLoggedUnavailableReasons = Set<String>()
+        private var fiLastRealFrameWallTime: CFTimeInterval?
+        private var fiLastRTMotionWasReset = true
+        private var fiLastRTMotionResetReason = "not-ready"
+        private var fiLastRTTraceWidth = 0
+        private var fiLastRTTraceHeight = 0
+        private var fiPresentedFrames: UInt64 = 0
+        private var fiRenderedFrames: UInt64 = 0
+        private var fiLastStatsTime: CFTimeInterval = CACurrentMediaTime()
+        private var fiLastStatsPresented: UInt64 = 0
+        private var fiLastStatsRendered: UInt64 = 0
 
         /// (Re)build the offscreen color + depth RT and the MTLFXSpatialScaler
         /// for the given input/output dimensions. Returns false if the device
@@ -3774,6 +3796,271 @@ struct MetalView: UIViewRepresentable {
             spatialScaler = nil
             #endif
             print("[Q3-UPSCALE] compute scaler ready: \(inputW)×\(inputH) → \(outputW)×\(outputH) (\(upscaleQuality.label))")
+            return true
+        }
+
+        @MainActor
+        private func fiLogUnavailable(_ reason: String) {
+            if fiLoggedUnavailableReasons.insert(reason).inserted {
+                print("[Q3-FI] unavailable reason=\(reason)")
+            }
+        }
+
+        @MainActor
+        private func resetFrameInterpolationHistory(reason: String) {
+            fiPreviousSceneSlot = nil
+            fiPendingDisplayTexture = nil
+            fiPendingDisplaySlot = nil
+            fiLastRealFrameWallTime = nil
+            fiLastRTMotionWasReset = true
+            fiLastRTMotionResetReason = reason
+        }
+
+        @MainActor
+        private func ensureFrameInterpolationTargets(device: MTLDevice, width: Int, height: Int, pixelFormat: MTLPixelFormat) -> Bool {
+            let w = max(1, width)
+            let h = max(1, height)
+            let key = (w, h, pixelFormat)
+            if fiTextureKey == key,
+               fiSceneColorTargets.allSatisfy({ $0 != nil }),
+               fiOutputTargets.allSatisfy({ $0 != nil }) {
+                return true
+            }
+            let sceneDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: pixelFormat, width: w, height: h, mipmapped: false)
+            sceneDesc.usage = [.renderTarget, .shaderRead]
+            sceneDesc.storageMode = .private
+            sceneDesc.textureType = .type2D
+            let outputDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: pixelFormat, width: w, height: h, mipmapped: false)
+            outputDesc.usage = [.shaderRead, .shaderWrite]
+            outputDesc.storageMode = .private
+            outputDesc.textureType = .type2D
+            var sceneTargets: [MTLTexture?] = []
+            sceneTargets.reserveCapacity(fiSceneRingCount)
+            for i in 0..<fiSceneRingCount {
+                guard let tex = device.makeTexture(descriptor: sceneDesc) else { fiLogUnavailable("target-alloc-scene"); return false }
+                tex.label = "Q3.FI.scene.\(i)"
+                sceneTargets.append(tex)
+            }
+            var outputTargets: [MTLTexture?] = []
+            outputTargets.reserveCapacity(fiOutputRingCount)
+            for i in 0..<fiOutputRingCount {
+                guard let tex = device.makeTexture(descriptor: outputDesc) else { fiLogUnavailable("target-alloc-output"); return false }
+                tex.label = "Q3.FI.output.\(i)"
+                outputTargets.append(tex)
+            }
+            fiSceneColorTargets = sceneTargets
+            fiOutputTargets = outputTargets
+            fiTextureKey = key
+            fiNextSceneSlot = 0
+            fiNextOutputSlot = 0
+            resetFrameInterpolationHistory(reason: "target-resize")
+            return true
+        }
+
+        @MainActor
+        private func nextFrameInterpolationSceneTarget(device: MTLDevice, width: Int, height: Int, pixelFormat: MTLPixelFormat) -> (texture: MTLTexture, slot: Int)? {
+            guard ensureFrameInterpolationTargets(device: device, width: width, height: height, pixelFormat: pixelFormat) else { return nil }
+            var slot = fiNextSceneSlot % fiSceneRingCount
+            for _ in 0..<fiSceneRingCount {
+                if slot != fiPreviousSceneSlot && slot != fiPendingDisplaySlot, let tex = fiSceneColorTargets[slot] {
+                    fiNextSceneSlot = (slot + 1) % fiSceneRingCount
+                    return (tex, slot)
+                }
+                slot = (slot + 1) % fiSceneRingCount
+            }
+            fiLogUnavailable("scene-ring-exhausted")
+            return nil
+        }
+
+        @MainActor
+        private func nextFrameInterpolationOutputTarget() -> MTLTexture? {
+            guard !fiOutputTargets.isEmpty else { return nil }
+            for _ in 0..<fiOutputRingCount {
+                let slot = fiNextOutputSlot % fiOutputRingCount
+                fiNextOutputSlot = (slot + 1) % fiOutputRingCount
+                if let tex = fiOutputTargets[slot] { return tex }
+            }
+            return nil
+        }
+
+        @MainActor
+        private func canUseFrameInterpolation(device: MTLDevice?, outputW: Int, outputH: Int, upscaleActive: Bool) -> Bool {
+            guard frameInterpolation == .on else { return false }
+            guard let device else { fiLogUnavailable("no-device"); return false }
+            guard outputW > 0 && outputH > 0 else { fiLogUnavailable("bad-size"); return false }
+            guard !upscaleActive else { fiLogUnavailable("upscale-active-stage23-native-only"); return false }
+            guard Q3_RTMix() > 0 else { fiLogUnavailable("rt-inactive-stage23-rt-only"); return false }
+            guard Q3MetalRenderer_IsWorldLoaded() != 0 else { fiLogUnavailable("world-not-loaded"); return false }
+            #if canImport(MetalFX) && !os(visionOS)
+            if #available(iOS 26.0, macOS 26.0, *) {
+                guard MTLFXFrameInterpolatorDescriptor.supportsDevice(device) else { fiLogUnavailable("device-unsupported"); return false }
+                return true
+            } else {
+                fiLogUnavailable("os-unavailable")
+                return false
+            }
+            #else
+            fiLogUnavailable("symbol-unavailable")
+            return false
+            #endif
+        }
+
+        #if canImport(MetalFX) && !os(visionOS)
+        @MainActor
+        private func ensureFrameInterpolator(device: MTLDevice, inputW: Int, inputH: Int, outputW: Int, outputH: Int, colorFormat: MTLPixelFormat) -> MTLFXFrameInterpolator? {
+            guard #available(iOS 26.0, macOS 26.0, *) else { fiLogUnavailable("os-unavailable"); return nil }
+            guard MTLFXFrameInterpolatorDescriptor.supportsDevice(device) else { fiLogUnavailable("device-unsupported"); return nil }
+            let key = (inputW, inputH, outputW, outputH, colorFormat)
+            if let frameInterpolator, frameInterpolatorKey == key { return frameInterpolator }
+            let desc = MTLFXFrameInterpolatorDescriptor()
+            desc.colorTextureFormat = colorFormat
+            desc.outputTextureFormat = colorFormat
+            desc.depthTextureFormat = .r32Float
+            desc.motionTextureFormat = .rg16Float
+            desc.uiTextureFormat = colorFormat
+            desc.inputWidth = max(1, inputW)
+            desc.inputHeight = max(1, inputH)
+            desc.outputWidth = max(1, outputW)
+            desc.outputHeight = max(1, outputH)
+            guard let interpolator = desc.makeFrameInterpolator(device: device) else { fiLogUnavailable("makeFrameInterpolator-nil"); return nil }
+            frameInterpolator = interpolator
+            frameInterpolatorKey = key
+            if !fiLoggedReady {
+                print("[Q3-FI] frame interpolator ready input=\(inputW)x\(inputH) output=\(outputW)x\(outputH) color=\(colorFormat) motion=rg16Float depth=r32Float")
+                fiLoggedReady = true
+            }
+            return interpolator
+        }
+        #endif
+
+        @MainActor
+        private func encodeFrameInterpolation(commandBuffer: MTLCommandBuffer, device: MTLDevice, currentSceneTexture: MTLTexture, sceneView: Q3MetalSceneView?, renderW: Int, renderH: Int, realFrameDelta: CFTimeInterval) -> MTLTexture? {
+            guard let previousSlot = fiPreviousSceneSlot, previousSlot >= 0, previousSlot < fiSceneColorTargets.count, let previousSceneTexture = fiSceneColorTargets[previousSlot] else { return nil }
+            guard !fiLastRTMotionWasReset else { return nil }
+            guard let depthTexture = rtGDepthTexture, let motionTexture = rtMotionTexture, fiLastRTTraceWidth > 0, fiLastRTTraceHeight > 0 else { fiLogUnavailable("gbuffer-missing"); return nil }
+            #if canImport(MetalFX) && !os(visionOS)
+            guard let interpolator = ensureFrameInterpolator(device: device, inputW: fiLastRTTraceWidth, inputH: fiLastRTTraceHeight, outputW: renderW, outputH: renderH, colorFormat: currentSceneTexture.pixelFormat),
+                  let outputTexture = nextFrameInterpolationOutputTarget() else { return nil }
+            interpolator.colorTexture = currentSceneTexture
+            interpolator.prevColorTexture = previousSceneTexture
+            interpolator.depthTexture = depthTexture
+            interpolator.motionTexture = motionTexture
+            interpolator.outputTexture = outputTexture
+            interpolator.uiTexture = nil
+            interpolator.isUITextureComposited = false
+            interpolator.jitterOffsetX = 0.0
+            interpolator.jitterOffsetY = 0.0
+            interpolator.deltaTime = Float(max(realFrameDelta, 1.0 / 240.0))
+            interpolator.nearPlane = 4.0
+            interpolator.farPlane = 8192.0
+            interpolator.fieldOfView = sceneView.map { $0.fovY } ?? 90.0
+            interpolator.aspectRatio = Float(max(renderW, 1)) / Float(max(renderH, 1))
+            interpolator.shouldResetHistory = false
+            interpolator.isDepthReversed = false
+            /* Stage17 rtMotion is UV-space cur-prev with top-left UV origin.
+             * MetalFX wants current-pixel -> previous-pixel in pixel units.
+             * Conversion: prev-cur = -(cur-prev), then multiply by the
+             * motion/depth resolution. No Y flip: both spaces are top-left. */
+            interpolator.motionVectorScaleX = -Float(max(fiLastRTTraceWidth, 1))
+            interpolator.motionVectorScaleY = -Float(max(fiLastRTTraceHeight, 1))
+            if #available(iOS 27.0, macOS 27.0, *) {
+                interpolator.contentWidth = max(fiLastRTTraceWidth, 1)
+                interpolator.contentHeight = max(fiLastRTTraceHeight, 1)
+                interpolator.depthContentOffsetX = 0
+                interpolator.depthContentOffsetY = 0
+                interpolator.motionContentOffsetX = 0
+                interpolator.motionContentOffsetY = 0
+                interpolator.outputOffsetX = 0
+                interpolator.outputOffsetY = 0
+            }
+            interpolator.encode(commandBuffer: commandBuffer)
+            return outputTexture
+            #else
+            fiLogUnavailable("symbol-unavailable")
+            return nil
+            #endif
+        }
+
+        @MainActor
+        private func copyFrameInterpolationScene(_ source: MTLTexture, to destination: MTLTexture, commandBuffer: MTLCommandBuffer) {
+            guard let blit = commandBuffer.makeBlitCommandEncoder() else { return }
+            blit.label = "Q3.FI.copySceneToDrawable"
+            blit.copy(from: source,
+                      sourceSlice: 0,
+                      sourceLevel: 0,
+                      sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                      sourceSize: MTLSize(width: min(source.width, destination.width), height: min(source.height, destination.height), depth: 1),
+                      to: destination,
+                      destinationSlice: 0,
+                      destinationLevel: 0,
+                      destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+            blit.endEncoding()
+        }
+
+        @MainActor
+        private func noteFrameInterpolationPresented(renderedRealFrame: Bool) {
+            guard frameInterpolation == .on else { return }
+            fiPresentedFrames &+= 1
+            if renderedRealFrame { fiRenderedFrames &+= 1 }
+            let now = CACurrentMediaTime()
+            guard now - fiLastStatsTime >= 2.0 else { return }
+            let dt = max(now - fiLastStatsTime, 0.0001)
+            let presentedDelta = fiPresentedFrames &- fiLastStatsPresented
+            let renderedDelta = fiRenderedFrames &- fiLastStatsRendered
+            let presentedFps = Double(presentedDelta) / dt
+            let renderFps = Double(renderedDelta) / dt
+            print(String(format: "[Q3-FI] stats presentedFps=%.1f renderFps=%.1f latency=one-real-frame pending=%d", presentedFps, renderFps, fiPendingDisplayTexture == nil ? 0 : 1))
+            fiLastStatsTime = now
+            fiLastStatsPresented = fiPresentedFrames
+            fiLastStatsRendered = fiRenderedFrames
+        }
+
+        @MainActor
+        private func presentPendingFrameInterpolationDisplay(in view: MTKView, outputW: Int, outputH: Int) -> Bool {
+            guard frameInterpolation == .on, let pendingTexture = fiPendingDisplayTexture else { return false }
+            guard pendingTexture.width == outputW, pendingTexture.height == outputH else { resetFrameInterpolationHistory(reason: "pending-size-mismatch"); return false }
+            guard let drawable = view.currentDrawable, let device = view.device, let commandQueue, let commandBuffer = commandQueue.makeCommandBuffer() else { return true }
+            guard let snapshot = Q3MetalRenderer_GetFrameSnapshot()?.pointee else { resetFrameInterpolationHistory(reason: "pending-no-snapshot"); return false }
+            commandBuffer.label = "Q3.FI.presentPending"
+            frameInflightSemaphore.wait()
+            var frameSemaphoreNeedsSignal = true
+            func signalFrameSemaphoreIfNeeded() {
+                if frameSemaphoreNeedsSignal {
+                    frameSemaphoreNeedsSignal = false
+                    frameInflightSemaphore.signal()
+                }
+            }
+            defer { signalFrameSemaphoreIfNeeded() }
+            let frameSlot = nextFrameSlot
+            nextFrameSlot = (nextFrameSlot + 1) % Self.maxInflightFrames
+            copyFrameInterpolationScene(pendingTexture, to: drawable.texture, commandBuffer: commandBuffer)
+            let uiDepth = ensureSceneDepthTexture(device: device, width: outputW, height: outputH)
+            let uiPass = makeLoadedRenderPassDescriptor(colorTexture: drawable.texture, depthTexture: uiDepth)
+            uiPass.depthAttachment.loadAction = .clear
+            uiPass.depthAttachment.storeAction = .store
+            uiPass.depthAttachment.clearDepth = 1.0
+            guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: uiPass) else { resetFrameInterpolationHistory(reason: "pending-ui-encoder-failed"); return false }
+            encoder.label = "Q3.FI.ui.pendingReal"
+            encoder.setViewport(MTLViewport(originX: 0, originY: 0, width: Double(outputW), height: Double(outputH), znear: 0.0, zfar: 1.0))
+            encoder.setScissorRect(MTLScissorRect(x: 0, y: 0, width: outputW, height: outputH))
+            encodeHUDAndUIPasses(encoder: encoder,
+                                 snapshot: snapshot,
+                                 device: device,
+                                 frameSlot: frameSlot,
+                                 renderW: outputW,
+                                 renderH: outputH,
+                                 mainSceneViewForLatePasses: Q3MetalRenderer_GetSceneView()?.pointee,
+                                 mainFlaresDrawnBeforeFog: false)
+            encoder.endEncoding()
+            encodePostprocess(commandBuffer: commandBuffer, sourceTexture: drawable.texture, outputTexture: drawable.texture)
+            fiPendingDisplayTexture = nil
+            fiPendingDisplaySlot = nil
+            noteFrameInterpolationPresented(renderedRealFrame: false)
+            let frameSemaphore = frameInflightSemaphore
+            commandBuffer.addCompletedHandler { _ in frameSemaphore.signal() }
+            frameSemaphoreNeedsSignal = false
+            commandBuffer.present(drawable)
+            commandBuffer.commit()
             return true
         }
 
@@ -3861,8 +4148,10 @@ struct MetalView: UIViewRepresentable {
         private var rtMotionTexture: MTLTexture?
         #if canImport(MetalFX) && !os(visionOS)
         private var rtTemporalDenoisedScaler: MTLFXTemporalDenoisedScaler?
+        private var frameInterpolator: MTLFXFrameInterpolator?
         #endif
         private var rtTemporalDenoisedScalerKey: (Int, Int, Int, Int, MTLPixelFormat) = (0, 0, 0, 0, .invalid)
+        private var frameInterpolatorKey: (Int, Int, Int, Int, MTLPixelFormat) = (0, 0, 0, 0, .invalid)
         private var rtWhiteTexture: MTLTexture?
         private var pbrMissingTexture: MTLTexture?
         private var sunShadowPipelineState: MTLRenderPipelineState?
@@ -5772,9 +6061,12 @@ struct MetalView: UIViewRepresentable {
             rtHistoryValid = false
             rtPrevViewProjection = nil
             rtTemporalDenoisedScalerKey = (0, 0, 0, 0, .invalid)
+            frameInterpolatorKey = (0, 0, 0, 0, .invalid)
             #if canImport(MetalFX) && !os(visionOS)
             rtTemporalDenoisedScaler = nil
+            frameInterpolator = nil
             #endif
+            resetFrameInterpolationHistory(reason: "rt-texture-resize")
             rtGBufferPrevCurrentLogPrinted = false
             print("[RT] textures trace=\(tw)x\(th) format=\(rtPixelFormat) composite=\(cw)x\(ch) denoised=\(cw)x\(ch) history=reset")
             if !rtGBufferReadyLogPrinted {
@@ -6324,8 +6616,13 @@ struct MetalView: UIViewRepresentable {
             uniforms.rtBudgetParams = SIMD4<Float>(Float(Q3_RTShadowBudget()), 0, 0, 0)
             rtPrevViewProjection = viewProj
             rtPrevViewProjectionWorldGeneration = worldGeneration
+            fiLastRTMotionWasReset = forcePrevCurrentForMV
+            fiLastRTTraceWidth = traceW
+            fiLastRTTraceHeight = traceH
+            let fiMotionResetReason = generationChanged ? "map-generation-change" : (prevWasMissing ? "first-frame" : (gbufferCut ? "camera-cut" : "none"))
+            fiLastRTMotionResetReason = fiMotionResetReason
             if forcePrevCurrentForMV && (!rtGBufferPrevCurrentLogPrinted || generationChanged) {
-                let reason = generationChanged ? "map-generation-change" : (prevWasMissing ? "first-frame" : "camera-cut")
+                let reason = fiMotionResetReason
                 if generationChanged, let prevGeneration {
                     print("[Q3-GBUFFER] prev=current (MV=0) reason=\(reason) generation=\(prevGeneration)->\(worldGeneration)")
                 } else {
@@ -8918,6 +9215,217 @@ struct MetalView: UIViewRepresentable {
             Q3MetalRenderer_UpdateDrawableSize(Int32(size.width), Int32(size.height))
         }
 
+        @MainActor
+        private func encodeHUDAndUIPasses(encoder: MTLRenderCommandEncoder,
+                                          snapshot: Q3MetalFrameSnapshot,
+                                          device: MTLDevice,
+                                          frameSlot: Int,
+                                          renderW: Int,
+                                          renderH: Int,
+                                          mainSceneViewForLatePasses: Q3MetalSceneView?,
+                                          mainFlaresDrawnBeforeFog: Bool) {
+            /* Multi-scene HUD sub-scenes. Scene 0 is the main world view
+             * handled by the blocks above. Scenes 1..sceneCount are HUD
+             * portrait heads, rotating ammo pickups, scoreboard faces,
+             * etc. Each has its own viewport rect + camera. Render only
+             * the entities in each scene's [entityCommandFirst .. +Count)
+             * range. Depth is cleared between sub-scenes by wrapping the
+             * whole thing after the world pass — currently we rely on
+             * each sub-scene's entities self-overlapping cleanly since
+             * they all submit at origin (0,0,0) with close depths. */
+            if snapshot.sceneCount > 1,
+               let scenesPointer = Q3MetalRenderer_GetSceneSnapshots(),
+               let entityDrawsPointer = Q3MetalRenderer_GetEntityDrawCommands(),
+               let entityPipelineState,
+               let entityBuffers = uploadEntityBuffers(device: device, slot: frameSlot) {
+                let entityVertexBuffer = entityBuffers.vertexBuffer
+                let entityIndexBuffer = entityBuffers.indexBuffer
+                let scenes = UnsafeBufferPointer(start: scenesPointer, count: Int(snapshot.sceneCount))
+                let allEntityDraws = UnsafeBufferPointer(start: entityDrawsPointer, count: Int(snapshot.entityCommandCount))
+                for sceneIdx in 1..<Int(snapshot.sceneCount) {
+                    let scene = scenes[sceneIdx]
+                    guard scene.entityCommandCount > 0 else { continue }
+                    guard scene.viewportWidth > 0 && scene.viewportHeight > 0 else { continue }
+
+                    encoder.setViewport(MTLViewport(
+                        originX: Double(scene.viewportX),
+                        originY: Double(scene.viewportY),
+                        width: Double(scene.viewportWidth),
+                        height: Double(scene.viewportHeight),
+                        znear: 0.0, zfar: 1.0))
+                    encoder.setScissorRect(MTLScissorRect(
+                        x: Int(scene.viewportX),
+                        y: Int(scene.viewportY),
+                        width: Int(scene.viewportWidth),
+                        height: Int(scene.viewportHeight)))
+
+                    let subSceneView = Q3MetalSceneView(
+                        fovX: scene.fovX, fovY: scene.fovY,
+                        viewOrigin: scene.viewOrigin, viewAxis: scene.viewAxis)
+                    let subViewProj = makeWorldViewProjection(subSceneView)
+                    var subUniforms = EntityUniforms(viewProjection: subViewProj)
+                    populateEntitySun(&subUniforms)
+
+                    encoder.setRenderPipelineState(entityPipelineState)
+                    /* Sub-scenes share the framebuffer's depth buffer with
+                     * the world pass, so lessEqual depth-test would reject
+                     * origin-space HUD geometry under world pixels at the
+                     * same screen position. Use the dedicated always-pass
+                     * depth state so HUD portraits render on top regardless
+                     * of what the world wrote. ensuredDepthStencilState
+                     * with nil falls back to lessEqual — not what we want. */
+                    if let alwaysDepth = alwaysPassDepthStencilState {
+                        encoder.setDepthStencilState(alwaysDepth)
+                    }
+                    encoder.setFrontFacing(.clockwise)
+                    encoder.setCullMode(.none)
+                    encoder.setVertexBuffer(entityVertexBuffer, offset: 0, index: 0)
+                    encoder.setVertexBytes(&subUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
+                    encoder.setFragmentBytes(&subUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
+                    // HUD sub-scene entity samples need clampToEdge — see
+                    // comment at the world-scene entity bind above. Same
+                    // reason: dlight/sprite/refraction stages tile under
+                    // .repeat. Sub-scenes run inside Q3.render.postFog.
+                    encoder.setFragmentSamplerState(uiSamplerState, index: 0)
+                    Self.bindDlightBlock(snapshot: snapshot, encoder: encoder, device: device, index: 2, extra: currentBakedDlights())
+
+                    let first = Int(scene.entityCommandFirst)
+                    let rawEnd = first + Int(scene.entityCommandCount)
+                    let end = min(max(first, rawEnd), allEntityDraws.count)
+                    guard first < end else { continue }
+                    for drawIdx in first..<end {
+                        let draw = allEntityDraws[drawIdx]
+                        guard draw.indexCount > 0 else { continue }
+                        guard let texture = texture(for: draw.textureHandle, device: device) else { continue }
+                        // PBR Phase 1 — entity sub-pass (HUD heads,
+                        // ammo rotations, scoreboard portraits). Keep classic
+                        // fallback here; PBR-only diagnostics are for 3D world/main
+                        // entity surfaces, not HUD/UI overlays.
+                        let q3Name = Q3MetalRenderer_GetTextureName(draw.textureHandle).map { String(cString: $0) } ?? "unknown"
+                        let preferClassicFX = shouldPreferClassicTextureForAlphaFX(q3Name, isEntity: true)
+                        let pbrTex = preferClassicFX ? nil : pbrAlbedoTexture(for: draw.textureHandle)
+                        encoder.setFragmentTexture(pbrTex ?? texture, index: 0)
+                        // PBR Phase 2 — bind normal map to slot 1 if the
+                        // material ships one. Nil bind leaves the slot
+                        // unbound; q3_entity_fragment uses is_null_texture
+                        // to skip the normal-mapped lighting branch.
+                        // Normal at index 1 — same fallback chain as the
+                        // primary entity bind site. Never nil to satisfy
+                        // Q3.entity pipeline's required `normalTexture` slot.
+                        let entityNormalTexSub = preferClassicFX
+                            ? pbrFlatNormalDefault()
+                            : (pbrNormalTexture(for: draw.textureHandle) ?? pbrFlatNormalDefault())
+                        encoder.setFragmentTexture(entityNormalTexSub, index: 1)
+                        // Roughness@3 + metallic@4 — same correctness rule as
+                        // the primary bind site. Q3.entity pipeline declares
+                        // them as required slots; an unbound texture there is
+                        // a Metal API-validation "missing fragment texture"
+                        // warning + UB GPU read on the sub-pass entity draws
+                        // (HUD/scoreboard portrait, weapon icons, etc.). The
+                        // 1×1 defaults are no-ops for non-PBR sub-pass paths.
+                        encoder.setFragmentTexture(pbrRoughnessDefault(), index: 3)
+                        encoder.setFragmentTexture(pbrMetallicDefault(), index: 4)
+                        // envCube @ 5 + envSampler @ 1 — required by
+                        // q3_entity_fragment even when PBR is off; missing
+                        // bindings trigger Metal validation errors on NV15's
+                        // ~44K entity draws (the sub-pass hits many surfaces).
+                        encoder.setFragmentTexture(ensurePBREnvCube(), index: 5)
+                        encoder.setFragmentSamplerState(ensurePBREnvSampler(), index: 1)
+                        // Emissive @ 6 for HUD/sub-pass entity draws. Zero
+                        // default (HUD elements have no emissive layer); the
+                        // sub-pass entityUniforms.emissiveParams left at the
+                        // struct default (1,1,1,0) so the MSL gate skips.
+                        encoder.setFragmentTexture(pbrEmissiveDefault(), index: 6)
+                        var pbrNormalScaleSub: Float = 0.0
+                        encoder.setFragmentBytes(&pbrNormalScaleSub, length: 4, index: 3)
+                        // PBR Phase F — rim params at buffer(4).
+                        var pbrRimParamsSub = SIMD2<Float>(0.0, Q3_PBRRimFalloff())
+                        encoder.setFragmentBytes(&pbrRimParamsSub, length: 8, index: 4)
+                        encoder.drawIndexedPrimitives(
+                            type: .triangle,
+                            indexCount: Int(draw.indexCount),
+                            indexType: .uint32,
+                            indexBuffer: entityIndexBuffer,
+                            indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride)
+                    }
+                }
+
+                // Restore full-screen viewport for flare + UI passes
+                // (renderW/H = upscale RT size when MetalFX active).
+                encoder.setViewport(MTLViewport(
+                    originX: 0, originY: 0,
+                    width: Double(renderW),
+                    height: Double(renderH),
+                    znear: 0.0, zfar: 1.0))
+                encoder.setScissorRect(MTLScissorRect(
+                    x: 0, y: 0,
+                    width: renderW,
+                    height: renderH))
+            }
+
+            /* Flare pass. When fog ray-box is active, main-scene flares
+             * were already drawn before fog so they are attenuated by the
+             * volume integration pass. Without fog, draw them here just
+             * before UI as before. */
+            if !mainFlaresDrawnBeforeFog, let sceneView = mainSceneViewForLatePasses {
+                _ = encodeMainFlarePass(encoder: encoder,
+                                        sceneView: sceneView,
+                                        snapshot: snapshot,
+                                        device: device)
+            }
+
+            let vertexCount = Int(snapshot.vertexCount)
+            if vertexCount > 0, let verticesPointer = Q3MetalRenderer_GetVertices(),
+               let vertexBuffer = uploadVertices(UnsafeBufferPointer(start: verticesPointer, count: vertexCount), device: device, slot: frameSlot) {
+                let vertices = UnsafeBufferPointer(start: verticesPointer, count: vertexCount)
+                let projection = makeOrthoProjection(width: max(Float(snapshot.drawableWidth), 1.0), height: max(Float(snapshot.drawableHeight), 1.0))
+                var uniforms = Uniforms(projection: projection)
+
+                encoder.setDepthStencilState(ensuredDepthStencilState(nil, device: device))
+                encoder.setFragmentSamplerState(uiSamplerState, index: 0)
+                encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+                encoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
+
+                if let drawCommandsPointer = Q3MetalRenderer_GetDrawCommands() {
+                    let drawCommands = UnsafeBufferPointer(start: drawCommandsPointer, count: Int(snapshot.commandCount))
+                    for draw in drawCommands {
+                        /* Per-draw pipeline bind — no cross-draw reuse.
+                         * Pipelines themselves are cached by (srcFactor,
+                         * dstFactor) as distinct MTLRenderPipelineState
+                         * objects built once in configureRenderer. The
+                         * binding call below is always issued before the
+                         * draw so a GL_ONE/GL_ONE additive state cannot
+                         * leak into a subsequent GL_DST_COLOR/GL_ZERO
+                         * filter draw. */
+                        let pipeline: MTLRenderPipelineState? = {
+                            switch draw.blendMode {
+                            /* Strict blend split — blendMode 1 and 5 MUST
+                             * use distinct pipelines. GL_ONE/GL_ONE must
+                             * never route through a .sourceAlpha pipeline
+                             * and GL_SRC_ALPHA/GL_ONE must never route
+                             * through a .one/.one pipeline. */
+                            case 1: return uiAdditiveAlphaPipelineState ?? uiPipelineState
+                            case 5: return uiAdditiveFullPipelineState ?? uiPipelineState
+                            case 3: return uiFilterPipelineState ?? uiPipelineState
+                            default: return uiPipelineState
+                            }
+                        }()
+                        if let pipeline {
+                            encoder.setRenderPipelineState(pipeline)
+                        }
+                        if let texture = texture(for: draw.textureHandle, device: device) {
+                            // PBR Phase 1 — final fallback / overlay path. Keep classic
+                            // fallback for UI overlays; PBR-only diagnostics are for
+                            // 3D world/main entity surfaces.
+                            let pbrTex = pbrAlbedoTexture(for: draw.textureHandle)
+                            encoder.setFragmentTexture(pbrTex ?? texture, index: 0)
+                            encoder.drawPrimitives(type: .triangle, vertexStart: Int(draw.firstVertex), vertexCount: Int(draw.vertexCount))
+                        }
+                    }
+                }
+            }
+        }
+
         func draw(in view: MTKView) {
             let drawFrameStart = CACurrentMediaTime()
             if commandQueue == nil {
@@ -8933,6 +9441,12 @@ struct MetalView: UIViewRepresentable {
              * to MetalFX. Native quality keeps the existing direct path. */
             let outputW = Int(view.drawableSize.width)
             let outputH = Int(view.drawableSize.height)
+            if frameInterpolation != .on {
+                resetFrameInterpolationHistory(reason: "toggle-off")
+            }
+            if presentPendingFrameInterpolationDisplay(in: view, outputW: outputW, outputH: outputH) {
+                return
+            }
             // Keep "Native" literal even with RT enabled. The old safety
             // override silently forced Native+RT through the 0.75 MetalFX
             // path; on current iOS/Xcode that path can assert inside
@@ -9011,6 +9525,22 @@ struct MetalView: UIViewRepresentable {
                 rtPerfFrame = view.device.flatMap { makeRTPerfFrame(device: $0) }
             }
 
+            let fiActiveThisFrame = canUseFrameInterpolation(device: view.device,
+                                                             outputW: outputW,
+                                                             outputH: outputH,
+                                                             upscaleActive: upscaleActive)
+            let fiSceneTarget = fiActiveThisFrame
+                ? view.device.flatMap { nextFrameInterpolationSceneTarget(device: $0,
+                                                                          width: renderW,
+                                                                          height: renderH,
+                                                                          pixelFormat: view.colorPixelFormat) }
+                : nil
+            let fiCurrentSceneTexture = fiSceneTarget?.texture
+            let fiCurrentSceneSlot = fiSceneTarget?.slot
+            if frameInterpolation == .on && !fiActiveThisFrame {
+                resetFrameInterpolationHistory(reason: "inactive")
+            }
+
             descriptor.colorAttachments[0].clearColor = MTLClearColor(
                 red: Double(snapshot.clearColor.0),
                 green: Double(snapshot.clearColor.1),
@@ -9029,6 +9559,9 @@ struct MetalView: UIViewRepresentable {
              * into sky/additive/UI captures as intermittent "light" patches. */
             descriptor.colorAttachments[0].loadAction = .clear
             descriptor.colorAttachments[0].storeAction = .store
+            if let fiCurrentSceneTexture {
+                descriptor.colorAttachments[0].texture = fiCurrentSceneTexture
+            }
 
             /* MetalFX path: redirect the main color attachment to our
              * offscreen RT. The descriptor's drawable.texture is left
@@ -10339,7 +10872,7 @@ struct MetalView: UIViewRepresentable {
                     worldASBuilt = (worldAccelerationStructure != nil)
                     worldASGeneration = worldASBuilt ? cachedWorldGeneration : 0
                 }
-                let rtTargetTexture = (upscaleActive ? upscaleColorTarget : drawable.texture) ?? drawable.texture
+                let rtTargetTexture = fiCurrentSceneTexture ?? ((upscaleActive ? upscaleColorTarget : drawable.texture) ?? drawable.texture)
                 // P0.2 (docs/2026-06-10-rt-gap-analysis-vs-rtx-remix.md):
                 // r_rt_preserve_entities 1 (default) keeps this composite-
                 // before-entities ordering — the raster entity/viewmodel/
@@ -10885,7 +11418,7 @@ struct MetalView: UIViewRepresentable {
 
             if rtPerfFrame != nil, Q3_RTMix() > 0, Q3_RTPreserveEntities() != 0 {
                 encoder.endEncoding()
-                let rtTargetTexture = (upscaleActive ? upscaleColorTarget : drawable.texture) ?? drawable.texture
+                let rtTargetTexture = fiCurrentSceneTexture ?? ((upscaleActive ? upscaleColorTarget : drawable.texture) ?? drawable.texture)
                 let postEntityPass = makeLoadedRenderPassDescriptor(colorTexture: rtTargetTexture,
                                                                     depthTexture: descriptor.depthAttachment.texture)
                 attachRTPerfSamples(to: postEntityPass, frame: rtPerfFrame, start: .uiStart, end: .uiEnd)
@@ -10920,7 +11453,7 @@ struct MetalView: UIViewRepresentable {
                     print("[RT] preserve entities OFF — legacy composite-after-entities size=\(renderW)x\(renderH)")
                     pbrLog("[RT] preserve entities OFF — legacy composite-after-entities size=\(renderW)x\(renderH)")
                 }
-                let rtTargetTexture = (upscaleActive ? upscaleColorTarget : drawable.texture) ?? drawable.texture
+                let rtTargetTexture = fiCurrentSceneTexture ?? ((upscaleActive ? upscaleColorTarget : drawable.texture) ?? drawable.texture)
                 // Parity with the preserve path: ensure entity buffers are
                 // valid even when the entity pass above was skipped
                 // (entityCommandCount == 0) and r_rt_entities is enabled.
@@ -10978,7 +11511,7 @@ struct MetalView: UIViewRepresentable {
                 // Substitute upscale RT for drawable when MetalFX is
                 // active — fog must read/write the same texture the main
                 // render targeted, otherwise we'd lose the world geometry.
-                let fogColorTex = (upscaleActive ? upscaleColorTarget : drawable.texture) ?? drawable.texture
+                let fogColorTex = fiCurrentSceneTexture ?? ((upscaleActive ? upscaleColorTarget : drawable.texture) ?? drawable.texture)
                 encodeFogVolumeRayBox(commandBuffer: commandBuffer,
                                       colorTexture: fogColorTex,
                                       depthTexture: sceneDepth,
@@ -11002,205 +11535,60 @@ struct MetalView: UIViewRepresentable {
                                                        height: renderH))
             }
 
-            /* Multi-scene HUD sub-scenes. Scene 0 is the main world view
-             * handled by the blocks above. Scenes 1..sceneCount are HUD
-             * portrait heads, rotating ammo pickups, scoreboard faces,
-             * etc. Each has its own viewport rect + camera. Render only
-             * the entities in each scene's [entityCommandFirst .. +Count)
-             * range. Depth is cleared between sub-scenes by wrapping the
-             * whole thing after the world pass — currently we rely on
-             * each sub-scene's entities self-overlapping cleanly since
-             * they all submit at origin (0,0,0) with close depths. */
-            if snapshot.sceneCount > 1,
-               let scenesPointer = Q3MetalRenderer_GetSceneSnapshots(),
-               let entityDrawsPointer = Q3MetalRenderer_GetEntityDrawCommands(),
-               let entityPipelineState,
-               let entityBuffers = uploadEntityBuffers(device: view.device, slot: frameSlot) {
-                let entityVertexBuffer = entityBuffers.vertexBuffer
-                let entityIndexBuffer = entityBuffers.indexBuffer
-                let scenes = UnsafeBufferPointer(start: scenesPointer, count: Int(snapshot.sceneCount))
-                let allEntityDraws = UnsafeBufferPointer(start: entityDrawsPointer, count: Int(snapshot.entityCommandCount))
-                for sceneIdx in 1..<Int(snapshot.sceneCount) {
-                    let scene = scenes[sceneIdx]
-                    guard scene.entityCommandCount > 0 else { continue }
-                    guard scene.viewportWidth > 0 && scene.viewportHeight > 0 else { continue }
-
-                    encoder.setViewport(MTLViewport(
-                        originX: Double(scene.viewportX),
-                        originY: Double(scene.viewportY),
-                        width: Double(scene.viewportWidth),
-                        height: Double(scene.viewportHeight),
-                        znear: 0.0, zfar: 1.0))
-                    encoder.setScissorRect(MTLScissorRect(
-                        x: Int(scene.viewportX),
-                        y: Int(scene.viewportY),
-                        width: Int(scene.viewportWidth),
-                        height: Int(scene.viewportHeight)))
-
-                    let subSceneView = Q3MetalSceneView(
-                        fovX: scene.fovX, fovY: scene.fovY,
-                        viewOrigin: scene.viewOrigin, viewAxis: scene.viewAxis)
-                    let subViewProj = makeWorldViewProjection(subSceneView)
-                    var subUniforms = EntityUniforms(viewProjection: subViewProj)
-                    populateEntitySun(&subUniforms)
-
-                    encoder.setRenderPipelineState(entityPipelineState)
-                    /* Sub-scenes share the framebuffer's depth buffer with
-                     * the world pass, so lessEqual depth-test would reject
-                     * origin-space HUD geometry under world pixels at the
-                     * same screen position. Use the dedicated always-pass
-                     * depth state so HUD portraits render on top regardless
-                     * of what the world wrote. ensuredDepthStencilState
-                     * with nil falls back to lessEqual — not what we want. */
-                    if let alwaysDepth = alwaysPassDepthStencilState {
-                        encoder.setDepthStencilState(alwaysDepth)
-                    }
-                    encoder.setFrontFacing(.clockwise)
-                    encoder.setCullMode(.none)
-                    encoder.setVertexBuffer(entityVertexBuffer, offset: 0, index: 0)
-                    encoder.setVertexBytes(&subUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
-                    encoder.setFragmentBytes(&subUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
-                    // HUD sub-scene entity samples need clampToEdge — see
-                    // comment at the world-scene entity bind above. Same
-                    // reason: dlight/sprite/refraction stages tile under
-                    // .repeat. Sub-scenes run inside Q3.render.postFog.
-                    encoder.setFragmentSamplerState(uiSamplerState, index: 0)
-                    Self.bindDlightBlock(snapshot: snapshot, encoder: encoder, device: view.device, index: 2, extra: currentBakedDlights())
-
-                    let first = Int(scene.entityCommandFirst)
-                    let rawEnd = first + Int(scene.entityCommandCount)
-                    let end = min(max(first, rawEnd), allEntityDraws.count)
-                    guard first < end else { continue }
-                    for drawIdx in first..<end {
-                        let draw = allEntityDraws[drawIdx]
-                        guard draw.indexCount > 0 else { continue }
-                        guard let texture = texture(for: draw.textureHandle, device: view.device) else { continue }
-                        // PBR Phase 1 — entity sub-pass (HUD heads,
-                        // ammo rotations, scoreboard portraits). Keep classic
-                        // fallback here; PBR-only diagnostics are for 3D world/main
-                        // entity surfaces, not HUD/UI overlays.
-                        let q3Name = Q3MetalRenderer_GetTextureName(draw.textureHandle).map { String(cString: $0) } ?? "unknown"
-                        let preferClassicFX = shouldPreferClassicTextureForAlphaFX(q3Name, isEntity: true)
-                        let pbrTex = preferClassicFX ? nil : pbrAlbedoTexture(for: draw.textureHandle)
-                        encoder.setFragmentTexture(pbrTex ?? texture, index: 0)
-                        // PBR Phase 2 — bind normal map to slot 1 if the
-                        // material ships one. Nil bind leaves the slot
-                        // unbound; q3_entity_fragment uses is_null_texture
-                        // to skip the normal-mapped lighting branch.
-                        // Normal at index 1 — same fallback chain as the
-                        // primary entity bind site. Never nil to satisfy
-                        // Q3.entity pipeline's required `normalTexture` slot.
-                        let entityNormalTexSub = preferClassicFX
-                            ? pbrFlatNormalDefault()
-                            : (pbrNormalTexture(for: draw.textureHandle) ?? pbrFlatNormalDefault())
-                        encoder.setFragmentTexture(entityNormalTexSub, index: 1)
-                        // Roughness@3 + metallic@4 — same correctness rule as
-                        // the primary bind site. Q3.entity pipeline declares
-                        // them as required slots; an unbound texture there is
-                        // a Metal API-validation "missing fragment texture"
-                        // warning + UB GPU read on the sub-pass entity draws
-                        // (HUD/scoreboard portrait, weapon icons, etc.). The
-                        // 1×1 defaults are no-ops for non-PBR sub-pass paths.
-                        encoder.setFragmentTexture(pbrRoughnessDefault(), index: 3)
-                        encoder.setFragmentTexture(pbrMetallicDefault(), index: 4)
-                        // envCube @ 5 + envSampler @ 1 — required by
-                        // q3_entity_fragment even when PBR is off; missing
-                        // bindings trigger Metal validation errors on NV15's
-                        // ~44K entity draws (the sub-pass hits many surfaces).
-                        encoder.setFragmentTexture(ensurePBREnvCube(), index: 5)
-                        encoder.setFragmentSamplerState(ensurePBREnvSampler(), index: 1)
-                        // Emissive @ 6 for HUD/sub-pass entity draws. Zero
-                        // default (HUD elements have no emissive layer); the
-                        // sub-pass entityUniforms.emissiveParams left at the
-                        // struct default (1,1,1,0) so the MSL gate skips.
-                        encoder.setFragmentTexture(pbrEmissiveDefault(), index: 6)
-                        var pbrNormalScaleSub: Float = 0.0
-                        encoder.setFragmentBytes(&pbrNormalScaleSub, length: 4, index: 3)
-                        // PBR Phase F — rim params at buffer(4).
-                        var pbrRimParamsSub = SIMD2<Float>(0.0, Q3_PBRRimFalloff())
-                        encoder.setFragmentBytes(&pbrRimParamsSub, length: 8, index: 4)
-                        encoder.drawIndexedPrimitives(
-                            type: .triangle,
-                            indexCount: Int(draw.indexCount),
-                            indexType: .uint32,
-                            indexBuffer: entityIndexBuffer,
-                            indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride)
-                    }
+            if let fiSceneTexture = fiCurrentSceneTexture,
+               let fiSceneSlot = fiCurrentSceneSlot,
+               let device = view.device {
+                encoder.endEncoding()
+                let fiNow = CACurrentMediaTime()
+                let realFrameDelta = fiLastRealFrameWallTime.map { fiNow - $0 } ?? (1.0 / 40.0)
+                let interpolatedTexture = encodeFrameInterpolation(commandBuffer: commandBuffer,
+                                                                   device: device,
+                                                                   currentSceneTexture: fiSceneTexture,
+                                                                   sceneView: mainSceneViewForLatePasses,
+                                                                   renderW: renderW,
+                                                                   renderH: renderH,
+                                                                   realFrameDelta: realFrameDelta)
+                let sceneForThisPresentation = interpolatedTexture ?? fiSceneTexture
+                if interpolatedTexture != nil {
+                    fiPendingDisplayTexture = fiSceneTexture
+                    fiPendingDisplaySlot = fiSceneSlot
+                } else {
+                    fiPendingDisplayTexture = nil
+                    fiPendingDisplaySlot = nil
                 }
+                fiPreviousSceneSlot = fiSceneSlot
+                fiLastRealFrameWallTime = fiNow
+                copyFrameInterpolationScene(sceneForThisPresentation,
+                                            to: drawable.texture,
+                                            commandBuffer: commandBuffer)
 
-                // Restore full-screen viewport for flare + UI passes
-                // (renderW/H = upscale RT size when MetalFX active).
-                encoder.setViewport(MTLViewport(
-                    originX: 0, originY: 0,
-                    width: Double(renderW),
-                    height: Double(renderH),
-                    znear: 0.0, zfar: 1.0))
-                encoder.setScissorRect(MTLScissorRect(
-                    x: 0, y: 0,
-                    width: renderW,
-                    height: renderH))
+                let uiPass = makeLoadedRenderPassDescriptor(colorTexture: drawable.texture,
+                                                            depthTexture: descriptor.depthAttachment.texture)
+                guard let fiUIEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: uiPass) else {
+                    return
+                }
+                encoder = fiUIEncoder
+                encoder.label = interpolatedTexture == nil ? "Q3.FI.ui.passThrough" : "Q3.FI.ui.interpolated"
+                encoder.setViewport(MTLViewport(originX: 0,
+                                                originY: 0,
+                                                width: Double(renderW),
+                                                height: Double(renderH),
+                                                znear: 0.0,
+                                                zfar: 1.0))
+                encoder.setScissorRect(MTLScissorRect(x: 0, y: 0,
+                                                       width: renderW,
+                                                       height: renderH))
             }
 
-            /* Flare pass. When fog ray-box is active, main-scene flares
-             * were already drawn before fog so they are attenuated by the
-             * volume integration pass. Without fog, draw them here just
-             * before UI as before. */
-            if !mainFlaresDrawnBeforeFog, let sceneView = mainSceneViewForLatePasses {
-                _ = encodeMainFlarePass(encoder: encoder,
-                                        sceneView: sceneView,
-                                        snapshot: snapshot,
-                                        device: view.device)
-            }
-
-            let vertexCount = Int(snapshot.vertexCount)
-            if vertexCount > 0, let verticesPointer = Q3MetalRenderer_GetVertices(),
-               let vertexBuffer = uploadVertices(UnsafeBufferPointer(start: verticesPointer, count: vertexCount), device: view.device, slot: frameSlot) {
-                let vertices = UnsafeBufferPointer(start: verticesPointer, count: vertexCount)
-                let projection = makeOrthoProjection(width: max(Float(snapshot.drawableWidth), 1.0), height: max(Float(snapshot.drawableHeight), 1.0))
-                var uniforms = Uniforms(projection: projection)
-
-                encoder.setDepthStencilState(ensuredDepthStencilState(nil, device: view.device))
-                encoder.setFragmentSamplerState(uiSamplerState, index: 0)
-                encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
-                encoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
-
-                if let drawCommandsPointer = Q3MetalRenderer_GetDrawCommands() {
-                    let drawCommands = UnsafeBufferPointer(start: drawCommandsPointer, count: Int(snapshot.commandCount))
-                    for draw in drawCommands {
-                        /* Per-draw pipeline bind — no cross-draw reuse.
-                         * Pipelines themselves are cached by (srcFactor,
-                         * dstFactor) as distinct MTLRenderPipelineState
-                         * objects built once in configureRenderer. The
-                         * binding call below is always issued before the
-                         * draw so a GL_ONE/GL_ONE additive state cannot
-                         * leak into a subsequent GL_DST_COLOR/GL_ZERO
-                         * filter draw. */
-                        let pipeline: MTLRenderPipelineState? = {
-                            switch draw.blendMode {
-                            /* Strict blend split — blendMode 1 and 5 MUST
-                             * use distinct pipelines. GL_ONE/GL_ONE must
-                             * never route through a .sourceAlpha pipeline
-                             * and GL_SRC_ALPHA/GL_ONE must never route
-                             * through a .one/.one pipeline. */
-                            case 1: return uiAdditiveAlphaPipelineState ?? uiPipelineState
-                            case 5: return uiAdditiveFullPipelineState ?? uiPipelineState
-                            case 3: return uiFilterPipelineState ?? uiPipelineState
-                            default: return uiPipelineState
-                            }
-                        }()
-                        if let pipeline {
-                            encoder.setRenderPipelineState(pipeline)
-                        }
-                        if let texture = texture(for: draw.textureHandle, device: view.device) {
-                            // PBR Phase 1 — final fallback / overlay path. Keep classic
-                            // fallback for UI overlays; PBR-only diagnostics are for
-                            // 3D world/main entity surfaces.
-                            let pbrTex = pbrAlbedoTexture(for: draw.textureHandle)
-                            encoder.setFragmentTexture(pbrTex ?? texture, index: 0)
-                            encoder.drawPrimitives(type: .triangle, vertexStart: Int(draw.firstVertex), vertexCount: Int(draw.vertexCount))
-                        }
-                    }
-                }
+            if let device = view.device {
+                encodeHUDAndUIPasses(encoder: encoder,
+                                     snapshot: snapshot,
+                                     device: device,
+                                     frameSlot: frameSlot,
+                                     renderW: renderW,
+                                     renderH: renderH,
+                                     mainSceneViewForLatePasses: mainSceneViewForLatePasses,
+                                     mainFlaresDrawnBeforeFog: mainFlaresDrawnBeforeFog)
             }
 
             encoder.endEncoding()
@@ -11238,6 +11626,7 @@ struct MetalView: UIViewRepresentable {
                 frameSemaphore.signal()
             }
             frameSemaphoreNeedsSignal = false
+            noteFrameInterpolationPresented(renderedRealFrame: true)
             commandBuffer.present(drawable)
             commandBuffer.commit()
 
