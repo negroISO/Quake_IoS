@@ -1,5 +1,6 @@
 import SwiftUI
 import MetalKit
+import ImageIO
 #if canImport(MetalFX)
 import MetalFX
 #endif
@@ -414,7 +415,9 @@ struct MetalView: UIViewRepresentable {
             // Stage 17: append-only tail field. Do not insert fields above this:
             // Swift and MSL RayTracingUniforms are bound as raw bytes.
             var prevViewProjection: simd_float4x4 = matrix_identity_float4x4
-            // Stage 19 append-only budget controls. x = r_rt_shadow_budget.
+            // Stage 19/24 append-only budget controls:
+            // x = r_rt_shadow_budget, y = emissive NEE light count,
+            // z = r_rt_emissive_nee enabled, w = reserved.
             var rtBudgetParams: SIMD4<Float> = SIMD4(2, 0, 0, 0)
         }
 
@@ -4205,6 +4208,33 @@ struct MetalView: UIViewRepresentable {
             var dirType: SIMD4<Float>
         }
 
+        // Stage24: compact triangle area lights harvested from authored
+        // emissive RT materials. Bound to rtKernel at buffer(9).
+        private let rtMaxEmissiveLights = 64
+        private var rtEmissiveLightBuffer: MTLBuffer?
+        private var rtEmissiveLightBufferCapacity: Int = 0
+        private var rtEmissiveLightsCPU: [RTEmissiveLightGPU] = []
+        private var rtEmissiveLightCount: Int = 0
+        private var rtEmissiveLightCandidateCount: Int = 0
+        private var rtEmissiveLightDroppedCount: Int = 0
+        private var rtEmissiveNEELogSignature: String = ""
+
+        private struct RTEmissiveLightGPU {
+            var p0Area: SIMD4<Float>       // xyz = p0, w = triangle area
+            var edge1Weight: SIMD4<Float>  // xyz = p1-p0, w = luma*area
+            var edge2Primitive: SIMD4<Float> // xyz = p2-p0, w = primitive id
+            var colorIntensity: SIMD4<Float> // rgb = authored emissive radiance, w = luma
+        }
+
+        private struct RTEmissiveLightCache {
+            var lights: [RTEmissiveLightGPU]
+            var candidateCount: Int
+            var droppedCount: Int
+            var mapName: String
+        }
+
+        private var rtEmissiveLightCache: [UInt64: RTEmissiveLightCache] = [:]
+
         private enum RTPerfSample: Int, CaseIterable {
             case rasterStart = 0
             case rasterEnd
@@ -4536,6 +4566,59 @@ struct MetalView: UIViewRepresentable {
             return (rtLightBuffer, rtLightCount)
         }
 
+        private func currentRTMapName() -> String {
+            let raw = Q3MetalRenderer_GetWorldMapName().flatMap { String(cString: $0) } ?? ""
+            let base = (raw as NSString).lastPathComponent
+            return (base as NSString).deletingPathExtension
+        }
+
+        @MainActor
+        private func applyRTEmissiveLightCache(_ cache: RTEmissiveLightCache,
+                                               device: MTLDevice) {
+            rtEmissiveLightsCPU = cache.lights
+            rtEmissiveLightCount = cache.lights.count
+            rtEmissiveLightCandidateCount = cache.candidateCount
+            rtEmissiveLightDroppedCount = cache.droppedCount
+            _ = ensureRTEmissiveLightBuffer(device: device, mapName: cache.mapName)
+        }
+
+        /// Uploads the Stage24 emissive-triangle area-light list. The kernel
+        /// always receives a valid buffer(9); count 0 means the NEE block is off.
+        @MainActor
+        private func ensureRTEmissiveLightBuffer(device: MTLDevice,
+                                                 mapName: String? = nil) -> (buffer: MTLBuffer?, count: Int) {
+            let count = max(rtEmissiveLightCount, 1)
+            let length = count * MemoryLayout<RTEmissiveLightGPU>.stride
+            if rtEmissiveLightBuffer == nil || rtEmissiveLightBufferCapacity < count {
+                rtEmissiveLightBuffer = device.makeBuffer(length: max(1, length),
+                                                          options: .storageModeShared)
+                rtEmissiveLightBufferCapacity = count
+                rtEmissiveLightBuffer?.label = "Q3.RT.emissiveNEE"
+            }
+            if let buf = rtEmissiveLightBuffer {
+                let ptr = buf.contents().bindMemory(to: RTEmissiveLightGPU.self,
+                                                     capacity: count)
+                ptr[0] = RTEmissiveLightGPU(p0Area: .zero,
+                                            edge1Weight: .zero,
+                                            edge2Primitive: .zero,
+                                            colorIntensity: .zero)
+                for (i, l) in rtEmissiveLightsCPU.enumerated() where i < count {
+                    ptr[i] = l
+                }
+            }
+            let map = mapName ?? currentRTMapName()
+            let sig = "\(map):\(rtEmissiveLightCount):\(rtEmissiveLightCandidateCount):\(rtEmissiveLightDroppedCount)"
+            if sig != rtEmissiveNEELogSignature {
+                rtEmissiveNEELogSignature = sig
+                let dropped = rtEmissiveLightDroppedCount
+                let suffix = dropped > 0 ? " dropped=\(dropped)" : ""
+                let msg = "[RT] emissive-NEE lights=\(rtEmissiveLightCount)/candidates=\(rtEmissiveLightCandidateCount) map=\(map)\(suffix)"
+                print(msg)
+                pbrLog(msg)
+            }
+            return (rtEmissiveLightBuffer, rtEmissiveLightCount)
+        }
+
         private func nextRTShadowCounterBuffer(device: MTLDevice) -> MTLBuffer? {
             let counterCount = 4
             let length = counterCount * MemoryLayout<UInt32>.stride
@@ -4802,7 +4885,9 @@ struct MetalView: UIViewRepresentable {
                 // Stage 17 append-only tail field. Do not insert fields above
                 // this; Swift and MSL structs are byte-bound.
                 float4x4 prevViewProjection;
-                // Stage 19 append-only controls. x = local-light shadow budget.
+                // Stage 19/24 append-only controls:
+                // x = local-light shadow budget, y = emissive NEE light count,
+                // z = emissive NEE enabled, w = reserved.
                 float4 rtBudgetParams;
             };
 
@@ -4814,6 +4899,13 @@ struct MetalView: UIViewRepresentable {
                 float4 posRadius;       // xyz world pos, w radius
                 float4 colorIntensity;  // rgb linear color, w intensity
                 float4 dirType;         // xyz emission dir, w type
+            };
+
+            struct RTEmissiveLight {
+                float4 p0Area;          // xyz p0, w triangle area
+                float4 edge1Weight;     // xyz p1-p0, w selection base weight
+                float4 edge2Primitive;  // xyz p2-p0, w primitive id
+                float4 colorIntensity;  // rgb authored radiance, w luma
             };
 
             struct RTWorldVertex {
@@ -4947,6 +5039,7 @@ struct MetalView: UIViewRepresentable {
                                  acceleration_structure<> entityAS [[buffer(5)]],
                                  const device RTLight *rtLights [[buffer(6)]],
                                  device atomic_uint *rtShadowCounters [[buffer(7)]],
+                                 const device RTEmissiveLight *rtEmissiveLights [[buffer(9)]],
                                  uint2 tid [[thread_position_in_grid]]) {
                 if (tid.x >= output.get_width() || tid.y >= output.get_height()) return;
                 float2 curUv = (float2(tid) + 0.5) / float2(output.get_width(), output.get_height());
@@ -5180,6 +5273,8 @@ struct MetalView: UIViewRepresentable {
                                 color += emitSample * mat.materialParams.x;
                                 color = min(color, float3(2.0));
                             }
+                            bool emissiveNEEEnabled = uniforms.rtBudgetParams.z > 0.5 &&
+                                                       uniforms.rtBudgetParams.y > 0.5;
                             // First-pass one-bounce indirect: gated by r_rt_bounces.
                             if (uniforms.rtControlParams.y > 0.5) {
                                 float rnd0 = rtHash12(float2(tid) + uniforms.fovParams.zz * float2(17.0, 31.0));
@@ -5192,15 +5287,20 @@ struct MetalView: UIViewRepresentable {
                                     uint btri = bounceHit.primitive_id;
                                     RTPrimitiveMaterial bounceMat = primitiveMaterials[btri];
                                     if (bounceMat.materialFlags.y != 0 && bounceMat.albedoSlot < 110) {
-                                        uint bi0 = indices[btri * 3 + 0];
-                                        uint bi1 = indices[btri * 3 + 1];
-                                        uint bi2 = indices[btri * 3 + 2];
-                                        float2 bb = bounceHit.triangle_barycentric_coord;
-                                        float bw = 1.0 - bb.x - bb.y;
-                                        float2 buv = vertices[bi0].texCoord * bw + vertices[bi1].texCoord * bb.x + vertices[bi2].texCoord * bb.y;
-                                        float3 emitAlbedo = texTable.albedo[bounceMat.albedoSlot].sample(repeatSampler, buv).rgb;
-                                        float3 emitSample = rtEmissionSample(texTable, bounceMat, emitAlbedo, repeatSampler, buv);
-                                        indirect = emitSample * max(bounceMat.materialParams.x, 0.8) * 0.22;
+                                        if (!emissiveNEEEnabled) {
+                                            uint bi0 = indices[btri * 3 + 0];
+                                            uint bi1 = indices[btri * 3 + 1];
+                                            uint bi2 = indices[btri * 3 + 2];
+                                            float2 bb = bounceHit.triangle_barycentric_coord;
+                                            float bw = 1.0 - bb.x - bb.y;
+                                            float2 buv = vertices[bi0].texCoord * bw + vertices[bi1].texCoord * bb.x + vertices[bi2].texCoord * bb.y;
+                                            float3 emitAlbedo = texTable.albedo[bounceMat.albedoSlot].sample(repeatSampler, buv).rgb;
+                                            float3 emitSample = rtEmissionSample(texTable, bounceMat, emitAlbedo, repeatSampler, buv);
+                                            indirect = emitSample * max(bounceMat.materialParams.x, 0.8) * 0.22;
+                                        }
+                                        /* Stage24 bias note: when emissive NEE is enabled, skip the
+                                         * old one-bounce emissive-hit add instead of MIS-weighting it.
+                                         * Direct visibility of the emissive primary surface is unchanged. */
                                     } else {
                                         indirect = float3(0.035);
                                     }
@@ -5295,6 +5395,125 @@ struct MetalView: UIViewRepresentable {
                                 // RT lighting rebalance: rtPBRGlobal.w boosts the
                                 // ray-traced direct (sun + local NEE, shadowed) term.
                                 color += albedoSample.rgb * direct * uniforms.rtPBRGlobal.w;
+                            }
+                            if (emissiveNEEEnabled) {
+                                uint emissiveCount = min((uint)max(uniforms.rtBudgetParams.y, 0.0), 64u);
+                                float totalWeight = 0.0;
+                                for (uint li = 0; li < emissiveCount; ++li) {
+                                    RTEmissiveLight el = rtEmissiveLights[li];
+                                    float3 center = el.p0Area.xyz + (el.edge1Weight.xyz + el.edge2Primitive.xyz) * (1.0 / 3.0);
+                                    float3 toC = center - hitPos;
+                                    float d2 = max(dot(toC, toC), 1.0);
+                                    totalWeight += max(el.edge1Weight.w, 0.0) / d2;
+                                }
+                                if (totalWeight > 0.0) {
+                                    float pick = rtHash12(float2(tid) + uniforms.fovParams.zz * float2(71.0, 13.0)) * totalWeight;
+                                    RTEmissiveLight chosen = rtEmissiveLights[0];
+                                    float chosenWeight = 0.0;
+                                    float accumWeight = 0.0;
+                                    for (uint li = 0; li < emissiveCount; ++li) {
+                                        RTEmissiveLight el = rtEmissiveLights[li];
+                                        float3 center = el.p0Area.xyz + (el.edge1Weight.xyz + el.edge2Primitive.xyz) * (1.0 / 3.0);
+                                        float3 toC = center - hitPos;
+                                        float d2 = max(dot(toC, toC), 1.0);
+                                        float wLight = max(el.edge1Weight.w, 0.0) / d2;
+                                        accumWeight += wLight;
+                                        if (pick <= accumWeight || li + 1u == emissiveCount) {
+                                            chosen = el;
+                                            chosenWeight = wLight;
+                                            break;
+                                        }
+                                    }
+                                    float area = max(chosen.p0Area.w, 0.0005);
+                                    float pdfSelect = max(chosenWeight / totalWeight, 0.0001);
+                                    float r0 = rtHash12(float2(tid.yx) + uniforms.fovParams.zz * float2(97.0, 23.0));
+                                    float r1 = rtHash12(float2(tid) + uniforms.fovParams.zz * float2(43.0, 89.0));
+                                    float su = sqrt(max(r0, 0.0));
+                                    float b1 = su * (1.0 - r1);
+                                    float b2 = su * r1;
+                                    float3 lp = chosen.p0Area.xyz + chosen.edge1Weight.xyz * b1 + chosen.edge2Primitive.xyz * b2;
+                                    float3 toL = lp - hitPos;
+                                    float d2 = max(dot(toL, toL), 1.0);
+                                    float dist = sqrt(d2);
+                                    float3 L = toL / dist;
+                                    float ndl = max(dot(N, L), 0.0);
+                                    float3 lightN = cross(chosen.edge1Weight.xyz, chosen.edge2Primitive.xyz);
+                                    if (dot(lightN, lightN) > 1.0e-8) {
+                                        lightN = normalize(lightN);
+                                        float cosEmit = max(dot(lightN, -L), 0.0);
+                                        float3 chosenHintForWrap = max(chosen.colorIntensity.rgb, float3(0.0));
+                                        bool greenEmissiveHint = chosenHintForWrap.y > max(chosenHintForWrap.x, chosenHintForWrap.z) * 1.35 &&
+                                                                 chosenHintForWrap.y > 0.01;
+                                        if (greenEmissiveHint) {
+                                            /* Same-plane medallion plaques should visibly
+                                             * bleed onto adjacent wall blocks in the RTX
+                                             * reference. A strict Lambert area term is near
+                                             * zero for coplanar receivers, so use a small
+                                             * wrap floor only for green emissive masks; the
+                                             * normal shadow ray below still prevents leaks. */
+                                            ndl = max(ndl, 0.12);
+                                            cosEmit = max(cosEmit, 0.10);
+                                        }
+                                        if (ndl > 0.0 && cosEmit > 0.0) {
+                                            uint chosenPrim = (uint)max(chosen.edge2Primitive.w + 0.5, 0.0);
+                                            ray sray(hitPos + N * 0.75, L, 0.1, max(dist - 0.05, 0.1));
+                                            auto sh = i.intersect(sray, worldAS);
+                                            bool shadowBlocked = sh.type == intersection_type::triangle &&
+                                                                 sh.primitive_id != chosenPrim &&
+                                                                 primitiveMaterials[sh.primitive_id].materialFlags.x == 0;
+                                            if (!shadowBlocked) {
+                                                float3 emissionRadiance = chosen.colorIntensity.rgb;
+                                                if (chosen.colorIntensity.w < 0.0) {
+                                                    RTPrimitiveMaterial lightMat = primitiveMaterials[chosenPrim];
+                                                    if (lightMat.albedoSlot < 110) {
+                                                        uint ei0 = indices[chosenPrim * 3 + 0];
+                                                        uint ei1 = indices[chosenPrim * 3 + 1];
+                                                        uint ei2 = indices[chosenPrim * 3 + 2];
+                                                        float b0 = 1.0 - b1 - b2;
+                                                        float2 euv = vertices[ei0].texCoord * b0 +
+                                                                     vertices[ei1].texCoord * b1 +
+                                                                     vertices[ei2].texCoord * b2;
+                                                        float3 eMask = texTable.emissive[lightMat.albedoSlot].sample(repeatSampler, euv).rgb;
+                                                        float eMax = max(eMask.x, max(eMask.y, eMask.z));
+                                                        float eMin = min(eMask.x, min(eMask.y, eMask.z));
+                                                        float neutralMask = 1.0 - saturate(((eMax - eMin) / max(eMax, 0.001)) * 4.0);
+                                                        /* Remix emissive DDSes often store a grayscale mask while
+                                                         * the source surface's albedo carries the authored hue
+                                                         * (q3dm1 medallion green, orange pips). For NEE, tint only
+                                                         * low-saturation masks by albedo; already-colored emissive
+                                                         * maps keep their own hue. Direct primary emission path is
+                                                         * unchanged. */
+                                                        float3 albedoTint = max(texTable.albedo[lightMat.albedoSlot].sample(repeatSampler, euv).rgb,
+                                                                                float3(0.02));
+                                                        float3 hint = max(chosen.colorIntensity.rgb, float3(0.0));
+                                                        float hintMax = max(hint.x, max(hint.y, hint.z));
+                                                        float hintMin = min(hint.x, min(hint.y, hint.z));
+                                                        bool hintSaturated = hintMax > 0.001 && (hintMax - hintMin) > hintMax * 0.25;
+                                                        if (hintSaturated) {
+                                                            albedoTint = hint / hintMax;
+                                                        }
+                                                        emissionRadiance = eMask *
+                                                                            mix(float3(1.0), albedoTint, neutralMask) *
+                                                                            lightMat.emissiveTintMode.xyz *
+                                                                            lightMat.materialParams.x;
+                                                        if (hintSaturated) {
+                                                            emissionRadiance = hint;
+                                                        }
+                                                    }
+                                                }
+                                                float geometry = ndl * cosEmit / d2;
+                                                float3 brdf = albedoSample.rgb * (1.0 / 3.14159265);
+                                                if (dot(emissionRadiance, float3(0.2126, 0.7152, 0.0722)) > 1.0e-5) {
+                                                    float3 nee = emissionRadiance *
+                                                                 brdf *
+                                                                 (geometry * area / pdfSelect);
+                                                    // Same direct-light rebalance scalar as authored local lights.
+                                                    color += min(nee * uniforms.rtPBRGlobal.w, float3(4.0));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             float rough = mat.materialParams.z;
                             float metal = mat.materialParams.w;
@@ -5567,7 +5786,10 @@ struct MetalView: UIViewRepresentable {
         }
 
         @MainActor
-        private func buildRTPrimitiveMaterials(device: MTLDevice, primitiveCount: Int, log: Bool = true) {
+        private func buildRTPrimitiveMaterials(device: MTLDevice,
+                                               primitiveCount: Int,
+                                               log: Bool = true,
+                                               cacheSignature: UInt64 = 0) {
             let invalid = UInt32.max
             let invalidMaterial = RTPrimitiveMaterial(
                 albedoSlot: invalid,
@@ -5619,11 +5841,83 @@ struct MetalView: UIViewRepresentable {
 
             guard let drawsPtr = Q3MetalRenderer_GetWorldAllDrawCommands() else {
                 // Buffer already populated with invalid; no further work.
+                rtEmissiveLightsCPU.removeAll(keepingCapacity: true)
+                rtEmissiveLightCount = 0
+                rtEmissiveLightCandidateCount = 0
+                rtEmissiveLightDroppedCount = 0
+                _ = ensureRTEmissiveLightBuffer(device: device, mapName: currentRTMapName())
                 return
             }
 
             let drawCount = Int(Q3MetalRenderer_GetWorldAllDrawCommandCount())
             let draws = UnsafeBufferPointer(start: drawsPtr, count: drawCount)
+            let worldVertexCount = Int(Q3MetalRenderer_GetWorldVertexCount())
+            let worldIndexCount = Int(Q3MetalRenderer_GetWorldIndexCount())
+            let worldVerticesPtr = Q3MetalRenderer_GetWorldVertices()
+            let worldIndicesPtr = Q3MetalRenderer_GetWorldIndices()
+            let worldVertices = worldVerticesPtr.map { UnsafeBufferPointer(start: $0, count: worldVertexCount) }
+            let worldIndices = worldIndicesPtr.map { UnsafeBufferPointer(start: $0, count: worldIndexCount) }
+
+            struct EmissiveCandidate {
+                let light: RTEmissiveLightGPU
+                let score: Float
+            }
+
+            var emissiveCandidates: [EmissiveCandidate] = []
+
+            func worldPos(_ vertex: Q3MetalWorldVertex) -> SIMD3<Float> {
+                SIMD3<Float>(vertex.position.0, vertex.position.1, vertex.position.2)
+            }
+
+            func worldNormal(_ vertex: Q3MetalWorldVertex) -> SIMD3<Float> {
+                SIMD3<Float>(vertex.normal.0, vertex.normal.1, vertex.normal.2)
+            }
+
+            func appendEmissiveCandidate(tri: Int,
+                                         radiance: SIMD3<Float>,
+                                         sampleTexture: Bool) {
+                guard radiance.x > 0 || radiance.y > 0 || radiance.z > 0,
+                      let worldVertices,
+                      let worldIndices,
+                      tri >= 0,
+                      tri * 3 + 2 < worldIndexCount else { return }
+                let vi0 = Int(worldIndices[tri * 3 + 0])
+                let vi1 = Int(worldIndices[tri * 3 + 1])
+                let vi2 = Int(worldIndices[tri * 3 + 2])
+                guard vi0 >= 0, vi0 < worldVertexCount,
+                      vi1 >= 0, vi1 < worldVertexCount,
+                      vi2 >= 0, vi2 < worldVertexCount else { return }
+                let p0 = worldPos(worldVertices[vi0])
+                var p1 = worldPos(worldVertices[vi1])
+                var p2 = worldPos(worldVertices[vi2])
+                var edge1 = p1 - p0
+                var edge2 = p2 - p0
+                var crossN = simd_cross(edge1, edge2)
+                let doubleArea = simd_length(crossN)
+                guard doubleArea > 0.001 else { return }
+                let avgN = worldNormal(worldVertices[vi0]) +
+                           worldNormal(worldVertices[vi1]) +
+                           worldNormal(worldVertices[vi2])
+                if simd_length_squared(avgN) > 1.0e-8 && simd_dot(crossN, avgN) < 0 {
+                    swap(&p1, &p2)
+                    edge1 = p1 - p0
+                    edge2 = p2 - p0
+                    crossN = simd_cross(edge1, edge2)
+                }
+                let area = max(0.5 * simd_length(crossN), 0.0005)
+                let luma = max(simd_dot(radiance, SIMD3<Float>(0.2126, 0.7152, 0.0722)), 0.0)
+                guard luma > 0 else { return }
+                let score = luma * area
+                let light = RTEmissiveLightGPU(
+                    p0Area: SIMD4<Float>(p0.x, p0.y, p0.z, area),
+                    edge1Weight: SIMD4<Float>(edge1.x, edge1.y, edge1.z, score),
+                    edge2Primitive: SIMD4<Float>(edge2.x, edge2.y, edge2.z, Float(tri)),
+                    // w < 0 means kernel should sample the actual emissive
+                    // texture at the chosen triangle UV; abs(luma) is still
+                    // available for diagnostics if needed.
+                    colorIntensity: SIMD4<Float>(radiance.x, radiance.y, radiance.z, sampleTexture ? -luma : luma))
+                emissiveCandidates.append(EmissiveCandidate(light: light, score: score))
+            }
 
             /* Pick the 16 most important handles by covered triangle count,
              * not the first 16 encountered. The first-come table made large
@@ -5707,6 +6001,10 @@ struct MetalView: UIViewRepresentable {
                 var rtEmissiveActive = authoredRTEmissive ? false : isEmissive
                 var rtEmissiveIntensity: Float = (!authoredRTEmissive && isEmissive) ? 0.8 : 0.0
                 var rtEmissiveTintMode = SIMD4<Float>(1, 1, 1, 0)
+                var rtAuthoredEmissiveForNEE = false
+                var rtEmissiveNEERadianceScale: Float = 1.0
+                var rtEmissiveNEESamplesTexture = false
+                var rtEmissiveNEEAverage = SIMD3<Float>(1, 1, 1)
                 // logEnabled: false — this 30 Hz RT prepass runs before any
                 // draw and was poisoning the one-shot world-atlas log with
                 // atlasTime=0.000 entries (dedup set is shared).
@@ -5719,6 +6017,35 @@ struct MetalView: UIViewRepresentable {
                         let authored = m.emissive_intensity
                         if authored > 0 || m.emissive != nil {
                             rtEmissiveActive = true
+                            rtAuthoredEmissiveForNEE = true
+                            let emissivePath = m.emissive.map { String(cString: $0) }
+                            let hasCanonicalEmissiveMap = emissivePath.map { Self.isCanonicalEmissivePath($0) } ?? false
+                            if hasCanonicalEmissiveMap {
+                                rtEmissiveNEESamplesTexture = true
+                                rtEmissiveNEEAverage = pbrEmissiveAverage(for: materialHandle) ?? SIMD3<Float>(1, 1, 1)
+                                if let cName = Q3MetalRenderer_GetTextureName(materialHandle) {
+                                    let materialName = String(cString: cName).lowercased()
+                                    if materialName.contains("metaldemonkillblock") ||
+                                        materialName.contains("demon_block15fx") {
+                                        /* q3dm1's medallion renders as a green
+                                         * plasma emblem, but the Remix sidecar
+                                         * for the underlying demon plaque stores
+                                         * a low-saturation emissive mask. Preserve
+                                         * the live authored hue for area-light NEE
+                                         * so the spill matches the visible source. */
+                                        rtEmissiveNEEAverage = SIMD3<Float>(0.02, 0.85, 0.10)
+                                    }
+                                }
+                            }
+                            /* Stage24 area lights need a triangle-average
+                             * emissive color. For map-backed materials, use an
+                             * ImageIO downsampled average of the actual DDS so
+                             * mostly-black masks do not act like solid white
+                             * panels in the light picker. When a material has
+                             * no canonical emissive mask, keep only a weak
+                             * constant fallback; broad invisible intensity-only
+                             * records otherwise dominate the 64-light cap. */
+                            rtEmissiveNEERadianceScale = hasCanonicalEmissiveMap ? 1.0 : 0.05
                             // /16 clamp tames RTX's huge HDR values (up to 982);
                             // the master scale + r_rt_exposure/r_rt_bloom tune the
                             // final on-screen brightness through the ACES tonemap.
@@ -5731,6 +6058,10 @@ struct MetalView: UIViewRepresentable {
                         }
                     }
                 }
+                let rtEmissiveRadiance = SIMD3<Float>(
+                    rtEmissiveTintMode.x,
+                    rtEmissiveTintMode.y,
+                    rtEmissiveTintMode.z) * rtEmissiveIntensity * rtEmissiveNEERadianceScale * rtEmissiveNEEAverage
                 let firstTri = Int(draw.firstIndex / 3)
                 let triCount = Int(draw.indexCount / 3)
                 guard firstTri < primitiveCount else { continue }
@@ -5767,6 +6098,11 @@ struct MetalView: UIViewRepresentable {
                             tcModParams3: chain.p3,
                             spriteAtlasParams: rtAtlasParams,
                             emissiveTintMode: rtEmissiveTintMode)
+                        if rtAuthoredEmissiveForNEE {
+                            appendEmissiveCandidate(tri: tri,
+                                                    radiance: rtEmissiveRadiance,
+                                                    sampleTexture: rtEmissiveNEESamplesTexture)
+                        }
                         assigned += 1
                     } else {
                         skippedOverwrite += 1
@@ -5775,6 +6111,29 @@ struct MetalView: UIViewRepresentable {
             }
             // Buffer is already populated; no final makeBuffer(bytes:) copy
             // needed (that was strategy A's primary win).
+            let sortedEmissive = emissiveCandidates.sorted {
+                if $0.score != $1.score { return $0.score > $1.score }
+                return $0.light.edge2Primitive.w < $1.light.edge2Primitive.w
+            }
+            let cappedEmissive = Array(sortedEmissive.prefix(rtMaxEmissiveLights).map { $0.light })
+            let droppedEmissive = max(0, emissiveCandidates.count - cappedEmissive.count)
+            rtEmissiveLightsCPU = cappedEmissive
+            rtEmissiveLightCount = cappedEmissive.count
+            rtEmissiveLightCandidateCount = emissiveCandidates.count
+            rtEmissiveLightDroppedCount = droppedEmissive
+            let emissiveMap = currentRTMapName()
+            let emissiveCache = RTEmissiveLightCache(lights: cappedEmissive,
+                                                     candidateCount: emissiveCandidates.count,
+                                                     droppedCount: droppedEmissive,
+                                                     mapName: emissiveMap)
+            let sigForEmissiveCache = cacheSignature != 0 ? cacheSignature : rtWorldMaterialSignature()
+            if sigForEmissiveCache != 0 {
+                if rtEmissiveLightCache.count > 96 {
+                    rtEmissiveLightCache.removeAll(keepingCapacity: true)
+                }
+                rtEmissiveLightCache[sigForEmissiveCache] = emissiveCache
+            }
+            _ = ensureRTEmissiveLightBuffer(device: device, mapName: emissiveMap)
             if log {
                 var lightmapFallbacks = 0
                 for i in 0..<primitiveCount {
@@ -5989,8 +6348,14 @@ struct MetalView: UIViewRepresentable {
             rtASVertexBuffer = worldVertexBuffer; rtASIndexBuffer = ib
             rtLastMaterialSignature = rtWorldMaterialSignature()
             rtPrimitiveMaterialBufferCache.removeAll(keepingCapacity: true)
+            rtEmissiveLightCache.removeAll(keepingCapacity: true)
             if rtLastMaterialSignature != 0, let buf = rtPrimitiveMaterialBuffer {
                 rtPrimitiveMaterialBufferCache[rtLastMaterialSignature] = buf
+                rtEmissiveLightCache[rtLastMaterialSignature] = RTEmissiveLightCache(
+                    lights: rtEmissiveLightsCPU,
+                    candidateCount: rtEmissiveLightCandidateCount,
+                    droppedCount: rtEmissiveLightDroppedCount,
+                    mapName: currentRTMapName())
             }
             print("[RT] built world AS: vertices=\(vertexCount) indices=\(indexCount) tris=\(indexCount / 3) size=\(sizes.accelerationStructureSize)")
             return accel
@@ -6475,11 +6840,28 @@ struct MetalView: UIViewRepresentable {
                     if let cached = rtPrimitiveMaterialBufferCache[sig] {
                         rtPrimitiveMaterialBuffer = cached
                         rtLastMaterialSignature = sig
+                        if let lightCache = rtEmissiveLightCache[sig] {
+                            applyRTEmissiveLightCache(lightCache, device: device)
+                        } else {
+                            let primitiveCount = Int(Q3MetalRenderer_GetWorldIndexCount()) / 3
+                            if primitiveCount > 0 {
+                                buildRTPrimitiveMaterials(device: device,
+                                                          primitiveCount: primitiveCount,
+                                                          log: false,
+                                                          cacheSignature: sig)
+                                if let buf = rtPrimitiveMaterialBuffer {
+                                    rtPrimitiveMaterialBufferCache[sig] = buf
+                                }
+                            }
+                        }
                     } else {
                         let primitiveCount = Int(Q3MetalRenderer_GetWorldIndexCount()) / 3
                         if primitiveCount > 0 {
                             let t0 = CACurrentMediaTime()
-                            buildRTPrimitiveMaterials(device: device, primitiveCount: primitiveCount, log: false)
+                            buildRTPrimitiveMaterials(device: device,
+                                                      primitiveCount: primitiveCount,
+                                                      log: false,
+                                                      cacheSignature: sig)
                             rtLastMaterialSignature = sig
                             if let buf = rtPrimitiveMaterialBuffer {
                                 if rtPrimitiveMaterialBufferCache.count > 96 {
@@ -6613,7 +6995,16 @@ struct MetalView: UIViewRepresentable {
             uniforms.rtPBRGlobal = SIMD4<Float>(Q3_RTNormalScale(), Float(Q3_RTDebugGBuffer()),
                                                 Q3_RTLightmapScale(), Q3_RTDirectScale())
             uniforms.prevViewProjection = prevViewProjectionForMV
-            uniforms.rtBudgetParams = SIMD4<Float>(Float(Q3_RTShadowBudget()), 0, 0, 0)
+            let emissiveInfo = ensureRTEmissiveLightBuffer(device: device)
+            let emissiveNEEEnabled = Q3_RTEmissiveNEE() != 0 && Q3_RTEmissive() > 0 &&
+                emissiveInfo.buffer != nil && emissiveInfo.count > 0
+            // rtBudgetParams append-only use:
+            // x = local-light shadow budget, y = emissive light count,
+            // z = r_rt_emissive_nee enable, w = reserved.
+            uniforms.rtBudgetParams = SIMD4<Float>(Float(Q3_RTShadowBudget()),
+                                                   emissiveNEEEnabled ? Float(emissiveInfo.count) : 0,
+                                                   emissiveNEEEnabled ? 1.0 : 0.0,
+                                                   0)
             rtPrevViewProjection = viewProj
             rtPrevViewProjectionWorldGeneration = worldGeneration
             fiLastRTMotionWasReset = forcePrevCurrentForMV
@@ -6734,6 +7125,7 @@ struct MetalView: UIViewRepresentable {
                 enc.setAccelerationStructure(entityAccelerationStructure ?? worldAS, bufferIndex: 5)
                 enc.setBuffer(lightInfo.buffer, offset: 0, index: 6)
                 enc.setBuffer(shadowCounterBuffer, offset: 0, index: 7)
+                enc.setBuffer(emissiveInfo.buffer, offset: 0, index: 9)
                 enc.dispatchThreadgroups(traceGroups, threadsPerThreadgroup: tg)
                 enc.endEncoding()
             }
@@ -8966,6 +9358,88 @@ struct MetalView: UIViewRepresentable {
         /// (1×1 black) so the pipeline slot stays valid.
         private var pbrEmissiveCache: [UInt32: MTLTexture] = [:]
         private var pbrEmissiveTried: Set<UInt32> = []
+        private var pbrEmissiveAverageCache: [UInt32: SIMD3<Float>] = [:]
+        private var pbrEmissiveAverageTried: Set<UInt32> = []
+
+        private static func isCanonicalEmissivePath(_ path: String) -> Bool {
+            let lower = path.lowercased()
+            return lower.contains("emissive") || lower.hasSuffix(".e.rtex.dds")
+        }
+
+        /// Downsampled CPU average of the authored emissive DDS. ImageIO can
+        /// decode the Remix BC7/DX10 DDS files that Metal samples. The result is
+        /// used only for the Stage24 area-light importance/radiance estimate;
+        /// map-backed lights still sample the real emissive texture in-kernel at
+        /// the chosen triangle UV, so sparse masks remain sparse.
+        private func pbrEmissiveAverage(for handle: UInt32) -> SIMD3<Float>? {
+            if let cached = pbrEmissiveAverageCache[handle] { return cached }
+            if pbrEmissiveAverageTried.contains(handle) { return nil }
+            pbrEmissiveAverageTried.insert(handle)
+
+            guard let matPtr = Q3MetalRenderer_GetPBRMaterial(handle) else { return nil }
+            let mat = matPtr.pointee
+            guard let eCStr = mat.emissive else { return nil }
+            let path = String(cString: eCStr)
+            guard Self.isCanonicalEmissivePath(path) else { return nil }
+
+            let url = URL(fileURLWithPath: path) as CFURL
+            guard let source = CGImageSourceCreateWithURL(url, [
+                kCGImageSourceShouldCache: false
+            ] as CFDictionary) else { return nil }
+
+            let thumbOptions: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: 128,
+                kCGImageSourceShouldCache: false
+            ]
+            let image = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbOptions as CFDictionary) ??
+                        CGImageSourceCreateImageAtIndex(source, 0, [
+                            kCGImageSourceShouldCache: false
+                        ] as CFDictionary)
+            guard let image else { return nil }
+
+            let width = max(1, image.width)
+            let height = max(1, image.height)
+            let bytesPerPixel = 4
+            let bytesPerRow = width * bytesPerPixel
+            var pixels = [UInt8](repeating: 0, count: bytesPerRow * height)
+            let drew = pixels.withUnsafeMutableBytes { raw -> Bool in
+                guard let base = raw.baseAddress,
+                      let ctx = CGContext(data: base,
+                                          width: width,
+                                          height: height,
+                                          bitsPerComponent: 8,
+                                          bytesPerRow: bytesPerRow,
+                                          space: CGColorSpaceCreateDeviceRGB(),
+                                          bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue |
+                                                      CGBitmapInfo.byteOrder32Big.rawValue) else { return false }
+                ctx.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+                return true
+            }
+            guard drew else { return nil }
+
+            @inline(__always)
+            func srgbToLinear(_ v: Float) -> Float {
+                if v <= 0.04045 { return v / 12.92 }
+                return pow((v + 0.055) / 1.055, 2.4)
+            }
+
+            var sum = SIMD3<Float>(0, 0, 0)
+            var count: Float = 0
+            for i in stride(from: 0, to: pixels.count, by: bytesPerPixel) {
+                let r = srgbToLinear(Float(pixels[i + 0]) / 255.0)
+                let g = srgbToLinear(Float(pixels[i + 1]) / 255.0)
+                let b = srgbToLinear(Float(pixels[i + 2]) / 255.0)
+                sum += SIMD3<Float>(r, g, b)
+                count += 1
+            }
+            guard count > 0 else { return nil }
+            let avg = sum / count
+            pbrEmissiveAverageCache[handle] = avg
+            return avg
+        }
+
         private func pbrEmissiveTexture(for handle: UInt32) -> MTLTexture? {
             if let cached = pbrEmissiveCache[handle] { return cached }
             if pbrEmissiveTried.contains(handle) { return nil }
@@ -8982,9 +9456,7 @@ struct MetalView: UIViewRepresentable {
             // inheritance are correct — this is a JSON authoring slip.
             // Filter at the load boundary: accept only paths containing
             // "emissive" OR ending in the canonical `.e.rtex.dds` suffix.
-            let lower = path.lowercased()
-            let canonical = lower.contains("emissive") || lower.hasSuffix(".e.rtex.dds")
-            if !canonical {
+            if !Self.isCanonicalEmissivePath(path) {
                 pbrLog("[Q3-PBR-SWIFT] suspicious emissive path handle=\(handle) path=\(path) reason=not_emissive_or_.e.rtex.dds — skipping load (default zero will bind)")
                 pbrEmissiveTried.insert(handle)
                 return nil

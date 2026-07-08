@@ -11891,6 +11891,17 @@ float Q3_RTEmissive(void) {
     return v;
 }
 
+/* r_rt_emissive_nee: Stage24 authored emissive surface next-event
+ * estimation. Default/off preserves the Stage22 path exactly; when enabled
+ * Swift builds a small emissive-triangle area-light list and rtKernel casts
+ * one extra shadow ray per primary opaque hit toward a sampled emissive
+ * triangle. */
+int Q3_RTEmissiveNEE(void) {
+    if (ri.Cvar_Get == NULL) return 0;
+    cvar_t *cv = ri.Cvar_Get("r_rt_emissive_nee", "0", CVAR_ARCHIVE);
+    return (cv && cv->integer != 0) ? 1 : 0;
+}
+
 float Q3_RTBloomRadius(void) {
     if (ri.Cvar_Get == NULL) return 3.0f;
     cvar_t *cv = ri.Cvar_Get("r_rt_bloom_radius", "3.0", CVAR_ARCHIVE);

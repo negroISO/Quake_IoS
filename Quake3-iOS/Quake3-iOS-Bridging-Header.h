@@ -263,6 +263,10 @@ float Q3_RTBloomRadius(void);
  * legacy albedo*0.8 fake. Intensity is (clamped /16) * scale, so emissive
  * surfaces cross the bloom threshold. */
 float Q3_RTEmissive(void);
+/* Stage24 emissive area-light NEE. Default 0/off; when enabled the RT kernel
+ * samples one emissive triangle per primary opaque hit and casts one shadow
+ * ray toward it. */
+int   Q3_RTEmissiveNEE(void);
 /* RT atmosphere/miss-fill tuning. Defaults off: density=0 keeps the
  * historic raster-sky-preserve alpha path. When density > 0, the RT trace
  * applies neutral-grey distance fog and can alpha-fill AS misses via
