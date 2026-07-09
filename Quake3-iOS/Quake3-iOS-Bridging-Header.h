@@ -192,6 +192,11 @@ int Q3MetalRenderer_GetPortalSurface(float *outOrigin3, float *outAxis9);
  * procedural cube when the EFFECTIVE value changes. */
 float Q3_PBREnvCubeGrey(void);
 float Q3_PBREnvCubeGreyRequested(void);
+/* r_pbr_envcube_live (default 1, archived): when enabled and no authored
+ * map skybox cube resolves, Swift replaces the procedural grey IBL fallback
+ * with a small camera-position world cubemap refreshed over several frames.
+ * 0 restores the legacy procedural envCube path exactly. */
+int Q3_PBREnvCubeLive(void);
 /* r_pbr_emissive_intensity_max (default 64.0, archived, clamped 0..1024) —
  * hard ceiling on the per-material emissive intensity that
  * `emissiveParamsForPBRMaterial` writes into `EntityUniforms.emissive

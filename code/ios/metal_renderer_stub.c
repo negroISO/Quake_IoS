@@ -11481,6 +11481,12 @@ float Q3_PBREnvCubeGrey(void) {
     return (requested > Q3_PBR_ENVCUBE_GREY_MIN) ? requested : Q3_PBR_ENVCUBE_GREY_MIN;
 }
 
+int Q3_PBREnvCubeLive(void) {
+    if (ri.Cvar_Get == NULL) return 1;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_envcube_live", "1", CVAR_ARCHIVE);
+    return (cv && cv->integer != 0) ? 1 : 0;
+}
+
 /* r_pbr_emissive_intensity_max (default 3.0, CVAR_ARCHIVE, clamped
  * 0..16) — emissive intensity ceiling used by `emissiveParamsForPBRMaterial`
  * to cap `materials.json::emissive_intensity` values before they reach

@@ -8214,6 +8214,7 @@ struct MetalView: UIViewRepresentable {
         /// frames don't re-attempt the FS loader once it has been determined
         /// to miss for the current stem.
         private var pbrEnvCubeStem: String?
+        private var pbrEnvCubeAuthoredMapSkybox: Bool = false
         // 2026-06-10: tracks the `r_pbr_envcube_grey` value used to build
         // the currently-cached procedural cube. When the cvar changes via
         // the in-game console, `ensurePBREnvCube()` notices the mismatch
@@ -8241,6 +8242,16 @@ struct MetalView: UIViewRepresentable {
         /// "bundle has no skybox at all" case in one path.
         private var pbrEnvBundleHasNoSkyboxAssets: Bool = false
         private var pbrEnvBundleCheckDone: Bool = false
+        private static let livePBREnvCubeSize = 64
+        private static let livePBREnvCubeCompleteMask: UInt8 = 0x3f
+        private static let livePBREnvCubeRefreshInterval: UInt64 = 120
+        private var pbrLiveEnvCube: MTLTexture?
+        private var pbrLiveEnvDepthTexture: MTLTexture?
+        private var pbrLiveEnvCubeGeneration: UInt32 = 0
+        private var pbrLiveEnvFacesValidMask: UInt8 = 0
+        private var pbrLiveEnvNextFace: Int = 0
+        private var pbrLiveEnvFrameCounter: UInt64 = 0
+        private var pbrLiveEnvLoggedActive = false
         private var pbrTriedAndMissed: Set<UInt32> = []
         private var pbrNormalTried: Set<UInt32> = []
         private var pbrRoughnessTried: Set<UInt32> = []
@@ -8942,7 +8953,7 @@ struct MetalView: UIViewRepresentable {
         /// orientation. v1 ships the simple mapping; if the resulting
         /// reflection looks rotated 90° on a face, swap the suffix mapping
         /// in this method.
-        private func tryBuildMapSkyboxCube() -> MTLTexture? {
+        private func tryBuildMapSkyboxCube() -> (texture: MTLTexture, authoredMapSkybox: Bool)? {
             // Skybox faces are packed in pk3 files, not loose
             // Bundle.main/baseq3/env files. Always probe through the Q3 FS
             // bridge. If the live cvar is a bad/archived non-env stem like
@@ -8967,7 +8978,7 @@ struct MetalView: UIViewRepresentable {
             addCandidate("env/space1")
 
             let suffixes = ["_rt", "_lf", "_up", "_dn", "_ft", "_bk"]
-            for (candidateIndex, stem) in candidates.enumerated() {
+            for stem in candidates {
                 var faceData: [(rgba: [UInt8], width: Int, height: Int)] = []
                 var missingFace: String? = nil
                 for (i, suffix) in suffixes.enumerated() {
@@ -9034,11 +9045,13 @@ struct MetalView: UIViewRepresentable {
                     cb.commit()
                     cb.waitUntilCompleted()
                 }
-                let fallbackNote = candidateIndex == 0 ? "" : " fallbackFrom='\(liveStem)'"
+                let authoredCandidate = stem != "env/space1" &&
+                    ((stem == liveStem) || (!liveStem.hasPrefix("env/") && stem == "env/\(liveStem)"))
+                let fallbackNote = authoredCandidate ? "" : " fallbackFrom='\(liveStem)'"
                 NSLog("[Q3-PBR-IBL] map skybox envCube ready stem=%@ %@%dx%dx6 mips=%d",
                       stem, fallbackNote, baseSize, baseSize, cube.mipmapLevelCount)
                 pbrLog("[Q3-PBR-IBL] map skybox envCube ready stem=\(stem)\(fallbackNote) \(baseSize)x\(baseSize)x6 mips=\(cube.mipmapLevelCount)")
-                return cube
+                return (cube, authoredCandidate)
             }
             return nil
         }
@@ -9074,7 +9087,7 @@ struct MetalView: UIViewRepresentable {
             return stem.isEmpty ? nil : stem
         }
 
-        private func ensurePBREnvCube() -> MTLTexture? {
+        private func ensurePBRStaticEnvCube() -> MTLTexture? {
             // Phase 6 v3 — live cvar-change detection. Read the active stem
             // and compare against the stem the cached cube was built from.
             // If the engine auto-publish (or user console set) has moved the
@@ -9095,6 +9108,7 @@ struct MetalView: UIViewRepresentable {
                 pbrLog("[Q3-PBR-IBL] skybox stem changed (\(pbrEnvCubeStem ?? "<nil>") → \(currentStem ?? "<nil>")) — invalidating cache")
                 pbrEnvCube = nil
                 pbrEnvCubeAttempted = false
+                pbrEnvCubeAuthoredMapSkybox = false
             }
             // 2026-06-10: invalidate the cached procedural cube when the
             // `r_pbr_envcube_grey` cvar has changed since we last built.
@@ -9108,6 +9122,7 @@ struct MetalView: UIViewRepresentable {
                     pbrLog("[Q3-PBR-IBL] envcube grey changed (\(String(format: "%.3f", pbrEnvCubeGreyBuilt)) → \(String(format: "%.3f", liveGrey))) — invalidating procedural cube")
                     pbrEnvCube = nil
                     pbrEnvCubeAttempted = false
+                    pbrEnvCubeAuthoredMapSkybox = false
                 }
             }
             if let cube = pbrEnvCube { return cube }
@@ -9120,9 +9135,10 @@ struct MetalView: UIViewRepresentable {
             // we cache and return immediately; the procedural fallback below
             // never fires for this session.
             if let mapCube = tryBuildMapSkyboxCube() {
-                pbrEnvCube = mapCube
+                pbrEnvCube = mapCube.texture
                 pbrEnvCubeStem = currentStem
-                return mapCube
+                pbrEnvCubeAuthoredMapSkybox = mapCube.authoredMapSkybox
+                return mapCube.texture
             }
             // Map cube build failed for currentStem. Remember it so the
             // next stem-change check above doesn't invalidate the cached
@@ -9205,6 +9221,7 @@ struct MetalView: UIViewRepresentable {
                 cb.waitUntilCompleted()
             }
             pbrEnvCube = cube
+            pbrEnvCubeAuthoredMapSkybox = false
             // Phase 6 v3 — stamp the procedural sentinel so if the cvar
             // later changes to a real loadable stem, ensurePBREnvCube
             // invalidates and re-tries the map-cube path next call.
@@ -9214,6 +9231,304 @@ struct MetalView: UIViewRepresentable {
                   size, size, cube.mipmapLevelCount, requestedGrey, greyFloat)
             pbrLog("[Q3-PBR-IBL] procedural envCube ready \(size)x\(size)x6 mips=\(cube.mipmapLevelCount) requestedGrey=\(String(format: "%.3f", requestedGrey)) effectiveGrey=\(String(format: "%.3f", greyFloat))")
             return cube
+        }
+
+        private func ensurePBREnvCube() -> MTLTexture? {
+            let staticCube = ensurePBRStaticEnvCube()
+            guard Q3_PBREnvCubeLive() != 0 else { return staticCube }
+            // Authored map skybox cubes keep priority over live captures.
+            // The legacy stock env/space1 fallback is not map-authored; live
+            // capture may replace it while r_pbr_envcube_live is enabled.
+            if pbrEnvCubeAuthoredMapSkybox {
+                return staticCube
+            }
+            guard pbrLiveEnvFacesValidMask == Self.livePBREnvCubeCompleteMask,
+                  let liveCube = pbrLiveEnvCube else {
+                return staticCube
+            }
+            return liveCube
+        }
+
+        private func livePBREnvCubeCamera(origin: SIMD3<Float>, face: Int) -> PortalCamera {
+            let forward: SIMD3<Float>
+            let upSeed: SIMD3<Float>
+            switch face {
+            case 0:
+                forward = SIMD3<Float>(1, 0, 0)
+                upSeed = SIMD3<Float>(0, 0, 1)
+            case 1:
+                forward = SIMD3<Float>(-1, 0, 0)
+                upSeed = SIMD3<Float>(0, 0, 1)
+            case 2:
+                forward = SIMD3<Float>(0, 1, 0)
+                upSeed = SIMD3<Float>(0, 0, 1)
+            case 3:
+                forward = SIMD3<Float>(0, -1, 0)
+                upSeed = SIMD3<Float>(0, 0, 1)
+            case 4:
+                forward = SIMD3<Float>(0, 0, 1)
+                upSeed = SIMD3<Float>(0, -1, 0)
+            default:
+                forward = SIMD3<Float>(0, 0, -1)
+                upSeed = SIMD3<Float>(0, 1, 0)
+            }
+            let left = simd_normalize(simd_cross(upSeed, forward))
+            let up = simd_normalize(simd_cross(forward, left))
+            return PortalCamera(fovX: 90.0,
+                                fovY: 90.0,
+                                origin: origin,
+                                axis0: forward,
+                                axis1: left,
+                                axis2: up)
+        }
+
+        private func ensureLivePBREnvCubeTargets(device: MTLDevice,
+                                                 generation: UInt32) -> (color: MTLTexture, depth: MTLTexture)? {
+            let size = Self.livePBREnvCubeSize
+            if pbrLiveEnvCubeGeneration == generation,
+               let color = pbrLiveEnvCube,
+               let depth = pbrLiveEnvDepthTexture,
+               color.width == size,
+               color.height == size,
+               depth.width == size,
+               depth.height == size {
+                return (color, depth)
+            }
+
+            if pbrLiveEnvCubeGeneration != 0, pbrLiveEnvCubeGeneration != generation {
+                pbrLog("[Q3-PBR-IBL] live envcube reinit generation=\(pbrLiveEnvCubeGeneration)->\(generation)")
+            }
+
+            let colorDesc = MTLTextureDescriptor.textureCubeDescriptor(pixelFormat: .bgra8Unorm,
+                                                                       size: size,
+                                                                       mipmapped: true)
+            colorDesc.usage = [.renderTarget, .shaderRead]
+            colorDesc.storageMode = .private
+            guard let color = device.makeTexture(descriptor: colorDesc) else {
+                pbrLog("[Q3-PBR-IBL] live envcube alloc FAILED size=\(size)")
+                return nil
+            }
+            color.label = "Q3.pbr.envcube.live"
+
+            let depthDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float,
+                                                                     width: size,
+                                                                     height: size,
+                                                                     mipmapped: false)
+            depthDesc.usage = [.renderTarget]
+            depthDesc.storageMode = .private
+            guard let depth = device.makeTexture(descriptor: depthDesc) else {
+                pbrLog("[Q3-PBR-IBL] live envcube depth alloc FAILED size=\(size)")
+                return nil
+            }
+            depth.label = "Q3.pbr.envcube.live.depth"
+
+            pbrLiveEnvCube = color
+            pbrLiveEnvDepthTexture = depth
+            pbrLiveEnvCubeGeneration = generation
+            pbrLiveEnvFacesValidMask = 0
+            pbrLiveEnvNextFace = 0
+            pbrLiveEnvFrameCounter = 0
+            pbrLiveEnvLoggedActive = false
+            return (color, depth)
+        }
+
+        @MainActor
+        private func updateLivePBREnvCube(commandBuffer: MTLCommandBuffer,
+                                          device: MTLDevice,
+                                          snapshot: Q3MetalFrameSnapshot,
+                                          sceneView: Q3MetalSceneView,
+                                          worldVertexBuffer: MTLBuffer,
+                                          worldIndexBuffer: MTLBuffer) {
+            guard Q3_PBREnvCubeLive() != 0,
+                  snapshot.worldCommandCount > 0,
+                  Q3MetalRenderer_IsWorldLoaded() != 0,
+                  let worldPipelineState,
+                  let worldFilterPipelineState,
+                  let worldDrawsPointer = Q3MetalRenderer_GetWorldAllDrawCommands() else {
+                return
+            }
+
+            let staticCube = ensurePBRStaticEnvCube()
+            // Authored skybox env assets, when available, are already the best
+            // IBL source. Live capture replaces only the non-map fallback
+            // cases (procedural grey or stock env/space1 fallback).
+            if pbrEnvCubeAuthoredMapSkybox { return }
+            guard let fallbackEnvCube = staticCube,
+                  let targets = ensureLivePBREnvCubeTargets(device: device,
+                                                            generation: snapshot.worldGeneration) else {
+                return
+            }
+
+            let drawCount = Int(Q3MetalRenderer_GetWorldAllDrawCommandCount())
+            guard drawCount > 0 else { return }
+
+            let bootstrapping = pbrLiveEnvFacesValidMask != Self.livePBREnvCubeCompleteMask
+            pbrLiveEnvFrameCounter &+= 1
+            if !bootstrapping && (pbrLiveEnvFrameCounter % Self.livePBREnvCubeRefreshInterval) != 0 {
+                return
+            }
+
+            let face = max(0, min(5, pbrLiveEnvNextFace))
+            let pass = MTLRenderPassDescriptor()
+            pass.colorAttachments[0].texture = targets.color
+            pass.colorAttachments[0].slice = face
+            pass.colorAttachments[0].level = 0
+            pass.colorAttachments[0].loadAction = .clear
+            pass.colorAttachments[0].storeAction = .store
+            pass.colorAttachments[0].clearColor = MTLClearColor(red: Double(snapshot.clearColor.0),
+                                                                 green: Double(snapshot.clearColor.1),
+                                                                 blue: Double(snapshot.clearColor.2),
+                                                                 alpha: 1.0)
+            pass.depthAttachment.texture = targets.depth
+            pass.depthAttachment.loadAction = .clear
+            pass.depthAttachment.storeAction = .dontCare
+            pass.depthAttachment.clearDepth = 1.0
+
+            guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else { return }
+            encoder.label = "Q3.pbr.envcube.live.face\(face)"
+            let size = Self.livePBREnvCubeSize
+            encoder.setViewport(MTLViewport(originX: 0,
+                                            originY: 0,
+                                            width: Double(size),
+                                            height: Double(size),
+                                            znear: 0,
+                                            zfar: 1))
+            encoder.setScissorRect(MTLScissorRect(x: 0, y: 0, width: size, height: size))
+            encoder.setFrontFacing(.clockwise)
+            encoder.setVertexBuffer(worldVertexBuffer, offset: 0, index: 0)
+
+            let origin = SIMD3<Float>(sceneView.viewOrigin.0,
+                                      sceneView.viewOrigin.1,
+                                      sceneView.viewOrigin.2)
+            let camera = livePBREnvCubeCamera(origin: origin, face: face)
+            var worldUniforms = makeWorldUniforms(camera: camera, device: device)
+            encoder.setVertexBytes(&worldUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
+            encoder.setFragmentBytes(&worldUniforms, length: MemoryLayout<WorldUniforms>.stride, index: 1)
+            encoder.setFragmentSamplerState(worldSamplerState, index: 0)
+            encoder.setFragmentSamplerState(ensurePBREnvSampler(), index: 1)
+            encoder.setFragmentTexture(fallbackEnvCube, index: 3)
+            encoder.setFragmentTexture(pbrFlatNormalDefault(), index: 2)
+            encoder.setFragmentTexture(pbrRoughnessDefault(), index: 4)
+            encoder.setFragmentTexture(pbrMetallicDefault(), index: 5)
+            encoder.setFragmentTexture(pbrEmissiveDefault(), index: 6)
+            encoder.setFragmentTexture(pbrEmissiveDefault(), index: 7)
+            encoder.setFragmentTexture(nil, index: 8)
+            encoder.setFragmentTexture(pbrEmissiveDefault(), index: 9)
+            Self.bindDlightBlock(snapshot: snapshot, encoder: encoder, device: device, index: 2, extra: currentBakedDlights())
+
+            let worldDraws = UnsafeBufferPointer(start: worldDrawsPointer, count: drawCount)
+            let skyFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
+            let fogOnlyBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY)
+            let portalBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_PORTAL)
+            let combinedLightmapBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_COMBINED_LIGHTMAP)
+            let timeSeconds = snapshot.shaderTime
+            var pbrWorldParams = SIMD4<Float>(0, 0, 0, 0)
+            encoder.setFragmentBytes(&pbrWorldParams, length: 16, index: 3)
+
+            for worldPass in [0, 1] {
+                for draw in worldDraws {
+                    guard draw.indexCount > 0,
+                          (draw.flags & (fogOnlyBit | portalBit)) == 0 else {
+                        continue
+                    }
+
+                    if (draw.flags & skyFlagBit) != 0 {
+                        guard worldPass == 0,
+                              let skyPipelineState,
+                              let skyDepthStencilState else { continue }
+                        let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+                        guard stageCount > 0 else { continue }
+                        let stage = Self.worldStage(draw, 0)
+                        guard Self.worldBlendClass(for: stage) == 0,
+                              let skyTexture = texture(for: stage.textureHandle, device: device) else { continue }
+                        encoder.setRenderPipelineState(skyPipelineState)
+                        encoder.setDepthStencilState(skyDepthStencilState)
+                        encoder.setCullMode(Self.metalCullMode(for: stage.cullMode))
+                        var skyUniforms = makeWorldDrawUniforms(draw: draw,
+                                                                stage: stage,
+                                                                timeSeconds: timeSeconds,
+                                                                combinedLightmapBit: combinedLightmapBit,
+                                                                forcePortalSample: false,
+                                                                renderSize: SIMD2<Float>(0, 0))
+                        skyUniforms.debugMode = 0
+                        skyUniforms.forceWhiteVertColor = 0
+                        skyUniforms.alphaTestThreshold = 0
+                        encoder.setFragmentTexture(skyTexture, index: 0)
+                        encoder.setFragmentBytes(&skyUniforms,
+                                                 length: MemoryLayout<WorldDrawUniforms>.stride,
+                                                 index: 0)
+                        encoder.setVertexBytes(&skyUniforms,
+                                               length: MemoryLayout<WorldDrawUniforms>.stride,
+                                               index: 2)
+                        encoder.drawIndexedPrimitives(type: .triangle,
+                                                      indexCount: Int(draw.indexCount),
+                                                      indexType: .uint32,
+                                                      indexBuffer: worldIndexBuffer,
+                                                      indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride)
+                        continue
+                    }
+
+                    let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+                    guard stageCount > 0 else { continue }
+                    for stageIndex in 0..<stageCount {
+                        let stage = Self.worldStage(draw, stageIndex)
+                        guard Self.worldRenderPass(for: stage) == worldPass,
+                              let baseTexture = texture(for: stage.textureHandle, device: device),
+                              let lightmapTexture = texture(for: draw.lightmapTextureHandle, device: device) else {
+                            continue
+                        }
+
+                        if worldPass == 1 {
+                            encoder.setRenderPipelineState(worldFilterPipelineState)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: device))
+                        } else {
+                            encoder.setRenderPipelineState(worldPipelineState)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: device))
+                        }
+                        encoder.setCullMode(Self.metalCullMode(for: stage.cullMode))
+                        encoder.setFragmentTexture(baseTexture, index: 0)
+                        encoder.setFragmentTexture(lightmapTexture, index: 1)
+
+                        var drawUniforms = makeWorldDrawUniforms(draw: draw,
+                                                                  stage: stage,
+                                                                  timeSeconds: timeSeconds,
+                                                                  combinedLightmapBit: combinedLightmapBit,
+                                                                  forcePortalSample: false,
+                                                                  renderSize: SIMD2<Float>(0, 0))
+                        drawUniforms.debugMode = 0
+                        drawUniforms.emissiveParams = SIMD4<Float>(1, 1, 1, 0)
+                        drawUniforms.parallaxParams = SIMD4<Float>(0, 0, 0, 0)
+                        encoder.setFragmentBytes(&drawUniforms,
+                                                 length: MemoryLayout<WorldDrawUniforms>.stride,
+                                                 index: 0)
+                        encoder.setVertexBytes(&drawUniforms,
+                                               length: MemoryLayout<WorldDrawUniforms>.stride,
+                                               index: 2)
+                        encoder.drawIndexedPrimitives(type: .triangle,
+                                                      indexCount: Int(draw.indexCount),
+                                                      indexType: .uint32,
+                                                      indexBuffer: worldIndexBuffer,
+                                                      indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride)
+                    }
+                }
+            }
+            encoder.endEncoding()
+
+            if let blit = commandBuffer.makeBlitCommandEncoder() {
+                blit.label = "Q3.pbr.envcube.live.mips"
+                blit.generateMipmaps(for: targets.color)
+                blit.endEncoding()
+            }
+
+            pbrLiveEnvFacesValidMask |= UInt8(1 << face)
+            pbrLiveEnvNextFace = (face + 1) % 6
+            if pbrLiveEnvFacesValidMask == Self.livePBREnvCubeCompleteMask,
+               !pbrLiveEnvLoggedActive {
+                pbrLiveEnvLoggedActive = true
+                let msg = "[Q3-PBR-IBL] live envcube active size=\(size)x\(size) refresh=bootstrap-6faces-then-one-face-every-\(Self.livePBREnvCubeRefreshInterval)-frames"
+                print(msg)
+                pbrLog(msg)
+            }
         }
 
         /// Phase 6 — env-cube sampler. Always `.clampToEdge` on all axes to
@@ -10762,6 +11077,20 @@ struct MetalView: UIViewRepresentable {
                 }
             }
             rtPortalMaterialExclusionActive = portalRenderActive
+
+            if let device = view.device,
+               snapshot.worldCommandCount > 0,
+               let sceneViewForEnvCube = Q3MetalRenderer_GetSceneView()?.pointee,
+               let liveWorldVertexBuffer = uploadWorldBuffers(device: device,
+                                                               generation: snapshot.worldGeneration),
+               let liveWorldIndexBuffer = worldIndexBuffer {
+                updateLivePBREnvCube(commandBuffer: commandBuffer,
+                                     device: device,
+                                     snapshot: snapshot,
+                                     sceneView: sceneViewForEnvCube,
+                                     worldVertexBuffer: liveWorldVertexBuffer,
+                                     worldIndexBuffer: liveWorldIndexBuffer)
+            }
 
             attachRTPerfSamples(to: descriptor, frame: rtPerfFrame, start: .rasterStart, end: .rasterEnd)
             guard var encoder = commandBuffer.makeRenderCommandEncoder(descriptor: descriptor) else {
