@@ -4218,6 +4218,7 @@ struct MetalView: UIViewRepresentable {
         private var rtEmissiveLightCandidateCount: Int = 0
         private var rtEmissiveLightDroppedCount: Int = 0
         private var rtEmissiveNEELogSignature: String = ""
+        private var rtEmissiveAuditLogSignature: String = ""
 
         private struct RTEmissiveLightGPU {
             var p0Area: SIMD4<Float>       // xyz = p0, w = triangle area
@@ -5785,6 +5786,16 @@ struct MetalView: UIViewRepresentable {
             catch { print("[RT] accumulate pipeline state error: \(error)"); return nil }
         }
 
+        private static let rtEmissiveCompressionExponent: Float = 0.45
+
+        private static func mappedRTEmissiveIntensityBase(_ authored: Float, maxEV: Float) -> Float {
+            let legacy = min(max(authored, 1.0), 16.0)
+            guard authored > 16.0, maxEV > 0.0 else { return legacy }
+            let compressed = 16.0 * pow(max(authored, 1.0) / 16.0, rtEmissiveCompressionExponent)
+            let ceiling = 16.0 * pow(2.0, max(0.0, min(maxEV, 8.0)))
+            return min(max(compressed, legacy), ceiling)
+        }
+
         @MainActor
         private func buildRTPrimitiveMaterials(device: MTLDevice,
                                                primitiveCount: Int,
@@ -5861,9 +5872,33 @@ struct MetalView: UIViewRepresentable {
             struct EmissiveCandidate {
                 let light: RTEmissiveLightGPU
                 let score: Float
+                let materialHandle: UInt32
+                let area: Float
+            }
+
+            struct EmissiveAuditRow {
+                var name: String
+                var authored: Float
+                var legacy: Float
+                var mapped: Float
+                var scale: Float
+                var direct: Float
+                var sampleTexture: Bool
+                var radianceScale: Float
+                var avg: SIMD3<Float>
+                var radiance: SIMD3<Float>
+                var draws: Int
+                var triangles: Int
+                var candidateTriangles: Int
+                var selectedTriangles: Int
+                var candidateArea: Float
+                var selectedArea: Float
+                var score: Float
+                var selectedScore: Float
             }
 
             var emissiveCandidates: [EmissiveCandidate] = []
+            var emissiveAuditRows: [UInt32: EmissiveAuditRow] = [:]
 
             func worldPos(_ vertex: Q3MetalWorldVertex) -> SIMD3<Float> {
                 SIMD3<Float>(vertex.position.0, vertex.position.1, vertex.position.2)
@@ -5874,6 +5909,7 @@ struct MetalView: UIViewRepresentable {
             }
 
             func appendEmissiveCandidate(tri: Int,
+                                         materialHandle: UInt32,
                                          radiance: SIMD3<Float>,
                                          sampleTexture: Bool) {
                 guard radiance.x > 0 || radiance.y > 0 || radiance.z > 0,
@@ -5916,7 +5952,16 @@ struct MetalView: UIViewRepresentable {
                     // texture at the chosen triangle UV; abs(luma) is still
                     // available for diagnostics if needed.
                     colorIntensity: SIMD4<Float>(radiance.x, radiance.y, radiance.z, sampleTexture ? -luma : luma))
-                emissiveCandidates.append(EmissiveCandidate(light: light, score: score))
+                emissiveCandidates.append(EmissiveCandidate(light: light,
+                                                            score: score,
+                                                            materialHandle: materialHandle,
+                                                            area: area))
+                if var row = emissiveAuditRows[materialHandle] {
+                    row.candidateTriangles += 1
+                    row.candidateArea += area
+                    row.score += score
+                    emissiveAuditRows[materialHandle] = row
+                }
             }
 
             /* Pick the 16 most important handles by covered triangle count,
@@ -6005,6 +6050,10 @@ struct MetalView: UIViewRepresentable {
                 var rtEmissiveNEERadianceScale: Float = 1.0
                 var rtEmissiveNEESamplesTexture = false
                 var rtEmissiveNEEAverage = SIMD3<Float>(1, 1, 1)
+                let rtEmissiveMaxEV = Q3_RTEmissiveMaxEV()
+                var rtAuthoredEmissiveRaw: Float = 0.0
+                var rtLegacyEmissiveIntensity: Float = 0.0
+                var rtMappedEmissiveIntensity: Float = 0.0
                 // logEnabled: false — this 30 Hz RT prepass runs before any
                 // draw and was poisoning the one-shot world-atlas log with
                 // atlasTime=0.000 entries (dedup set is shared).
@@ -6046,10 +6095,15 @@ struct MetalView: UIViewRepresentable {
                              * constant fallback; broad invisible intensity-only
                              * records otherwise dominate the 64-light cap. */
                             rtEmissiveNEERadianceScale = hasCanonicalEmissiveMap ? 1.0 : 0.05
-                            // /16 clamp tames RTX's huge HDR values (up to 982);
-                            // the master scale + r_rt_exposure/r_rt_bloom tune the
-                            // final on-screen brightness through the ACES tonemap.
-                            rtEmissiveIntensity = min(max(authored, 1.0), 16.0) * rtEmissiveScale
+                            rtAuthoredEmissiveRaw = authored
+                            rtLegacyEmissiveIntensity = min(max(authored, 1.0), 16.0)
+                            rtMappedEmissiveIntensity = Self.mappedRTEmissiveIntensityBase(authored, maxEV: rtEmissiveMaxEV)
+                            // Stage27: preserve the old authored ordering below
+                            // 16, then compress high Remix radiance instead of
+                            // crushing every strong emitter to one flat value.
+                            // Set r_rt_emissive_maxev 0 to reproduce the former
+                            // hard min(max(authored,1),16) ceiling exactly.
+                            rtEmissiveIntensity = rtMappedEmissiveIntensity * rtEmissiveScale
                             if m.has_emissive_color != 0 {
                                 rtEmissiveTintMode = SIMD4<Float>(m.emissive_color_r, m.emissive_color_g, m.emissive_color_b, 1)
                             } else {
@@ -6062,6 +6116,30 @@ struct MetalView: UIViewRepresentable {
                     rtEmissiveTintMode.x,
                     rtEmissiveTintMode.y,
                     rtEmissiveTintMode.z) * rtEmissiveIntensity * rtEmissiveNEERadianceScale * rtEmissiveNEEAverage
+                if rtAuthoredEmissiveForNEE {
+                    let name = textureNameForLog(materialHandle)
+                    let triCountForAudit = Int(draw.indexCount / 3)
+                    let row = emissiveAuditRows[materialHandle]
+                    emissiveAuditRows[materialHandle] = EmissiveAuditRow(
+                        name: row?.name ?? name,
+                        authored: max(row?.authored ?? 0.0, rtAuthoredEmissiveRaw),
+                        legacy: max(row?.legacy ?? 0.0, rtLegacyEmissiveIntensity),
+                        mapped: max(row?.mapped ?? 0.0, rtMappedEmissiveIntensity),
+                        scale: rtEmissiveScale,
+                        direct: max(row?.direct ?? 0.0, rtEmissiveIntensity),
+                        sampleTexture: (row?.sampleTexture ?? false) || rtEmissiveNEESamplesTexture,
+                        radianceScale: rtEmissiveNEERadianceScale,
+                        avg: rtEmissiveNEEAverage,
+                        radiance: rtEmissiveRadiance,
+                        draws: (row?.draws ?? 0) + 1,
+                        triangles: (row?.triangles ?? 0) + triCountForAudit,
+                        candidateTriangles: row?.candidateTriangles ?? 0,
+                        selectedTriangles: row?.selectedTriangles ?? 0,
+                        candidateArea: row?.candidateArea ?? 0.0,
+                        selectedArea: row?.selectedArea ?? 0.0,
+                        score: row?.score ?? 0.0,
+                        selectedScore: row?.selectedScore ?? 0.0)
+                }
                 let firstTri = Int(draw.firstIndex / 3)
                 let triCount = Int(draw.indexCount / 3)
                 guard firstTri < primitiveCount else { continue }
@@ -6100,6 +6178,7 @@ struct MetalView: UIViewRepresentable {
                             emissiveTintMode: rtEmissiveTintMode)
                         if rtAuthoredEmissiveForNEE {
                             appendEmissiveCandidate(tri: tri,
+                                                    materialHandle: materialHandle,
                                                     radiance: rtEmissiveRadiance,
                                                     sampleTexture: rtEmissiveNEESamplesTexture)
                         }
@@ -6115,7 +6194,16 @@ struct MetalView: UIViewRepresentable {
                 if $0.score != $1.score { return $0.score > $1.score }
                 return $0.light.edge2Primitive.w < $1.light.edge2Primitive.w
             }
-            let cappedEmissive = Array(sortedEmissive.prefix(rtMaxEmissiveLights).map { $0.light })
+            let selectedEmissive = Array(sortedEmissive.prefix(rtMaxEmissiveLights))
+            for c in selectedEmissive {
+                if var row = emissiveAuditRows[c.materialHandle] {
+                    row.selectedTriangles += 1
+                    row.selectedArea += c.area
+                    row.selectedScore += c.score
+                    emissiveAuditRows[c.materialHandle] = row
+                }
+            }
+            let cappedEmissive = selectedEmissive.map { $0.light }
             let droppedEmissive = max(0, emissiveCandidates.count - cappedEmissive.count)
             rtEmissiveLightsCPU = cappedEmissive
             rtEmissiveLightCount = cappedEmissive.count
@@ -6134,6 +6222,23 @@ struct MetalView: UIViewRepresentable {
                 rtEmissiveLightCache[sigForEmissiveCache] = emissiveCache
             }
             _ = ensureRTEmissiveLightBuffer(device: device, mapName: emissiveMap)
+            if !emissiveAuditRows.isEmpty {
+                let auditSig = "\(emissiveMap):\(String(format: "%.3f", Double(Q3_RTEmissive()))):\(String(format: "%.3f", Double(Q3_RTEmissiveMaxEV()))):\(emissiveAuditRows.count):\(emissiveCandidates.count):\(rtEmissiveLightCount)"
+                if auditSig != rtEmissiveAuditLogSignature {
+                    rtEmissiveAuditLogSignature = auditSig
+                    let rows = emissiveAuditRows.sorted {
+                        if $0.value.authored != $1.value.authored { return $0.value.authored > $1.value.authored }
+                        return $0.value.name < $1.value.name
+                    }
+                    let exponent = Self.rtEmissiveCompressionExponent
+                    print("[RT-EMISSIVE-AUDIT] map=\(emissiveMap) scale=\(String(format: "%.3f", Double(Q3_RTEmissive()))) maxEV=\(String(format: "%.3f", Double(Q3_RTEmissiveMaxEV()))) exponent=\(String(format: "%.3f", Double(exponent))) rows=\(rows.count) candidates=\(emissiveCandidates.count) selected=\(rtEmissiveLightCount) feeds=direct:materialParams.x neeWeight:luma*area neeRadiance:materialParams.x_or_cachedRadiance")
+                    for (handle, row) in rows {
+                        let luma = max(simd_dot(row.radiance, SIMD3<Float>(0.2126, 0.7152, 0.0722)), 0.0)
+                        let binding = row.authored > 16.0 && row.legacy >= 16.0
+                        print("[RT-EMISSIVE-AUDIT] handle=\(handle) name='\(row.name)' authored=\(String(format: "%.3f", Double(row.authored))) legacyClamp=\(String(format: "%.3f", Double(row.legacy))) mappedBase=\(String(format: "%.3f", Double(row.mapped))) directIntensity=\(String(format: "%.3f", Double(row.direct))) binding=\(binding ? 1 : 0) sampleTexture=\(row.sampleTexture ? 1 : 0) avg=(\(String(format: "%.3f", Double(row.avg.x))),\(String(format: "%.3f", Double(row.avg.y))),\(String(format: "%.3f", Double(row.avg.z)))) neeRadianceLuma=\(String(format: "%.3f", Double(luma))) draws=\(row.draws) tris=\(row.triangles) candidates=\(row.candidateTriangles) selected=\(row.selectedTriangles) candArea=\(String(format: "%.2f", Double(row.candidateArea))) selArea=\(String(format: "%.2f", Double(row.selectedArea)))")
+                    }
+                }
+            }
             if log {
                 var lightmapFallbacks = 0
                 for i in 0..<primitiveCount {
@@ -6173,6 +6278,7 @@ struct MetalView: UIViewRepresentable {
             }
             mixScaled(Q3_PBREmissiveIntensityMax(), clamp: 16_000)
             mixScaled(Q3_RTEmissive(), clamp: 16_000)
+            mixScaled(Q3_RTEmissiveMaxEV(), clamp: 8_000)
             mix(UInt64(Q3_PBRBakedLightmaps() != 0 ? 1 : 0))
             let fogOnlyBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY)
             let skyFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)

@@ -268,9 +268,10 @@ float Q3_RTBloomThreshold(void);
 float Q3_RTBloomRadius(void);
 /* Master scale for authored emissive (materials.json emissive_intensity) fed
  * into the RT HDR color. Default 1 = authored emissive-mask DDS active; 0 =
- * legacy albedo*0.8 fake. Intensity is (clamped /16) * scale, so emissive
- * surfaces cross the bloom threshold. */
+ * legacy albedo*0.8 fake. Stage27 maps authored HDR values with a compressive
+ * curve before this scale; r_rt_emissive_maxev 0 restores the old hard clamp. */
 float Q3_RTEmissive(void);
+float Q3_RTEmissiveMaxEV(void);
 /* Stage24 emissive area-light NEE. Default 0/off; when enabled the RT kernel
  * samples one emissive triangle per primary opaque hit and casts one shadow
  * ray toward it. */
