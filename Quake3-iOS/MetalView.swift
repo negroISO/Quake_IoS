@@ -7530,6 +7530,7 @@ struct MetalView: UIViewRepresentable {
             return uniforms
         }
 
+        @MainActor
         private func encodePortalWorldPass(commandBuffer: MTLCommandBuffer,
                                            device: MTLDevice,
                                            snapshot: Q3MetalFrameSnapshot,
@@ -7538,6 +7539,7 @@ struct MetalView: UIViewRepresentable {
                                            depthTexture: MTLTexture,
                                            worldVertexBuffer: MTLBuffer,
                                            worldIndexBuffer: MTLBuffer,
+                                           frameSlot: Int,
                                            sunShadowTexture: MTLTexture?,
                                            sunShadowMatrix: simd_float4x4) -> Bool {
             guard let worldPipelineState,
@@ -7681,6 +7683,35 @@ struct MetalView: UIViewRepresentable {
                     encoded += 1
                 }
             }
+            if snapshot.entityCommandCount > 0 {
+                var portalEntityFirst = 0
+                var portalEntityCount = Int(snapshot.entityCommandCount)
+                if snapshot.sceneCount > 0, let scenesPtr = Q3MetalRenderer_GetSceneSnapshots() {
+                    let mainScene = UnsafeBufferPointer(start: scenesPtr, count: 1)[0]
+                    portalEntityFirst = Int(mainScene.entityCommandFirst)
+                    portalEntityCount = Int(mainScene.entityCommandCount)
+                }
+                let entityViewProjection = makeWorldViewProjection(origin: camera.origin,
+                                                                   axis0: camera.axis0,
+                                                                   axis1: camera.axis1,
+                                                                   axis2: camera.axis2,
+                                                                   fovX: camera.fovX,
+                                                                   fovY: camera.fovY)
+                encodeEntityDrawRange(encoder: encoder,
+                                      device: device,
+                                      snapshot: snapshot,
+                                      frameSlot: frameSlot,
+                                      entityDrawFirst: portalEntityFirst,
+                                      entityDrawCount: portalEntityCount,
+                                      viewProjection: entityViewProjection,
+                                      cameraPos: camera.origin,
+                                      cameraForward: camera.axis0,
+                                      renderW: colorTexture.width,
+                                      renderH: colorTexture.height,
+                                      skipThirdPerson: false,
+                                      allowDepthHack: false)
+            }
+
             encoder.endEncoding()
             return encoded > 0
         }
@@ -9688,6 +9719,499 @@ struct MetalView: UIViewRepresentable {
         }
 
         @MainActor
+        private func encodeEntityDrawRange(encoder: MTLRenderCommandEncoder,
+                                           device: MTLDevice,
+                                           snapshot: Q3MetalFrameSnapshot,
+                                           frameSlot: Int,
+                                           entityDrawFirst: Int,
+                                           entityDrawCount: Int,
+                                           viewProjection: simd_float4x4,
+                                           cameraPos entityCameraPos: SIMD3<Float>,
+                                           cameraForward entityCameraForward: SIMD3<Float>,
+                                           renderW: Int,
+                                           renderH: Int,
+                                           skipThirdPerson: Bool,
+                                           allowDepthHack: Bool) {
+            guard entityDrawCount > 0,
+                  let entityPipelineState,
+                  let entityBuffers = uploadEntityBuffers(device: device, slot: frameSlot) else {
+                return
+            }
+                let entityVertexBuffer = entityBuffers.vertexBuffer
+                let entityIndexBuffer = entityBuffers.indexBuffer
+                let entityViewProjection = viewProjection
+                let cameraPos = entityCameraPos
+                let cameraForward = entityCameraForward
+                let entityTimeSeconds = Float(CACurrentMediaTime() - frameTimeOrigin)
+                var entityUniforms = EntityUniforms(viewProjection: entityViewProjection, cameraPos: cameraPos, tcGen: 0, timeSeconds: entityTimeSeconds)
+                populateEntitySun(&entityUniforms)
+                entityUniforms.cameraForward = cameraForward
+                encoder.setRenderPipelineState(entityPipelineState)
+                encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: device))
+                encoder.setFrontFacing(.clockwise)
+                encoder.setCullMode(.none)
+                encoder.setVertexBuffer(entityVertexBuffer, offset: 0, index: 0)
+                encoder.setVertexBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
+                encoder.setFragmentBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
+                // Q3 per-stage wrap routing — sampler is bound per-draw
+                // inside the loop below based on the new
+                // Q3_METAL_ENTITY_DRAWFLAG_CLAMPMAP bit (sourced from the
+                // Q3 .shader `clampmap` vs `map` directive). World samp
+                // (.repeat) is the default for `map` stages (quad damage
+                // breathing field, scrolling chrome shells); ui samp
+                // (.clampToEdge) for `clampmap` stages (dlight projection
+                // discs, HUD pics). Seed with repeat — the prior
+                // single-bind-clampToEdge here killed the quad shell.
+                encoder.setFragmentSamplerState(worldSamplerState, index: 0)
+                var entityLastSamplerWasClamp: Bool = false
+                /* RF_DEPTHHACK / first-person weapon depth range.
+                 *
+                 * Q3's GL backend calls glDepthRange(0, 0.3) for depth-hack
+                 * entities. Keeping only `.lessEqual` without the depth-range
+                 * compression lets stored world depth occlude the viewmodel
+                 * after the RT preserve path ends/reopens the render encoder.
+                 * Use Metal's viewport z range per draw so self-occlusion is
+                 * preserved while the weapon projects into the near depth
+                 * slice, then restore 0..1 for normal entities/flares/UI. */
+                var entityDepthRangeHackActive = false
+                func setEntityDepthRangeHack(_ active: Bool) {
+                    guard entityDepthRangeHackActive != active else { return }
+                    entityDepthRangeHackActive = active
+                    encoder.setViewport(MTLViewport(originX: 0, originY: 0,
+                                                    width: Double(renderW),
+                                                    height: Double(renderH),
+                                                    znear: 0.0,
+                                                    zfar: active ? 0.3 : 1.0))
+                }
+
+                // Dlights for entities (viewmodel, players, pickups lit by
+                // nearby muzzle flash / rocket glow). Same block as world pass.
+                Self.bindDlightBlock(snapshot: snapshot, encoder: encoder, device: device, index: 2, extra: currentBakedDlights())
+
+                if let entityDrawsPointer = Q3MetalRenderer_GetEntityDrawCommands() {
+                    let totalEntityDraws = Int(snapshot.entityCommandCount)
+                    guard totalEntityDraws > 0 else { return }
+                    let allEntityDraws = UnsafeBufferPointer(start: entityDrawsPointer, count: totalEntityDraws)
+                    let first = max(0, min(entityDrawFirst, totalEntityDraws))
+                    let requestedEnd = first + max(0, entityDrawCount)
+                    let end = min(totalEntityDraws, max(first, requestedEnd))
+                    guard first < end else { return }
+                    let depthHackBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_DEPTHHACK)
+                    let thirdPersonBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_THIRD_PERSON)
+                    let additiveBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE)
+                    let additiveFullBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE_FULL)
+                    let alphaBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ALPHA)
+                    let filterBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_FILTER)
+                    let subtractBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_SUBTRACT)
+                    let tcGenEnvBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_TCGEN_ENV)
+                    let scenePolyBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_SCENE_POLY)
+                    let aTestGT0Bit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ATEST_GT0)
+                    let rtPreserveDepthHackAlways = Q3_RTMix() > 0 && Q3_RTPreserveEntities() != 0
+                    // P0.2: hoisted once per frame — feeds
+                    // entityUniforms.viewmodelParams.z per draw below.
+                    let rtDebugEntityMaskActive = Q3_RTDebugEntityMask() != 0
+
+                    // Ordered entity passes:
+                    // 0 = opaque, 1 = filter, 2 = alpha,
+                    // 3 = additive (GL_SRC_ALPHA/GL_ONE — alpha-modulated),
+                    // 4 = subtract (blood/bullet/shadow decals),
+                    // 5 = additive-full (GL_ONE/GL_ONE — explosion cores).
+                    for entityPass in 0..<6 {
+                    for drawIdx in first..<end {
+                        let draw = allEntityDraws[drawIdx]
+                        guard draw.indexCount > 0 else { continue }
+                        if skipThirdPerson && (draw.flags & thirdPersonBit) != 0 { continue }
+                        let isEntityAdditive = (draw.flags & additiveBit) != 0
+                        let isEntityAdditiveFull = (draw.flags & additiveFullBit) != 0
+                        let isEntityAlpha = (draw.flags & alphaBit) != 0
+                        let isEntityFilter = (draw.flags & filterBit) != 0
+                        let isEntitySubtract = (draw.flags & subtractBit) != 0
+                        let drawPass = isEntityAdditiveFull ? 5
+                                     : isEntitySubtract ? 4
+                                     : isEntityAdditive ? 3
+                                     : isEntityAlpha ? 2
+                                     : isEntityFilter ? 1
+                                     : 0
+                        guard drawPass == entityPass else { continue }
+                        guard let texture = texture(for: draw.textureHandle, device: device) else {
+                            continue
+                        }
+                        let wantsDepthHack = (draw.flags & depthHackBit) != 0
+                        if !allowDepthHack && wantsDepthHack { continue }
+                        setEntityDepthRangeHack(wantsDepthHack)
+                        // Per-draw tcGen flag — rebind EntityUniforms so the
+                        // fragment shader picks up the current reflection-map
+                        // switch. Default is 0 (mesh ST). Quad shell, regen,
+                        // battlesuit carry TCGEN_ENV, sharing a viewProjection
+                        // and cameraPos with the base entity pass.
+                        entityUniforms.tcGen = (draw.flags & tcGenEnvBit) != 0 ? 1.0 : 0.0
+                        Self.packEntityTcMods(handle: draw.textureHandle, into: &entityUniforms)
+                        Self.packEntityAlphaFunc(handle: draw.textureHandle, into: &entityUniforms)
+                        Self.packEntityRgbGen(handle: draw.textureHandle, into: &entityUniforms)
+                        /* deformVertexes wave (shell shaders: quad, quadWeapon,
+                         * regen, battlesuit). Per-draw because each customShader
+                         * carries its own div/base/amp. */
+                        Self.packEntityDeform(handle: draw.textureHandle, into: &entityUniforms)
+                        // Reset to (0,0,0,0) before packing so a previous
+                        // atlas draw doesn't bleed into a non-atlas one
+                        // sharing the same uniform buffer across the loop.
+                        entityUniforms.spriteAtlasParams = SIMD4<Float>(0, 0, 0, 0)
+                        // packEntityAtlas writes spriteAtlasParams and returns
+                        // the atlas albedo texture when an indirect-name hit
+                        // landed (e.g. yellow health → envmapyel atlas DDS).
+                        // Caller binds this at fragment slot 0 in place of the
+                        // static 64×64 envmap .jpg so the MSL atlas sub-rect
+                        // remap actually has frames to sample.
+                        let entityAtlasAlbedoOverride = packEntityAtlas(handle: draw.textureHandle, into: &entityUniforms)
+                        /* Per-draw refEntity_t.shaderRGBA fed through to MSL
+                         * for rgbGen=entity / oneMinusEntity (5/6) and
+                         * alphaGen=entity / oneMinusEntity (5/6). */
+                        let ec = draw.entityColor
+                        entityUniforms.entityColor = SIMD4<Float>(ec.0, ec.1, ec.2, ec.3)
+                        entityUniforms.timeSeconds = draw.shaderTime
+                        entityUniforms.suppressDlights = (drawPass == 3 || drawPass == 5) ? 1 : 0
+                        /* Per TASK PART 3: no rgbGen/alphaGen override for
+                         * scene polys — the shader's resolved genMode
+                         * flows through verbatim from packEntityRgbGen. */
+                        let isScenePoly = (draw.flags & scenePolyBit) != 0
+                        entityUniforms.fogColorDistance = SIMD4<Float>(0, 0, 0, 0)
+                        entityUniforms.fogParams = SIMD4<Float>(0, 0, 0, 0)
+                        entityUniforms.fogSurface = SIMD4<Float>(0, 0, 0, 0)
+                        if draw.fogIndex != UInt32(Q3_METAL_NO_FOG) {
+                            let count = Q3MetalRenderer_GetWorldFogCount()
+                            if Int(draw.fogIndex) < count,
+                               let fogs = Q3MetalRenderer_GetWorldFogs() {
+                                let f = fogs.advanced(by: Int(draw.fogIndex)).pointee
+                                entityUniforms.fogColorDistance = SIMD4(f.color.0, f.color.1, f.color.2, f.distance)
+                                entityUniforms.fogParams = SIMD4(f.tcScale, f.hasSurface != 0 ? 1.0 : 0.0, 0, 0)
+                                entityUniforms.fogSurface = SIMD4(f.surface.0, f.surface.1, f.surface.2, f.surface.3)
+                            }
+                        }
+                        /* Implicit alphaFunc GT0 for sprite billboards whose
+                         * additive shader didn't declare alphaFunc. Matches
+                         * upstream Q3 intent: dark / transparent regions of
+                         * rlboom/plasma/flash JPEGs must not contribute to
+                         * GL_ONE/GL_ONE blending. Threshold 0.004 (GT0). */
+                        if (draw.flags & aTestGT0Bit) != 0,
+                           entityUniforms.alphaTestThreshold == 0 {
+                            entityUniforms.alphaTestThreshold = 0.004
+                        }
+                        encoder.setFragmentBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
+                        /* CRITICAL: also bind to the vertex stage. Before
+                         * this, entityUniforms was bound ONCE before the
+                         * loop (line ~3498) with the initial state where
+                         * deformWaveFunc=0, then per-draw updates from
+                         * packEntityDeform / packEntityTcMods / etc. only
+                         * pushed to setFragmentBytes. The vertex shader
+                         * kept reading the stale outside-loop uniforms —
+                         * so q3_entity_vertex's `if (uniforms.deformWaveFunc
+                         * != 0u)` outer guard always failed for chrome
+                         * shell entities (powerups/quadWeapon, regen,
+                         * battlesuit, battleWeapon, redflag, blueflag),
+                         * silently skipping the +base unit halo expansion.
+                         * Diagnosed via 10× multiplier producing zero
+                         * visible effect — proved the block never entered.
+                         * Fragment-only path was a footgun: tcGen env +
+                         * chrome appearance worked because those uniforms
+                         * are fragment-side; deformWave is vertex-side. */
+                        encoder.setVertexBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
+                        if drawPass == 5, let entityAdditiveFullPipelineState {
+                            /* GL_ONE/GL_ONE — NEVER shared with the alpha-
+                             * modulated additive pipeline per strict spec. */
+                            encoder.setRenderPipelineState(entityAdditiveFullPipelineState)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveLessDepthStencilState, device: device))
+                        } else if drawPass == 4, let entitySubtractPipelineState {
+                            encoder.setRenderPipelineState(entitySubtractPipelineState)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveEntityDepthStencilState, device: device))
+                        } else if drawPass == 3, let entityAdditivePipelineState {
+                            encoder.setRenderPipelineState(entityAdditivePipelineState)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveLessDepthStencilState, device: device))
+                        } else if drawPass == 2, let entityAlphaPipelineState {
+                            encoder.setRenderPipelineState(entityAlphaPipelineState)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveEntityDepthStencilState, device: device))
+                            // NOTE 2026-06-01: tried swapping to depthStencilState
+                            // (write=YES) so the fog volume could see alpha
+                            // entities. Symptom did exist (health/armor floating
+                            // above fog) but the fix had cross-pass side effects
+                            // — fog turned green, rocket-explosion brightness
+                            // dropped. The Q3.entity.alpha pipeline is shared
+                            // by multi-stage shaders where some stages also
+                            // route through additive blending; writing depth on
+                            // an alpha stage occluded subsequent additive stages
+                            // of the same entity. Proper fix requires per-stage
+                            // depth control (write depth only on the OPAQUE
+                            // base stage of multi-stage entity shaders, leave
+                            // additive overlay stages with write=NO). Defer.
+                        } else if drawPass == 1, let entityFilterPipelineState {
+                            encoder.setRenderPipelineState(entityFilterPipelineState)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveEntityDepthStencilState, device: device))
+                        } else {
+                            encoder.setRenderPipelineState(entityPipelineState)
+                            /* Scene polys never write depth regardless of
+                             * pass — emulates upstream Q3 decal
+                             * `polygonOffset` behaviour so decals can't
+                             * z-fight with the surface they sit on. */
+                            let state = isScenePoly ? additiveEntityDepthStencilState
+                                      : (wantsDepthHack ? depthHackDepthStencilState : depthStencilState)
+                            encoder.setDepthStencilState(ensuredDepthStencilState(state, device: device))
+                        }
+                        if rtPreserveDepthHackAlways, wantsDepthHack, let alwaysDepth = alwaysPassDepthStencilState {
+                            encoder.setDepthStencilState(alwaysDepth)
+                        }
+                        // PBR Phase 1: when q3_pbr_lookup_by_name matched
+                        // a Q3 shader (rocket / shotgun / bfg / etc.), the
+                        // C-side stamped pbrMaterial on the metalTexture
+                        // and we bind the HD DDS albedo here instead of
+                        // the original pak0 JPG-decoded texture. Falls
+                        // back to the original on miss / DDS-load fail.
+                        let q3Name = Q3MetalRenderer_GetTextureName(draw.textureHandle).map { String(cString: $0) } ?? "unknown"
+                        entityUniforms.forceLuminanceAlpha = Self.textureAlphaSynthesisMode(q3Name)
+                        let preferClassicFX = isEntityAdditive || isEntityAdditiveFull || isEntityAlpha || isScenePoly ||
+                                              entityUniforms.forceLuminanceAlpha != 0 ||
+                                              shouldPreferClassicTextureForAlphaFX(q3Name, isEntity: true)
+                        // Entity-side FX-stage sidecar promotion experiment
+                        // reverted 2026-06-12: enabling the world-path
+                        // useWorldPBR/classicFX combined return on entities
+                        // tanked frame time from 13.9 ms → 121 ms (72 fps → 8 fps)
+                        // on q3dm1, even after caching the Q3MetalRenderer_GetPBRMaterial
+                        // lookup Swift-side. The cost wasn't the lookup itself but
+                        // the per-draw pbrAlbedoTexture/pbrNormalTexture cache
+                        // probes that fire for every FX entity once the gate
+                        // promotes them. The plasammo chrome-clobbering bug is
+                        // still fixed by the packEntityAtlas hasAuthoredAlbedo
+                        // gate from earlier this session — that runs once per
+                        // (handle, atlas) lookup, not per draw. Full entity-side
+                        // PBR sidecar promotion needs either (a) cached per-handle
+                        // texture references in EntityFrameContext to skip the
+                        // dict probe, or (b) the per-frame texture cache promoted
+                        // to a flat array keyed by handle. Deferred.
+                        let pbrTex = preferClassicFX ? nil : pbrAlbedoTexture(for: draw.textureHandle)
+                        // 2026-06-10: emissiveParams must be written BEFORE the
+                        // setVertexBytes/setFragmentBytes upload, not after.
+                        // Previously assigned ~98 lines below, which meant the
+                        // GPU only ever saw the struct's default `(1,1,1,0)`
+                        // — the `.w == 0` MSL gate then skipped the emissive
+                        // accumulation on every entity draw, regardless of
+                        // material. Visible as flat/dark viewmodels with no
+                        // emissive glow even when the material had an
+                        // emissive map bound at fragment slot 6.
+                        entityUniforms.emissiveParams = emissiveParamsForPBRMaterial(handle: draw.textureHandle)
+                        // 2026-06-10: viewmodel-only base-color floor. .x is
+                        // the floor strength from `r_pbr_viewmodel_floor`
+                        // (CVAR_ARCHIVE, default 0.65). .y is the gate flag
+                        // (1.0 for RF_DEPTHHACK, 0.0 for world entities) so
+                        // the MSL `if (.y > 0.5)` runs only on first-person
+                        // weapons. World pickups, scene polys, and HUD heads
+                        // get (0,0,0,0) and skip the floor entirely.
+                        let vmFloor = Q3_PBRViewmodelFloor()
+                        // P0.2: .z doubles as the r_rt_debug_entity_mask
+                        // flag — q3_entity_fragment returns solid white
+                        // when it is > 0.5 (after alpha-test discards), to
+                        // visualize the entity coverage preserved over the
+                        // RT composite. Main-scene entity loop only; the
+                        // HUD/scoreboard sub-pass leaves viewmodelParams at
+                        // struct default (0,0,0,0) so it is never masked.
+                        entityUniforms.viewmodelParams = SIMD4<Float>(
+                            vmFloor,
+                            wantsDepthHack ? 1.0 : 0.0,
+                            rtDebugEntityMaskActive ? 1.0 : 0.0,
+                            // .w = world-entity readability floor (non-viewmodel
+                            // pickups) so full-metal items (RL/plasma/ammo/health,
+                            // metallic=1.0) don't go near-invisible under the dark
+                            // IBL cube. Viewmodels use .x instead.
+                            wantsDepthHack ? 0.0 : Q3_PBREntityFloor())
+                        if wantsDepthHack && !loggedViewmodelFloorOnce && vmFloor > 0.0 {
+                            loggedViewmodelFloorOnce = true
+                            pbrLog("[Q3-PBR-ENTITY] viewmodel floor enabled strength=\(String(format: "%.3f", vmFloor))")
+                        }
+                        // 2026-06-19: additive-stage brightness cap (RT mode only).
+                        // Chrome-envmap / explosion additive stages pass the
+                        // .lessEqual depth test (they ARE in front) but their bright
+                        // additive specular blooms and reads through dark RT walls.
+                        // Cap the per-fragment output for additive/additive-full
+                        // stages; non-additive draws and raster mode get a huge
+                        // value so the MSL `min()` is a no-op. Set explicitly every
+                        // draw so no stale cap bleeds into the next entity.
+                        let entityAdditiveStage = isEntityAdditive || isEntityAdditiveFull
+                        entityUniforms.additiveClampParams = SIMD4<Float>(
+                            (Q3_RTMix() > 0 && entityAdditiveStage) ? Q3_RTEntityAdditiveMax() : 1e9,
+                            0, 0, 0)
+                        encoder.setVertexBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
+                        encoder.setFragmentBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
+                        if (preferClassicFX || (draw.flags & aTestGT0Bit) != 0),
+                           loggedAlphaEffectTextures.insert(draw.textureHandle).inserted {
+                            var info = Q3MetalTextureInfo()
+                            _ = Q3MetalRenderer_GetTextureInfo(draw.textureHandle, &info)
+                            let pbrLabel = pbrTex?.label ?? "nil"
+                            let srcLabel = texture.label ?? "nil"
+                            logAlphaTextureDiagnostic("[ALPHA-TEX] handle=\(draw.textureHandle) name='\(q3Name)' pass=\(drawPass) flags=0x\(String(draw.flags, radix: 16)) alphaFunc=\(info.alphaFunc) rgbGen=\(info.rgbGen) alphaGen=\(info.alphaGen) forceLum=\(entityUniforms.forceLuminanceAlpha) classicFX=\(preferClassicFX ? 1 : 0) pbr='\(pbrLabel)' src='\(srcLabel)' size=\(info.width)x\(info.height)")
+                        }
+                        let baseEntityColor = preferClassicFX
+                            ? texture
+                            : entityBaseTextureForPBRDebug(handle: draw.textureHandle, fallback: texture)
+                        // Atlas override wins over the base color binding. When
+                        // packEntityAtlas resolved the indirect-name fallback,
+                        // it returned the atlas DDS; that's what slot 0 needs to
+                        // be, not the static 64×64 envmap source .jpg.
+                        let entityColorTexture = entityAtlasAlbedoOverride ?? baseEntityColor
+                        encoder.setFragmentTexture(entityColorTexture, index: 0)
+                        // PBR Phase 2 — bind normal map only for opaque PBR entity
+                        // base skins. Alpha/additive FX stages keep the original Q3
+                        // shader texture/alpha behaviour; a normal map on those
+                        // quads creates white blobs and bogus lighting.
+                        // Normal at index 1: never bind nil — Q3.entity pipeline
+                        // shader declares `normalTexture` as required, and an
+                        // unbound slot causes Metal API-validation warnings
+                        // (57/frame) plus undefined GPU reads on tcGen-env
+                        // entity draws (yellow/red health, quad shell). Fall
+                        // back to a 1×1 flat normal so the binding stays valid
+                        // while behaving as identity for PBR-off draws.
+                        let entityNormalTex = preferClassicFX
+                            ? pbrFlatNormalDefault()
+                            : (pbrNormalTexture(for: draw.textureHandle) ?? pbrFlatNormalDefault())
+                        encoder.setFragmentTexture(entityNormalTex, index: 1)
+                        // PBR Phase 4 — viewmodel-vs-world entity gating.
+                        // Viewmodels (RF_DEPTHHACK) get the wide
+                        // (0.6..1.2) range for prominent surface relief;
+                        // world entities (spinning pickups, dropped
+                        // weapons) get the tight (0.78..1.18) range to
+                        // avoid Mikkelsen TBN derivative instability on
+                        // rotating geometry.
+                        var pbrNormalScaleEntity: Float = wantsDepthHack ? 1.0 : 0.0
+                        encoder.setFragmentBytes(&pbrNormalScaleEntity, length: 4, index: 3)
+                        // PBR Phase F — rim params at buffer(4). Disable the
+                        // Fresnel rim for now: it reads as a white outline on
+                        // weapons/items with the current RTX/PBR assets.
+                        // 2026-06-10: viewmodels (RF_DEPTHHACK) get a small rim
+                        // intensity (0.25) so PBR-metal viewmodels get a visible
+                        // edge highlight without the white-outline overdrive that
+                        // killed it on world pickups. World entities keep 0.0 —
+                        // the rim term was causing white halos on tcGen-env
+                        // chrome items previously.
+                        let rimIntensity: Float = wantsDepthHack ? 0.25 : 0.0
+                        var pbrRimParamsEntity = SIMD2<Float>(rimIntensity, Q3_PBRRimFalloff())
+                        encoder.setFragmentBytes(&pbrRimParamsEntity, length: 8, index: 4)
+                        // PBR Phase 4 — Cook-Torrance specular textures.
+                        // Roughness at slot 3, metallic at slot 4. The
+                        // MSL fragment guards both with is_null_texture
+                        // so weapons without the maps (machinegun, etc.)
+                        // skip the specular block entirely. Currently
+                        // only the rocket launcher has both maps wired
+                        // in materials.json.
+                        // PBR Phase 5 A/B gate — when r_pbr_phase5=0, bind nil
+                        // for roughness + metallic so the MSL `hasFullPBR`
+                        // check falls through and the Cook-Torrance + Burley
+                        // direct-sun block is skipped. Pure v6 Fresnel rim
+                        // remains active. Note: this also disables Phase 6 IBL
+                        // (gated inside hasFullPBR) so a clean Phase 5 A/B
+                        // requires IBL stays on — but IBL is only PRESENT
+                        // inside hasFullPBR, so without Phase 5 there's no
+                        // hasFullPBR block to host IBL either. Two-axis A/B
+                        // (phase5 × ibl) needs both cvars: r_pbr_phase5=0
+                        // → no GGX peak, no IBL; r_pbr_ibl=0 → IBL replaced
+                        // by 0.35 ambient floor (Phase 5 GGX still fires).
+                        let phase5Enabled = Q3_PBRPhase5Enabled() != 0 && !preferClassicFX && pbrTex != nil
+                        // Roughness slot 3 + metallic slot 4: never nil.
+                        // Same reasoning as the normal slot above —
+                        // Q3.entity pipeline declares them, and unbound
+                        // slots produce Metal validation warnings plus
+                        // undefined reads. Fall back to the 1×1 default
+                        // constants so the binding is valid even when
+                        // phase5 is disabled.
+                        let entityRoughTex = phase5Enabled
+                            ? (pbrRoughnessTexture(for: draw.textureHandle) ?? pbrRoughnessDefault())
+                            : pbrRoughnessDefault()
+                        let entityMetalTex = phase5Enabled
+                            ? (pbrMetallicTexture(for: draw.textureHandle) ?? pbrMetallicDefault())
+                            : pbrMetallicDefault()
+                        encoder.setFragmentTexture(entityRoughTex, index: 3)
+                        encoder.setFragmentTexture(entityMetalTex, index: 4)
+                        // Phase 6 IBL — procedural env cubemap + dedicated
+                        // clampToEdge sampler. Bound nil-safe; MSL guards via
+                        // is_null_texture so a fail-to-alloc falls back to
+                        // Phase 5 ambient floor without crashing.
+                        // envCube at index 5 — always bind to procedural cube
+                        // even when IBL disabled. The MSL fragment branches on
+                        // its own IBL gate so the bound cube is unused, but the
+                        // pipeline slot stays valid for Metal validation.
+                        encoder.setFragmentTexture(ensurePBREnvCube(), index: 5)
+                        encoder.setFragmentSamplerState(ensurePBREnvSampler(), index: 1)
+                        // Emissive @ 6 for primary entity bind site. Always
+                        // bound — material's emissive DDS if present, zero
+                        // default otherwise. Pair with entityUniforms.
+                        // emissiveParams written below.
+                        let entityEmissiveTex = pbrEmissiveTexture(for: draw.textureHandle) ?? pbrEmissiveDefault()
+                        encoder.setFragmentTexture(entityEmissiveTex, index: 6)
+                        // (emissiveParams now assigned above, pre-upload — see comment near line 7541)
+                        // 2026-06-10: one-shot per-handle viewmodel PBR resolution log.
+                        // Surfaces what materials each first-person weapon resolves
+                        // to, dedup'd by handle. Fires only for wantsDepthHack draws
+                        // (RF_DEPTHHACK = viewmodel) so HUD/world-entity noise is
+                        // suppressed. Use to diagnose "viewmodel looks dark/flat":
+                        // if albedo/normal/roughness/metallic show "nil-default",
+                        // the material is missing from materials.json. If the
+                        // preferClassicFX flag is 1, an FX classifier rule is
+                        // forcing the viewmodel onto the non-PBR path.
+                        if wantsDepthHack,
+                           loggedViewmodelPBRHandles.insert(draw.textureHandle).inserted {
+                            let albedoSrc: String
+                            if preferClassicFX {
+                                albedoSrc = "classicFX-forced"
+                            } else if pbrTex != nil {
+                                albedoSrc = pbrTex?.label ?? "pbr"
+                            } else {
+                                albedoSrc = "nil-default(classic-q3-tex)"
+                            }
+                            let normalSrc = (!preferClassicFX && pbrNormalTexture(for: draw.textureHandle) != nil) ?
+                                (pbrNormalTexture(for: draw.textureHandle)?.label ?? "pbr") : "nil-default(flat)"
+                            let roughSrc = (phase5Enabled && pbrRoughnessTexture(for: draw.textureHandle) != nil) ?
+                                (pbrRoughnessTexture(for: draw.textureHandle)?.label ?? "pbr") : "nil-default(0.55)"
+                            let metalSrc = (phase5Enabled && pbrMetallicTexture(for: draw.textureHandle) != nil) ?
+                                (pbrMetallicTexture(for: draw.textureHandle)?.label ?? "pbr") : "nil-default(0.50)"
+                            let emissiveSrc = (pbrEmissiveTexture(for: draw.textureHandle) != nil) ?
+                                (pbrEmissiveTexture(for: draw.textureHandle)?.label ?? "pbr") : "nil-default(0,0,0)"
+                            pbrLog("[Q3-PBR-ENTITY] viewmodel handle=\(draw.textureHandle) name='\(q3Name)' albedo=\(albedoSrc) normal=\(normalSrc) roughness=\(roughSrc) metallic=\(metalSrc) emissive=\(emissiveSrc) phase5=\(phase5Enabled ? 1 : 0) preferClassicFX=\(preferClassicFX ? 1 : 0) envCubeBound=1")
+                        }
+                        // Per-draw sampler routing.
+                        //
+                        // Two ways to land on clampToEdge:
+                        //   1. Q3_METAL_ENTITY_DRAWFLAG_CLAMPMAP bit — set
+                        //      from the shader's `clampmap` directive via
+                        //      EntityFlagsForTexture → wrapClampMode.
+                        //   2. isScenePoly — force clamp for blast-marks /
+                        //      blood / shadow decals submitted via
+                        //      RE_AddPolyToScene. Q3 decal textures fade
+                        //      to alpha=0 at UV edges; with the world
+                        //      sampler's .repeat wrap, edge UVs (~0.99
+                        //      from the poly clip) sample from the
+                        //      opposite side of the texture (which has
+                        //      alpha=1 near the center), producing the
+                        //      "checkerboard square tile" artifact the
+                        //      user reported on rocket blasts. Decal
+                        //      shaders use `map` not `clampmap`, so the
+                        //      CLAMPMAP flag is off — but Q3's stock
+                        //      ref_gl behaviour is to clamp ALL scene
+                        //      polys regardless.
+                        let wantClamp = isScenePoly ||
+                            (draw.flags & UInt32(Q3_METAL_ENTITY_DRAWFLAG_CLAMPMAP)) != 0
+                        if wantClamp != entityLastSamplerWasClamp {
+                            encoder.setFragmentSamplerState(wantClamp ? uiSamplerState : worldSamplerState, index: 0)
+                            entityLastSamplerWasClamp = wantClamp
+                        }
+                        encoder.drawIndexedPrimitives(
+                            type: .triangle,
+                            indexCount: Int(draw.indexCount),
+                            indexType: .uint32,
+                            indexBuffer: entityIndexBuffer,
+                            indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride
+                        )
+                    }
+                    } // end entityPass loop
+                    setEntityDepthRangeHack(false)
+                }
+            }
+
+        @MainActor
         private func encodeHUDAndUIPasses(encoder: MTLRenderCommandEncoder,
                                           snapshot: Q3MetalFrameSnapshot,
                                           device: MTLDevice,
@@ -10111,6 +10635,7 @@ struct MetalView: UIViewRepresentable {
                                                            depthTexture: portalTargets.depth,
                                                            worldVertexBuffer: portalWorldBuffers.vertexBuffer,
                                                            worldIndexBuffer: portalWorldBuffers.indexBuffer,
+                                                           frameSlot: frameSlot,
                                                            sunShadowTexture: currentSunShadowTexture,
                                                            sunShadowMatrix: currentSunShadowMatrix)
                 if portalRenderActive {
@@ -11413,479 +11938,31 @@ struct MetalView: UIViewRepresentable {
             }
 
             if snapshot.entityCommandCount > 0,
-               let entityPipelineState,
-               let sceneView = Q3MetalRenderer_GetSceneView()?.pointee,
-               let entityBuffers = uploadEntityBuffers(device: view.device, slot: frameSlot) {
-                let entityVertexBuffer = entityBuffers.vertexBuffer
-                let entityIndexBuffer = entityBuffers.indexBuffer
+               let device = view.device,
+               let sceneView = Q3MetalRenderer_GetSceneView()?.pointee {
+                var mainEntityFirst = 0
+                var mainEntityCount = Int(snapshot.entityCommandCount)
+                if snapshot.sceneCount > 0, let scenesPtr = Q3MetalRenderer_GetSceneSnapshots() {
+                    let mainScene = UnsafeBufferPointer(start: scenesPtr, count: 1)[0]
+                    mainEntityFirst = Int(mainScene.entityCommandFirst)
+                    mainEntityCount = Int(mainScene.entityCommandCount)
+                }
                 let entityViewProjection = makeWorldViewProjection(sceneView)
                 let cameraPos = SIMD3<Float>(sceneView.viewOrigin.0, sceneView.viewOrigin.1, sceneView.viewOrigin.2)
                 let cameraForward = SIMD3<Float>(sceneView.viewAxis.0, sceneView.viewAxis.1, sceneView.viewAxis.2)
-                let entityTimeSeconds = Float(CACurrentMediaTime() - frameTimeOrigin)
-                var entityUniforms = EntityUniforms(viewProjection: entityViewProjection, cameraPos: cameraPos, tcGen: 0, timeSeconds: entityTimeSeconds)
-                populateEntitySun(&entityUniforms)
-                entityUniforms.cameraForward = cameraForward
-                encoder.setRenderPipelineState(entityPipelineState)
-                encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: view.device))
-                encoder.setFrontFacing(.clockwise)
-                encoder.setCullMode(.none)
-                encoder.setVertexBuffer(entityVertexBuffer, offset: 0, index: 0)
-                encoder.setVertexBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
-                encoder.setFragmentBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
-                // Q3 per-stage wrap routing — sampler is bound per-draw
-                // inside the loop below based on the new
-                // Q3_METAL_ENTITY_DRAWFLAG_CLAMPMAP bit (sourced from the
-                // Q3 .shader `clampmap` vs `map` directive). World samp
-                // (.repeat) is the default for `map` stages (quad damage
-                // breathing field, scrolling chrome shells); ui samp
-                // (.clampToEdge) for `clampmap` stages (dlight projection
-                // discs, HUD pics). Seed with repeat — the prior
-                // single-bind-clampToEdge here killed the quad shell.
-                encoder.setFragmentSamplerState(worldSamplerState, index: 0)
-                var entityLastSamplerWasClamp: Bool = false
-                /* RF_DEPTHHACK / first-person weapon depth range.
-                 *
-                 * Q3's GL backend calls glDepthRange(0, 0.3) for depth-hack
-                 * entities. Keeping only `.lessEqual` without the depth-range
-                 * compression lets stored world depth occlude the viewmodel
-                 * after the RT preserve path ends/reopens the render encoder.
-                 * Use Metal's viewport z range per draw so self-occlusion is
-                 * preserved while the weapon projects into the near depth
-                 * slice, then restore 0..1 for normal entities/flares/UI. */
-                var entityDepthRangeHackActive = false
-                func setEntityDepthRangeHack(_ active: Bool) {
-                    guard entityDepthRangeHackActive != active else { return }
-                    entityDepthRangeHackActive = active
-                    encoder.setViewport(MTLViewport(originX: 0, originY: 0,
-                                                    width: Double(renderW),
-                                                    height: Double(renderH),
-                                                    znear: 0.0,
-                                                    zfar: active ? 0.3 : 1.0))
-                }
-
-                // Dlights for entities (viewmodel, players, pickups lit by
-                // nearby muzzle flash / rocket glow). Same block as world pass.
-                Self.bindDlightBlock(snapshot: snapshot, encoder: encoder, device: view.device, index: 2, extra: currentBakedDlights())
-
-                if let entityDrawsPointer = Q3MetalRenderer_GetEntityDrawCommands() {
-                    /* Multi-scene: clamp the world pass's entity loop to
-                     * scene[0]'s range. The pool now contains entities for
-                     * EVERY scene (world + HUD sub-scenes) back-to-back;
-                     * unclamped iteration would render HUD entities at
-                     * origin (0,0,0) inside the main world view. */
-                    var mainEntityCount = Int(snapshot.entityCommandCount)
-                    if snapshot.sceneCount > 0, let scenesPtr = Q3MetalRenderer_GetSceneSnapshots() {
-                        mainEntityCount = Int(UnsafeBufferPointer(start: scenesPtr, count: 1)[0].entityCommandCount)
-                    }
-                    let entityDraws = UnsafeBufferPointer(start: entityDrawsPointer, count: mainEntityCount)
-                    let depthHackBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_DEPTHHACK)
-                    let additiveBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE)
-                    let additiveFullBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE_FULL)
-                    let alphaBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ALPHA)
-                    let filterBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_FILTER)
-                    let subtractBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_SUBTRACT)
-                    let tcGenEnvBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_TCGEN_ENV)
-                    let scenePolyBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_SCENE_POLY)
-                    let aTestGT0Bit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ATEST_GT0)
-                    let rtPreserveDepthHackAlways = Q3_RTMix() > 0 && Q3_RTPreserveEntities() != 0
-                    // P0.2: hoisted once per frame — feeds
-                    // entityUniforms.viewmodelParams.z per draw below.
-                    let rtDebugEntityMaskActive = Q3_RTDebugEntityMask() != 0
-
-                    // Ordered entity passes:
-                    // 0 = opaque, 1 = filter, 2 = alpha,
-                    // 3 = additive (GL_SRC_ALPHA/GL_ONE — alpha-modulated),
-                    // 4 = subtract (blood/bullet/shadow decals),
-                    // 5 = additive-full (GL_ONE/GL_ONE — explosion cores).
-                    for entityPass in 0..<6 {
-                    for draw in entityDraws where draw.indexCount > 0 {
-                        let isEntityAdditive = (draw.flags & additiveBit) != 0
-                        let isEntityAdditiveFull = (draw.flags & additiveFullBit) != 0
-                        let isEntityAlpha = (draw.flags & alphaBit) != 0
-                        let isEntityFilter = (draw.flags & filterBit) != 0
-                        let isEntitySubtract = (draw.flags & subtractBit) != 0
-                        let drawPass = isEntityAdditiveFull ? 5
-                                     : isEntitySubtract ? 4
-                                     : isEntityAdditive ? 3
-                                     : isEntityAlpha ? 2
-                                     : isEntityFilter ? 1
-                                     : 0
-                        guard drawPass == entityPass else { continue }
-                        guard let texture = texture(for: draw.textureHandle, device: view.device) else {
-                            continue
-                        }
-                        let wantsDepthHack = (draw.flags & depthHackBit) != 0
-                        setEntityDepthRangeHack(wantsDepthHack)
-                        // Per-draw tcGen flag — rebind EntityUniforms so the
-                        // fragment shader picks up the current reflection-map
-                        // switch. Default is 0 (mesh ST). Quad shell, regen,
-                        // battlesuit carry TCGEN_ENV, sharing a viewProjection
-                        // and cameraPos with the base entity pass.
-                        entityUniforms.tcGen = (draw.flags & tcGenEnvBit) != 0 ? 1.0 : 0.0
-                        Self.packEntityTcMods(handle: draw.textureHandle, into: &entityUniforms)
-                        Self.packEntityAlphaFunc(handle: draw.textureHandle, into: &entityUniforms)
-                        Self.packEntityRgbGen(handle: draw.textureHandle, into: &entityUniforms)
-                        /* deformVertexes wave (shell shaders: quad, quadWeapon,
-                         * regen, battlesuit). Per-draw because each customShader
-                         * carries its own div/base/amp. */
-                        Self.packEntityDeform(handle: draw.textureHandle, into: &entityUniforms)
-                        // Reset to (0,0,0,0) before packing so a previous
-                        // atlas draw doesn't bleed into a non-atlas one
-                        // sharing the same uniform buffer across the loop.
-                        entityUniforms.spriteAtlasParams = SIMD4<Float>(0, 0, 0, 0)
-                        // packEntityAtlas writes spriteAtlasParams and returns
-                        // the atlas albedo texture when an indirect-name hit
-                        // landed (e.g. yellow health → envmapyel atlas DDS).
-                        // Caller binds this at fragment slot 0 in place of the
-                        // static 64×64 envmap .jpg so the MSL atlas sub-rect
-                        // remap actually has frames to sample.
-                        let entityAtlasAlbedoOverride = packEntityAtlas(handle: draw.textureHandle, into: &entityUniforms)
-                        /* Per-draw refEntity_t.shaderRGBA fed through to MSL
-                         * for rgbGen=entity / oneMinusEntity (5/6) and
-                         * alphaGen=entity / oneMinusEntity (5/6). */
-                        let ec = draw.entityColor
-                        entityUniforms.entityColor = SIMD4<Float>(ec.0, ec.1, ec.2, ec.3)
-                        entityUniforms.timeSeconds = draw.shaderTime
-                        entityUniforms.suppressDlights = (drawPass == 3 || drawPass == 5) ? 1 : 0
-                        /* Per TASK PART 3: no rgbGen/alphaGen override for
-                         * scene polys — the shader's resolved genMode
-                         * flows through verbatim from packEntityRgbGen. */
-                        let isScenePoly = (draw.flags & scenePolyBit) != 0
-                        entityUniforms.fogColorDistance = SIMD4<Float>(0, 0, 0, 0)
-                        entityUniforms.fogParams = SIMD4<Float>(0, 0, 0, 0)
-                        entityUniforms.fogSurface = SIMD4<Float>(0, 0, 0, 0)
-                        if draw.fogIndex != UInt32(Q3_METAL_NO_FOG) {
-                            let count = Q3MetalRenderer_GetWorldFogCount()
-                            if Int(draw.fogIndex) < count,
-                               let fogs = Q3MetalRenderer_GetWorldFogs() {
-                                let f = fogs.advanced(by: Int(draw.fogIndex)).pointee
-                                entityUniforms.fogColorDistance = SIMD4(f.color.0, f.color.1, f.color.2, f.distance)
-                                entityUniforms.fogParams = SIMD4(f.tcScale, f.hasSurface != 0 ? 1.0 : 0.0, 0, 0)
-                                entityUniforms.fogSurface = SIMD4(f.surface.0, f.surface.1, f.surface.2, f.surface.3)
-                            }
-                        }
-                        /* Implicit alphaFunc GT0 for sprite billboards whose
-                         * additive shader didn't declare alphaFunc. Matches
-                         * upstream Q3 intent: dark / transparent regions of
-                         * rlboom/plasma/flash JPEGs must not contribute to
-                         * GL_ONE/GL_ONE blending. Threshold 0.004 (GT0). */
-                        if (draw.flags & aTestGT0Bit) != 0,
-                           entityUniforms.alphaTestThreshold == 0 {
-                            entityUniforms.alphaTestThreshold = 0.004
-                        }
-                        encoder.setFragmentBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
-                        /* CRITICAL: also bind to the vertex stage. Before
-                         * this, entityUniforms was bound ONCE before the
-                         * loop (line ~3498) with the initial state where
-                         * deformWaveFunc=0, then per-draw updates from
-                         * packEntityDeform / packEntityTcMods / etc. only
-                         * pushed to setFragmentBytes. The vertex shader
-                         * kept reading the stale outside-loop uniforms —
-                         * so q3_entity_vertex's `if (uniforms.deformWaveFunc
-                         * != 0u)` outer guard always failed for chrome
-                         * shell entities (powerups/quadWeapon, regen,
-                         * battlesuit, battleWeapon, redflag, blueflag),
-                         * silently skipping the +base unit halo expansion.
-                         * Diagnosed via 10× multiplier producing zero
-                         * visible effect — proved the block never entered.
-                         * Fragment-only path was a footgun: tcGen env +
-                         * chrome appearance worked because those uniforms
-                         * are fragment-side; deformWave is vertex-side. */
-                        encoder.setVertexBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
-                        if drawPass == 5, let entityAdditiveFullPipelineState {
-                            /* GL_ONE/GL_ONE — NEVER shared with the alpha-
-                             * modulated additive pipeline per strict spec. */
-                            encoder.setRenderPipelineState(entityAdditiveFullPipelineState)
-                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveLessDepthStencilState, device: view.device))
-                        } else if drawPass == 4, let entitySubtractPipelineState {
-                            encoder.setRenderPipelineState(entitySubtractPipelineState)
-                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveEntityDepthStencilState, device: view.device))
-                        } else if drawPass == 3, let entityAdditivePipelineState {
-                            encoder.setRenderPipelineState(entityAdditivePipelineState)
-                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveLessDepthStencilState, device: view.device))
-                        } else if drawPass == 2, let entityAlphaPipelineState {
-                            encoder.setRenderPipelineState(entityAlphaPipelineState)
-                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveEntityDepthStencilState, device: view.device))
-                            // NOTE 2026-06-01: tried swapping to depthStencilState
-                            // (write=YES) so the fog volume could see alpha
-                            // entities. Symptom did exist (health/armor floating
-                            // above fog) but the fix had cross-pass side effects
-                            // — fog turned green, rocket-explosion brightness
-                            // dropped. The Q3.entity.alpha pipeline is shared
-                            // by multi-stage shaders where some stages also
-                            // route through additive blending; writing depth on
-                            // an alpha stage occluded subsequent additive stages
-                            // of the same entity. Proper fix requires per-stage
-                            // depth control (write depth only on the OPAQUE
-                            // base stage of multi-stage entity shaders, leave
-                            // additive overlay stages with write=NO). Defer.
-                        } else if drawPass == 1, let entityFilterPipelineState {
-                            encoder.setRenderPipelineState(entityFilterPipelineState)
-                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveEntityDepthStencilState, device: view.device))
-                        } else {
-                            encoder.setRenderPipelineState(entityPipelineState)
-                            /* Scene polys never write depth regardless of
-                             * pass — emulates upstream Q3 decal
-                             * `polygonOffset` behaviour so decals can't
-                             * z-fight with the surface they sit on. */
-                            let state = isScenePoly ? additiveEntityDepthStencilState
-                                      : (wantsDepthHack ? depthHackDepthStencilState : depthStencilState)
-                            encoder.setDepthStencilState(ensuredDepthStencilState(state, device: view.device))
-                        }
-                        if rtPreserveDepthHackAlways, wantsDepthHack, let alwaysDepth = alwaysPassDepthStencilState {
-                            encoder.setDepthStencilState(alwaysDepth)
-                        }
-                        // PBR Phase 1: when q3_pbr_lookup_by_name matched
-                        // a Q3 shader (rocket / shotgun / bfg / etc.), the
-                        // C-side stamped pbrMaterial on the metalTexture
-                        // and we bind the HD DDS albedo here instead of
-                        // the original pak0 JPG-decoded texture. Falls
-                        // back to the original on miss / DDS-load fail.
-                        let q3Name = Q3MetalRenderer_GetTextureName(draw.textureHandle).map { String(cString: $0) } ?? "unknown"
-                        entityUniforms.forceLuminanceAlpha = Self.textureAlphaSynthesisMode(q3Name)
-                        let preferClassicFX = isEntityAdditive || isEntityAdditiveFull || isEntityAlpha || isScenePoly ||
-                                              entityUniforms.forceLuminanceAlpha != 0 ||
-                                              shouldPreferClassicTextureForAlphaFX(q3Name, isEntity: true)
-                        // Entity-side FX-stage sidecar promotion experiment
-                        // reverted 2026-06-12: enabling the world-path
-                        // useWorldPBR/classicFX combined return on entities
-                        // tanked frame time from 13.9 ms → 121 ms (72 fps → 8 fps)
-                        // on q3dm1, even after caching the Q3MetalRenderer_GetPBRMaterial
-                        // lookup Swift-side. The cost wasn't the lookup itself but
-                        // the per-draw pbrAlbedoTexture/pbrNormalTexture cache
-                        // probes that fire for every FX entity once the gate
-                        // promotes them. The plasammo chrome-clobbering bug is
-                        // still fixed by the packEntityAtlas hasAuthoredAlbedo
-                        // gate from earlier this session — that runs once per
-                        // (handle, atlas) lookup, not per draw. Full entity-side
-                        // PBR sidecar promotion needs either (a) cached per-handle
-                        // texture references in EntityFrameContext to skip the
-                        // dict probe, or (b) the per-frame texture cache promoted
-                        // to a flat array keyed by handle. Deferred.
-                        let pbrTex = preferClassicFX ? nil : pbrAlbedoTexture(for: draw.textureHandle)
-                        // 2026-06-10: emissiveParams must be written BEFORE the
-                        // setVertexBytes/setFragmentBytes upload, not after.
-                        // Previously assigned ~98 lines below, which meant the
-                        // GPU only ever saw the struct's default `(1,1,1,0)`
-                        // — the `.w == 0` MSL gate then skipped the emissive
-                        // accumulation on every entity draw, regardless of
-                        // material. Visible as flat/dark viewmodels with no
-                        // emissive glow even when the material had an
-                        // emissive map bound at fragment slot 6.
-                        entityUniforms.emissiveParams = emissiveParamsForPBRMaterial(handle: draw.textureHandle)
-                        // 2026-06-10: viewmodel-only base-color floor. .x is
-                        // the floor strength from `r_pbr_viewmodel_floor`
-                        // (CVAR_ARCHIVE, default 0.65). .y is the gate flag
-                        // (1.0 for RF_DEPTHHACK, 0.0 for world entities) so
-                        // the MSL `if (.y > 0.5)` runs only on first-person
-                        // weapons. World pickups, scene polys, and HUD heads
-                        // get (0,0,0,0) and skip the floor entirely.
-                        let vmFloor = Q3_PBRViewmodelFloor()
-                        // P0.2: .z doubles as the r_rt_debug_entity_mask
-                        // flag — q3_entity_fragment returns solid white
-                        // when it is > 0.5 (after alpha-test discards), to
-                        // visualize the entity coverage preserved over the
-                        // RT composite. Main-scene entity loop only; the
-                        // HUD/scoreboard sub-pass leaves viewmodelParams at
-                        // struct default (0,0,0,0) so it is never masked.
-                        entityUniforms.viewmodelParams = SIMD4<Float>(
-                            vmFloor,
-                            wantsDepthHack ? 1.0 : 0.0,
-                            rtDebugEntityMaskActive ? 1.0 : 0.0,
-                            // .w = world-entity readability floor (non-viewmodel
-                            // pickups) so full-metal items (RL/plasma/ammo/health,
-                            // metallic=1.0) don't go near-invisible under the dark
-                            // IBL cube. Viewmodels use .x instead.
-                            wantsDepthHack ? 0.0 : Q3_PBREntityFloor())
-                        if wantsDepthHack && !loggedViewmodelFloorOnce && vmFloor > 0.0 {
-                            loggedViewmodelFloorOnce = true
-                            pbrLog("[Q3-PBR-ENTITY] viewmodel floor enabled strength=\(String(format: "%.3f", vmFloor))")
-                        }
-                        // 2026-06-19: additive-stage brightness cap (RT mode only).
-                        // Chrome-envmap / explosion additive stages pass the
-                        // .lessEqual depth test (they ARE in front) but their bright
-                        // additive specular blooms and reads through dark RT walls.
-                        // Cap the per-fragment output for additive/additive-full
-                        // stages; non-additive draws and raster mode get a huge
-                        // value so the MSL `min()` is a no-op. Set explicitly every
-                        // draw so no stale cap bleeds into the next entity.
-                        let entityAdditiveStage = isEntityAdditive || isEntityAdditiveFull
-                        entityUniforms.additiveClampParams = SIMD4<Float>(
-                            (Q3_RTMix() > 0 && entityAdditiveStage) ? Q3_RTEntityAdditiveMax() : 1e9,
-                            0, 0, 0)
-                        encoder.setVertexBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
-                        encoder.setFragmentBytes(&entityUniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
-                        if (preferClassicFX || (draw.flags & aTestGT0Bit) != 0),
-                           loggedAlphaEffectTextures.insert(draw.textureHandle).inserted {
-                            var info = Q3MetalTextureInfo()
-                            _ = Q3MetalRenderer_GetTextureInfo(draw.textureHandle, &info)
-                            let pbrLabel = pbrTex?.label ?? "nil"
-                            let srcLabel = texture.label ?? "nil"
-                            logAlphaTextureDiagnostic("[ALPHA-TEX] handle=\(draw.textureHandle) name='\(q3Name)' pass=\(drawPass) flags=0x\(String(draw.flags, radix: 16)) alphaFunc=\(info.alphaFunc) rgbGen=\(info.rgbGen) alphaGen=\(info.alphaGen) forceLum=\(entityUniforms.forceLuminanceAlpha) classicFX=\(preferClassicFX ? 1 : 0) pbr='\(pbrLabel)' src='\(srcLabel)' size=\(info.width)x\(info.height)")
-                        }
-                        let baseEntityColor = preferClassicFX
-                            ? texture
-                            : entityBaseTextureForPBRDebug(handle: draw.textureHandle, fallback: texture)
-                        // Atlas override wins over the base color binding. When
-                        // packEntityAtlas resolved the indirect-name fallback,
-                        // it returned the atlas DDS; that's what slot 0 needs to
-                        // be, not the static 64×64 envmap source .jpg.
-                        let entityColorTexture = entityAtlasAlbedoOverride ?? baseEntityColor
-                        encoder.setFragmentTexture(entityColorTexture, index: 0)
-                        // PBR Phase 2 — bind normal map only for opaque PBR entity
-                        // base skins. Alpha/additive FX stages keep the original Q3
-                        // shader texture/alpha behaviour; a normal map on those
-                        // quads creates white blobs and bogus lighting.
-                        // Normal at index 1: never bind nil — Q3.entity pipeline
-                        // shader declares `normalTexture` as required, and an
-                        // unbound slot causes Metal API-validation warnings
-                        // (57/frame) plus undefined GPU reads on tcGen-env
-                        // entity draws (yellow/red health, quad shell). Fall
-                        // back to a 1×1 flat normal so the binding stays valid
-                        // while behaving as identity for PBR-off draws.
-                        let entityNormalTex = preferClassicFX
-                            ? pbrFlatNormalDefault()
-                            : (pbrNormalTexture(for: draw.textureHandle) ?? pbrFlatNormalDefault())
-                        encoder.setFragmentTexture(entityNormalTex, index: 1)
-                        // PBR Phase 4 — viewmodel-vs-world entity gating.
-                        // Viewmodels (RF_DEPTHHACK) get the wide
-                        // (0.6..1.2) range for prominent surface relief;
-                        // world entities (spinning pickups, dropped
-                        // weapons) get the tight (0.78..1.18) range to
-                        // avoid Mikkelsen TBN derivative instability on
-                        // rotating geometry.
-                        var pbrNormalScaleEntity: Float = wantsDepthHack ? 1.0 : 0.0
-                        encoder.setFragmentBytes(&pbrNormalScaleEntity, length: 4, index: 3)
-                        // PBR Phase F — rim params at buffer(4). Disable the
-                        // Fresnel rim for now: it reads as a white outline on
-                        // weapons/items with the current RTX/PBR assets.
-                        // 2026-06-10: viewmodels (RF_DEPTHHACK) get a small rim
-                        // intensity (0.25) so PBR-metal viewmodels get a visible
-                        // edge highlight without the white-outline overdrive that
-                        // killed it on world pickups. World entities keep 0.0 —
-                        // the rim term was causing white halos on tcGen-env
-                        // chrome items previously.
-                        let rimIntensity: Float = wantsDepthHack ? 0.25 : 0.0
-                        var pbrRimParamsEntity = SIMD2<Float>(rimIntensity, Q3_PBRRimFalloff())
-                        encoder.setFragmentBytes(&pbrRimParamsEntity, length: 8, index: 4)
-                        // PBR Phase 4 — Cook-Torrance specular textures.
-                        // Roughness at slot 3, metallic at slot 4. The
-                        // MSL fragment guards both with is_null_texture
-                        // so weapons without the maps (machinegun, etc.)
-                        // skip the specular block entirely. Currently
-                        // only the rocket launcher has both maps wired
-                        // in materials.json.
-                        // PBR Phase 5 A/B gate — when r_pbr_phase5=0, bind nil
-                        // for roughness + metallic so the MSL `hasFullPBR`
-                        // check falls through and the Cook-Torrance + Burley
-                        // direct-sun block is skipped. Pure v6 Fresnel rim
-                        // remains active. Note: this also disables Phase 6 IBL
-                        // (gated inside hasFullPBR) so a clean Phase 5 A/B
-                        // requires IBL stays on — but IBL is only PRESENT
-                        // inside hasFullPBR, so without Phase 5 there's no
-                        // hasFullPBR block to host IBL either. Two-axis A/B
-                        // (phase5 × ibl) needs both cvars: r_pbr_phase5=0
-                        // → no GGX peak, no IBL; r_pbr_ibl=0 → IBL replaced
-                        // by 0.35 ambient floor (Phase 5 GGX still fires).
-                        let phase5Enabled = Q3_PBRPhase5Enabled() != 0 && !preferClassicFX && pbrTex != nil
-                        // Roughness slot 3 + metallic slot 4: never nil.
-                        // Same reasoning as the normal slot above —
-                        // Q3.entity pipeline declares them, and unbound
-                        // slots produce Metal validation warnings plus
-                        // undefined reads. Fall back to the 1×1 default
-                        // constants so the binding is valid even when
-                        // phase5 is disabled.
-                        let entityRoughTex = phase5Enabled
-                            ? (pbrRoughnessTexture(for: draw.textureHandle) ?? pbrRoughnessDefault())
-                            : pbrRoughnessDefault()
-                        let entityMetalTex = phase5Enabled
-                            ? (pbrMetallicTexture(for: draw.textureHandle) ?? pbrMetallicDefault())
-                            : pbrMetallicDefault()
-                        encoder.setFragmentTexture(entityRoughTex, index: 3)
-                        encoder.setFragmentTexture(entityMetalTex, index: 4)
-                        // Phase 6 IBL — procedural env cubemap + dedicated
-                        // clampToEdge sampler. Bound nil-safe; MSL guards via
-                        // is_null_texture so a fail-to-alloc falls back to
-                        // Phase 5 ambient floor without crashing.
-                        // envCube at index 5 — always bind to procedural cube
-                        // even when IBL disabled. The MSL fragment branches on
-                        // its own IBL gate so the bound cube is unused, but the
-                        // pipeline slot stays valid for Metal validation.
-                        encoder.setFragmentTexture(ensurePBREnvCube(), index: 5)
-                        encoder.setFragmentSamplerState(ensurePBREnvSampler(), index: 1)
-                        // Emissive @ 6 for primary entity bind site. Always
-                        // bound — material's emissive DDS if present, zero
-                        // default otherwise. Pair with entityUniforms.
-                        // emissiveParams written below.
-                        let entityEmissiveTex = pbrEmissiveTexture(for: draw.textureHandle) ?? pbrEmissiveDefault()
-                        encoder.setFragmentTexture(entityEmissiveTex, index: 6)
-                        // (emissiveParams now assigned above, pre-upload — see comment near line 7541)
-                        // 2026-06-10: one-shot per-handle viewmodel PBR resolution log.
-                        // Surfaces what materials each first-person weapon resolves
-                        // to, dedup'd by handle. Fires only for wantsDepthHack draws
-                        // (RF_DEPTHHACK = viewmodel) so HUD/world-entity noise is
-                        // suppressed. Use to diagnose "viewmodel looks dark/flat":
-                        // if albedo/normal/roughness/metallic show "nil-default",
-                        // the material is missing from materials.json. If the
-                        // preferClassicFX flag is 1, an FX classifier rule is
-                        // forcing the viewmodel onto the non-PBR path.
-                        if wantsDepthHack,
-                           loggedViewmodelPBRHandles.insert(draw.textureHandle).inserted {
-                            let albedoSrc: String
-                            if preferClassicFX {
-                                albedoSrc = "classicFX-forced"
-                            } else if pbrTex != nil {
-                                albedoSrc = pbrTex?.label ?? "pbr"
-                            } else {
-                                albedoSrc = "nil-default(classic-q3-tex)"
-                            }
-                            let normalSrc = (!preferClassicFX && pbrNormalTexture(for: draw.textureHandle) != nil) ?
-                                (pbrNormalTexture(for: draw.textureHandle)?.label ?? "pbr") : "nil-default(flat)"
-                            let roughSrc = (phase5Enabled && pbrRoughnessTexture(for: draw.textureHandle) != nil) ?
-                                (pbrRoughnessTexture(for: draw.textureHandle)?.label ?? "pbr") : "nil-default(0.55)"
-                            let metalSrc = (phase5Enabled && pbrMetallicTexture(for: draw.textureHandle) != nil) ?
-                                (pbrMetallicTexture(for: draw.textureHandle)?.label ?? "pbr") : "nil-default(0.50)"
-                            let emissiveSrc = (pbrEmissiveTexture(for: draw.textureHandle) != nil) ?
-                                (pbrEmissiveTexture(for: draw.textureHandle)?.label ?? "pbr") : "nil-default(0,0,0)"
-                            pbrLog("[Q3-PBR-ENTITY] viewmodel handle=\(draw.textureHandle) name='\(q3Name)' albedo=\(albedoSrc) normal=\(normalSrc) roughness=\(roughSrc) metallic=\(metalSrc) emissive=\(emissiveSrc) phase5=\(phase5Enabled ? 1 : 0) preferClassicFX=\(preferClassicFX ? 1 : 0) envCubeBound=1")
-                        }
-                        // Per-draw sampler routing.
-                        //
-                        // Two ways to land on clampToEdge:
-                        //   1. Q3_METAL_ENTITY_DRAWFLAG_CLAMPMAP bit — set
-                        //      from the shader's `clampmap` directive via
-                        //      EntityFlagsForTexture → wrapClampMode.
-                        //   2. isScenePoly — force clamp for blast-marks /
-                        //      blood / shadow decals submitted via
-                        //      RE_AddPolyToScene. Q3 decal textures fade
-                        //      to alpha=0 at UV edges; with the world
-                        //      sampler's .repeat wrap, edge UVs (~0.99
-                        //      from the poly clip) sample from the
-                        //      opposite side of the texture (which has
-                        //      alpha=1 near the center), producing the
-                        //      "checkerboard square tile" artifact the
-                        //      user reported on rocket blasts. Decal
-                        //      shaders use `map` not `clampmap`, so the
-                        //      CLAMPMAP flag is off — but Q3's stock
-                        //      ref_gl behaviour is to clamp ALL scene
-                        //      polys regardless.
-                        let wantClamp = isScenePoly ||
-                            (draw.flags & UInt32(Q3_METAL_ENTITY_DRAWFLAG_CLAMPMAP)) != 0
-                        if wantClamp != entityLastSamplerWasClamp {
-                            encoder.setFragmentSamplerState(wantClamp ? uiSamplerState : worldSamplerState, index: 0)
-                            entityLastSamplerWasClamp = wantClamp
-                        }
-                        encoder.drawIndexedPrimitives(
-                            type: .triangle,
-                            indexCount: Int(draw.indexCount),
-                            indexType: .uint32,
-                            indexBuffer: entityIndexBuffer,
-                            indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride
-                        )
-                    }
-                    } // end entityPass loop
-                    setEntityDepthRangeHack(false)
-                }
+                encodeEntityDrawRange(encoder: encoder,
+                                      device: device,
+                                      snapshot: snapshot,
+                                      frameSlot: frameSlot,
+                                      entityDrawFirst: mainEntityFirst,
+                                      entityDrawCount: mainEntityCount,
+                                      viewProjection: entityViewProjection,
+                                      cameraPos: cameraPos,
+                                      cameraForward: cameraForward,
+                                      renderW: renderW,
+                                      renderH: renderH,
+                                      skipThirdPerson: true,
+                                      allowDepthHack: true)
             }
 
             if rtPerfFrame != nil, Q3_RTMix() > 0, Q3_RTPreserveEntities() != 0 {

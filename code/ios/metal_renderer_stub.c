@@ -345,6 +345,7 @@ typedef struct {
 typedef struct {
     refEntity_t entity;
     qboolean mirrored;
+    uint32_t flags;
 } metalSceneEntity_t;
 
 typedef struct {
@@ -488,9 +489,13 @@ static uint32_t s_entityVertexCapacity;
 static uint32_t s_entityIndexCapacity;
 static uint32_t s_entityDrawCapacity;
 static uint32_t s_entityAcceptedThisFrame;
+static uint32_t s_entityAcceptedThirdPersonThisFrame;
 static uint32_t s_entityRejectedNullThisFrame;
 static uint32_t s_entityRejectedTypeThisFrame;
 static uint32_t s_entityRejectedModelThisFrame;
+
+#define METAL_SCENE_ENTITY_FLAG_THIRD_PERSON (1u << 0)
+#define METAL_ENTITY_DRAWFLAG_THIRD_PERSON   (1u << 11)
 
 #define MAX_SHADER_MAP_ENTRIES 4096
 #define METAL_ANIMMAP_MAX_FRAMES 16
@@ -8847,12 +8852,42 @@ static void RE_ClearScene(void) {
      * HUD scenes' RE_RenderScene runs — which is exactly when Swift reads
      * s_frameSnapshot. Resets happen in RE_RenderScene (gated on world). */
     s_entityAcceptedThisFrame = 0;
+    s_entityAcceptedThirdPersonThisFrame = 0;
     s_entityRejectedNullThisFrame = 0;
     s_entityRejectedTypeThisFrame = 0;
     s_entityRejectedModelThisFrame = 0;
 }
 
 static uint32_t s_rawEntryCount;  /* unconditional counter for debug */
+
+static uint32_t MetalSceneEntityFlagsForRefEntity(const refEntity_t *re) {
+    uint32_t flags = 0;
+    if (re != NULL && (re->renderfx & RF_THIRD_PERSON)) {
+        flags |= METAL_SCENE_ENTITY_FLAG_THIRD_PERSON;
+    }
+    return flags;
+}
+
+static uint32_t MetalEntityDrawFlagsForSceneEntity(const metalSceneEntity_t *sceneEntity,
+                                                   uint32_t drawFlags) {
+    if (sceneEntity != NULL &&
+        (sceneEntity->flags & METAL_SCENE_ENTITY_FLAG_THIRD_PERSON)) {
+        drawFlags |= METAL_ENTITY_DRAWFLAG_THIRD_PERSON;
+    }
+    return drawFlags;
+}
+
+static void MetalAcceptSceneEntity(const refEntity_t *re, qboolean mirrored) {
+    uint32_t flags = MetalSceneEntityFlagsForRefEntity(re);
+    s_sceneEntities[s_sceneEntityCount].entity = *re;
+    s_sceneEntities[s_sceneEntityCount].mirrored = mirrored;
+    s_sceneEntities[s_sceneEntityCount].flags = flags;
+    s_sceneEntityCount += 1;
+    s_entityAcceptedThisFrame += 1;
+    if (flags & METAL_SCENE_ENTITY_FLAG_THIRD_PERSON) {
+        s_entityAcceptedThirdPersonThisFrame += 1;
+    }
+}
 
 static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime) {
     vec3_t cross;
@@ -8881,10 +8916,7 @@ static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime
      * the view axes, which aren't known here). */
     if (re->reType == RT_SPRITE) {
         AuditOnce("ENTITY:RT_SPRITE");
-        s_sceneEntities[s_sceneEntityCount].entity = *re;
-        s_sceneEntities[s_sceneEntityCount].mirrored = qfalse;
-        s_sceneEntityCount += 1;
-        s_entityAcceptedThisFrame += 1;
+        MetalAcceptSceneEntity(re, qfalse);
         return;
     }
     /* RT_LIGHTNING: beam from origin ("from") to oldorigin ("to"). We emit
@@ -8895,10 +8927,7 @@ static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime
      * the billboard math needs the viewer origin. */
     if (re->reType == RT_LIGHTNING) {
         AuditOnce("ENTITY:RT_LIGHTNING");
-        s_sceneEntities[s_sceneEntityCount].entity = *re;
-        s_sceneEntities[s_sceneEntityCount].mirrored = qfalse;
-        s_sceneEntityCount += 1;
-        s_entityAcceptedThisFrame += 1;
+        MetalAcceptSceneEntity(re, qfalse);
         return;
     }
     /* RT_RAIL_CORE: the main rail gun beam — single view-aligned quad
@@ -8906,10 +8935,7 @@ static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime
      * but with r_railCoreWidth (Q3 default = 16). */
     if (re->reType == RT_RAIL_CORE) {
         AuditOnce("ENTITY:RT_RAIL_CORE");
-        s_sceneEntities[s_sceneEntityCount].entity = *re;
-        s_sceneEntities[s_sceneEntityCount].mirrored = qfalse;
-        s_sceneEntityCount += 1;
-        s_entityAcceptedThisFrame += 1;
+        MetalAcceptSceneEntity(re, qfalse);
         return;
     }
     /* RT_RAIL_RINGS: the spiraling rings around the rail beam. Q3 emits
@@ -8917,10 +8943,7 @@ static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime
      * segment with the ring texture (customShader) for MVP. */
     if (re->reType == RT_RAIL_RINGS) {
         AuditOnce("ENTITY:RT_RAIL_RINGS");
-        s_sceneEntities[s_sceneEntityCount].entity = *re;
-        s_sceneEntities[s_sceneEntityCount].mirrored = qfalse;
-        s_sceneEntityCount += 1;
-        s_entityAcceptedThisFrame += 1;
+        MetalAcceptSceneEntity(re, qfalse);
         return;
     }
     /* RT_BEAM: grappling hook chain, CTF mission beams. Stock Q3 renders
@@ -8928,10 +8951,7 @@ static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime
      * quad between origin ("from") and oldorigin ("to") for MVP. */
     if (re->reType == RT_BEAM) {
         AuditOnce("ENTITY:RT_BEAM");
-        s_sceneEntities[s_sceneEntityCount].entity = *re;
-        s_sceneEntities[s_sceneEntityCount].mirrored = qfalse;
-        s_sceneEntityCount += 1;
-        s_entityAcceptedThisFrame += 1;
+        MetalAcceptSceneEntity(re, qfalse);
         return;
     }
     if (re->reType != RT_MODEL) {
@@ -8974,11 +8994,8 @@ static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime
         }
     }
 
-    s_sceneEntities[s_sceneEntityCount].entity = *re;
     CrossProduct(re->axis[0], re->axis[1], cross);
-    s_sceneEntities[s_sceneEntityCount].mirrored = (DotProduct(re->axis[2], cross) < 0.0f);
-    s_sceneEntityCount += 1;
-    s_entityAcceptedThisFrame += 1;
+    MetalAcceptSceneEntity(re, (DotProduct(re->axis[2], cross) < 0.0f));
 }
 static void RE_AddPolyToScene(qhandle_t hShader, int numVerts, const polyVert_t *verts, int num) {
     int polyIdx;
@@ -9185,9 +9202,10 @@ static void RE_RenderScene(const refdef_t *fd) {
 	        );
         ri.Printf(
             PRINT_ALL,
-            "Metal entity queue[%u]: accepted=%u rejectNull=%u rejectType=%u rejectModel=%u sceneEntities=%u clearCalls=%u renderCalls=%u rawEntries=%u\n",
+            "Metal entity queue[%u]: accepted=%u thirdPerson=%u rejectNull=%u rejectType=%u rejectModel=%u sceneEntities=%u clearCalls=%u renderCalls=%u rawEntries=%u\n",
             s_sceneLogCounter,
             s_entityAcceptedThisFrame,
+            s_entityAcceptedThirdPersonThisFrame,
             s_entityRejectedNullThisFrame,
             s_entityRejectedTypeThisFrame,
             s_entityRejectedModelThisFrame,
@@ -9209,9 +9227,11 @@ static void RE_RenderScene(const refdef_t *fd) {
                 vec3_t firstVertWorld;
                 qboolean haveFirstVert = qfalse;
                 int depthHack;
+                int thirdPerson;
                 mdl = FindModelByHandle(se->entity.hModel);
                 name = (mdl && mdl->inUse) ? mdl->name : "<unknown>";
                 depthHack = (se->entity.renderfx & RF_DEPTHHACK) ? 1 : 0;
+                thirdPerson = (se->flags & METAL_SCENE_ENTITY_FLAG_THIRD_PERSON) ? 1 : 0;
 
                 /* Compute the first vertex's world position to verify the
                  * transform produces sensible coords. */
@@ -9239,28 +9259,28 @@ static void RE_RenderScene(const refdef_t *fd) {
                     ri.Printf(
                         PRINT_ALL,
                         "Metal cgame ent[%u/%u]: model='%s' origin=(%.1f %.1f %.1f) axis0=(%.2f %.2f %.2f) "
-                        "rfx=0x%x hMdl=%d reType=%d cShader=%d cSkin=%d depthHack=%d firstVtxWorld=(%.1f %.1f %.1f)\n",
+                        "rfx=0x%x hMdl=%d reType=%d cShader=%d cSkin=%d depthHack=%d thirdPerson=%d firstVtxWorld=(%.1f %.1f %.1f)\n",
                         s_sceneLogCounter, logIdx,
                         name,
                         se->entity.origin[0], se->entity.origin[1], se->entity.origin[2],
                         se->entity.axis[0][0], se->entity.axis[0][1], se->entity.axis[0][2],
                         se->entity.renderfx, se->entity.hModel, se->entity.reType,
                         se->entity.customShader, se->entity.customSkin,
-                        depthHack,
+                        depthHack, thirdPerson,
                         firstVertWorld[0], firstVertWorld[1], firstVertWorld[2]
                     );
                 } else {
                     ri.Printf(
                         PRINT_ALL,
                         "Metal cgame ent[%u/%u]: model='%s' origin=(%.1f %.1f %.1f) axis0=(%.2f %.2f %.2f) "
-                        "rfx=0x%x hMdl=%d reType=%d cShader=%d cSkin=%d depthHack=%d firstVtxWorld=N/A\n",
+                        "rfx=0x%x hMdl=%d reType=%d cShader=%d cSkin=%d depthHack=%d thirdPerson=%d firstVtxWorld=N/A\n",
                         s_sceneLogCounter, logIdx,
                         name,
                         se->entity.origin[0], se->entity.origin[1], se->entity.origin[2],
                         se->entity.axis[0][0], se->entity.axis[0][1], se->entity.axis[0][2],
                         se->entity.renderfx, se->entity.hModel, se->entity.reType,
                         se->entity.customShader, se->entity.customSkin,
-                        depthHack
+                        depthHack, thirdPerson
                     );
                 }
                 logged += 1;
@@ -9860,18 +9880,6 @@ static void RE_RenderScene(const refdef_t *fd) {
                     continue;
                 }
 
-                /* Q3 renderfx visibility filtering.
-                 * RF_THIRD_PERSON: body parts of local player — skip in
-                 *   first-person view (render only in mirrors / third-
-                 *   person cameras). Fixes "looking down shows own body".
-                 * No need for RF_FIRST_PERSON whitelist: stock cgame
-                 *   flags the viewmodel with RF_FIRST_PERSON|RF_DEPTHHACK;
-                 *   we already handle DEPTHHACK and we want it to render
-                 *   in our (first-person) view so don't skip it. */
-                if (sceneEntity->entity.renderfx & RF_THIRD_PERSON) {
-                    continue;
-                }
-
                 header = model->md3;
                 frameIndex = sceneEntity->entity.frame;
                 oldFrameIndex = sceneEntity->entity.oldframe;
@@ -10158,7 +10166,9 @@ static void RE_RenderScene(const refdef_t *fd) {
                             s_entityDraws[entityDrawCursor].indexCount = entityIndexCursor - firstIndex;
                             s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)stageHandle;
                             s_entityDraws[entityDrawCursor].flags =
-                                EntityFlagsForTexture(stageHandle, baseDrawFlags, qfalse);
+                                MetalEntityDrawFlagsForSceneEntity(
+                                    sceneEntity,
+                                    EntityFlagsForTexture(stageHandle, baseDrawFlags, qfalse));
                             SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity, stageHandle);
                             entityDrawCursor += 1;
                         }
@@ -10166,7 +10176,8 @@ static void RE_RenderScene(const refdef_t *fd) {
                         s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
                         s_entityDraws[entityDrawCursor].indexCount = entityIndexCursor - firstIndex;
                         s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)textureHandle;
-                        s_entityDraws[entityDrawCursor].flags = drawFlags;
+                        s_entityDraws[entityDrawCursor].flags =
+                            MetalEntityDrawFlagsForSceneEntity(sceneEntity, drawFlags);
                         SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity, textureHandle);
                         entityDrawCursor += 1;
                     }

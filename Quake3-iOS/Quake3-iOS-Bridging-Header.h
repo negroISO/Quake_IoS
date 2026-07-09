@@ -3,6 +3,14 @@
 
 #include "../code/ios/metal_renderer_shared.h"
 
+/* Stage25 portal-entity visibility bit. Carried in Q3MetalEntityDrawCmd.flags
+ * for draws sourced from refEntity_t.renderfx & RF_THIRD_PERSON. Kept here
+ * (rather than changing the shared ABI struct layout) so Swift can skip these
+ * in the main view and include them in the portal/mirror entity pass. */
+#ifndef Q3_METAL_ENTITY_DRAWFLAG_THIRD_PERSON
+#define Q3_METAL_ENTITY_DRAWFLAG_THIRD_PERSON (1u << 11)
+#endif
+
 void Quake3_Init(const char *basePath);
 void Quake3_Frame(void);
 void Q3Gamepad_SetState(float leftX, float leftY, float rightX, float rightY,
