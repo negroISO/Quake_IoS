@@ -284,6 +284,7 @@ static float s_currentColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
 static metalTexture_t s_textures[Q3_METAL_MAX_TEXTURES];
 static qhandle_t s_nextTextureHandle = 1;
 static qhandle_t s_whiteTextureHandle;
+static qhandle_t s_transparentBrandingTextureHandle;
 static qhandle_t s_skyTextureHandle;
 static qhandle_t s_timHellBaseTextureHandle;
 static qhandle_t s_timHellAddTextureHandle;
@@ -1252,6 +1253,34 @@ static metalModel_t *AllocModelSlot(void) {
     return NULL;
 }
 
+static qboolean MetalPathMatchesImageBase(const char *name, const char *base) {
+    size_t len;
+    char next;
+    if (name == NULL || base == NULL || name[0] == '\0' || base[0] == '\0') {
+        return qfalse;
+    }
+    len = strlen(base);
+    if (Q_stricmpn(name, base, (int)len)) {
+        return qfalse;
+    }
+    next = name[len];
+    return (next == '\0' || next == '.') ? qtrue : qfalse;
+}
+
+static qboolean IsBrandingTextureName(const char *name) {
+    return MetalPathMatchesImageBase(name, "textures/nvidia/geforce_banner") ||
+           MetalPathMatchesImageBase(name, "textures/nvidia/logo1alpha") ||
+           MetalPathMatchesImageBase(name, "textures/nvidia/logo1small") ||
+           MetalPathMatchesImageBase(name, "textures/nvidia/logo_alpha") ||
+           MetalPathMatchesImageBase(name, "textures/nvidia/nvidia_screen");
+}
+
+static qboolean IsBrandingWorldShaderName(const char *name) {
+    return MetalPathMatchesImageBase(name, "textures/nvidia/geforce_banner") ||
+           MetalPathMatchesImageBase(name, "textures/nvidia/logo_alpha") ||
+           MetalPathMatchesImageBase(name, "textures/nvidia/nvidia_screen");
+}
+
 static qhandle_t EnsureWhiteTexture(void) {
     metalTexture_t *texture;
     byte *rgba;
@@ -1278,6 +1307,34 @@ static qhandle_t EnsureWhiteTexture(void) {
     Q_strncpyz(texture->name, "*white", sizeof(texture->name));
     s_whiteTextureHandle = texture->handle;
     return s_whiteTextureHandle;
+}
+
+static qhandle_t EnsureTransparentBrandingTexture(void) {
+    metalTexture_t *texture;
+    byte *rgba;
+
+    if (s_transparentBrandingTextureHandle != 0) {
+        return s_transparentBrandingTextureHandle;
+    }
+
+    texture = AllocTextureSlot();
+    if (texture == NULL) {
+        return EnsureWhiteTexture();
+    }
+
+    rgba = ri.Malloc(4);
+    rgba[0] = 0;
+    rgba[1] = 0;
+    rgba[2] = 0;
+    rgba[3] = 0;
+
+    texture->width = 1;
+    texture->height = 1;
+    texture->rgbaBytes = rgba;
+    texture->blendMode = 2; /* source-over alpha; harmless for UI fallbacks. */
+    Q_strncpyz(texture->name, "*transparent_branding", sizeof(texture->name));
+    s_transparentBrandingTextureHandle = texture->handle;
+    return s_transparentBrandingTextureHandle;
 }
 
 static qhandle_t RegisterRawTexture(const char *name, byte *rgba, int width, int height) {
@@ -1393,6 +1450,23 @@ static qboolean IsDrawableWorldShader(const dshader_t *shader) {
 
     surfaceFlags = LittleLong(shader->surfaceFlags);
     if (surfaceFlags & SURF_NODRAW) {
+        return qfalse;
+    }
+    if (IsBrandingWorldShaderName(shader->shader)) {
+        static char s_brandWorldSeen[8][MAX_QPATH];
+        static int s_brandWorldSeenCount = 0;
+        qboolean seen = qfalse;
+        int i;
+        for (i = 0; i < s_brandWorldSeenCount; ++i) {
+            if (!Q_stricmp(s_brandWorldSeen[i], shader->shader)) { seen = qtrue; break; }
+        }
+        if (!seen) {
+            if (s_brandWorldSeenCount < (int)(sizeof(s_brandWorldSeen) / sizeof(s_brandWorldSeen[0]))) {
+                Q_strncpyz(s_brandWorldSeen[s_brandWorldSeenCount++], shader->shader, MAX_QPATH);
+            }
+            MetalTelemetryPrintf("metal_branding", PRINT_ALL,
+                "[Q3-BRANDING] skipped world shader '%s'\n", shader->shader);
+        }
         return qfalse;
     }
 
@@ -2096,6 +2170,23 @@ static qhandle_t RegisterTexture(const char *name) {
         !Q_stricmp(name, "*whiteimage") ||
         !Q_stricmp(name, "*default")) {
         return EnsureWhiteTexture();
+    }
+    if (IsBrandingTextureName(name)) {
+        static char s_brandTextureSeen[8][MAX_QPATH];
+        static int s_brandTextureSeenCount = 0;
+        qboolean seen = qfalse;
+        int i;
+        for (i = 0; i < s_brandTextureSeenCount; ++i) {
+            if (!Q_stricmp(s_brandTextureSeen[i], name)) { seen = qtrue; break; }
+        }
+        if (!seen) {
+            if (s_brandTextureSeenCount < (int)(sizeof(s_brandTextureSeen) / sizeof(s_brandTextureSeen[0]))) {
+                Q_strncpyz(s_brandTextureSeen[s_brandTextureSeenCount++], name, MAX_QPATH);
+            }
+            MetalTelemetryPrintf("metal_branding", PRINT_ALL,
+                "[Q3-BRANDING] transparent texture '%s'\n", name);
+        }
+        return EnsureTransparentBrandingTexture();
     }
 
     {
