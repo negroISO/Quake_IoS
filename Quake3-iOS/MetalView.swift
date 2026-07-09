@@ -3711,7 +3711,7 @@ struct MetalView: UIViewRepresentable {
         private var spatialUpscalePipelineState: MTLComputePipelineState?
         /// Cached (inputW, inputH, outputW, outputH) the scaler was built
         /// for; rebuild lazily on any change (drawable resize, quality flip).
-        private var spatialScalerKey: (Int, Int, Int, Int) = (0, 0, 0, 0)
+        private var spatialScalerKey: (Int, Int, Int, Int, MTLPixelFormat) = (0, 0, 0, 0, .invalid)
 
         /* MetalFX frame interpolation (Q3FrameInterpolation). Stage23 keeps
          * this RT/native-only: Stage17 exports motion/depth only from the RT
@@ -3747,15 +3747,21 @@ struct MetalView: UIViewRepresentable {
         /// rendering. Called from draw() lazily when upscaleQuality != .native.
         private func ensureSpatialUpscaleTargets(device: MTLDevice,
                                                  inputW: Int, inputH: Int,
-                                                 outputW: Int, outputH: Int) -> Bool {
-            let key = (inputW, inputH, outputW, outputH)
+                                                 outputW: Int, outputH: Int,
+                                                 colorFormat: MTLPixelFormat) -> Bool {
+            let sceneColorFormat = colorFormat == .invalid ? MTLPixelFormat.bgra8Unorm : colorFormat
+            let resolveColorFormat = MTLPixelFormat.rgba16Float
+            let key = (inputW, inputH, outputW, outputH, sceneColorFormat)
             if upscaleColorTarget != nil && upscaleResolvedColorTarget != nil &&
                 upscaleDepthTarget != nil && spatialScalerKey == key { return true }
 
             // Color RT (.private, [renderTarget, shaderRead] — Q3 renders
-            // INTO this, compute scaler READS this.
+            // INTO this, compute scaler READS this. The format must match the
+            // render pipeline states, which are built against MTKView's
+            // colorPixelFormat; using RGBA16F here trips Metal validation and
+            // corrupts unvalidated device output.
             let colorDesc = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: .rgba16Float,
+                pixelFormat: sceneColorFormat,
                 width: inputW, height: inputH, mipmapped: false)
             colorDesc.usage = [.renderTarget, .shaderRead]
             colorDesc.storageMode = .private
@@ -3768,7 +3774,7 @@ struct MetalView: UIViewRepresentable {
             upscaleColorTarget = color
 
             let resolvedDesc = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: .rgba16Float,
+                pixelFormat: resolveColorFormat,
                 width: outputW, height: outputH, mipmapped: false)
             resolvedDesc.usage = [.shaderRead, .shaderWrite]
             resolvedDesc.storageMode = .private
@@ -3798,7 +3804,9 @@ struct MetalView: UIViewRepresentable {
             #if canImport(MetalFX)
             spatialScaler = nil
             #endif
-            print("[Q3-UPSCALE] compute scaler ready: \(inputW)×\(inputH) → \(outputW)×\(outputH) (\(upscaleQuality.label))")
+            let logMessage = "[Q3-UPSCALE] backend=compute input=\(inputW)x\(inputH) output=\(outputW)x\(outputH) sceneFormat=\(sceneColorFormat) resolveFormat=\(resolveColorFormat) postprocessOutputFormat=drawable(\(colorFormat)) quality=\(upscaleQuality.label)"
+            print(logMessage)
+            pbrLog(logMessage)
             return true
         }
 
@@ -10878,7 +10886,12 @@ struct MetalView: UIViewRepresentable {
                 let rs = effectiveUpscaleQuality.renderSize(forOutput: view.drawableSize)
                 let rW = max(1, Int(rs.width))
                 let rH = max(1, Int(rs.height))
-                if ensureSpatialUpscaleTargets(device: device, inputW: rW, inputH: rH, outputW: outputW, outputH: outputH) {
+                if ensureSpatialUpscaleTargets(device: device,
+                                               inputW: rW,
+                                               inputH: rH,
+                                               outputW: outputW,
+                                               outputH: outputH,
+                                               colorFormat: view.colorPixelFormat) {
                     upscaleActive = true
                     renderW = rW
                     renderH = rH
