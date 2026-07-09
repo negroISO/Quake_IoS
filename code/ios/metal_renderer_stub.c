@@ -110,7 +110,7 @@ static void Q3_FileLogf(const char *fmt, ...) {
  * avoid realloc plumbing touching every accessor; revisit if a future map
  * exceeds this. */
 #define Q3_METAL_MAX_DRAWS 65536
-#define Q3_METAL_MAX_TEXTURES 1024
+#define Q3_METAL_MAX_TEXTURES 4096
 #define Q3_METAL_MAX_MODELS 1024
 #define Q3_METAL_MAX_REFENTITIES 1024
 
