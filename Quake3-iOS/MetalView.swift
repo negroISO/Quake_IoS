@@ -8294,6 +8294,318 @@ struct MetalView: UIViewRepresentable {
             return MTKTextureLoader(device: dev)
         }()
 
+        private enum PBRSidecarKind: String {
+            case albedo
+            case normal
+            case roughness
+            case metallic
+            case emissive
+            case height
+            case atlas
+            case worldNormal = "world-normal"
+        }
+
+        private struct PBRDDSMip {
+            let offset: Int
+            let size: Int
+            let width: Int
+            let height: Int
+            let bytesPerRow: Int
+        }
+
+        private struct PBRDDSInfo {
+            let width: Int
+            let height: Int
+            let mipCount: Int
+            let dxgiFormat: UInt32
+            let pixelFormat: MTLPixelFormat
+            let blockBytes: Int
+            let mips: [PBRDDSMip]
+
+            var maxDimension: Int { max(width, height) }
+
+            func bytes(from startMip: Int) -> UInt64 {
+                guard startMip < mips.count else { return 0 }
+                return UInt64(mips[startMip...].reduce(0) { $0 + $1.size })
+            }
+        }
+
+        private let pbrMemoryMiB: UInt64 = 1024 * 1024
+        private var pbrTextureMemoryUsedBytes: UInt64 = 0
+        private var pbrTextureMemoryPeakBytes: UInt64 = 0
+        private var pbrTextureMipDropCount: UInt32 = 0
+        private var pbrTextureDroppedCount: UInt32 = 0
+        private var pbrTextureMipSavedBytes: UInt64 = 0
+        private var pbrTextureMemoryAnnounced = false
+
+        private func pbrTextureBudgetMB() -> Int {
+            max(0, Int(Q3_PBRTextureBudgetMB()))
+        }
+
+        private func pbrTextureBudgetBytes() -> UInt64? {
+            let mb = pbrTextureBudgetMB()
+            return mb > 0 ? UInt64(mb) * pbrMemoryMiB : nil
+        }
+
+        private func pbrMemMB(_ bytes: UInt64) -> String {
+            String(format: "%.1f", Double(bytes) / Double(pbrMemoryMiB))
+        }
+
+        private func announcePBRTextureBudgetIfNeeded(handle: UInt32) {
+            guard !pbrTextureMemoryAnnounced else { return }
+            pbrTextureMemoryAnnounced = true
+            let budgetText = pbrTextureBudgetMB() == 0 ? "0MB(unlimited)" : "\(pbrTextureBudgetMB())MB"
+            pbrLog("[Q3-PBR-MEM] budget=\(budgetText) used=\(pbrMemMB(pbrTextureMemoryUsedBytes))MB after handle=\(handle) peak=0.0MB mipDropped=0 saved=0.0MB")
+        }
+
+        private func recordPBRTextureLoad(_ texture: MTLTexture,
+                                          handle: UInt32,
+                                          kind: PBRSidecarKind,
+                                          path: String,
+                                          sourceWidth: Int? = nil,
+                                          sourceHeight: Int? = nil,
+                                          startMip: Int = 0,
+                                          fullBytes: UInt64? = nil) {
+            announcePBRTextureBudgetIfNeeded(handle: handle)
+            let allocated = UInt64(texture.allocatedSize)
+            let accounted = allocated > 0 ? allocated : (fullBytes ?? 0)
+            pbrTextureMemoryUsedBytes += accounted
+            pbrTextureMemoryPeakBytes = max(pbrTextureMemoryPeakBytes, pbrTextureMemoryUsedBytes)
+            if startMip > 0, let fullBytes {
+                pbrTextureMipDropCount += 1
+                let saved = fullBytes > accounted ? (fullBytes - accounted) : 0
+                pbrTextureMipSavedBytes += saved
+                let srcW = sourceWidth ?? texture.width
+                let srcH = sourceHeight ?? texture.height
+                pbrLog("[Q3-PBR-MEM] mip-drop handle=\(handle) kind=\(kind.rawValue) skip=\(startMip) size=\(srcW)x\(srcH)->\(texture.width)x\(texture.height) saved=\(pbrMemMB(saved))MB path=\(path)")
+            }
+            let budgetText = pbrTextureBudgetMB() == 0 ? "0MB(unlimited)" : "\(pbrTextureBudgetMB())MB"
+            pbrLog("[Q3-PBR-MEM] budget=\(budgetText) used=\(pbrMemMB(pbrTextureMemoryUsedBytes))MB after handle=\(handle) kind=\(kind.rawValue) alloc=\(pbrMemMB(accounted))MB peak=\(pbrMemMB(pbrTextureMemoryPeakBytes))MB mipDropped=\(pbrTextureMipDropCount) saved=\(pbrMemMB(pbrTextureMipSavedBytes))MB")
+        }
+
+        private func recordPBRTextureDrop(handle: UInt32,
+                                          kind: PBRSidecarKind,
+                                          path: String,
+                                          reason: String) {
+            announcePBRTextureBudgetIfNeeded(handle: handle)
+            pbrTextureDroppedCount += 1
+            let budgetText = pbrTextureBudgetMB() == 0 ? "0MB(unlimited)" : "\(pbrTextureBudgetMB())MB"
+            pbrLog("[Q3-PBR-MEM] dropped handle=\(handle) kind=\(kind.rawValue) budget=\(budgetText) used=\(pbrMemMB(pbrTextureMemoryUsedBytes))MB drops=\(pbrTextureDroppedCount) reason=\(reason) path=\(path)")
+        }
+
+        private func resetPBRTextureMemoryAccounting(reason: String) {
+            if pbrTextureMemoryAnnounced {
+                let budgetText = pbrTextureBudgetMB() == 0 ? "0MB(unlimited)" : "\(pbrTextureBudgetMB())MB"
+                pbrLog("[Q3-PBR-MEM] reset reason=\(reason) budget=\(budgetText) peak=\(pbrMemMB(pbrTextureMemoryPeakBytes))MB used=\(pbrMemMB(pbrTextureMemoryUsedBytes))MB mipDropped=\(pbrTextureMipDropCount) saved=\(pbrMemMB(pbrTextureMipSavedBytes))MB drops=\(pbrTextureDroppedCount)")
+            }
+            pbrTextureMemoryUsedBytes = 0
+            pbrTextureMemoryPeakBytes = 0
+            pbrTextureMipDropCount = 0
+            pbrTextureDroppedCount = 0
+            pbrTextureMipSavedBytes = 0
+            pbrTextureMemoryAnnounced = false
+        }
+
+        private static func pbrDDSU32(_ data: Data, _ offset: Int) -> UInt32 {
+            guard offset + 3 < data.count else { return 0 }
+            return UInt32(data[offset]) |
+                   (UInt32(data[offset + 1]) << 8) |
+                   (UInt32(data[offset + 2]) << 16) |
+                   (UInt32(data[offset + 3]) << 24)
+        }
+
+        private func pbrDDSInfo(path: String, srgb: Bool) -> PBRDDSInfo? {
+            guard let fh = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else { return nil }
+            defer { try? fh.close() }
+            let header = fh.readData(ofLength: 148)
+            guard header.count >= 148,
+                  header[0] == 0x44, header[1] == 0x44, header[2] == 0x53, header[3] == 0x20,
+                  header[84] == 0x44, header[85] == 0x58, header[86] == 0x31, header[87] == 0x30 else {
+                return nil
+            }
+            let height = Int(Self.pbrDDSU32(header, 12))
+            let width = Int(Self.pbrDDSU32(header, 16))
+            let mipCount = max(1, Int(Self.pbrDDSU32(header, 28)))
+            let dxgiFormat = Self.pbrDDSU32(header, 128)
+            guard width > 0, height > 0 else { return nil }
+
+            let pixelFormat: MTLPixelFormat
+            let blockBytes: Int
+            switch dxgiFormat {
+            case 80: // DXGI_FORMAT_BC4_UNORM
+                pixelFormat = .bc4_rUnorm
+                blockBytes = 8
+            case 83: // DXGI_FORMAT_BC5_UNORM
+                pixelFormat = .bc5_rgUnorm
+                blockBytes = 16
+            case 98: // DXGI_FORMAT_BC7_UNORM
+                pixelFormat = srgb ? .bc7_rgbaUnorm_srgb : .bc7_rgbaUnorm
+                blockBytes = 16
+            case 99: // DXGI_FORMAT_BC7_UNORM_SRGB
+                pixelFormat = .bc7_rgbaUnorm_srgb
+                blockBytes = 16
+            default:
+                return nil
+            }
+
+            var mips: [PBRDDSMip] = []
+            mips.reserveCapacity(mipCount)
+            var cursor = 148
+            var mipW = width
+            var mipH = height
+            for _ in 0..<mipCount {
+                let blocksWide = max(1, (mipW + 3) / 4)
+                let blocksHigh = max(1, (mipH + 3) / 4)
+                let bytesPerRow = blocksWide * blockBytes
+                let size = bytesPerRow * blocksHigh
+                mips.append(PBRDDSMip(offset: cursor,
+                                      size: size,
+                                      width: mipW,
+                                      height: mipH,
+                                      bytesPerRow: bytesPerRow))
+                cursor += size
+                mipW = max(1, mipW / 2)
+                mipH = max(1, mipH / 2)
+            }
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+               let fileSize = attrs[.size] as? NSNumber,
+               cursor > fileSize.intValue {
+                return nil
+            }
+            return PBRDDSInfo(width: width,
+                              height: height,
+                              mipCount: mipCount,
+                              dxgiFormat: dxgiFormat,
+                              pixelFormat: pixelFormat,
+                              blockBytes: blockBytes,
+                              mips: mips)
+        }
+
+        private func pbrMipStartForBudget(info: PBRDDSInfo,
+                                          budgetBytes: UInt64,
+                                          fullBytes: UInt64) -> Int {
+            // Use a small guard band before the user-facing budget because
+            // compressed texture allocatedSize can be a few percent higher
+            // than the DDS byte estimate used before upload.
+            let triggerBytes = (budgetBytes * 95) / 100
+            guard pbrTextureMemoryUsedBytes + fullBytes > triggerBytes else { return 0 }
+            // Phone budget policy: once the projected PBR sidecar allocation
+            // crosses the cvar budget, keep every large material present but
+            // load from a lower DDS mip chain. Do NOT keep walking mips until
+            // the single texture "fits" the remaining bytes: if the budget is
+            // already slightly exceeded, that degenerates later materials to
+            // 1×1 and is visually worse than falling back/dropping. The bounded
+            // policy matches the brief: skip mip0 for ~1024+ textures, skip
+            // mip0+1 for 4K-ish textures. Smaller maps only drop to a 512-ish
+            // chain after the budget is already exhausted.
+            var startMip = 0
+            if info.maxDimension >= 3072 || min(info.width, info.height) >= 2048 {
+                startMip = 2
+            } else if info.maxDimension >= 1024 {
+                startMip = 1
+            } else if info.maxDimension > 512 && pbrTextureMemoryUsedBytes >= triggerBytes {
+                startMip = 1
+            }
+            return min(startMip, max(0, info.mipCount - 1))
+        }
+
+        private func loadPBRDDSFromMip(path: String,
+                                       label: String,
+                                       info: PBRDDSInfo,
+                                       startMip: Int) -> MTLTexture? {
+            guard let device = self.commandQueue?.device else { return nil }
+            guard startMip >= 0, startMip < info.mips.count else { return nil }
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return nil }
+            let first = info.mips[startMip]
+            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: info.pixelFormat,
+                                                                width: first.width,
+                                                                height: first.height,
+                                                                mipmapped: (info.mipCount - startMip) > 1)
+            desc.mipmapLevelCount = info.mipCount - startMip
+            desc.usage = [.shaderRead]
+            // Manual uploads use a shared compressed texture so replace(region:)
+            // can write the selected DDS mip chain directly. The texture remains
+            // BC-compressed; allocatedSize is still the accounting source of truth.
+            desc.storageMode = .shared
+            guard let texture = device.makeTexture(descriptor: desc) else { return nil }
+            texture.label = label
+            for srcLevel in startMip..<info.mipCount {
+                let mip = info.mips[srcLevel]
+                guard mip.offset + mip.size <= data.count else { return nil }
+                data.withUnsafeBytes { raw in
+                    let base = raw.baseAddress!.advanced(by: mip.offset)
+                    texture.replace(region: MTLRegionMake2D(0, 0, mip.width, mip.height),
+                                    mipmapLevel: srcLevel - startMip,
+                                    withBytes: base,
+                                    bytesPerRow: mip.bytesPerRow)
+                }
+            }
+            return texture
+        }
+
+        private func loadBudgetedPBRTexture(loader: MTKTextureLoader,
+                                            url: URL,
+                                            options: [MTKTextureLoader.Option: Any],
+                                            handle: UInt32,
+                                            kind: PBRSidecarKind,
+                                            label: String,
+                                            srgb: Bool) throws -> MTLTexture {
+            let path = url.path
+            let info = pbrDDSInfo(path: path, srgb: srgb)
+            let fullBytes = info?.bytes(from: 0)
+            let budgetBytes = pbrTextureBudgetBytes()
+            if let info, let fullBytes, let budgetBytes {
+                let startMip = pbrMipStartForBudget(info: info,
+                                                    budgetBytes: budgetBytes,
+                                                    fullBytes: fullBytes)
+                if startMip > 0 {
+                    if let texture = loadPBRDDSFromMip(path: path,
+                                                       label: label,
+                                                       info: info,
+                                                       startMip: startMip) {
+                        recordPBRTextureLoad(texture,
+                                             handle: handle,
+                                             kind: kind,
+                                             path: path,
+                                             sourceWidth: info.width,
+                                             sourceHeight: info.height,
+                                             startMip: startMip,
+                                             fullBytes: fullBytes)
+                        return texture
+                    }
+                    recordPBRTextureDrop(handle: handle,
+                                         kind: kind,
+                                         path: path,
+                                         reason: "mip-drop-load-failed")
+                    throw NSError(domain: "Q3PBRTextureBudget",
+                                  code: 1,
+                                  userInfo: [NSLocalizedDescriptionKey: "PBR DDS mip-drop load failed"])
+                }
+            }
+
+            if let budgetBytes, let fullBytes, pbrTextureMemoryUsedBytes + fullBytes > budgetBytes {
+                recordPBRTextureDrop(handle: handle,
+                                     kind: kind,
+                                     path: path,
+                                     reason: "over-budget-unmippable")
+                throw NSError(domain: "Q3PBRTextureBudget",
+                              code: 2,
+                              userInfo: [NSLocalizedDescriptionKey: "PBR texture budget exceeded and DDS was not mippable"])
+            }
+
+            let texture = try loader.newTexture(URL: url, options: options)
+            texture.label = label
+            recordPBRTextureLoad(texture,
+                                 handle: handle,
+                                 kind: kind,
+                                 path: path,
+                                 sourceWidth: info?.width,
+                                 sourceHeight: info?.height,
+                                 startMip: 0,
+                                 fullBytes: fullBytes)
+            return texture
+        }
+
         /// Returns the PBR albedo texture for a Q3 handle, or nil when
         /// no PBR material was bound or the DDS load fails. First call
         /// per handle does the load; subsequent calls hit the cache.
@@ -8626,8 +8938,13 @@ struct MetalView: UIViewRepresentable {
                 .generateMipmaps:     NSNumber(value: false),
             ]
             do {
-                let tex = try loader.newTexture(URL: url, options: opts)
-                tex.label = "Q3.pbr.entity_atlas.\(name)"
+                let tex = try loadBudgetedPBRTexture(loader: loader,
+                                                     url: url,
+                                                     options: opts,
+                                                     handle: 0,
+                                                     kind: .atlas,
+                                                     label: "Q3.pbr.entity_atlas.\(name)",
+                                                     srgb: true)
                 entityAtlasAlbedoCache[name] = tex
                 entityAtlasIsCaptureCache[name] = false
                 pbrLog("[Q3-PBR-SWIFT] loaded entity-atlas (ingested) name='\(name)' size=\(tex.width)x\(tex.height) path=\(path)")
@@ -8638,6 +8955,7 @@ struct MetalView: UIViewRepresentable {
                 // Try the tolerant in-process reader before giving up.
                 pbrLog("[Q3-PBR-SWIFT] MTKLoader rejected name='\(name)' err=\(error.localizedDescription) — trying capture-format reader")
                 if let tex = loadCaptureFormatDDS(path: path, label: "Q3.pbr.entity_atlas.\(name)") {
+                    recordPBRTextureLoad(tex, handle: 0, kind: .atlas, path: path)
                     entityAtlasAlbedoCache[name] = tex
                     entityAtlasIsCaptureCache[name] = true
                     pbrLog("[Q3-PBR-SWIFT] loaded entity-atlas (capture-format) name='\(name)' size=\(tex.width)x\(tex.height) path=\(path)")
@@ -8699,8 +9017,13 @@ struct MetalView: UIViewRepresentable {
                 .generateMipmaps:     NSNumber(value: false),  // DDS already ships mips
             ]
             do {
-                let tex = try loader.newTexture(URL: url, options: opts)
-                tex.label = "Q3.pbr.albedo.h\(handle)"
+                let tex = try loadBudgetedPBRTexture(loader: loader,
+                                                     url: url,
+                                                     options: opts,
+                                                     handle: handle,
+                                                     kind: .albedo,
+                                                     label: "Q3.pbr.albedo.h\(handle)",
+                                                     srgb: true)
                 pbrAlbedoCache[handle] = tex
                 pbrLog("[Q3-PBR-SWIFT] loaded albedo handle=\(handle) size=\(tex.width)x\(tex.height) path=\(path)")
                 return tex
@@ -8713,6 +9036,7 @@ struct MetalView: UIViewRepresentable {
                 // just because the Apple loader refused the capture wrapper.
                 pbrLog("[Q3-PBR-SWIFT] MTKLoader rejected albedo handle=\(handle) err=\(error.localizedDescription) — trying capture-format reader path=\(path)")
                 if let tex = loadCaptureFormatDDS(path: path, label: "Q3.pbr.albedo.h\(handle).capture") {
+                    recordPBRTextureLoad(tex, handle: handle, kind: .albedo, path: path)
                     pbrAlbedoCache[handle] = tex
                     pbrLog("[Q3-PBR-SWIFT] loaded albedo (capture-format) handle=\(handle) size=\(tex.width)x\(tex.height) path=\(path)")
                     return tex
@@ -8773,8 +9097,13 @@ struct MetalView: UIViewRepresentable {
                 .generateMipmaps:     NSNumber(value: false),
             ]
             do {
-                let tex = try loader.newTexture(URL: url, options: opts)
-                tex.label = "Q3.pbr.normal.h\(handle)"
+                let tex = try loadBudgetedPBRTexture(loader: loader,
+                                                     url: url,
+                                                     options: opts,
+                                                     handle: handle,
+                                                     kind: .normal,
+                                                     label: "Q3.pbr.normal.h\(handle)",
+                                                     srgb: false)
                 pbrNormalCache[handle] = tex
                 pbrLog("[Q3-PBR-SWIFT] loaded normal handle=\(handle) size=\(tex.width)x\(tex.height) path=\(path)")
                 return tex
@@ -8805,8 +9134,13 @@ struct MetalView: UIViewRepresentable {
                 .generateMipmaps:     NSNumber(value: false),
             ]
             do {
-                let tex = try loader.newTexture(URL: url, options: opts)
-                tex.label = "Q3.pbr.normal.generic.shotgun_n"
+                let tex = try loadBudgetedPBRTexture(loader: loader,
+                                                     url: url,
+                                                     options: opts,
+                                                     handle: 0,
+                                                     kind: .normal,
+                                                     label: "Q3.pbr.normal.generic.shotgun_n",
+                                                     srgb: false)
                 pbrGenericNormalTex = tex
                 pbrLog("[Q3-PBR-SWIFT] loaded generic-normal size=\(tex.width)x\(tex.height)")
                 return tex
@@ -9687,8 +10021,13 @@ struct MetalView: UIViewRepresentable {
                         .generateMipmaps:     NSNumber(value: false),
                     ]
                     do {
-                        let tex = try loader.newTexture(URL: url, options: opts)
-                        tex.label = "Q3.pbr.roughness.h\(handle)"
+                        let tex = try loadBudgetedPBRTexture(loader: loader,
+                                                             url: url,
+                                                             options: opts,
+                                                             handle: handle,
+                                                             kind: .roughness,
+                                                             label: "Q3.pbr.roughness.h\(handle)",
+                                                             srgb: false)
                         pbrRoughnessCache[handle] = tex
                         pbrLog("[Q3-PBR-SWIFT] loaded roughness handle=\(handle) size=\(tex.width)x\(tex.height) path=\(path)")
                         return tex
@@ -9746,8 +10085,13 @@ struct MetalView: UIViewRepresentable {
                         .generateMipmaps:     NSNumber(value: false),
                     ]
                     do {
-                        let tex = try loader.newTexture(URL: url, options: opts)
-                        tex.label = "Q3.pbr.metallic.h\(handle)"
+                        let tex = try loadBudgetedPBRTexture(loader: loader,
+                                                            url: url,
+                                                            options: opts,
+                                                            handle: handle,
+                                                            kind: .metallic,
+                                                            label: "Q3.pbr.metallic.h\(handle)",
+                                                            srgb: false)
                         pbrMetallicCache[handle] = tex
                         pbrLog("[Q3-PBR-SWIFT] loaded metallic handle=\(handle) size=\(tex.width)x\(tex.height) path=\(path)")
                         return tex
@@ -9934,8 +10278,13 @@ struct MetalView: UIViewRepresentable {
                 .generateMipmaps:     NSNumber(value: false),
             ]
             do {
-                let tex = try loader.newTexture(URL: url, options: opts)
-                tex.label = "Q3.pbr.emissive.h\(handle)"
+                let tex = try loadBudgetedPBRTexture(loader: loader,
+                                                     url: url,
+                                                     options: opts,
+                                                     handle: handle,
+                                                     kind: .emissive,
+                                                     label: "Q3.pbr.emissive.h\(handle)",
+                                                     srgb: true)
                 pbrEmissiveCache[handle] = tex
                 pbrLog("[Q3-PBR-SWIFT] loaded emissive handle=\(handle) size=\(tex.width)x\(tex.height) path=\(path)")
                 return tex
@@ -9974,8 +10323,13 @@ struct MetalView: UIViewRepresentable {
                 .generateMipmaps:     NSNumber(value: false),
             ]
             do {
-                let tex = try loader.newTexture(URL: URL(fileURLWithPath: path), options: opts)
-                tex.label = "Q3.pbr.height.h\(handle)"
+                let tex = try loadBudgetedPBRTexture(loader: loader,
+                                                     url: URL(fileURLWithPath: path),
+                                                     options: opts,
+                                                     handle: handle,
+                                                     kind: .height,
+                                                     label: "Q3.pbr.height.h\(handle)",
+                                                     srgb: false)
                 pbrHeightCache[handle] = tex
                 pbrLog("[Q3-PBR-SWIFT] loaded height handle=\(handle) size=\(tex.width)x\(tex.height) path=\(path)")
                 return tex
@@ -10070,8 +10424,13 @@ struct MetalView: UIViewRepresentable {
                 .generateMipmaps:     NSNumber(value: false),
             ]
             do {
-                let tex = try loader.newTexture(URL: url, options: opts)
-                tex.label = "Q3.pbr.world.normal.metal_plate"
+                let tex = try loadBudgetedPBRTexture(loader: loader,
+                                                     url: url,
+                                                     options: opts,
+                                                     handle: 0,
+                                                     kind: .worldNormal,
+                                                     label: "Q3.pbr.world.normal.metal_plate",
+                                                     srgb: false)
                 pbrWorldNormalTexture = tex
                 pbrLog("[Q3-PBR-SWIFT] loaded world-normal size=\(tex.width)x\(tex.height)")
                 return tex
@@ -13329,6 +13688,7 @@ struct MetalView: UIViewRepresentable {
             // 3840x3840 PBR textures consume ~2.2 GB alone; without this,
             // switching maps accumulates textures until iOS kills the app
             // at its ~3.3 GB memory limit (EXC_RESOURCE MEMORY).
+            resetPBRTextureMemoryAccounting(reason: "world-generation-\(generation)")
             pbrAlbedoCache.removeAll(keepingCapacity: false)
             pbrNormalCache.removeAll(keepingCapacity: false)
             pbrRoughnessCache.removeAll(keepingCapacity: false)

@@ -208,6 +208,11 @@ int Q3_PBREnvCubeLive(void);
  * guard. */
 float Q3_PBREmissiveIntensityMax(void);
 int   Q3_PBROnlyTextures(void);
+/* r_pbr_texture_budget_mb (archived): maximum summed allocation for loaded
+ * PBR sidecar MTLTextures. Default is device-scaled in C from
+ * os_proc_available_memory()/2 capped at 4096 MB; 0 restores legacy
+ * unlimited loading. Swift enforces via mip-drop on PBR sidecar DDS loads. */
+int   Q3_PBRTextureBudgetMB(void);
 float Q3_RTMix(void);
 float Q3_SetRTMix(float mix);
 float Q3_RTExposure(void);

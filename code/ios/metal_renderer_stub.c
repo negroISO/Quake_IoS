@@ -40,6 +40,11 @@ If a visual issue exists, fix the generic mismatch against ioq3/Kenny behavior.
 #include "ios_local.h"
 #include "q3_pbr.h"
 #include <os/log.h>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#include <os/proc.h>
+#include <sys/sysctl.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -11309,6 +11314,60 @@ int q3_pbr_cvar_enabled(void) {
      * subset under <bundle>/baseq3/pbr/ — no env vars required. */
     cvar_t *cv = ri.Cvar_Get("r_pbrMaterials", "1", CVAR_ARCHIVE);
     return cv ? cv->integer : 0;
+}
+
+static int Q3_DefaultPBRTextureBudgetMB(void) {
+    static int s_defaultBudgetMB = -1;
+    if (s_defaultBudgetMB >= 0) {
+        return s_defaultBudgetMB;
+    }
+
+    unsigned long long memoryBytes = 0;
+#if defined(__APPLE__)
+#if TARGET_OS_IPHONE && !TARGET_OS_MACCATALYST
+    size_t available = os_proc_available_memory();
+    if (available > 0) {
+        memoryBytes = (unsigned long long)available;
+    }
+#endif
+    if (memoryBytes == 0) {
+        uint64_t physical = 0;
+        size_t physicalSize = sizeof(physical);
+        if (sysctlbyname("hw.memsize", &physical, &physicalSize, NULL, 0) == 0 && physical > 0) {
+            memoryBytes = (unsigned long long)physical;
+        }
+    }
+#endif
+
+    if (memoryBytes == 0) {
+        s_defaultBudgetMB = 4096;
+        return s_defaultBudgetMB;
+    }
+
+    unsigned long long memoryMB = memoryBytes / (1024ull * 1024ull);
+    unsigned long long halfMB = memoryMB / 2ull;
+    if (halfMB == 0) {
+        halfMB = memoryMB;
+    }
+    if (halfMB > 4096ull) {
+        halfMB = 4096ull;
+    }
+    s_defaultBudgetMB = (int)halfMB;
+    return s_defaultBudgetMB;
+}
+
+int Q3_PBRTextureBudgetMB(void) {
+    int defaultBudgetMB = Q3_DefaultPBRTextureBudgetMB();
+    if (ri.Cvar_Get == NULL) {
+        return defaultBudgetMB;
+    }
+    char defaultValue[32];
+    snprintf(defaultValue, sizeof(defaultValue), "%d", defaultBudgetMB);
+    cvar_t *cv = ri.Cvar_Get("r_pbr_texture_budget_mb", defaultValue, CVAR_ARCHIVE);
+    int v = cv ? cv->integer : defaultBudgetMB;
+    if (v < 0) v = 0;          /* 0 = unlimited / legacy */
+    if (v > 65536) v = 65536;  /* guard absurd archived values */
+    return v;
 }
 
 float Q3_PostprocessIntensity(void) {
