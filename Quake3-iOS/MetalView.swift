@@ -4140,6 +4140,8 @@ struct MetalView: UIViewRepresentable {
         private var postprocessEncodeCount: Int = 0
         private var postprocessLogPrintedOnce: Bool = false
         private var exposureLogPrintedOnce: Bool = false
+        private var entityPostOrderLoggedOnce: Bool = false
+        private var entityPostExposureLogCount: Int = 0
         private var postprocessLastWallTime: CFTimeInterval?
 
         private var worldAccelerationStructure: MTLAccelerationStructure?
@@ -5022,6 +5024,27 @@ struct MetalView: UIViewRepresentable {
             postprocessEncodeCount += 1
             if postprocessEncodeCount == 1 || postprocessEncodeCount % 120 == 0 {
                 print("[MTL_POSTPROC] encode #\(postprocessEncodeCount) intensity=\(u.intensity) auto=\(u.autoExposure) gamma=\(u.gamma) tonemap=\(u.tonemap) size=\(w)x\(h)")
+            }
+        }
+
+        @MainActor
+        private func logEntityPostOrderIfNeeded(commandBuffer: MTLCommandBuffer,
+                                                targetTexture: MTLTexture,
+                                                renderW: Int,
+                                                renderH: Int) {
+            if !entityPostOrderLoggedOnce {
+                entityPostOrderLoggedOnce = true
+                let msg = "[Q3-ENTITY-POST] order=world-post-then-entities target=\(targetTexture.width)x\(targetTexture.height) viewport=\(renderW)x\(renderH) meter=world-pre-entity entityExposureApplied=0"
+                pbrLog(msg)
+            }
+            guard entityPostExposureLogCount < 3,
+                  let exposureBuffer else { return }
+            entityPostExposureLogCount += 1
+            let sampleIndex = entityPostExposureLogCount
+            commandBuffer.addCompletedHandler { _ in
+                let value = exposureBuffer.contents().bindMemory(to: Float.self, capacity: 1).pointee
+                print(String(format: "[Q3-ENTITY-POST] exposureSample=%d factor=%.3f entityExposureApplied=0",
+                             sampleIndex, value))
             }
         }
 
@@ -13036,6 +13059,21 @@ struct MetalView: UIViewRepresentable {
                 }
             }
 
+            let autoExposureActive = Q3_PostprocessEnabled() != 0 && Q3_PostprocessAutoExposure() != 0
+            /* Stage39 native/default path: when RT is composited before the
+             * preserved raster entity layer, run the world postprocess before
+             * those entities so exposure meters the RT world/fog image only.
+             * Upscale/FI require a separate resolve path, so leave their
+             * existing ordering intact for this bounded increment. */
+            let rtWorldPostBeforeEntitiesActive =
+                autoExposureActive &&
+                Q3_RTMix() > 0 &&
+                Q3_RTPreserveEntities() != 0 &&
+                Q3MetalRenderer_IsWorldLoaded() != 0 &&
+                !upscaleActive &&
+                fiCurrentSceneTexture == nil
+            var rtWorldPostprocessEncodedBeforeEntities = false
+
             /* RT world composite must happen before raster entities/HUD.
              * The trace replaces/blends only the already-rendered world color;
              * subsequent entity, flare, sub-scene, and UI passes draw over it.
@@ -13083,7 +13121,9 @@ struct MetalView: UIViewRepresentable {
                                         perfFrame: rtPerfFrame)
                     let postRTPass = makeLoadedRenderPassDescriptor(colorTexture: rtTargetTexture,
                                                                     depthTexture: descriptor.depthAttachment.texture)
-                    attachRTPerfSamples(to: postRTPass, frame: rtPerfFrame, start: .entityStart, end: .entityEnd)
+                    if !rtWorldPostBeforeEntitiesActive {
+                        attachRTPerfSamples(to: postRTPass, frame: rtPerfFrame, start: .entityStart, end: .entityEnd)
+                    }
                     guard let postRTEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: postRTPass) else {
                         return
                     }
@@ -13120,6 +13160,80 @@ struct MetalView: UIViewRepresentable {
                                                sunShadowMatrix: currentSunShadowMatrix)
             }
 
+            let mainSceneViewForLatePasses = Q3MetalRenderer_GetSceneView()?.pointee
+            var mainFlaresDrawnBeforeFog = false
+
+            if rtWorldPostBeforeEntitiesActive {
+                if wantsFogRayBox, let sceneView = mainSceneViewForLatePasses {
+                    mainFlaresDrawnBeforeFog = encodeMainFlarePass(
+                        encoder: encoder,
+                        sceneView: sceneView,
+                        snapshot: snapshot,
+                        device: view.device)
+                } else if let sceneView = mainSceneViewForLatePasses, let device = view.device {
+                    mainFlaresDrawnBeforeFog = encodeMainFlarePass(
+                        encoder: encoder,
+                        sceneView: sceneView,
+                        snapshot: snapshot,
+                        device: device)
+                }
+
+                if let sceneView = mainSceneViewForLatePasses,
+                   let device = view.device,
+                   let sceneDepth,
+                   wantsFogRayBox {
+                    encoder.endEncoding()
+                    let fogColorTex = drawable.texture
+                    encodeFogVolumeRayBox(commandBuffer: commandBuffer,
+                                          colorTexture: fogColorTex,
+                                          depthTexture: sceneDepth,
+                                          device: device,
+                                          sceneView: sceneView)
+                    let postFogPass = makeLoadedRenderPassDescriptor(colorTexture: fogColorTex,
+                                                                     depthTexture: sceneDepth)
+                    guard let postFogEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: postFogPass) else {
+                        return
+                    }
+                    encoder = postFogEncoder
+                    encoder.label = "Q3.render.postFog.preEntityPost"
+                    encoder.setViewport(MTLViewport(originX: 0,
+                                                    originY: 0,
+                                                    width: Double(renderW),
+                                                    height: Double(renderH),
+                                                    znear: 0.0,
+                                                    zfar: 1.0))
+                    encoder.setScissorRect(MTLScissorRect(x: 0, y: 0,
+                                                           width: renderW,
+                                                           height: renderH))
+                }
+
+                encoder.endEncoding()
+                encodePostprocess(commandBuffer: commandBuffer,
+                                  sourceTexture: drawable.texture,
+                                  outputTexture: drawable.texture)
+                logEntityPostOrderIfNeeded(commandBuffer: commandBuffer,
+                                           targetTexture: drawable.texture,
+                                           renderW: renderW,
+                                           renderH: renderH)
+
+                let postWorldPass = makeLoadedRenderPassDescriptor(colorTexture: drawable.texture,
+                                                                   depthTexture: descriptor.depthAttachment.texture)
+                guard let postWorldEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: postWorldPass) else {
+                    return
+                }
+                encoder = postWorldEncoder
+                encoder.label = "Q3.render.entities.afterWorldPost"
+                encoder.setViewport(MTLViewport(originX: 0, originY: 0,
+                                                width: Double(renderW),
+                                                height: Double(renderH),
+                                                znear: 0.0,
+                                                zfar: 1.0))
+                encoder.setScissorRect(MTLScissorRect(x: 0, y: 0,
+                                                       width: renderW,
+                                                       height: renderH))
+                rtWorldPostprocessEncodedBeforeEntities = true
+            }
+
             if snapshot.entityCommandCount > 0,
                let device = view.device,
                let sceneView = Q3MetalRenderer_GetSceneView()?.pointee {
@@ -13148,7 +13262,8 @@ struct MetalView: UIViewRepresentable {
                                       allowDepthHack: true)
             }
 
-            if rtPerfFrame != nil, Q3_RTMix() > 0, Q3_RTPreserveEntities() != 0 {
+            if !rtWorldPostprocessEncodedBeforeEntities,
+               rtPerfFrame != nil, Q3_RTMix() > 0, Q3_RTPreserveEntities() != 0 {
                 encoder.endEncoding()
                 let rtTargetTexture = fiCurrentSceneTexture ?? ((upscaleActive ? upscaleColorTarget : drawable.texture) ?? drawable.texture)
                 let postEntityPass = makeLoadedRenderPassDescriptor(colorTexture: rtTargetTexture,
@@ -13220,9 +13335,8 @@ struct MetalView: UIViewRepresentable {
                 _ = encodeLateWorldFogOverlayPass(postRTEncoder, sceneView: sceneView)
             }
 
-            let mainSceneViewForLatePasses = Q3MetalRenderer_GetSceneView()?.pointee
-            var mainFlaresDrawnBeforeFog = false
-            if wantsFogRayBox, let sceneView = mainSceneViewForLatePasses {
+            if !rtWorldPostprocessEncodedBeforeEntities,
+               wantsFogRayBox, let sceneView = mainSceneViewForLatePasses {
                 /* Draw BSP flare billboards before the depth-limited fog
                  * volume pass so fog attenuates light sprites just like the
                  * already-encoded world/entities. Keeping flares in the
@@ -13236,7 +13350,8 @@ struct MetalView: UIViewRepresentable {
                     device: view.device)
             }
 
-            if let sceneView = mainSceneViewForLatePasses,
+            if !rtWorldPostprocessEncodedBeforeEntities,
+               let sceneView = mainSceneViewForLatePasses,
                let device = view.device,
                let sceneDepth,
                wantsFogRayBox {
@@ -13313,13 +13428,13 @@ struct MetalView: UIViewRepresentable {
                                                        height: renderH))
             }
 
-            let autoExposureActive = Q3_PostprocessEnabled() != 0 && Q3_PostprocessAutoExposure() != 0
             if autoExposureActive {
                 // Auto-exposure measures and tone-maps the 3D scene before HUD/UI.
                 // Main-scene flares are part of the lit 3D scene, so keep them
                 // before q3_postprocess; HUD sub-scenes and 2D overlays are drawn
                 // after q3_postprocess and therefore do not pump exposure.
-                if !mainFlaresDrawnBeforeFog, let sceneView = mainSceneViewForLatePasses, let device = view.device {
+                if !rtWorldPostprocessEncodedBeforeEntities,
+                   !mainFlaresDrawnBeforeFog, let sceneView = mainSceneViewForLatePasses, let device = view.device {
                     _ = encodeMainFlarePass(encoder: encoder,
                                             sceneView: sceneView,
                                             snapshot: snapshot,
@@ -13337,28 +13452,30 @@ struct MetalView: UIViewRepresentable {
             }
 
             encoder.endEncoding()
-            encodeRTPerfPoint(commandBuffer: commandBuffer, frame: rtPerfFrame, sample: .postStart)
+            if !rtWorldPostprocessEncodedBeforeEntities {
+                encodeRTPerfPoint(commandBuffer: commandBuffer, frame: rtPerfFrame, sample: .postStart)
 
-            if upscaleActive,
-               let colorRT = (rtCompositeForUpscale ?? upscaleColorTarget),
-               let resolveRT = upscaleResolvedColorTarget {
-                encodeSpatialUpscale(commandBuffer: commandBuffer,
-                                     source: colorRT,
-                                     output: resolveRT)
-                encodePostprocess(commandBuffer: commandBuffer,
-                                  sourceTexture: resolveRT,
-                                  outputTexture: drawable.texture,
-                                  measureExposure: false)
-            } else if upscaleActive {
-                encodePostprocess(commandBuffer: commandBuffer,
-                                  sourceTexture: drawable.texture,
-                                  outputTexture: drawable.texture)
-            } else {
-                encodePostprocess(commandBuffer: commandBuffer,
-                                  sourceTexture: drawable.texture,
-                                  outputTexture: drawable.texture)
+                if upscaleActive,
+                   let colorRT = (rtCompositeForUpscale ?? upscaleColorTarget),
+                   let resolveRT = upscaleResolvedColorTarget {
+                    encodeSpatialUpscale(commandBuffer: commandBuffer,
+                                         source: colorRT,
+                                         output: resolveRT)
+                    encodePostprocess(commandBuffer: commandBuffer,
+                                      sourceTexture: resolveRT,
+                                      outputTexture: drawable.texture,
+                                      measureExposure: false)
+                } else if upscaleActive {
+                    encodePostprocess(commandBuffer: commandBuffer,
+                                      sourceTexture: drawable.texture,
+                                      outputTexture: drawable.texture)
+                } else {
+                    encodePostprocess(commandBuffer: commandBuffer,
+                                      sourceTexture: drawable.texture,
+                                      outputTexture: drawable.texture)
+                }
+                encodeRTPerfPoint(commandBuffer: commandBuffer, frame: rtPerfFrame, sample: .postEnd)
             }
-            encodeRTPerfPoint(commandBuffer: commandBuffer, frame: rtPerfFrame, sample: .postEnd)
 
             if autoExposureActive, let device = view.device {
                 let uiDepth = ensureSceneDepthTexture(device: device,
