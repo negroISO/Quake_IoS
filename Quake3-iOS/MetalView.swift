@@ -8812,14 +8812,22 @@ struct MetalView: UIViewRepresentable {
                 }
             }
 
-            if let budgetBytes, let fullBytes, pbrTextureMemoryUsedBytes + fullBytes > budgetBytes {
-                recordPBRTextureDrop(handle: handle,
-                                     kind: kind,
-                                     path: path,
-                                     reason: "over-budget-unmippable")
-                throw NSError(domain: "Q3PBRTextureBudget",
-                              code: 2,
-                              userInfo: [NSLocalizedDescriptionKey: "PBR texture budget exceeded and DDS was not mippable"])
+            let fileBytes = ((try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? NSNumber)?.uint64Value
+            let budgetEstimateBytes = fullBytes ?? fileBytes
+            if let budgetBytes, let estimatedBytes = budgetEstimateBytes, pbrTextureMemoryUsedBytes + estimatedBytes > budgetBytes {
+                let smallDDSBudgetBypassBytes: UInt64 = 256 * 1024
+                if path.lowercased().hasSuffix(".dds") && estimatedBytes <= smallDDSBudgetBypassBytes {
+                    let budgetText = "\(pbrTextureBudgetMB())MB"
+                    pbrLog("[Q3-PBR-MEM] small-dds-budget-bypass handle=\(handle) kind=\(kind.rawValue) budget=\(budgetText) used=\(pbrMemMB(pbrTextureMemoryUsedBytes))MB size=\(pbrMemMB(estimatedBytes))MB path=\(path)")
+                } else {
+                    recordPBRTextureDrop(handle: handle,
+                                         kind: kind,
+                                         path: path,
+                                         reason: "over-budget-unmippable")
+                    throw NSError(domain: "Q3PBRTextureBudget",
+                                  code: 2,
+                                  userInfo: [NSLocalizedDescriptionKey: "PBR texture budget exceeded and DDS was not mippable"])
+                }
             }
 
             let texture = try loader.newTexture(URL: url, options: options)
