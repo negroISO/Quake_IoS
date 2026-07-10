@@ -97,6 +97,8 @@ void Q3DebugTelemetry_Log(const char *type, const char *message);
  * r_postprocess_gamma (default 0.95, range [0.5, 2.5]) control the curve.
  * r_postprocess_autoexposure (default 1) replaces the fixed intensity with
  * scene-adaptive exposure clamped by r_exposure_min / r_exposure_max.
+ * r_exposure_highlight_limit (default 0.9, 0 disables) caps auto exposure
+ * from a full-frame P95-ish highlight sample before ACES.
  * Encoded after world+entity+UI passes; skipped when disabled. */
 int Q3_PostprocessEnabled(void);
 float Q3_PostprocessIntensity(void);
@@ -106,6 +108,7 @@ int Q3_PostprocessTonemap(void);
 int Q3_PostprocessAutoExposure(void);
 float Q3_ExposureMin(void);
 float Q3_ExposureMax(void);
+float Q3_ExposureHighlightLimit(void);
 
 /* Audio backend (ios_main.m SNDDMA + ring buffer). Set the rate BEFORE
  * Quake3_Init so SNDDMA_Init allocates correctly. Pull is called from

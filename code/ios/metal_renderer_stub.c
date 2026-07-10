@@ -11504,6 +11504,19 @@ float Q3_ExposureMax(void) {
     return v;
 }
 
+/* r_exposure_highlight_limit (default 0.9): when auto exposure is enabled,
+ * Swift also meters a full-frame P95-ish highlight proxy and caps exposure so
+ * that bright ceilings/skies land at or below this pre-ACES level. 0 disables
+ * the guard and preserves Stage32 mean-log-luminance behavior. */
+float Q3_ExposureHighlightLimit(void) {
+    if (ri.Cvar_Get == NULL) return 0.9f;
+    cvar_t *cv = ri.Cvar_Get("r_exposure_highlight_limit", "0.9", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.9f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 4.0f) v = 4.0f;
+    return v;
+}
+
 /* r_postprocess_tonemap (default 1 = ON): when set, q3_postprocess applies an
  * ACES filmic tonemap after pre-exposure so raised exposure rolls highlights
  * off smoothly instead of hard-clipping. 0 = legacy hard saturate clip. */

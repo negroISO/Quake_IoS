@@ -4715,6 +4715,7 @@ struct MetalView: UIViewRepresentable {
             var exposureMin: Float
             var exposureMax: Float
             var exposureKey: Float
+            var exposureHighlightLimit: Float
             var deltaTime: Float
         }
 
@@ -4740,6 +4741,7 @@ struct MetalView: UIViewRepresentable {
                 float exposureMin;
                 float exposureMax;
                 float exposureKey;
+                float exposureHighlightLimit;
                 float deltaTime;
             };
 
@@ -4757,25 +4759,44 @@ struct MetalView: UIViewRepresentable {
                                            uint tid [[thread_index_in_threadgroup]]) {
                 constexpr sampler s(filter::linear, address::clamp_to_edge);
                 threadgroup float partial[256];
+                threadgroup float partialMax[256];
+                threadgroup atomic_uint highlightHist[16];
                 const uint grid = 64u;
                 const uint total = grid * grid;
                 const float2 regionOrigin = float2(0.175, 0.175);
                 const float2 regionScale = float2(0.65, 0.65);
+                const bool highlightGuard = u.exposureHighlightLimit > 0.0;
+                const float highlightBinMax = 2.0;
+                const float highlightBinWidth = highlightBinMax / 16.0;
+                if (highlightGuard && tid < 16u) {
+                    atomic_store_explicit(&highlightHist[tid], 0u, memory_order_relaxed);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
                 float sum = 0.0;
+                float localMax = 0.0;
                 for (uint i = tid; i < total; i += 256u) {
                     uint sx = i & 63u;
                     uint sy = i >> 6u;
                     float2 uv = (float2(sx, sy) + 0.5) / float(grid);
-                    uv = regionOrigin + uv * regionScale;
-                    float3 rgb = max(source.sample(s, uv).rgb, float3(0.0));
+                    float2 centralUV = regionOrigin + uv * regionScale;
+                    float3 rgb = max(source.sample(s, centralUV).rgb, float3(0.0));
                     float lum = dot(rgb, float3(0.2126, 0.7152, 0.0722));
                     sum += log(max(lum, 1.0e-4));
+                    if (highlightGuard) {
+                        float3 fullRgb = max(source.sample(s, uv).rgb, float3(0.0));
+                        float fullLum = dot(fullRgb, float3(0.2126, 0.7152, 0.0722));
+                        localMax = max(localMax, fullLum);
+                        uint bin = uint(clamp(floor((fullLum / highlightBinMax) * 16.0), 0.0, 15.0));
+                        atomic_fetch_add_explicit(&highlightHist[bin], 1u, memory_order_relaxed);
+                    }
                 }
                 partial[tid] = sum;
+                partialMax[tid] = localMax;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 for (uint stride = 128u; stride > 0u; stride >>= 1u) {
                     if (tid < stride) {
                         partial[tid] += partial[tid + stride];
+                        partialMax[tid] = max(partialMax[tid], partialMax[tid + stride]);
                     }
                     threadgroup_barrier(mem_flags::mem_threadgroup);
                 }
@@ -4784,6 +4805,22 @@ struct MetalView: UIViewRepresentable {
                     float lo = min(u.exposureMin, u.exposureMax);
                     float hi = max(u.exposureMin, u.exposureMax);
                     float target = clamp(u.exposureKey / max(avgLum, 1.0e-4), lo, hi);
+                    if (highlightGuard) {
+                        const uint threshold = (total * 95u + 99u) / 100u;
+                        uint cumulative = 0u;
+                        uint percentileBin = 15u;
+                        for (uint b = 0u; b < 16u; ++b) {
+                            cumulative += atomic_load_explicit(&highlightHist[b], memory_order_relaxed);
+                            if (cumulative >= threshold) {
+                                percentileBin = b;
+                                break;
+                            }
+                        }
+                        float highlightLum = max((float(percentileBin) + 0.5) * highlightBinWidth,
+                                                 partialMax[0]);
+                        float highlightExposure = u.exposureHighlightLimit / max(highlightLum, 1.0e-4);
+                        target = clamp(min(target, highlightExposure), lo, hi);
+                    }
                     float prev = exposureBuffer[0];
                     bool cold = (!isfinite(prev)) || prev <= 0.0;
                     if (cold) {
@@ -4888,6 +4925,7 @@ struct MetalView: UIViewRepresentable {
                                        exposureMin: exposureMin,
                                        exposureMax: exposureMax,
                                        exposureKey: 0.18,
+                                       exposureHighlightLimit: Q3_ExposureHighlightLimit(),
                                        deltaTime: delta)
         }
 
@@ -4924,8 +4962,8 @@ struct MetalView: UIViewRepresentable {
             enc.endEncoding()
             if !exposureLogPrintedOnce {
                 exposureLogPrintedOnce = true
-                let msg = String(format: "[Q3-EXPOSURE] auto ready mode=reduce key=%.3f clamp=[%.2f,%.2f] sample=64x64 central=65%% tau=0.70 perf=single-threadgroup expected<0.5ms",
-                                 uniforms.exposureKey, uniforms.exposureMin, uniforms.exposureMax)
+                let msg = String(format: "[Q3-EXPOSURE] auto ready mode=reduce key=%.3f clamp=[%.2f,%.2f] highlightLimit=%.3f sample=64x64 central=65%% highlight=fullframe-p95+max tau=0.70 perf=single-threadgroup expected<0.5ms",
+                                 uniforms.exposureKey, uniforms.exposureMin, uniforms.exposureMax, uniforms.exposureHighlightLimit)
                 print(msg)
                 pbrLog(msg)
             }
