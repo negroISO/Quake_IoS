@@ -4678,6 +4678,17 @@ struct MetalView: UIViewRepresentable {
         private var rtLastMaterialRefreshTime: Float = 0
         private var rtLastMaterialSignature: UInt64 = 0
         private var rtPortalMaterialExclusionActive = false
+        private struct RTMaterialSignatureCacheKey: Equatable {
+            var worldGeneration: UInt32
+            var drawCount: UInt32
+            var pbrEmitMaxBits: UInt64
+            var rtEmitBits: UInt64
+            var rtEmitMaxEVBits: UInt64
+            var pbrBakedLightmaps: UInt32
+            var mirrorExclusion: Bool
+        }
+        private var rtMaterialSignatureCacheKey: RTMaterialSignatureCacheKey?
+        private var rtMaterialSignatureCacheValue: UInt64 = 0
         private var rtLastEnvCubeLabel: String?
         private var rtHistoryValid = false
         private var rtJitterFrame: UInt32 = 0
@@ -6451,7 +6462,7 @@ struct MetalView: UIViewRepresentable {
                                                      candidateCount: emissiveCandidates.count,
                                                      droppedCount: droppedEmissive,
                                                      mapName: emissiveMap)
-            let sigForEmissiveCache = cacheSignature != 0 ? cacheSignature : rtWorldMaterialSignature()
+            let sigForEmissiveCache = cacheSignature
             if sigForEmissiveCache != 0 {
                 if rtEmissiveLightCache.count > 96 {
                     rtEmissiveLightCache.removeAll(keepingCapacity: true)
@@ -6489,14 +6500,39 @@ struct MetalView: UIViewRepresentable {
         }
 
         @MainActor
-        private func rtWorldMaterialSignature() -> UInt64 {
+        private func rtWorldMaterialSignature(worldGeneration: UInt32) -> UInt64 {
+            let drawCount = Q3MetalRenderer_GetWorldAllDrawCommandCount()
+            guard drawCount > 0 else { return 0 }
+            let key = RTMaterialSignatureCacheKey(
+                worldGeneration: worldGeneration,
+                drawCount: drawCount,
+                pbrEmitMaxBits: Self.floatBits(Q3_PBREmissiveIntensityMax()),
+                rtEmitBits: Self.floatBits(Q3_RTEmissive()),
+                rtEmitMaxEVBits: Self.floatBits(Q3_RTEmissiveMaxEV()),
+                pbrBakedLightmaps: UInt32(Q3_PBRBakedLightmaps() != 0 ? 1 : 0),
+                mirrorExclusion: rtPortalMaterialExclusionActive)
+            if rtMaterialSignatureCacheKey == key {
+                return rtMaterialSignatureCacheValue
+            }
+            let sig = computeRTWorldMaterialSignature(drawCount: Int(drawCount))
+            if sig != 0 {
+                rtMaterialSignatureCacheKey = key
+                rtMaterialSignatureCacheValue = sig
+            } else {
+                rtMaterialSignatureCacheKey = nil
+                rtMaterialSignatureCacheValue = 0
+            }
+            return sig
+        }
+
+        @MainActor
+        private func computeRTWorldMaterialSignature(drawCount: Int) -> UInt64 {
             /* Portal mirrors are a raster side-pass. When active, key RT's
              * material-refresh gate on the same static world-material table
              * and ignore portal-marked surfaces; the reflected portal pass may
              * touch animated/off-main materials, but those must not churn the
              * RT primitive-material cache. */
             guard let drawsPtr = Q3MetalRenderer_GetWorldAllDrawCommands() else { return 0 }
-            let drawCount = Int(Q3MetalRenderer_GetWorldAllDrawCommandCount())
             guard drawCount > 0 else { return 0 }
             let draws = UnsafeBufferPointer(start: drawsPtr, count: drawCount)
             var h: UInt64 = 0xcbf29ce484222325
@@ -6689,7 +6725,7 @@ struct MetalView: UIViewRepresentable {
             cb.commit(); cb.waitUntilCompleted()
             if let err = cb.error { print("[RT] AS build failed: \(err)"); return nil }
             rtASVertexBuffer = worldVertexBuffer; rtASIndexBuffer = ib
-            rtLastMaterialSignature = rtWorldMaterialSignature()
+            rtLastMaterialSignature = rtWorldMaterialSignature(worldGeneration: snapshot.worldGeneration)
             rtPrimitiveMaterialBufferCache.removeAll(keepingCapacity: true)
             rtEmissiveLightCache.removeAll(keepingCapacity: true)
             if rtLastMaterialSignature != 0, let buf = rtPrimitiveMaterialBuffer {
@@ -7178,7 +7214,7 @@ struct MetalView: UIViewRepresentable {
             guard worldASBuilt, let worldAS = worldAccelerationStructure else { return nil }
             let rtNow = Float(CACurrentMediaTime() - frameTimeOrigin)
             if rtNow - rtLastMaterialRefreshTime >= (1.0 / 30.0) {
-                let sig = rtWorldMaterialSignature()
+                let sig = rtWorldMaterialSignature(worldGeneration: worldGeneration)
                 if sig != 0 && sig != rtLastMaterialSignature {
                     if let cached = rtPrimitiveMaterialBufferCache[sig] {
                         rtPrimitiveMaterialBuffer = cached
