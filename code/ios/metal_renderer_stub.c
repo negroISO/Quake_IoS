@@ -50,6 +50,14 @@ If a visual issue exists, fix the generic mismatch against ioq3/Kenny behavior.
 #include <errno.h>
 #include <sys/stat.h>   /* GetRefAPI PBR bundle-path probe */
 
+/* Cached miss marker for metalTexture_t.pbrMaterial. Valid material pointers
+ * come from q3_pbr's heap-backed tables and are never address 1. */
+#define Q3_PBR_MATERIAL_MISS_SENTINEL ((const q3_pbr_material_t *)(uintptr_t)1)
+
+static qboolean Q3PBRMaterialIsMissSentinel(const q3_pbr_material_t *m) {
+    return ((uintptr_t)m) == (uintptr_t)Q3_PBR_MATERIAL_MISS_SENTINEL;
+}
+
 /* Append a line to Documents/q3_diag.log inside the app sandbox.
  * Catalyst launched directly from scripts may expose HOME as the real user
  * home, which is sandbox-denied. Prefer CFFIXED_USER_HOME when present; it
@@ -206,9 +214,10 @@ typedef struct {
      * mod.usda manifest, pbrMaterial points at the resolved material
      * record. Swift consumes this via Q3MetalRenderer_GetPBRMaterial
      * to lazy-load DDS textures and bind them to the PBR fragment
-     * shader. NULL when no match. */
+     * shader. NULL when unknown/no registration hit; address 1 after a
+     * Q3MetalRenderer_GetPBRMaterial name-fallback miss. */
     uint64_t pbrContentHash;
-    const void *pbrMaterial;  /* opaque pointer to q3_pbr_material_t */
+    const void *pbrMaterial;  /* opaque pointer to q3_pbr_material_t; address 1 = cached miss */
 } metalTexture_t;
 
 refimport_t ri;
@@ -1124,7 +1133,10 @@ static void EmitQ3SurfaceProbe(const char *mapName,
             matTex = FindTextureByHandle((qhandle_t)materialHandle);
             if (matTex != NULL) {
                 mat = (const q3_pbr_material_t *)matTex->pbrMaterial;
-                if (mat != NULL) {
+                if (Q3PBRMaterialIsMissSentinel(mat)) {
+                    mat = NULL;
+                    materialSource = "cached-miss";
+                } else if (mat != NULL) {
                     materialSource = "hash";
                 } else if (matTex->name[0] != '\0') {
                     mat = q3_pbr_lookup_by_name(matTex->name);
@@ -2584,7 +2596,7 @@ static qboolean WorldMapPathIsClassicEffectLayer(const char *path) {
 }
 
 static qboolean PBRMaterialHasWorldSidecar(const q3_pbr_material_t *m) {
-    if (m == NULL || m->albedo == NULL) return qfalse;
+    if (m == NULL || Q3PBRMaterialIsMissSentinel(m) || m->albedo == NULL) return qfalse;
     if (m->normal != NULL || m->roughness != NULL || m->metallic != NULL ||
         m->emissive != NULL || m->height != NULL) {
         return qtrue;
@@ -11316,9 +11328,10 @@ int Q3_PostprocessEnabled(void) {
 const Q3PBRMaterialPaths *Q3MetalRenderer_GetPBRMaterial(unsigned int textureHandle) {
     static Q3PBRMaterialPaths s_paths;  /* not thread-safe; Swift renderer is single-threaded */
     if (textureHandle == 0) return NULL;
-    const metalTexture_t *tex = FindTextureByHandle((qhandle_t)textureHandle);
+    metalTexture_t *tex = FindTextureByHandle((qhandle_t)textureHandle);
     if (tex == NULL) return NULL;
     const q3_pbr_material_t *m = (const q3_pbr_material_t *)tex->pbrMaterial;
+    if (Q3PBRMaterialIsMissSentinel(m)) return NULL;
     /* Composite-handle fallback. Entity per-stage handles register with
      * composite names like "*entity-stage:N:models/.../plasammo.tga"
      * (created at line 2198) and do NOT bind a pbrMaterial at registration.
@@ -11341,8 +11354,13 @@ const Q3PBRMaterialPaths *Q3MetalRenderer_GetPBRMaterial(unsigned int textureHan
             const q3_pbr_material_t *mn = q3_pbr_lookup_by_name(resolve);
             if (mn != NULL) {
                 m = mn;
+                tex->pbrMaterial = mn;
+            } else if (m == NULL && q3_pbr_table_ready()) {
+                tex->pbrMaterial = Q3_PBR_MATERIAL_MISS_SENTINEL;
             }
         }
+    } else if (m == NULL && q3_pbr_table_ready()) {
+        tex->pbrMaterial = Q3_PBR_MATERIAL_MISS_SENTINEL;
     }
     if (m == NULL) return NULL;
     s_paths.albedo    = m->albedo;
