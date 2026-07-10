@@ -1011,6 +1011,9 @@ struct MetalView: UIViewRepresentable {
             var atlasByHandle: [UInt32: EntityAtlasResolution] = [:]
         }
 
+        private var entityAtlasResolutionCache: [UInt32: EntityAtlasResolution] = [:]
+        private var entityAtlasResolutionMisses: Set<UInt32> = []
+
         /// Returns the atlas albedo MTLTexture to bind at fragment slot 0
         /// when the entity draw resolved to an animated atlas material.
         /// Caller must replace the original color texture with the returned
@@ -1149,8 +1152,23 @@ struct MetalView: UIViewRepresentable {
         }
 
         private func packEntityAtlas(handle: UInt32, into uniforms: inout EntityUniforms) -> MTLTexture? {
-            let resolution = resolveEntityAtlas(handle: handle)
+            let resolution = cachedEntityAtlasResolution(handle: handle)
             return applyEntityAtlas(resolution, into: &uniforms)
+        }
+
+        private func cachedEntityAtlasResolution(handle: UInt32) -> EntityAtlasResolution? {
+            if let cached = entityAtlasResolutionCache[handle] {
+                return cached
+            }
+            if entityAtlasResolutionMisses.contains(handle) {
+                return nil
+            }
+            if let resolved = resolveEntityAtlas(handle: handle) {
+                entityAtlasResolutionCache[handle] = resolved
+                return resolved
+            }
+            entityAtlasResolutionMisses.insert(handle)
+            return nil
         }
 
         private func buildEntityFrameContext(draws: UnsafeBufferPointer<Q3MetalEntityDrawCmd>,
@@ -1163,7 +1181,7 @@ struct MetalView: UIViewRepresentable {
             for drawIdx in first..<end {
                 let handle = draws[drawIdx].textureHandle
                 guard handle != 0, seenHandles.insert(handle).inserted else { continue }
-                if let resolution = resolveEntityAtlas(handle: handle) {
+                if let resolution = cachedEntityAtlasResolution(handle: handle) {
                     context.atlasByHandle[handle] = resolution
                 }
             }
