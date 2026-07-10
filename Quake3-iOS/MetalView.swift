@@ -4135,8 +4135,12 @@ struct MetalView: UIViewRepresentable {
          * Q3_PostprocessEnabled() — when off, the compute pipeline is
          * never compiled (lazy init in ensurePostprocessPipeline). */
         private var postprocessPipelineState: MTLComputePipelineState?
+        private var exposureReducePipelineState: MTLComputePipelineState?
+        private var exposureBuffer: MTLBuffer?
         private var postprocessEncodeCount: Int = 0
         private var postprocessLogPrintedOnce: Bool = false
+        private var exposureLogPrintedOnce: Bool = false
+        private var postprocessLastWallTime: CFTimeInterval?
 
         private var worldAccelerationStructure: MTLAccelerationStructure?
         private var rtPipelineState: MTLComputePipelineState?
@@ -4707,6 +4711,11 @@ struct MetalView: UIViewRepresentable {
             var intensity: Float
             var gamma: Float
             var tonemap: Float
+            var autoExposure: Float
+            var exposureMin: Float
+            var exposureMax: Float
+            var exposureKey: Float
+            var deltaTime: Float
         }
 
         private struct RTBlendUniforms {
@@ -4727,11 +4736,69 @@ struct MetalView: UIViewRepresentable {
                 float intensity;
                 float gamma;
                 float tonemap;
+                float autoExposure;
+                float exposureMin;
+                float exposureMax;
+                float exposureKey;
+                float deltaTime;
             };
+
+            inline float q3_active_exposure(constant PPUniforms &u,
+                                            device const float *exposureBuffer) {
+                if (u.autoExposure > 0.5 && exposureBuffer != nullptr) {
+                    return clamp(exposureBuffer[0], u.exposureMin, u.exposureMax);
+                }
+                return u.intensity;
+            }
+
+            kernel void q3_exposure_reduce(texture2d<float, access::sample> source [[texture(0)]],
+                                           device float *exposureBuffer [[buffer(0)]],
+                                           constant PPUniforms &u [[buffer(1)]],
+                                           uint tid [[thread_index_in_threadgroup]]) {
+                constexpr sampler s(filter::linear, address::clamp_to_edge);
+                threadgroup float partial[256];
+                const uint grid = 64u;
+                const uint total = grid * grid;
+                const float2 regionOrigin = float2(0.175, 0.175);
+                const float2 regionScale = float2(0.65, 0.65);
+                float sum = 0.0;
+                for (uint i = tid; i < total; i += 256u) {
+                    uint sx = i & 63u;
+                    uint sy = i >> 6u;
+                    float2 uv = (float2(sx, sy) + 0.5) / float(grid);
+                    uv = regionOrigin + uv * regionScale;
+                    float3 rgb = max(source.sample(s, uv).rgb, float3(0.0));
+                    float lum = dot(rgb, float3(0.2126, 0.7152, 0.0722));
+                    sum += log(max(lum, 1.0e-4));
+                }
+                partial[tid] = sum;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+                    if (tid < stride) {
+                        partial[tid] += partial[tid + stride];
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+                if (tid == 0u) {
+                    float avgLum = exp(partial[0] / float(total));
+                    float lo = min(u.exposureMin, u.exposureMax);
+                    float hi = max(u.exposureMin, u.exposureMax);
+                    float target = clamp(u.exposureKey / max(avgLum, 1.0e-4), lo, hi);
+                    float prev = exposureBuffer[0];
+                    bool cold = (!isfinite(prev)) || prev <= 0.0;
+                    if (cold) {
+                        prev = clamp(u.intensity, lo, hi);
+                    }
+                    float tau = 0.70;
+                    float alpha = cold ? 1.0 : clamp(1.0 - exp(-max(u.deltaTime, 0.0) / tau), 0.0, 1.0);
+                    exposureBuffer[0] = mix(prev, target, alpha);
+                }
+            }
 
             kernel void q3_postprocess(texture2d<float, access::read> source [[texture(0)]],
                                        texture2d<float, access::write> target [[texture(1)]],
                                        constant PPUniforms &u [[buffer(0)]],
+                                       device const float *exposureBuffer [[buffer(1)]],
                                        uint2 tid [[thread_position_in_grid]]) {
                 uint w = target.get_width();
                 uint h = target.get_height();
@@ -4747,7 +4814,8 @@ struct MetalView: UIViewRepresentable {
                 // which is still LDR-ish, so this reshapes tone rather than
                 // recovering truly-clipped emissive; the HDR backbuffer is the
                 // separate T2 follow-up for true highlight recovery.)
-                float3 rgb = max(c.rgb * u.intensity, float3(0.0));
+                float exposure = q3_active_exposure(u, exposureBuffer);
+                float3 rgb = max(c.rgb * exposure, float3(0.0));
                 if (u.tonemap > 0.5) {
                     // ACES filmic fit (Narkowicz) — same curve as the RT blendRT path.
                     rgb = (rgb * (2.51 * rgb + 0.03)) /
@@ -4760,6 +4828,7 @@ struct MetalView: UIViewRepresentable {
             kernel void q3_spatial_upscale(texture2d<float, access::sample> source [[texture(0)]],
                                            texture2d<float, access::write> output [[texture(1)]],
                                            constant PPUniforms &u [[buffer(0)]],
+                                           device const float *exposureBuffer [[buffer(1)]],
                                            uint2 tid [[thread_position_in_grid]]) {
                 uint w = output.get_width();
                 uint h = output.get_height();
@@ -4767,12 +4836,13 @@ struct MetalView: UIViewRepresentable {
                 constexpr sampler s(filter::linear, address::clamp_to_edge);
                 float2 uv = (float2(tid) + 0.5) / float2(max(w, 1u), max(h, 1u));
                 float4 c = source.sample(s, uv);
-                float3 rgb = max(c.rgb * u.intensity, float3(0.0));
+                float exposure = q3_active_exposure(u, exposureBuffer);
+                float3 rgb = max(c.rgb * exposure, float3(0.0));
                 if (u.tonemap > 0.5) {
                     rgb = (rgb * (2.51 * rgb + 0.03)) /
                           (rgb * (2.43 * rgb + 0.59) + 0.14);
                 } else {
-                    rgb *= u.intensity;
+                    rgb *= exposure;
                 }
                 output.write(float4(saturate(rgb), c.a), tid);
             }
@@ -4788,6 +4858,9 @@ struct MetalView: UIViewRepresentable {
                 if let upFn = lib.makeFunction(name: "q3_spatial_upscale") {
                     spatialUpscalePipelineState = try? device.makeComputePipelineState(function: upFn)
                 }
+                if let exposureFn = lib.makeFunction(name: "q3_exposure_reduce") {
+                    exposureReducePipelineState = try? device.makeComputePipelineState(function: exposureFn)
+                }
                 if !postprocessLogPrintedOnce {
                     print("[MTL_POSTPROC] q3_postprocess pipeline ready")
                     postprocessLogPrintedOnce = true
@@ -4800,22 +4873,93 @@ struct MetalView: UIViewRepresentable {
         }
 
         @MainActor
-        private func encodePostprocess(commandBuffer: MTLCommandBuffer,
-                                       sourceTexture: MTLTexture,
-                                       outputTexture: MTLTexture) {
-            if sourceTexture === outputTexture && Q3_PostprocessEnabled() == 0 { return }
-            guard let device = commandBuffer.device as MTLDevice?,
-                  let pso = ensurePostprocessPipeline(device: device),
+        private func makePostprocessUniforms() -> PostprocessUniforms {
+            let now = CACurrentMediaTime()
+            let rawDelta = postprocessLastWallTime.map { now - $0 } ?? (1.0 / 60.0)
+            postprocessLastWallTime = now
+            let delta = Float(min(max(rawDelta, 1.0 / 240.0), 0.25))
+            let fixedIntensity = Q3_PostprocessIntensity()
+            let exposureMin = Q3_ExposureMin()
+            let exposureMax = max(exposureMin, Q3_ExposureMax())
+            return PostprocessUniforms(intensity: fixedIntensity,
+                                       gamma: Q3_PostprocessGamma(),
+                                       tonemap: Float(Q3_PostprocessTonemap()),
+                                       autoExposure: Float(Q3_PostprocessAutoExposure()),
+                                       exposureMin: exposureMin,
+                                       exposureMax: exposureMax,
+                                       exposureKey: 0.18,
+                                       deltaTime: delta)
+        }
+
+        @MainActor
+        private func ensureExposureBuffer(device: MTLDevice, initialExposure: Float) -> MTLBuffer? {
+            if let exposureBuffer { return exposureBuffer }
+            guard let buffer = device.makeBuffer(length: MemoryLayout<Float>.stride,
+                                                 options: .storageModeShared) else {
+                return nil
+            }
+            buffer.label = "Q3.exposure.adapted"
+            buffer.contents().bindMemory(to: Float.self, capacity: 1).pointee = initialExposure
+            exposureBuffer = buffer
+            return buffer
+        }
+
+        @MainActor
+        private func encodeExposureReduction(commandBuffer: MTLCommandBuffer,
+                                             sourceTexture: MTLTexture,
+                                             uniforms: inout PostprocessUniforms,
+                                             exposureBuffer: MTLBuffer) {
+            guard uniforms.autoExposure > 0.5,
+                  let pso = exposureReducePipelineState,
                   let enc = commandBuffer.makeComputeCommandEncoder() else {
                 return
             }
+            enc.label = "Q3.exposure.reduce"
+            enc.setComputePipelineState(pso)
+            enc.setTexture(sourceTexture, index: 0)
+            enc.setBuffer(exposureBuffer, offset: 0, index: 0)
+            enc.setBytes(&uniforms, length: MemoryLayout<PostprocessUniforms>.size, index: 1)
+            enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            enc.endEncoding()
+            if !exposureLogPrintedOnce {
+                exposureLogPrintedOnce = true
+                let msg = String(format: "[Q3-EXPOSURE] auto ready mode=reduce key=%.3f clamp=[%.2f,%.2f] sample=64x64 central=65%% tau=0.70 perf=single-threadgroup expected<0.5ms",
+                                 uniforms.exposureKey, uniforms.exposureMin, uniforms.exposureMax)
+                print(msg)
+                pbrLog(msg)
+            }
+        }
+
+        @MainActor
+        private func encodePostprocess(commandBuffer: MTLCommandBuffer,
+                                       sourceTexture: MTLTexture,
+                                       outputTexture: MTLTexture,
+                                       measureExposure: Bool = true) {
+            if sourceTexture === outputTexture && Q3_PostprocessEnabled() == 0 { return }
+            guard let device = commandBuffer.device as MTLDevice?,
+                  let pso = ensurePostprocessPipeline(device: device) else {
+                return
+            }
+            var u = makePostprocessUniforms()
+            let exposureBuffer = ensureExposureBuffer(device: device, initialExposure: u.intensity)
+            if measureExposure, let exposureBuffer {
+                encodeExposureReduction(commandBuffer: commandBuffer,
+                                        sourceTexture: sourceTexture,
+                                        uniforms: &u,
+                                        exposureBuffer: exposureBuffer)
+            }
+            guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
             enc.label = "Q3.postprocess"
             enc.setComputePipelineState(pso)
             enc.setTexture(sourceTexture, index: 0)
             enc.setTexture(outputTexture, index: 1)
-            var u = PostprocessUniforms(intensity: Q3_PostprocessIntensity(),
-                                        gamma: Q3_PostprocessGamma(),
-                                        tonemap: Float(Q3_PostprocessTonemap()))
+            if let exposureBuffer {
+                enc.setBuffer(exposureBuffer, offset: 0, index: 1)
+            } else {
+                var fallbackExposure = u.intensity
+                enc.setBytes(&fallbackExposure, length: MemoryLayout<Float>.stride, index: 1)
+            }
             enc.setBytes(&u, length: MemoryLayout<PostprocessUniforms>.size, index: 0)
             let w = outputTexture.width
             let h = outputTexture.height
@@ -4825,9 +4969,21 @@ struct MetalView: UIViewRepresentable {
                                        depth: 1)
             enc.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerThreadgroup)
             enc.endEncoding()
+            let exposureLogFrame = postprocessEncodeCount + 1
+            if u.autoExposure > 0.5,
+               let exposureBuffer,
+               (exposureLogFrame == 1 || exposureLogFrame % 120 == 0) {
+                let minExposure = u.exposureMin
+                let maxExposure = u.exposureMax
+                commandBuffer.addCompletedHandler { _ in
+                    let value = exposureBuffer.contents().bindMemory(to: Float.self, capacity: 1).pointee
+                    print(String(format: "[Q3-EXPOSURE] frame=%d adapted=%.3f clamp=[%.2f,%.2f]",
+                                 exposureLogFrame, value, minExposure, maxExposure))
+                }
+            }
             postprocessEncodeCount += 1
             if postprocessEncodeCount == 1 || postprocessEncodeCount % 120 == 0 {
-                print("[MTL_POSTPROC] encode #\(postprocessEncodeCount) intensity=\(u.intensity) gamma=\(u.gamma) tonemap=\(u.tonemap) size=\(w)x\(h)")
+                print("[MTL_POSTPROC] encode #\(postprocessEncodeCount) intensity=\(u.intensity) auto=\(u.autoExposure) gamma=\(u.gamma) tonemap=\(u.tonemap) size=\(w)x\(h)")
             }
         }
 
@@ -4843,15 +4999,27 @@ struct MetalView: UIViewRepresentable {
                                           source: MTLTexture,
                                           output: MTLTexture) {
             guard let device = commandBuffer.device as MTLDevice?,
-                  let pso = ensureSpatialUpscalePipeline(device: device),
-                  let enc = commandBuffer.makeComputeCommandEncoder() else { return }
+                  let pso = ensureSpatialUpscalePipeline(device: device) else { return }
+            var u = makePostprocessUniforms()
+            u.tonemap = 1.0
+            let exposureBuffer = ensureExposureBuffer(device: device, initialExposure: u.intensity)
+            if let exposureBuffer {
+                encodeExposureReduction(commandBuffer: commandBuffer,
+                                        sourceTexture: source,
+                                        uniforms: &u,
+                                        exposureBuffer: exposureBuffer)
+            }
+            guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
             enc.label = "Q3.spatialUpscale"
             enc.setComputePipelineState(pso)
             enc.setTexture(source, index: 0)
             enc.setTexture(output, index: 1)
-            var u = PostprocessUniforms(intensity: Q3_PostprocessIntensity(),
-                                        gamma: Q3_PostprocessGamma(),
-                                        tonemap: 1.0)
+            if let exposureBuffer {
+                enc.setBuffer(exposureBuffer, offset: 0, index: 1)
+            } else {
+                var fallbackExposure = u.intensity
+                enc.setBytes(&fallbackExposure, length: MemoryLayout<Float>.stride, index: 1)
+            }
             enc.setBytes(&u, length: MemoryLayout<PostprocessUniforms>.size, index: 0)
             let tg = MTLSize(width: 8, height: 8, depth: 1)
             let groups = MTLSize(width: (output.width + 7) / 8,
@@ -11008,6 +11176,8 @@ struct MetalView: UIViewRepresentable {
                                           renderH: Int,
                                           mainSceneViewForLatePasses: Q3MetalSceneView?,
                                           mainFlaresDrawnBeforeFog: Bool) {
+            let uiScaleX = Float(renderW) / max(Float(snapshot.drawableWidth), 1.0)
+            let uiScaleY = Float(renderH) / max(Float(snapshot.drawableHeight), 1.0)
             /* Multi-scene HUD sub-scenes. Scene 0 is the main world view
              * handled by the blocks above. Scenes 1..sceneCount are HUD
              * portrait heads, rotating ammo pickups, scoreboard faces,
@@ -11030,18 +11200,27 @@ struct MetalView: UIViewRepresentable {
                     let scene = scenes[sceneIdx]
                     guard scene.entityCommandCount > 0 else { continue }
                     guard scene.viewportWidth > 0 && scene.viewportHeight > 0 else { continue }
+                    let sx = Float(scene.viewportX) * uiScaleX
+                    let sy = Float(scene.viewportY) * uiScaleY
+                    let sw = max(1.0, Float(scene.viewportWidth) * uiScaleX)
+                    let sh = max(1.0, Float(scene.viewportHeight) * uiScaleY)
+
+                    let scissorX = min(max(0, Int(sx.rounded(.down))), max(renderW - 1, 0))
+                    let scissorY = min(max(0, Int(sy.rounded(.down))), max(renderH - 1, 0))
+                    let scissorW = max(1, min(max(renderW - scissorX, 1), Int(sw.rounded(.up))))
+                    let scissorH = max(1, min(max(renderH - scissorY, 1), Int(sh.rounded(.up))))
 
                     encoder.setViewport(MTLViewport(
-                        originX: Double(scene.viewportX),
-                        originY: Double(scene.viewportY),
-                        width: Double(scene.viewportWidth),
-                        height: Double(scene.viewportHeight),
+                        originX: Double(sx),
+                        originY: Double(sy),
+                        width: Double(sw),
+                        height: Double(sh),
                         znear: 0.0, zfar: 1.0))
                     encoder.setScissorRect(MTLScissorRect(
-                        x: Int(scene.viewportX),
-                        y: Int(scene.viewportY),
-                        width: Int(scene.viewportWidth),
-                        height: Int(scene.viewportHeight)))
+                        x: scissorX,
+                        y: scissorY,
+                        width: scissorW,
+                        height: scissorH))
 
                     let subSceneView = Q3MetalSceneView(
                         fovX: scene.fovX, fovY: scene.fovY,
@@ -12936,7 +13115,19 @@ struct MetalView: UIViewRepresentable {
                                                        height: renderH))
             }
 
-            if let device = view.device {
+            let autoExposureActive = Q3_PostprocessEnabled() != 0 && Q3_PostprocessAutoExposure() != 0
+            if autoExposureActive {
+                // Auto-exposure measures and tone-maps the 3D scene before HUD/UI.
+                // Main-scene flares are part of the lit 3D scene, so keep them
+                // before q3_postprocess; HUD sub-scenes and 2D overlays are drawn
+                // after q3_postprocess and therefore do not pump exposure.
+                if !mainFlaresDrawnBeforeFog, let sceneView = mainSceneViewForLatePasses, let device = view.device {
+                    _ = encodeMainFlarePass(encoder: encoder,
+                                            sceneView: sceneView,
+                                            snapshot: snapshot,
+                                            device: device)
+                }
+            } else if let device = view.device {
                 encodeHUDAndUIPasses(encoder: encoder,
                                      snapshot: snapshot,
                                      device: device,
@@ -12958,7 +13149,8 @@ struct MetalView: UIViewRepresentable {
                                      output: resolveRT)
                 encodePostprocess(commandBuffer: commandBuffer,
                                   sourceTexture: resolveRT,
-                                  outputTexture: drawable.texture)
+                                  outputTexture: drawable.texture,
+                                  measureExposure: false)
             } else if upscaleActive {
                 encodePostprocess(commandBuffer: commandBuffer,
                                   sourceTexture: drawable.texture,
@@ -12969,6 +13161,41 @@ struct MetalView: UIViewRepresentable {
                                   outputTexture: drawable.texture)
             }
             encodeRTPerfPoint(commandBuffer: commandBuffer, frame: rtPerfFrame, sample: .postEnd)
+
+            if autoExposureActive, let device = view.device {
+                let uiDepth = ensureSceneDepthTexture(device: device,
+                                                     width: outputW,
+                                                     height: outputH)
+                let uiPass = makeLoadedRenderPassDescriptor(colorTexture: drawable.texture,
+                                                            depthTexture: uiDepth)
+                if uiDepth != nil {
+                    uiPass.depthAttachment.loadAction = .clear
+                    uiPass.depthAttachment.storeAction = .store
+                    uiPass.depthAttachment.clearDepth = 1.0
+                }
+                guard let uiEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: uiPass) else {
+                    return
+                }
+                uiEncoder.label = "Q3.render.ui.afterPostprocess"
+                uiEncoder.setViewport(MTLViewport(originX: 0, originY: 0,
+                                                  width: Double(outputW),
+                                                  height: Double(outputH),
+                                                  znear: 0.0,
+                                                  zfar: 1.0))
+                uiEncoder.setScissorRect(MTLScissorRect(x: 0, y: 0,
+                                                        width: outputW,
+                                                        height: outputH))
+                encodeHUDAndUIPasses(encoder: uiEncoder,
+                                     snapshot: snapshot,
+                                     device: device,
+                                     frameSlot: frameSlot,
+                                     renderW: outputW,
+                                     renderH: outputH,
+                                     mainSceneViewForLatePasses: mainSceneViewForLatePasses,
+                                     mainFlaresDrawnBeforeFog: true)
+                uiEncoder.endEncoding()
+            }
+
             attachRTPerfCompletion(commandBuffer: commandBuffer, frame: rtPerfFrame)
             // Cache drawable.texture BEFORE present(). Reading
             // drawable.texture after commandBuffer.present(drawable)

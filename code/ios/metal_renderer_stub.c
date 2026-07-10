@@ -11285,12 +11285,11 @@ const char *Q3MetalRenderer_GetTextureName(uint32_t textureHandle) {
  *     rgb = saturate(rgb * intensity);
  *     rgb = pow(rgb, gamma);
  *
- * Default intensity was tuned to match Catalyst+RT lighting at medium upscale.
- * We use this as a scene-wide exposure lift for RTX parity work: baseline
- * 2.5 raises mid-tones compared to 1.5 while preserving ACES shoulder control
- * via gamma. Raise/lower at runtime with the existing cvars if needed.
+ * Default fixed intensity was tuned to match Catalyst+RT lighting at medium
+ * upscale. Auto-exposure now replaces that multiplier when enabled; the fixed
+ * r_postprocess_intensity remains the exact legacy fallback and initial value.
  *
- * These three accessors are idempotent: ri.Cvar_Get registers on first
+ * These accessors are idempotent: ri.Cvar_Get registers on first
  * call, returns the existing cvar on subsequent calls. Range clamps are
  * defensive — keeps a user dialing extreme values from blowing out or
  * crushing the image entirely.
@@ -11474,6 +11473,34 @@ float Q3_PostprocessIntensity(void) {
     float v = cv ? cv->value : 2.2f;
     if (v < 0.5f) v = 0.5f;
     if (v > 4.0f) v = 4.0f;
+    return v;
+}
+
+/* r_postprocess_autoexposure (default 1): when enabled, Swift measures the
+ * 3D scene's log-average luminance on the GPU and uses the adapted exposure
+ * instead of the fixed r_postprocess_intensity multiplier. 0 preserves the
+ * exact legacy fixed-intensity path for A/B captures. */
+int Q3_PostprocessAutoExposure(void) {
+    if (ri.Cvar_Get == NULL) return 1;
+    cvar_t *cv = ri.Cvar_Get("r_postprocess_autoexposure", "1", CVAR_ARCHIVE);
+    return (cv && cv->value != 0.0f) ? 1 : 0;
+}
+
+float Q3_ExposureMin(void) {
+    if (ri.Cvar_Get == NULL) return 1.0f;
+    cvar_t *cv = ri.Cvar_Get("r_exposure_min", "0.5", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 1.0f;
+    if (v < 0.05f) v = 0.05f;
+    if (v > 8.0f) v = 8.0f;
+    return v;
+}
+
+float Q3_ExposureMax(void) {
+    if (ri.Cvar_Get == NULL) return 2.4f;
+    cvar_t *cv = ri.Cvar_Get("r_exposure_max", "2.4", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 2.4f;
+    if (v < 0.05f) v = 0.05f;
+    if (v > 8.0f) v = 8.0f;
     return v;
 }
 
