@@ -1002,6 +1002,15 @@ struct MetalView: UIViewRepresentable {
             ("powerups/battlesuit",           "textures/effects/envmapgold"),
         ]
 
+        private struct EntityAtlasResolution {
+            var spriteAtlasParams: SIMD4<Float>
+            var atlasTexture: MTLTexture?
+        }
+
+        private struct EntityFrameContext {
+            var atlasByHandle: [UInt32: EntityAtlasResolution] = [:]
+        }
+
         /// Returns the atlas albedo MTLTexture to bind at fragment slot 0
         /// when the entity draw resolved to an animated atlas material.
         /// Caller must replace the original color texture with the returned
@@ -1016,7 +1025,7 @@ struct MetalView: UIViewRepresentable {
         ///      mapped to the underlying envmap source path
         ///      (`textures/effects/envmapyel`) whose hash-keyed materials.json
         ///      block carries the sprite_sheet_* fields and the atlas DDS.
-        private func packEntityAtlas(handle: UInt32, into uniforms: inout EntityUniforms) -> MTLTexture? {
+        private func resolveEntityAtlas(handle: UInt32) -> EntityAtlasResolution? {
             var sprite_cols: Int32 = 0
             var sprite_rows: Int32 = 0
             var sprite_fps: Float = 0
@@ -1081,6 +1090,7 @@ struct MetalView: UIViewRepresentable {
                 }
             }
             guard sprite_cols > 0 && sprite_rows > 0 else { return nil }
+            var spriteAtlasParams = SIMD4<Float>(0, 0, 0, 0)
             // Single-frame capture DDS files (capture_textures_dds/<HASH>.dds)
             // are NOT real 4×4 atlases — they're snapshots of one envmap
             // moment. Treating them as atlases slices a coherent envmap
@@ -1095,7 +1105,7 @@ struct MetalView: UIViewRepresentable {
                     Self.loggedEntityAtlasSingleFrameNames.insert(n)
                     pbrLog("[Q3-PBR-SWIFT] entity-atlas single-frame capture name='\(n)' forcing atlas params off (capture DDS is not a 4x4 sprite sheet)")
                 }
-                uniforms.spriteAtlasParams = SIMD4<Float>(0, 0, 0, 0)
+                spriteAtlasParams = SIMD4<Float>(0, 0, 0, 0)
             } else if atlasTexture == nil {
                 // The atlas metadata is only valid when the replacement
                 // atlas texture actually loaded. Some Remix animation strips
@@ -1103,13 +1113,13 @@ struct MetalView: UIViewRepresentable {
                 // loading fails, leave sprite remap off so the classic fallback
                 // texture is sampled normally instead of being sliced into
                 // bogus fractional frames.
-                uniforms.spriteAtlasParams = SIMD4<Float>(0, 0, 0, 0)
+                spriteAtlasParams = SIMD4<Float>(0, 0, 0, 0)
             } else {
-                uniforms.spriteAtlasParams = SIMD4<Float>(
+                spriteAtlasParams = SIMD4<Float>(
                     Float(sprite_cols),
                     Float(sprite_rows),
                     sprite_fps,
-                    Float(CACurrentMediaTime() - frameTimeOrigin))
+                    0)
             }
             if let cName = Q3MetalRenderer_GetTextureName(handle) {
                 let name = String(cString: cName)
@@ -1120,7 +1130,44 @@ struct MetalView: UIViewRepresentable {
                     pbrLog("[Q3-PBR-SWIFT] entity-atlas-load handle=\(handle) name='\(logKey)' cols=\(sprite_cols) rows=\(sprite_rows) fps=\(fpsStr) atlasTex=\(atlasTexture?.label ?? "nil")")
                 }
             }
-            return atlasTexture
+            if atlasTexture == nil && spriteAtlasParams.x == 0 {
+                return nil
+            }
+            return EntityAtlasResolution(spriteAtlasParams: spriteAtlasParams,
+                                         atlasTexture: atlasTexture)
+        }
+
+        private func applyEntityAtlas(_ resolution: EntityAtlasResolution?,
+                                      into uniforms: inout EntityUniforms) -> MTLTexture? {
+            guard var resolution else { return nil }
+            if resolution.spriteAtlasParams.x > 0.5,
+               resolution.spriteAtlasParams.y > 0.5 {
+                resolution.spriteAtlasParams.w = Float(CACurrentMediaTime() - frameTimeOrigin)
+            }
+            uniforms.spriteAtlasParams = resolution.spriteAtlasParams
+            return resolution.atlasTexture
+        }
+
+        private func packEntityAtlas(handle: UInt32, into uniforms: inout EntityUniforms) -> MTLTexture? {
+            let resolution = resolveEntityAtlas(handle: handle)
+            return applyEntityAtlas(resolution, into: &uniforms)
+        }
+
+        private func buildEntityFrameContext(draws: UnsafeBufferPointer<Q3MetalEntityDrawCmd>,
+                                             first: Int,
+                                             end: Int) -> EntityFrameContext {
+            var context = EntityFrameContext()
+            var seenHandles = Set<UInt32>()
+            seenHandles.reserveCapacity(max(0, end - first))
+            context.atlasByHandle.reserveCapacity(min(max(0, end - first), 128))
+            for drawIdx in first..<end {
+                let handle = draws[drawIdx].textureHandle
+                guard handle != 0, seenHandles.insert(handle).inserted else { continue }
+                if let resolution = resolveEntityAtlas(handle: handle) {
+                    context.atlasByHandle[handle] = resolution
+                }
+            }
+            return context
         }
 
         private static func packEntityTcMods(handle: UInt32, into uniforms: inout EntityUniforms) {
@@ -10868,6 +10915,9 @@ struct MetalView: UIViewRepresentable {
                     let scenePolyBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_SCENE_POLY)
                     let aTestGT0Bit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ATEST_GT0)
                     let rtPreserveDepthHackAlways = Q3_RTMix() > 0 && Q3_RTPreserveEntities() != 0
+                    let entityFrameContext = buildEntityFrameContext(draws: allEntityDraws,
+                                                                     first: first,
+                                                                     end: end)
                     // P0.2: hoisted once per frame — feeds
                     // entityUniforms.viewmodelParams.z per draw below.
                     let rtDebugEntityMaskActive = Q3_RTDebugEntityMask() != 0
@@ -10917,13 +10967,13 @@ struct MetalView: UIViewRepresentable {
                         // atlas draw doesn't bleed into a non-atlas one
                         // sharing the same uniform buffer across the loop.
                         entityUniforms.spriteAtlasParams = SIMD4<Float>(0, 0, 0, 0)
-                        // packEntityAtlas writes spriteAtlasParams and returns
-                        // the atlas albedo texture when an indirect-name hit
-                        // landed (e.g. yellow health → envmapyel atlas DDS).
-                        // Caller binds this at fragment slot 0 in place of the
-                        // static 64×64 envmap .jpg so the MSL atlas sub-rect
-                        // remap actually has frames to sample.
-                        let entityAtlasAlbedoOverride = packEntityAtlas(handle: draw.textureHandle, into: &entityUniforms)
+                        // EntityFrameContext resolves unique handles once per
+                        // frame. Per draw, only copy prepacked atlas params and
+                        // return the atlas albedo override when an indirect
+                        // name hit landed (e.g. yellow health → envmapyel).
+                        let entityAtlasAlbedoOverride = applyEntityAtlas(
+                            entityFrameContext.atlasByHandle[draw.textureHandle],
+                            into: &entityUniforms)
                         /* Per-draw refEntity_t.shaderRGBA fed through to MSL
                          * for rgbGen=entity / oneMinusEntity (5/6) and
                          * alphaGen=entity / oneMinusEntity (5/6). */
