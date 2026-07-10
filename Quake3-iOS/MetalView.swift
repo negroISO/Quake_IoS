@@ -4188,14 +4188,14 @@ struct MetalView: UIViewRepresentable {
         private var entityASLogCounter: UInt64 = 0
         private var rtPrimitiveMaterialBuffer: MTLBuffer?
         private var rtPrimitiveMaterialBufferCache: [UInt64: MTLBuffer] = [:]
-        private let rtMaxAlbedoSlots = 110
+        private let rtMaxAlbedoSlots = 176
         private let rtMaxLightmapSlots = 64
         /* RT texture argument buffer tables. `rtAlbedoHandles[i]` is the
          * material handle for every parallel sidecar table slot: albedo,
          * normal, height, and Increment-2 emissive. Do not reserve albedo
          * slots for emissive maps; authored emission is sampled from the
          * dedicated texTable.emissive[i] array. */
-        private var rtAlbedoHandles = [UInt32](repeating: 0, count: 110)
+        private var rtAlbedoHandles = [UInt32](repeating: 0, count: 176)
         private var rtLightmapHandles = [UInt32](repeating: 0, count: 64)
         private var rtLogPrintedOnce = false
         private var rtOverlayLogPrintedOnce = false
@@ -5179,18 +5179,18 @@ struct MetalView: UIViewRepresentable {
 
             // Step 2a: RT texture table moved into an argument buffer so the
             // 128 direct-binding limit no longer caps the table. Albedo gets
-            // [[id(0..109)]], lightmap [[id(110..173)]], then sidecars.
+            // [[id(0..175)]], lightmap [[id(176..239)]], then sidecars.
             // Swift mirrors this id layout when encoding (see encodeRTOverlay).
             struct RTTexTable {
-                array<texture2d<float>, 110> albedo;    // id 0..109
-                array<texture2d<float>, 64> lightmap;   // id 110..173
+                array<texture2d<float>, 176> albedo;    // id 0..175
+                array<texture2d<float>, 64> lightmap;   // id 176..239
                 // Step 2b+: PBR sidecar tables, PARALLEL to albedo: sidecar[i]
                 // corresponds to the material at albedo slot i.
-                array<texture2d<float>, 110> normal;    // id 174..283
-                array<texture2d<float>, 110> height;    // id 284..393
+                array<texture2d<float>, 176> normal;    // id 240..415
+                array<texture2d<float>, 176> height;    // id 416..591
                 // RT emissive Increment 2: real authored emissive maps, parallel
                 // to albedo. Missing authored maps bind a 1x1 black default.
-                array<texture2d<float>, 110> emissive;  // id 394..503
+                array<texture2d<float>, 176> emissive;  // id 592..767
             };
 
             float3 rtEmissionSample(const device RTTexTable& texTable,
@@ -5198,7 +5198,7 @@ struct MetalView: UIViewRepresentable {
                                     float3 legacyRGB,
                                     sampler textureSampler,
                                     float2 uv) {
-                if (mat.emissiveTintMode.w > 0.5 && mat.albedoSlot < 110) {
+                if (mat.emissiveTintMode.w > 0.5 && mat.albedoSlot < 176) {
                     return texTable.emissive[mat.albedoSlot].sample(textureSampler, uv).rgb * mat.emissiveTintMode.xyz;
                 }
                 return legacyRGB;
@@ -5372,7 +5372,7 @@ struct MetalView: UIViewRepresentable {
                             ? saturate(uniforms.rtAtmosphereParams.z)
                             : 0.0;
                         primaryDistance = uniforms.jitterNearFar.w;
-                    } else if (mat.albedoSlot < 110) {
+                    } else if (mat.albedoSlot < 176) {
                         float2 uv0 = vertices[i0].texCoord;
                         float2 uv1 = vertices[i1].texCoord;
                         float2 uv2 = vertices[i2].texCoord;
@@ -5524,7 +5524,7 @@ struct MetalView: UIViewRepresentable {
                                 if (bounceHit.type == intersection_type::triangle) {
                                     uint btri = bounceHit.primitive_id;
                                     RTPrimitiveMaterial bounceMat = primitiveMaterials[btri];
-                                    if (bounceMat.materialFlags.y != 0 && bounceMat.albedoSlot < 110) {
+                                    if (bounceMat.materialFlags.y != 0 && bounceMat.albedoSlot < 176) {
                                         if (!emissiveNEEEnabled) {
                                             uint bi0 = indices[btri * 3 + 0];
                                             uint bi1 = indices[btri * 3 + 1];
@@ -5703,7 +5703,7 @@ struct MetalView: UIViewRepresentable {
                                                 float3 emissionRadiance = chosen.colorIntensity.rgb;
                                                 if (chosen.colorIntensity.w < 0.0) {
                                                     RTPrimitiveMaterial lightMat = primitiveMaterials[chosenPrim];
-                                                    if (lightMat.albedoSlot < 110) {
+                                                    if (lightMat.albedoSlot < 176) {
                                                         uint ei0 = indices[chosenPrim * 3 + 0];
                                                         uint ei1 = indices[chosenPrim * 3 + 1];
                                                         uint ei2 = indices[chosenPrim * 3 + 2];
@@ -5776,7 +5776,7 @@ struct MetalView: UIViewRepresentable {
                                         RTPrimitiveMaterial rmat = primitiveMaterials[rtri];
                                         float3 reflHitOrigin = hitPos + N * 0.75;
                                         float3 reflHitPos = reflHitOrigin + R * rh.distance;
-                                        if (rmat.albedoSlot < 110) {
+                                        if (rmat.albedoSlot < 176) {
                                             uint ri0 = indices[rtri * 3 + 0];
                                             uint ri1 = indices[rtri * 3 + 1];
                                             uint ri2 = indices[rtri * 3 + 2];
@@ -7403,13 +7403,13 @@ struct MetalView: UIViewRepresentable {
                 // Step 2a: encode the RT texture table into an argument buffer
                 // (buffer 8) instead of direct setTexture binds. Frees the
                 // 128-binding cap for albedo/lightmap/sidecar tables. The MSL
-                // RTTexTable lays out albedo at id 0..109, lightmap at id 110..173.
+                // RTTexTable lays out albedo at id 0..175, lightmap at id 176..239.
                 if let argEnc = rtTexArgEncoder, let fallbackTex = ensureRTWhiteTexture(device: device) {
                     var rtTexResident: [MTLTexture] = []
                     rtTexResident.reserveCapacity(rtMaxAlbedoSlots * 4 + rtMaxLightmapSlots)
-                    // Order MUST match RTTexTable id layout: albedo(0..109),
-                    // lightmap(110..173), normal(174..283), height(284..393),
-                    // emissive(394..503).
+                    // Order MUST match RTTexTable id layout: albedo(0..175),
+                    // lightmap(176..239), normal(240..415), height(416..591),
+                    // emissive(592..767).
                     for i in 0..<rtMaxAlbedoSlots {
                         let h = rtAlbedoHandles[i]
                         rtTexResident.append(pbrAlbedoTexture(for: h) ?? texture(for: h, device: device) ?? fallbackTex)
