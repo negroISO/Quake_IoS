@@ -11609,6 +11609,161 @@ struct MetalView: UIViewRepresentable {
                 descriptor.depthAttachment.clearDepth = 1.0
             }
 
+            func encodeLateWorldFogOverlayPass(_ passEncoder: MTLRenderCommandEncoder,
+                                               sceneView: Q3MetalSceneView) -> Int {
+                guard Q3_RTMix() > 0,
+                      let device = view.device,
+                      let worldAlphaPipelineState,
+                      snapshot.worldCommandCount > 0,
+                      let drawsPointer = Q3MetalRenderer_GetWorldDrawCommands(),
+                      let vertexBuffer = uploadWorldBuffers(device: device, generation: snapshot.worldGeneration),
+                      let indexBuffer = worldIndexBuffer else {
+                    return 0
+                }
+
+                let draws = UnsafeBufferPointer(start: drawsPointer, count: Int(snapshot.worldCommandCount))
+                let fogOnlyBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY)
+                let fogOverlayBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_OVERLAY)
+                let noFog = UInt32(Q3_METAL_NO_FOG)
+                let timeSeconds = snapshot.shaderTime
+                let viewProjection = makeWorldViewProjection(sceneView)
+                var passWorldUniforms = makeWorldUniforms(sceneView: sceneView,
+                                                           viewProjection: viewProjection,
+                                                           device: device)
+
+                passEncoder.setFrontFacing(.clockwise)
+                passEncoder.setRenderPipelineState(worldAlphaPipelineState)
+                // Depth source: the same raster scene depth attachment that
+                // world pass 0 filled before the RT color composite. RT blend
+                // changes color only, so this LEQUAL/read-only state preserves
+                // stock BSP occlusion for the replayed fog sheets.
+                passEncoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState,
+                                                                           device: device))
+                passEncoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+                passEncoder.setVertexBytes(&passWorldUniforms,
+                                           length: MemoryLayout<WorldUniforms>.stride,
+                                           index: 1)
+                passEncoder.setFragmentBytes(&passWorldUniforms,
+                                             length: MemoryLayout<WorldUniforms>.stride,
+                                             index: 1)
+                passEncoder.setFragmentSamplerState(worldSamplerState, index: 0)
+                passEncoder.setFragmentSamplerState(ensurePBREnvSampler(), index: 1)
+                passEncoder.setFragmentTexture(pbrFlatNormalDefault(), index: 2)
+                passEncoder.setFragmentTexture(ensurePBREnvCube(), index: 3)
+                passEncoder.setFragmentTexture(pbrRoughnessDefault(), index: 4)
+                passEncoder.setFragmentTexture(pbrMetallicDefault(), index: 5)
+                passEncoder.setFragmentTexture(pbrFlatNormalDefault(), index: 6)
+                passEncoder.setFragmentTexture(pbrFlatNormalDefault(), index: 7)
+                passEncoder.setFragmentTexture(descriptor.depthAttachment.texture, index: 8)
+                passEncoder.setFragmentTexture(pbrFlatNormalDefault(), index: 9)
+                Self.bindDlightBlock(snapshot: snapshot,
+                                     encoder: passEncoder,
+                                     device: device,
+                                     index: 2,
+                                     extra: currentBakedDlights())
+                var pbrWorldFogParams = SIMD4<Float>(0, 0, 0, 0)
+                passEncoder.setFragmentBytes(&pbrWorldFogParams, length: 16, index: 3)
+
+                var encoded = 0
+                for draw in draws {
+                    guard draw.indexCount > 0,
+                          (draw.flags & fogOnlyBit) != 0,
+                          draw.fogIndex != noFog,
+                          let fogs = Q3MetalRenderer_GetWorldFogs(),
+                          Int(draw.fogIndex) < Q3MetalRenderer_GetWorldFogCount(),
+                          let lightmapTexture = texture(for: draw.lightmapTextureHandle, device: device) else {
+                        continue
+                    }
+
+                    let fog = fogs.advanced(by: Int(draw.fogIndex)).pointee
+                    guard fog.distance > 0 else { continue }
+                    let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+                    guard stageCount > 0 else { continue }
+
+                    let fogOverlayDraw = (draw.flags & fogOverlayBit) != 0
+                    if fogOverlayDraw && fog.hasBounds != 0 {
+                        let rawMin = SIMD3<Float>(fog.boundsMin.0, fog.boundsMin.1, fog.boundsMin.2)
+                        let rawMax = SIMD3<Float>(fog.boundsMax.0, fog.boundsMax.1, fog.boundsMax.2)
+                        let bmin = simd_min(rawMin, rawMax)
+                        let bmax = simd_max(rawMin, rawMax)
+                        let margin: Float = 0.5
+                        if passWorldUniforms.cameraPos.x >= bmin.x - margin,
+                           passWorldUniforms.cameraPos.x <= bmax.x + margin,
+                           passWorldUniforms.cameraPos.y >= bmin.y - margin,
+                           passWorldUniforms.cameraPos.y <= bmax.y + margin,
+                           passWorldUniforms.cameraPos.z >= bmin.z - margin,
+                           passWorldUniforms.cameraPos.z <= bmax.z + margin {
+                            continue
+                        }
+                    }
+
+                    let stage = Self.worldStage(draw, 0)
+                    let chain = Self.fillTcMods(stage)
+                    let (tv0, tv1) = Self.tcGenVectors(stage)
+                    var fogUniforms = WorldDrawUniforms(
+                        tcGen: Float(stage.tcGen),
+                        tcModCount: chain.count,
+                        rgbGen: 0,
+                        alphaGen: 0,
+                        blendMode: 2,
+                        timeSeconds: timeSeconds,
+                        rgbWaveFunc: 0,
+                        alphaWaveFunc: 0,
+                        tcModType: chain.types,
+                        tcModParams0: chain.p0,
+                        tcModParams1: chain.p1,
+                        tcModParams2: chain.p2,
+                        tcModParams3: chain.p3,
+                        fogColorDistance: SIMD4<Float>(fog.color.0, fog.color.1, fog.color.2, fog.distance),
+                        fogParams: SIMD4<Float>(fog.tcScale, fog.hasSurface != 0 ? 1.0 : 0.0, 0, 0),
+                        fogSurface: SIMD4<Float>(fog.surface.0, fog.surface.1, fog.surface.2, fog.surface.3),
+                        tcGenVec0: tv0,
+                        tcGenVec1: tv1,
+                        deformWaveFunc: stage.deformWaveFunc,
+                        deformWaveDiv: stage.deformWaveDiv != 0 ? stage.deformWaveDiv : 1.0,
+                        deformWaveBase: stage.deformWaveBase,
+                        deformWaveAmp: stage.deformWaveAmp,
+                        deformWavePhase: stage.deformWavePhase,
+                        deformWaveFreq: stage.deformWaveFreq,
+                        deformMoveFunc: stage.deformMoveFunc,
+                        deformMoveVector: SIMD3(stage.deformMoveVector.0,
+                                                stage.deformMoveVector.1,
+                                                stage.deformMoveVector.2),
+                        deformMoveBase: stage.deformMoveBase,
+                        deformMoveAmp: stage.deformMoveAmp,
+                        deformMovePhase: stage.deformMovePhase,
+                        deformMoveFreq: stage.deformMoveFreq,
+                        deformBulgeWidth: stage.deformBulgeWidth,
+                        deformBulgeHeight: stage.deformBulgeHeight,
+                        deformBulgeSpeed: stage.deformBulgeSpeed,
+                        autospriteMode: stage.autospriteMode,
+                        debugMode: 0,
+                        forceWhiteVertColor: 0,
+                        alphaTestThreshold: 0,
+                        fogOnly: 1,
+                        stageUsesLightmap: 0,
+                        drawHasLightmapStage: 0,
+                        _pad0: fogOverlayDraw ? 1.0 : 0.0)
+
+                    passEncoder.setCullMode(fogOverlayDraw ? .none : Self.metalCullMode(for: stage.cullMode))
+                    passEncoder.setFragmentTexture(lightmapTexture, index: 0)
+                    passEncoder.setFragmentTexture(lightmapTexture, index: 1)
+                    passEncoder.setFragmentBytes(&fogUniforms,
+                                                 length: MemoryLayout<WorldDrawUniforms>.stride,
+                                                 index: 0)
+                    passEncoder.setVertexBytes(&fogUniforms,
+                                               length: MemoryLayout<WorldDrawUniforms>.stride,
+                                               index: 2)
+                    passEncoder.drawIndexedPrimitives(type: .triangle,
+                                                      indexCount: Int(draw.indexCount),
+                                                      indexType: .uint32,
+                                                      indexBuffer: indexBuffer,
+                                                      indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride)
+                    encoded += 1
+                }
+                return encoded
+            }
+
             var currentSunShadowTexture: MTLTexture? = nil
             var currentSunShadowMatrix = matrix_identity_float4x4
             if let device = view.device,
@@ -12172,6 +12327,9 @@ struct MetalView: UIViewRepresentable {
                     // the later pass 1).
                     let worldPassOrder = [0, 2, 3, 4, 1, 5]
                     for worldPass in worldPassOrder {
+                        if worldPass == 5 && Q3_RTMix() > 0 {
+                            continue
+                        }
                         let passEntries = worldPassEntriesByPass[worldPass]
                         let useCWorldBatchesForPass = cWorldBatchIndexBuffer != nil && worldPass <= 4
                         if false && worldPass <= 1 && !passEntries.contains(where: { $0.stageIndex < 0 }) {
@@ -12939,6 +13097,7 @@ struct MetalView: UIViewRepresentable {
                     encoder.setScissorRect(MTLScissorRect(x: 0, y: 0,
                                                            width: renderW,
                                                            height: renderH))
+                    _ = encodeLateWorldFogOverlayPass(postRTEncoder, sceneView: sceneView)
                 }
             }
 
@@ -13058,6 +13217,7 @@ struct MetalView: UIViewRepresentable {
                 encoder.setScissorRect(MTLScissorRect(x: 0, y: 0,
                                                        width: renderW,
                                                        height: renderH))
+                _ = encodeLateWorldFogOverlayPass(postRTEncoder, sceneView: sceneView)
             }
 
             let mainSceneViewForLatePasses = Q3MetalRenderer_GetSceneView()?.pointee
