@@ -4187,14 +4187,14 @@ struct MetalView: UIViewRepresentable {
         private var rtPrimitiveMaterialBuffer: MTLBuffer?
         private var rtPrimitiveMaterialBufferCache: [UInt64: MTLBuffer] = [:]
         private let rtMaxAlbedoSlots = 110
-        private let rtMaxLightmapSlots = 16
+        private let rtMaxLightmapSlots = 64
         /* RT texture argument buffer tables. `rtAlbedoHandles[i]` is the
          * material handle for every parallel sidecar table slot: albedo,
          * normal, height, and Increment-2 emissive. Do not reserve albedo
          * slots for emissive maps; authored emission is sampled from the
          * dedicated texTable.emissive[i] array. */
         private var rtAlbedoHandles = [UInt32](repeating: 0, count: 110)
-        private var rtLightmapHandles = [UInt32](repeating: 0, count: 16)
+        private var rtLightmapHandles = [UInt32](repeating: 0, count: 64)
         private var rtLogPrintedOnce = false
         private var rtOverlayLogPrintedOnce = false
         private var rtEmissiveTableLogPrintedOnce = false
@@ -5155,19 +5155,19 @@ struct MetalView: UIViewRepresentable {
             };
 
             // Step 2a: RT texture table moved into an argument buffer so the
-            // 128 direct-binding limit no longer caps the table (room for PBR
-            // sidecars later). albedo gets [[id(0..109)]], lightmap [[id(110..125)]].
+            // 128 direct-binding limit no longer caps the table. Albedo gets
+            // [[id(0..109)]], lightmap [[id(110..173)]], then sidecars.
             // Swift mirrors this id layout when encoding (see encodeRTOverlay).
             struct RTTexTable {
                 array<texture2d<float>, 110> albedo;    // id 0..109
-                array<texture2d<float>, 16> lightmap;   // id 110..125
+                array<texture2d<float>, 64> lightmap;   // id 110..173
                 // Step 2b+: PBR sidecar tables, PARALLEL to albedo: sidecar[i]
                 // corresponds to the material at albedo slot i.
-                array<texture2d<float>, 110> normal;    // id 126..235
-                array<texture2d<float>, 110> height;    // id 236..345
+                array<texture2d<float>, 110> normal;    // id 174..283
+                array<texture2d<float>, 110> height;    // id 284..393
                 // RT emissive Increment 2: real authored emissive maps, parallel
                 // to albedo. Missing authored maps bind a 1x1 black default.
-                array<texture2d<float>, 110> emissive;  // id 346..455
+                array<texture2d<float>, 110> emissive;  // id 394..503
             };
 
             float3 rtEmissionSample(const device RTTexTable& texTable,
@@ -5461,7 +5461,7 @@ struct MetalView: UIViewRepresentable {
                             // First-pass translucency: shade blended surfaces but emit partial
                             // alpha so the composite pass preserves raster behind/through them.
                             float3 lightmap = float3(1.0);
-                            if (mat.lightmapSlot < 16) {
+                            if (mat.lightmapSlot < 64) {
                                 lightmap = texTable.lightmap[mat.lightmapSlot].sample(clampSampler, lmuv).rgb;
                             }
                             float ambientFloor = uniforms.rtToneParams.z;
@@ -5476,7 +5476,7 @@ struct MetalView: UIViewRepresentable {
                             outputAlpha = clamp(effectiveAlpha, 0.0, 0.70);
                         } else {
                             float3 lightmap = float3(1.0);
-                            if (mat.lightmapSlot < 16) {
+                            if (mat.lightmapSlot < 64) {
                                 lightmap = texTable.lightmap[mat.lightmapSlot].sample(clampSampler, lmuv).rgb;
                             }
                             float ambientFloor = uniforms.rtToneParams.z;
@@ -5792,7 +5792,7 @@ struct MetalView: UIViewRepresentable {
                                             }
                                             float3 ralb = texTable.albedo[rmat.albedoSlot].sample(repeatSampler, ruv).rgb;
                                             float3 rlight = float3(1.0);
-                                            if (rmat.lightmapSlot < 16) {
+                                            if (rmat.lightmapSlot < 64) {
                                                 rlight = texTable.lightmap[rmat.lightmapSlot].sample(clampSampler, rlm).rgb;
                                             }
                                             reflColor = ralb * max(rlight * 1.25, float3(uniforms.rtToneParams.z));
@@ -6236,7 +6236,7 @@ struct MetalView: UIViewRepresentable {
                 guard stage.useLightmap == 0 else { continue }
                 // Task 1 RT fallback: an opaque world primitive only needs its
                 // original/base Q3 texture slot. If its lightmap did not make the
-                // small 16-slot RT lightmap table, keep the material valid and let
+                // bounded RT lightmap table, keep the material valid and let
                 // the kernel shade it with the ambient floor instead of dropping to
                 // transparent/debug fallback.
                 if !isSkyDraw && aSlotOptional == nil { continue }
@@ -7378,15 +7378,15 @@ struct MetalView: UIViewRepresentable {
                 }
                 enc.setTexture(envCube, index: 1)
                 // Step 2a: encode the RT texture table into an argument buffer
-                // (buffer 8) instead of 126 direct setTexture binds. Frees the
-                // 128-binding cap so PBR sidecars can be added later. The MSL
-                // RTTexTable lays out albedo at id 0..109, lightmap at id 110..125.
+                // (buffer 8) instead of direct setTexture binds. Frees the
+                // 128-binding cap for albedo/lightmap/sidecar tables. The MSL
+                // RTTexTable lays out albedo at id 0..109, lightmap at id 110..173.
                 if let argEnc = rtTexArgEncoder, let fallbackTex = ensureRTWhiteTexture(device: device) {
                     var rtTexResident: [MTLTexture] = []
                     rtTexResident.reserveCapacity(rtMaxAlbedoSlots * 4 + rtMaxLightmapSlots)
                     // Order MUST match RTTexTable id layout: albedo(0..109),
-                    // lightmap(110..125), normal(126..235), height(236..345),
-                    // emissive(346..455).
+                    // lightmap(110..173), normal(174..283), height(284..393),
+                    // emissive(394..503).
                     for i in 0..<rtMaxAlbedoSlots {
                         let h = rtAlbedoHandles[i]
                         rtTexResident.append(pbrAlbedoTexture(for: h) ?? texture(for: h, device: device) ?? fallbackTex)
