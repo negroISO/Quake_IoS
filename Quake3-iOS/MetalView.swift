@@ -13060,19 +13060,20 @@ struct MetalView: UIViewRepresentable {
             }
 
             let autoExposureActive = Q3_PostprocessEnabled() != 0 && Q3_PostprocessAutoExposure() != 0
-            /* Stage39 native/default path: when RT is composited before the
+            /* Stage39 default path: when RT is composited before the
              * preserved raster entity layer, run the world postprocess before
              * those entities so exposure meters the RT world/fog image only.
-             * Upscale/FI require a separate resolve path, so leave their
-             * existing ordering intact for this bounded increment. */
+             * Upscale resolves the world first, then draws entities at the
+             * drawable size; frame generation keeps its existing path. */
             let rtWorldPostBeforeEntitiesActive =
                 autoExposureActive &&
                 Q3_RTMix() > 0 &&
                 Q3_RTPreserveEntities() != 0 &&
                 Q3MetalRenderer_IsWorldLoaded() != 0 &&
-                !upscaleActive &&
                 fiCurrentSceneTexture == nil
             var rtWorldPostprocessEncodedBeforeEntities = false
+            var entityRenderW = renderW
+            var entityRenderH = renderH
 
             /* RT world composite must happen before raster entities/HUD.
              * The trace replaces/blends only the already-rendered world color;
@@ -13183,7 +13184,7 @@ struct MetalView: UIViewRepresentable {
                    let sceneDepth,
                    wantsFogRayBox {
                     encoder.endEncoding()
-                    let fogColorTex = drawable.texture
+                    let fogColorTex = (upscaleActive ? upscaleColorTarget : drawable.texture) ?? drawable.texture
                     encodeFogVolumeRayBox(commandBuffer: commandBuffer,
                                           colorTexture: fogColorTex,
                                           depthTexture: sceneDepth,
@@ -13208,29 +13209,58 @@ struct MetalView: UIViewRepresentable {
                 }
 
                 encoder.endEncoding()
-                encodePostprocess(commandBuffer: commandBuffer,
-                                  sourceTexture: drawable.texture,
-                                  outputTexture: drawable.texture)
+                let entityColorTexture: MTLTexture
+                let entityDepthTexture: MTLTexture?
+                if upscaleActive,
+                   let colorRT = (rtCompositeForUpscale ?? upscaleColorTarget),
+                   let resolveRT = upscaleResolvedColorTarget {
+                    encodeSpatialUpscale(commandBuffer: commandBuffer,
+                                         source: colorRT,
+                                         output: resolveRT)
+                    encodePostprocess(commandBuffer: commandBuffer,
+                                      sourceTexture: resolveRT,
+                                      outputTexture: drawable.texture,
+                                      measureExposure: false)
+                    entityColorTexture = drawable.texture
+                    entityDepthTexture = view.device.flatMap {
+                        ensureSceneDepthTexture(device: $0,
+                                                width: outputW,
+                                                height: outputH)
+                    }
+                    entityRenderW = outputW
+                    entityRenderH = outputH
+                } else {
+                    encodePostprocess(commandBuffer: commandBuffer,
+                                      sourceTexture: drawable.texture,
+                                      outputTexture: drawable.texture)
+                    entityColorTexture = drawable.texture
+                    entityDepthTexture = descriptor.depthAttachment.texture
+                }
                 logEntityPostOrderIfNeeded(commandBuffer: commandBuffer,
-                                           targetTexture: drawable.texture,
-                                           renderW: renderW,
-                                           renderH: renderH)
+                                           targetTexture: entityColorTexture,
+                                           renderW: entityRenderW,
+                                           renderH: entityRenderH)
 
-                let postWorldPass = makeLoadedRenderPassDescriptor(colorTexture: drawable.texture,
-                                                                   depthTexture: descriptor.depthAttachment.texture)
+                let postWorldPass = makeLoadedRenderPassDescriptor(colorTexture: entityColorTexture,
+                                                                   depthTexture: entityDepthTexture)
+                if upscaleActive, entityDepthTexture != nil {
+                    postWorldPass.depthAttachment.loadAction = .clear
+                    postWorldPass.depthAttachment.storeAction = .store
+                    postWorldPass.depthAttachment.clearDepth = 1.0
+                }
                 guard let postWorldEncoder = commandBuffer.makeRenderCommandEncoder(descriptor: postWorldPass) else {
                     return
                 }
                 encoder = postWorldEncoder
                 encoder.label = "Q3.render.entities.afterWorldPost"
                 encoder.setViewport(MTLViewport(originX: 0, originY: 0,
-                                                width: Double(renderW),
-                                                height: Double(renderH),
+                                                width: Double(entityRenderW),
+                                                height: Double(entityRenderH),
                                                 znear: 0.0,
                                                 zfar: 1.0))
                 encoder.setScissorRect(MTLScissorRect(x: 0, y: 0,
-                                                       width: renderW,
-                                                       height: renderH))
+                                                       width: entityRenderW,
+                                                       height: entityRenderH))
                 rtWorldPostprocessEncodedBeforeEntities = true
             }
 
@@ -13256,8 +13286,8 @@ struct MetalView: UIViewRepresentable {
                                       viewProjection: entityViewProjection,
                                       cameraPos: cameraPos,
                                       cameraForward: cameraForward,
-                                      renderW: renderW,
-                                      renderH: renderH,
+                                      renderW: entityRenderW,
+                                      renderH: entityRenderH,
                                       skipThirdPerson: true,
                                       allowDepthHack: true)
             }
