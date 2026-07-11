@@ -8648,7 +8648,7 @@ struct MetalView: UIViewRepresentable {
         /// "bundle has no skybox at all" case in one path.
         private var pbrEnvBundleHasNoSkyboxAssets: Bool = false
         private var pbrEnvBundleCheckDone: Bool = false
-        private static let livePBREnvCubeSize = 64
+        private static let livePBREnvCubeSize = 128
         private static let livePBREnvCubeCompleteMask: UInt8 = 0x3f
         private static let livePBREnvCubeRefreshInterval: UInt64 = 120
         private var pbrLiveEnvCube: MTLTexture?
