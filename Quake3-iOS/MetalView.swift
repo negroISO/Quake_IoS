@@ -5598,9 +5598,9 @@ struct MetalView: UIViewRepresentable {
                             }
                             gLightmapValue = lightmap;
                             float ambientFloor = uniforms.rtToneParams.z;
-                            // RT lighting rebalance: rtPBRGlobal.z dims the baked
-                            // lightmap (toward RT-direct/RTX look); ambient floor preserved.
-                            color = albedoSample.rgb * max(lightmap * 1.25 * uniforms.rtPBRGlobal.z, float3(ambientFloor));
+                            // Match the raster world's Quake 3 2x lightmap overbright.
+                            // rtPBRGlobal.z remains the user scale on top of that invariant.
+                            color = albedoSample.rgb * max(lightmap * 2.0 * uniforms.rtPBRGlobal.z, float3(ambientFloor));
                             if (mat.materialFlags.y != 0) {
                                 float3 emitSample = rtEmissionSample(texTable, mat, albedoSample.rgb, repeatSampler, uv);
                                 color += emitSample * mat.materialParams.x * effectiveAlpha;
@@ -5614,9 +5614,9 @@ struct MetalView: UIViewRepresentable {
                             }
                             gLightmapValue = lightmap;
                             float ambientFloor = uniforms.rtToneParams.z;
-                            // RT lighting rebalance: rtPBRGlobal.z dims the baked
-                            // lightmap (toward RT-direct/RTX look); ambient floor preserved.
-                            color = albedoSample.rgb * max(lightmap * 1.25 * uniforms.rtPBRGlobal.z, float3(ambientFloor));
+                            // Match the raster world's Quake 3 2x lightmap overbright.
+                            // rtPBRGlobal.z remains the user scale on top of that invariant.
+                            color = albedoSample.rgb * max(lightmap * 2.0 * uniforms.rtPBRGlobal.z, float3(ambientFloor));
                             if (mat.materialFlags.y != 0) {
                                 float3 emitSample = rtEmissionSample(texTable, mat, albedoSample.rgb, repeatSampler, uv);
                                 color += emitSample * mat.materialParams.x;
