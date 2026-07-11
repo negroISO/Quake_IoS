@@ -4350,6 +4350,8 @@ struct MetalView: UIViewRepresentable {
         private enum RTPerfSample: Int, CaseIterable {
             case rasterStart = 0
             case rasterEnd
+            case entityASBuildStart
+            case entityASBuildEnd
             case traceStart
             case traceEnd
             case denoiseStart
@@ -4368,6 +4370,11 @@ struct MetalView: UIViewRepresentable {
             let sampleBuffer: MTLCounterSampleBuffer
             let frameId: UInt64
             let fpsEstimate: Double
+            var cpuEntityUploadMs: Double = 0
+            var cpuEntityASEncodeMs: Double = 0
+            var cpuEntityMaterialMs: Double = 0
+            var entityASBuilt = false
+            var entityASSkipped = false
 
             init(sampleBuffer: MTLCounterSampleBuffer, frameId: UInt64, fpsEstimate: Double) {
                 self.sampleBuffer = sampleBuffer
@@ -4543,6 +4550,7 @@ struct MetalView: UIViewRepresentable {
                     return value <= total * maxFraction ? value : 0.0
                 }
                 let trace = sane(deltaMs(.traceStart, .traceEnd), maxFraction: 1.10)
+                let entityASBuild = sane(deltaMs(.entityASBuildStart, .entityASBuildEnd), maxFraction: 0.60)
                 var denoise = sane(deltaMs(.denoiseStart, .denoiseEnd), maxFraction: 0.60)
                 let blend = sane(deltaMs(.blendStart, .blendEnd), maxFraction: 0.35)
                 var raster = sane(deltaMs(.rasterStart, .rasterEnd), maxFraction: 0.90)
@@ -4550,17 +4558,19 @@ struct MetalView: UIViewRepresentable {
                 let ui = sane(deltaMs(.uiStart, .uiEnd), maxFraction: 0.45)
                 let post = sane(deltaMs(.postStart, .postEnd), maxFraction: 0.35)
                 if total > 0.0 {
-                    let withoutRaster = trace + denoise + blend + entity + ui + post
+                    let withoutRaster = trace + entityASBuild + denoise + blend + entity + ui + post
                     if raster > 0.0, withoutRaster + raster > total * 1.10 {
                         raster = max(0.0, total - withoutRaster)
                     }
-                    if denoise > 0.0, trace + denoise + blend + raster + entity + ui + post > total * 1.10 {
+                    if denoise > 0.0, trace + entityASBuild + denoise + blend + raster + entity + ui + post > total * 1.10 {
                         denoise = 0.0
                     }
                 }
                 let fps = frame.fpsEstimate > 0.0 ? frame.fpsEstimate : (total > 0.0 ? 1000.0 / total : 0.0)
-                print(String(format: "[RT-PERF] trace=%.1fms denoise=%.1fms blend=%.1fms raster=%.1fms entity=%.1fms post=%.1fms ui=%.1fms total=%.1fms fps=%.0f frame=%llu",
-                             trace, denoise, blend, raster, entity, post, ui, total, fps, frame.frameId))
+                print(String(format: "[RT-PERF] trace=%.1fms entityAS=%.1fms denoise=%.1fms blend=%.1fms raster=%.1fms entity=%.1fms post=%.1fms ui=%.1fms total=%.1fms fps=%.0f cpuUpload=%.2fms cpuASEncode=%.2fms cpuMaterials=%.2fms entityASBuilt=%d entityASSkipped=%d frame=%llu",
+                             trace, entityASBuild, denoise, blend, raster, entity, post, ui, total, fps,
+                             frame.cpuEntityUploadMs, frame.cpuEntityASEncodeMs, frame.cpuEntityMaterialMs,
+                             frame.entityASBuilt ? 1 : 0, frame.entityASSkipped ? 1 : 0, frame.frameId))
             }
         }
 
@@ -6896,7 +6906,14 @@ struct MetalView: UIViewRepresentable {
         @MainActor
         private func encodeEntityAccelerationStructureBuild(device: MTLDevice,
                                                             commandBuffer: MTLCommandBuffer,
-                                                            slot: Int) -> MTLAccelerationStructure? {
+                                                            slot: Int,
+                                                            perfFrame: RTPerfFrame? = nil) -> MTLAccelerationStructure? {
+            let cpuStart = CACurrentMediaTime()
+            defer {
+                if let perfFrame {
+                    perfFrame.cpuEntityASEncodeMs = (CACurrentMediaTime() - cpuStart) * 1000.0
+                }
+            }
             guard Q3_RTEntities() != 0 || Q3_RTEntityReflections() != 0 else {
                 entityAccelerationStructure = nil
                 entityASSize = 0
@@ -6951,6 +6968,7 @@ struct MetalView: UIViewRepresentable {
                       scratchBuffer: scratch,
                       scratchBufferOffset: 0)
             enc.endEncoding()
+            perfFrame?.entityASBuilt = true
             entityASLogCounter &+= 1
             if entityASLogCounter == 1 || entityASLogCounter % 120 == 0 {
                 print("[RT] built entity AS: slot=\(clampedSlot) vertices=\(vertexCount) indices=\(indexCount) tris=\(indexCount / 3) size=\(sizes.accelerationStructureSize)")
@@ -7832,13 +7850,17 @@ struct MetalView: UIViewRepresentable {
                                          entityIndexBufferForRT != nil &&
                                          entityVertexBufferForRT != nil
             if entityReflectionActive {
+                let materialCPUStart = CACurrentMediaTime()
                 entityPrimitiveMaterialBufferForRT = buildRTEntityPrimitiveMaterials(device: device,
                                                                                      active: true)
+                perfFrame?.cpuEntityMaterialMs = (CACurrentMediaTime() - materialCPUStart) * 1000.0
                 if entityPrimitiveMaterialBufferForRT == nil {
                     entityReflectionActive = false
                 }
             } else {
+                let materialCPUStart = CACurrentMediaTime()
                 _ = buildRTEntityPrimitiveMaterials(device: device, active: false)
+                perfFrame?.cpuEntityMaterialMs = (CACurrentMediaTime() - materialCPUStart) * 1000.0
             }
             if entityASAvailable {
                 if entityPrimaryRequested && entityReflectionActive {
@@ -13722,9 +13744,13 @@ struct MetalView: UIViewRepresentable {
                         print("[RT] preserve entities mask active size=\(renderW)x\(renderH) (composite-before-entities)")
                         pbrLog("[RT] preserve entities mask active size=\(renderW)x\(renderH) (composite-before-entities)")
                     }
+                    let entityUploadCPUStart = CACurrentMediaTime()
                     _ = uploadEntityBuffers(device: device, slot: frameSlot)
+                    rtPerfFrame?.cpuEntityUploadMs = (CACurrentMediaTime() - entityUploadCPUStart) * 1000.0
                     encoder.endEncoding()
-                    _ = encodeEntityAccelerationStructureBuild(device: device, commandBuffer: commandBuffer, slot: frameSlot)
+                    encodeRTPerfPoint(commandBuffer: commandBuffer, frame: rtPerfFrame, sample: .entityASBuildStart)
+                    _ = encodeEntityAccelerationStructureBuild(device: device, commandBuffer: commandBuffer, slot: frameSlot, perfFrame: rtPerfFrame)
+                    encodeRTPerfPoint(commandBuffer: commandBuffer, frame: rtPerfFrame, sample: .entityASBuildEnd)
                     _ = encodeRTOverlay(commandBuffer: commandBuffer,
                                         rasterTexture: rtTargetTexture,
                                         outputDrawableTexture: rtTargetTexture,
@@ -13948,9 +13974,13 @@ struct MetalView: UIViewRepresentable {
                 // Parity with the preserve path: ensure entity buffers are
                 // valid even when the entity pass above was skipped
                 // (entityCommandCount == 0) and r_rt_entities is enabled.
+                let entityUploadCPUStart = CACurrentMediaTime()
                 _ = uploadEntityBuffers(device: device, slot: frameSlot)
+                rtPerfFrame?.cpuEntityUploadMs = (CACurrentMediaTime() - entityUploadCPUStart) * 1000.0
                 encoder.endEncoding()
-                _ = encodeEntityAccelerationStructureBuild(device: device, commandBuffer: commandBuffer, slot: frameSlot)
+                encodeRTPerfPoint(commandBuffer: commandBuffer, frame: rtPerfFrame, sample: .entityASBuildStart)
+                _ = encodeEntityAccelerationStructureBuild(device: device, commandBuffer: commandBuffer, slot: frameSlot, perfFrame: rtPerfFrame)
+                encodeRTPerfPoint(commandBuffer: commandBuffer, frame: rtPerfFrame, sample: .entityASBuildEnd)
                 _ = encodeRTOverlay(commandBuffer: commandBuffer,
                                     rasterTexture: rtTargetTexture,
                                     outputDrawableTexture: rtTargetTexture,
