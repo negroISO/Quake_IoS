@@ -1897,6 +1897,36 @@ static qboolean PathHasFXNameMarker(const char *path) {
     return qfalse;
 }
 
+static qboolean WeaponModelPathHasExplicitFXMarker(const char *path) {
+    const char *base = path;
+    const char *p;
+    char stem[MAX_QPATH];
+    if (path == NULL) return qfalse;
+    if (Q_stricmpn(path, "models/weapons2/", 16)) return qfalse;
+    for (p = path; *p; ++p) {
+        if (*p == '/' || *p == '\\') base = p + 1;
+    }
+    if (base[0] == '\0') return qfalse;
+    COM_StripExtension(base, stem, sizeof(stem));
+
+    if ((stem[0] == 'f' || stem[0] == 'F') && stem[1] == '_') return qtrue; /* f_* = muzzle flash */
+    if (Q_stristr(stem, ".glow")  != NULL) return qtrue;
+    if (Q_stristr(stem, "_glo")   != NULL) return qtrue;
+    if (Q_stristr(stem, "glow")   != NULL) return qtrue;
+    if (Q_stristr(stem, "flare")  != NULL) return qtrue;
+    if (Q_stristr(stem, "flash")  != NULL) return qtrue;
+    if (Q_stristr(stem, "muzzle") != NULL) return qtrue;
+    if (Q_stristr(stem, "laser")  != NULL) return qtrue;
+    if (Q_stristr(stem, "beam")   != NULL) return qtrue;
+    if (Q_stristr(stem, "bolt")   != NULL) return qtrue;
+    if (Q_stristr(stem, "spark")  != NULL) return qtrue;
+    if (Q_stristr(stem, "smoke")  != NULL) return qtrue;
+    if (Q_stristr(stem, "puff")   != NULL) return qtrue;
+    if (Q_stristr(stem, "explos") != NULL) return qtrue;
+    if (Q_stristr(stem, "tracer") != NULL) return qtrue;
+    return qfalse;
+}
+
 static qboolean TextureNeedsLuminanceAlpha(const char *path) {
     /* Synthesize alpha for textures whose .tga was authored with a
      * DARK (near-black) background + bright emissive core. Max(R,G,B)
@@ -1926,7 +1956,7 @@ static qboolean TextureNeedsLuminanceAlpha(const char *path) {
      * .tga is missing and we fall back to the .jpg base color. */
     if (!Q_stricmpn(path, "models/powerups/", 16)) return PathHasFXNameMarker(path);
     if (!Q_stricmpn(path, "models/ammo/", 12))     return PathHasFXNameMarker(path);
-    if (!Q_stricmpn(path, "models/weapons2/", 16)) return PathHasFXNameMarker(path);
+    if (!Q_stricmpn(path, "models/weapons2/", 16)) return WeaponModelPathHasExplicitFXMarker(path);
     if (!Q_stricmpn(path, "textures/sfx/", 13)) return qtrue;
     if (!Q_stricmpn(path, "textures/effects/", 17)) return qtrue;
     if (!Q_stricmpn(path, "gfx/damage/", 11)) return qtrue;

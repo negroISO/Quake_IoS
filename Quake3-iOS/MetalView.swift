@@ -7059,15 +7059,13 @@ struct MetalView: UIViewRepresentable {
             } else {
                 n = raw
             }
-            // 2026-06-10: weapon viewmodel base-skin guard. Opaque first-person
-            // weapon bodies live at `models/weapons2/<weapon>/<weapon>.tga`
-            // (and `<weapon>2.tga` for the lightning gun's body). Without this
-            // guard the broad token list below catches `"plasma"`, `"rail"`,
-            // etc. and force-disables PBR on the plasma/railgun viewmodels
-            // even though they should be reading as PBR metal. Sub-files in
-            // the same directory (f_*.tga flash, tracer/explosion/muzzle FX
-            // entries) still fall through to the token check below.
-            if Self.isWeaponViewmodelBaseSkin(n) { return false }
+            // Weapon viewmodel solid-component guard. Opaque/solid first-person
+            // weapon parts live under `models/weapons2/<weapon>/`; broad FX
+            // tokens below (`rail`, `plasma`, `glass`, and the directory name
+            // `lightning`) otherwise force-disable PBR on railgun body panels
+            // and lightning glass. Explicit flash/glow/laser/muzzle assets in
+            // the same directories still fall through to the classic-FX path.
+            if Self.isWeaponModelSolidComponentSkin(n) { return false }
             if n.hasPrefix("sprites/") || n.hasPrefix("gfx/") || n.hasPrefix("models/weaphits/") ||
                n.hasPrefix("models/ammo/rocket/rockfl") || n.hasPrefix("models/mapobjects/teleporter/") ||
                n.hasPrefix("textures/sfx/") || n.hasPrefix("textures/effects/") {
@@ -8492,29 +8490,57 @@ struct MetalView: UIViewRepresentable {
             return raw
         }
 
-        // Matches `models/weapons2/<weapon>/<weapon>.<ext>` and
-        // `models/weapons2/<weapon>/<weapon>2.<ext>` (lightning gun's `lightning2.tga`).
-        // Used by `shouldPreferClassicTextureForAlphaFX` and `textureAlphaSynthesisMode`
-        // to exempt opaque weapon viewmodel base skins from FX classifier rules.
-        private static func isWeaponViewmodelBaseSkin(_ n: String) -> Bool {
-            guard n.hasPrefix("models/weapons2/") else { return false }
+        private static func weaponModelPathParts(_ n: String) -> (weapon: String, stem: String)? {
+            guard n.hasPrefix("models/weapons2/") else { return nil }
             let parts = n.split(separator: "/")
-            guard parts.count == 4 else { return false }
+            guard parts.count == 4 else { return nil }
             let weapon = String(parts[2])
             let leaf = String(parts[3])
-            guard let basenameNoExt = leaf.split(separator: ".").first.map(String.init) else { return false }
-            return basenameNoExt == weapon || basenameNoExt == "\(weapon)2"
+            let stem: String
+            if let dot = leaf.lastIndex(of: ".") {
+                stem = String(leaf[..<dot])
+            } else {
+                stem = leaf
+            }
+            return (weapon, stem)
+        }
+
+        // Matches `models/weapons2/<weapon>/<weapon>.<ext>` and
+        // `models/weapons2/<weapon>/<weapon>2.<ext>` (lightning gun's `lightning2.tga`).
+        // Used by `isWeaponModelSolidComponentSkin` for the original base-body exemption.
+        private static func isWeaponViewmodelBaseSkin(_ n: String) -> Bool {
+            guard let parts = weaponModelPathParts(n) else { return false }
+            return parts.stem == parts.weapon || parts.stem == "\(parts.weapon)2"
+        }
+
+        private static func isWeaponModelExplicitFXStem(_ stem: String) -> Bool {
+            if stem.hasPrefix("f_") { return true }
+            let markers = [
+                ".glow", "_glo", "glow", "flare", "flash", "muzzle",
+                "laser", "beam", "bolt", "spark", "smoke", "puff",
+                "explos", "tracer"
+            ]
+            return markers.contains { stem.contains($0) }
+        }
+
+        // Generic Stage50 classifier boundary: weapon model directories mix
+        // solid viewmodel parts and true FX sprites. Treat non-explicit-FX
+        // leaves as solid components so broad global tokens (`rail`, `plasma`,
+        // `glass`, `lightning`) do not bypass PBR or synthesize sprite alpha.
+        private static func isWeaponModelSolidComponentSkin(_ n: String) -> Bool {
+            guard let parts = weaponModelPathParts(n) else { return false }
+            if isWeaponViewmodelBaseSkin(n) { return true }
+            if isWeaponModelExplicitFXStem(parts.stem) { return false }
+            return true
         }
 
         private static func textureAlphaSynthesisMode(_ name: String) -> UInt32 {
             let n = normalizedQ3TextureName(name)
-            // 2026-06-10: weapon viewmodel base-skin guard. `n.contains("lightning")`
-            // below catches the lightning gun's `lightning2.tga` body texture and
-            // force-routes it into the alpha-from-luminance FX path, which makes
-            // the viewmodel render as a flat additive sprite. Skip alpha synthesis
-            // for opaque weapon base skins; sub-files (f_*.tga, etc.) still match
-            // the rules below.
-            if isWeaponViewmodelBaseSkin(n) { return 0 }
+            // Same weapon solid-component boundary as
+            // `shouldPreferClassicTextureForAlphaFX`: a directory token like
+            // `models/weapons2/lightning/...` must not synthesize sprite alpha
+            // for opaque glass/body parts. Explicit FX leaves still match below.
+            if isWeaponModelSolidComponentSkin(n) { return 0 }
             // White-background captures: alpha is the inverse of luminance.
             // These were the visible white square / white blob artifacts.
             // Health/ammo pickup shell stages and sphere/orb overlays commonly
