@@ -4241,6 +4241,7 @@ struct MetalView: UIViewRepresentable {
         private var rtGRoughnessTexture: MTLTexture?
         private var rtDenoiseMaskTexture: MTLTexture?
         private var rtMotionTexture: MTLTexture?
+        private var rtDenoiseFence: MTLFence?
         #if canImport(MetalFX) && !os(visionOS)
         private var rtTemporalDenoisedScaler: MTLFXTemporalDenoisedScaler?
         private var frameInterpolator: MTLFXFrameInterpolator?
@@ -4775,6 +4776,7 @@ struct MetalView: UIViewRepresentable {
         private var rtLastMetricsLogTime: CFTimeInterval = 0
         private var rtDenoiseBackendLogPrinted = false
         private var rtDenoiseFallbackLogPrinted = false
+        private var rtDenoiseCatalystDisabledLogPrinted = false
         private var rtLastCameraPos: SIMD3<Float>?
         private var rtLastCameraForward: SIMD3<Float>?
         private var rtPrevViewProjection: simd_float4x4?
@@ -6889,7 +6891,7 @@ struct MetalView: UIViewRepresentable {
             let compDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: pixelFormat, width: cw, height: ch, mipmapped: false)
             compDesc.usage = [.shaderRead, .shaderWrite]; compDesc.storageMode = .private
             let denoisedDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: rtPixelFormat, width: cw, height: ch, mipmapped: false)
-            denoisedDesc.usage = [.shaderRead, .shaderWrite]; denoisedDesc.storageMode = .private
+            denoisedDesc.usage = [.shaderRead, .shaderWrite, .renderTarget]; denoisedDesc.storageMode = .private
             let gNormalDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: tw, height: th, mipmapped: false)
             gNormalDesc.usage = [.shaderRead, .shaderWrite]; gNormalDesc.storageMode = .private
             let gDepthDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: tw, height: th, mipmapped: false)
@@ -6984,7 +6986,19 @@ struct MetalView: UIViewRepresentable {
             desc.roughnessTextureFormat = .r16Float
             desc.isSpecularHitDistanceTextureEnabled = false
             desc.specularHitDistanceTextureFormat = .r16Float
+            #if targetEnvironment(macCatalyst)
+            // The Catalyst MetalFX/ANE backend is also unstable when the
+            // optional strength-mask plane is present on the same denoise
+            // sessions that trip the ANERegion/assertion path. The mask only
+            // gates RT entity/non-world pixels; Catalyst keeps preserved
+            // raster entities composited after RT, so leave the required
+            // color/depth/motion/albedo/normal/roughness guides intact and
+            // omit this optional plane here. iOS/device keeps the original
+            // Stage-18 mask behavior.
+            desc.isDenoiseStrengthMaskTextureEnabled = false
+            #else
             desc.isDenoiseStrengthMaskTextureEnabled = true
+            #endif
             desc.denoiseStrengthMaskTextureFormat = .r8Unorm
             desc.isTransparencyOverlayTextureEnabled = false
             desc.transparencyOverlayTextureFormat = .rgba16Float
@@ -6995,6 +7009,11 @@ struct MetalView: UIViewRepresentable {
             desc.inputHeight = inputH
             desc.outputWidth = outputW
             desc.outputHeight = outputH
+            /* The output texture carries .renderTarget because MetalFX reports
+             * outputTextureUsage=7 (shaderRead|shaderWrite|renderTarget).
+             * Synchronous initialization alone did not prevent the Catalyst
+             * assertions, so leave initialization on the default async path
+             * and synchronize the live resources with scaler.fence instead. */
             desc.requiresSynchronousInitialization = false
             desc.isAutoExposureEnabled = false
             guard let scaler = desc.makeTemporalDenoisedScaler(device: device) else {
@@ -7008,13 +7027,26 @@ struct MetalView: UIViewRepresentable {
             rtTemporalDenoisedScalerKey = key
             rtDenoiseFallbackLogPrinted = false
             if !rtDenoiseBackendLogPrinted {
-                print("[RT-DENOISE] MetalFX TemporalDenoisedScaler ready input=\(inputW)x\(inputH) output=\(outputW)x\(outputH) motion=rg16Float depth=r32Float normal=rgba16Float roughness=r16Float mask=r8Unorm")
+                #if targetEnvironment(macCatalyst)
+                let maskMode = "disabled-catalyst"
+                #else
+                let maskMode = "r8Unorm"
+                #endif
+                print("[RT-DENOISE] MetalFX TemporalDenoisedScaler ready input=\(inputW)x\(inputH) output=\(outputW)x\(outputH) motion=rg16Float depth=r32Float normal=rgba16Float roughness=r16Float mask=\(maskMode)")
                 rtDenoiseBackendLogPrinted = true
             }
             return scaler
         }
         #endif
 
+        @MainActor
+        private func ensureRTDenoiseFence(device: MTLDevice) -> MTLFence? {
+            if let rtDenoiseFence { return rtDenoiseFence }
+            let fence = device.makeFence()
+            fence?.label = "Q3.RT.denoise.fence"
+            rtDenoiseFence = fence
+            return fence
+        }
 
         @MainActor
         private func ensureRTWhiteTexture(device: MTLDevice) -> MTLTexture? {
@@ -7385,10 +7417,22 @@ struct MetalView: UIViewRepresentable {
                   let accumPSO = ensureRTAccumPipeline(device: device),
                   let blendPSO = ensureRTBlendPipeline(device: device) else { return nil }
             let rtResolutionScale = Q3_RTTraceScale()
+            let rtDenoiseRequested = Q3_RTDenoise() != 0
+            var rtDenoiseEnabled = rtDenoiseRequested
+            #if targetEnvironment(macCatalyst)
+            if rtDenoiseEnabled {
+                rtDenoiseEnabled = false
+                if !rtDenoiseCatalystDisabledLogPrinted {
+                    print("[RT-DENOISE] Catalyst MetalFX backend disabled reason=metalfx-ane-assertion using legacy path")
+                    rtDenoiseCatalystDisabledLogPrinted = true
+                }
+            } else {
+                rtDenoiseCatalystDisabledLogPrinted = false
+            }
+            #endif
             let rtBounceCount = Q3_RTBounces()
             let rtTAAEnabled = Q3_RTTAA() > 0.5
             let rtTAAAlpha = Q3_RTTAAAlpha()
-            let rtDenoiseEnabled = Q3_RTDenoise() != 0
             let rtDebugView = Q3_RTDebugView()
             let rtDebugGBuffer = Q3_RTDebugGBuffer()
             let traceW = max(1, Int((Float(renderW) * rtResolutionScale).rounded(.toNearestOrAwayFromZero)))
@@ -7438,6 +7482,7 @@ struct MetalView: UIViewRepresentable {
             #else
             let rtDenoiseActive = false
             #endif
+            let rtDenoiseFence = rtDenoiseActive ? ensureRTDenoiseFence(device: device) : nil
 
             let viewProj = makeWorldViewProjection(sceneView)
             let cameraPos = SIMD3<Float>(sceneView.viewOrigin.0, sceneView.viewOrigin.1, sceneView.viewOrigin.2)
@@ -7542,7 +7587,7 @@ struct MetalView: UIViewRepresentable {
                 rtGBufferPrevCurrentLogPrinted = true
             }
             if !rtOverlayLogPrintedOnce {
-                print("[RT] overlay active mix=\(mixValue) trace=\(traceW)x\(traceH) scale=\(rtResolutionScale) bounces=\(rtBounceCount) taa=\(rtTAAEnabled ? 1 : 0) denoise=\(rtDenoiseEnabled ? 1 : 0) composite=\(renderW)x\(renderH) camera=\(cameraPos)")
+                print("[RT] overlay active mix=\(mixValue) trace=\(traceW)x\(traceH) scale=\(rtResolutionScale) bounces=\(rtBounceCount) taa=\(rtTAAEnabled ? 1 : 0) denoise=\(rtDenoiseRequested ? 1 : 0) composite=\(renderW)x\(renderH) camera=\(cameraPos)")
                 rtOverlayLogPrintedOnce = true
             }
             let tg = MTLSize(width: 16, height: 16, depth: 1)
@@ -7647,6 +7692,9 @@ struct MetalView: UIViewRepresentable {
                 enc.setBuffer(shadowCounterBuffer, offset: 0, index: 7)
                 enc.setBuffer(emissiveInfo.buffer, offset: 0, index: 9)
                 enc.dispatchThreadgroups(traceGroups, threadsPerThreadgroup: tg)
+                if let rtDenoiseFence {
+                    enc.updateFence(rtDenoiseFence)
+                }
                 enc.endEncoding()
             }
             var rtColorForBlend: MTLTexture = accumTex
@@ -7669,7 +7717,11 @@ struct MetalView: UIViewRepresentable {
                 scaler.normalTexture = gNormalTex
                 scaler.roughnessTexture = gRoughnessTex
                 scaler.specularHitDistanceTexture = nil
+                #if targetEnvironment(macCatalyst)
+                scaler.denoiseStrengthMaskTexture = nil
+                #else
                 scaler.denoiseStrengthMaskTexture = denoiseMaskTex
+                #endif
                 scaler.transparencyOverlayTexture = nil
                 scaler.outputTexture = denoisedTex
                 scaler.exposureTexture = nil
@@ -7686,6 +7738,12 @@ struct MetalView: UIViewRepresentable {
                 scaler.isDepthReversed = false
                 scaler.worldToViewMatrix = matrix_identity_float4x4
                 scaler.viewToClipMatrix = viewProj
+                // MetalFX documents this fence as the synchronization point
+                // for untracked resources. The Catalyst denoiser/ANE path was
+                // asserting when it consumed the just-written RT G-buffer in
+                // the same command buffer; make the trace -> denoise -> blend
+                // dependency explicit.
+                scaler.fence = rtDenoiseFence
                 scaler.encode(commandBuffer: commandBuffer)
                 rtColorForBlend = denoisedTex
                 rtAlphaForBlend = rtTex
@@ -7747,6 +7805,9 @@ struct MetalView: UIViewRepresentable {
                                                   start: .blendStart,
                                                   end: .blendEnd,
                                                   label: "Q3.RT.blend") {
+                if rtDenoiseMode == "metalfx", let rtDenoiseFence {
+                    enc.waitForFence(rtDenoiseFence)
+                }
                 enc.setComputePipelineState(blendPSO)
                 enc.setTexture(rtColorForBlend, index: 0)
                 enc.setTexture(rasterTexture, index: 1)
@@ -7763,7 +7824,7 @@ struct MetalView: UIViewRepresentable {
                 let frameId = rtMetricsFrame
                 let scaleText = String(format: "%.2f", rtResolutionScale)
                 let taaText = rtTAAEnabled ? "1" : "0"
-                let denoiseText = rtDenoiseEnabled ? "1" : "0"
+                let denoiseText = rtDenoiseRequested ? "1" : "0"
                 let alphaText = String(format: "%.2f", rtTAAAlpha)
                 let bloomText = String(format: "%.2f", blendUniforms.bloomIntensity)
                 print("[RT] metrics frame=\(frameId) trace=\(traceW)x\(traceH) composite=\(renderW)x\(renderH) scale=\(scaleText) bounces=\(Int(rtBounceCount)) taa=\(taaText) denoise=\(denoiseText) denoiseMode=\(rtDenoiseMode) taaAlpha=\(alphaText) hdr=\(Q3_RTHDR()) bloom=\(bloomText) groups=\(traceGroups.width)x\(traceGroups.height)")
