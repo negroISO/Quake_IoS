@@ -12029,14 +12029,29 @@ int Q3_RTPerfHUD(void) {
 }
 
 int Q3_RTShadowBudget(void) {
-    if (ri.Cvar_Get == NULL) return 0;
-    /* Stage 19: local-light shadow-ray budget. 0=sun only, 1=sun+best local,
-     * 2=sun+top-2 locals. Default 0 is the Stage19 shipped perf point;
-     * set 2 to reproduce Stage18's deterministic top-2 local-light behavior. */
-    cvar_t *cv = ri.Cvar_Get("r_rt_shadow_budget", "0", CVAR_ARCHIVE);
-    int v = cv ? cv->integer : 0;
+    static qboolean migrationChecked = qfalse;
+    if (ri.Cvar_Get == NULL) return 2;
+    /* Stage 19/52: local-light shadow-ray budget. 0=sun only,
+     * 1=sun+best local, 2=sun+top-2 locals. Stage52 defaults to 2:
+     * it materially lifts NV15's authored local-light contribution while
+     * staying inside the measured Catalyst perf envelope. The clamp remains
+     * 4 for diagnostics/tuning, but 4 is not the default. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_shadow_budget", "2", CVAR_ARCHIVE);
+    if (!migrationChecked) {
+        migrationChecked = qtrue;
+        /* Stage52 archived-default migration: Stage19 shipped 0, which
+         * disabled all authored local-light direct lighting by default. Move
+         * only the stale archived 0 to the new correctness/perf default. */
+        if (cv && cv->integer == 0 && cv->resetString && !Q_stricmp(cv->resetString, "2")) {
+            if (ri.Cvar_Set != NULL) {
+                ri.Cvar_Set("r_rt_shadow_budget", "2");
+            }
+            return 2;
+        }
+    }
+    int v = cv ? cv->integer : 2;
     if (v < 0) v = 0;
-    if (v > 2) v = 2;
+    if (v > 4) v = 4;
     return v;
 }
 

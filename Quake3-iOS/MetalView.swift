@@ -5668,7 +5668,7 @@ struct MetalView: UIViewRepresentable {
                             uint lightCount = (uint)uniforms.rtLightParams.x;
                             if (lightCount > 0) {
                                 float lightScale = uniforms.rtLightParams.y;
-                                uint localShadowBudget = min((uint)max(uniforms.rtBudgetParams.x, 0.0), 2u);
+                                uint localShadowBudget = min((uint)max(uniforms.rtBudgetParams.x, 0.0), 4u);
                                 float3 direct = float3(0.0);
                                 uint firstLocal = 0;
                                 // Sun: always sampled when present (loader
@@ -5693,9 +5693,9 @@ struct MetalView: UIViewRepresentable {
                                         }
                                     }
                                 }
-                                /* Deterministic top-2 light selection: scan
+                                /* Deterministic top-K light selection: scan
                                  * the whole list with cheap ALU scoring, cast
-                                 * shadow rays ONLY for the two strongest
+                                 * shadow rays ONLY for the strongest local
                                  * contributors. No stochastic pick → no pdf
                                  * multiply → no firefly noise (the v1 sampler
                                  * picked 1 of N and multiplied by N, which
@@ -5703,7 +5703,8 @@ struct MetalView: UIViewRepresentable {
                                  * is far cheaper than one shadow ray. */
                                 if (localShadowBudget > 0) {
                                     uint bestIdx0 = 0xFFFFFFFFu, bestIdx1 = 0xFFFFFFFFu;
-                                    float bestS0 = 0.0, bestS1 = 0.0;
+                                    uint bestIdx2 = 0xFFFFFFFFu, bestIdx3 = 0xFFFFFFFFu;
+                                    float bestS0 = 0.0, bestS1 = 0.0, bestS2 = 0.0, bestS3 = 0.0;
                                     for (uint li = firstLocal; li < lightCount; ++li) {
                                         float3 toL = rtLights[li].posRadius.xyz - hitPos;
                                         float d2 = max(dot(toL, toL), 1.0);
@@ -5712,14 +5713,23 @@ struct MetalView: UIViewRepresentable {
                                         float s = rtLights[li].colorIntensity.w * ndl /
                                                   (d2 + r * r + 1.0);
                                         if (s > bestS0) {
+                                            bestS3 = bestS2; bestIdx3 = bestIdx2;
+                                            bestS2 = bestS1; bestIdx2 = bestIdx1;
                                             bestS1 = bestS0; bestIdx1 = bestIdx0;
                                             bestS0 = s; bestIdx0 = li;
                                         } else if (s > bestS1) {
+                                            bestS3 = bestS2; bestIdx3 = bestIdx2;
+                                            bestS2 = bestS1; bestIdx2 = bestIdx1;
                                             bestS1 = s; bestIdx1 = li;
+                                        } else if (s > bestS2) {
+                                            bestS3 = bestS2; bestIdx3 = bestIdx2;
+                                            bestS2 = s; bestIdx2 = li;
+                                        } else if (s > bestS3) {
+                                            bestS3 = s; bestIdx3 = li;
                                         }
                                     }
                                     for (uint k = 0; k < localShadowBudget; ++k) {
-                                        uint li = (k == 0) ? bestIdx0 : bestIdx1;
+                                        uint li = (k == 0) ? bestIdx0 : ((k == 1) ? bestIdx1 : ((k == 2) ? bestIdx2 : bestIdx3));
                                         if (li == 0xFFFFFFFFu) { continue; }
                                         RTLight Lgt = rtLights[li];
                                         float3 toL = Lgt.posRadius.xyz - hitPos;
