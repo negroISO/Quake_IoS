@@ -3562,14 +3562,14 @@
         0.11196911,
         0.11196911
       ],
-      "emissive_intensity": 982.55994,
+      "emissive_intensity": 3.0,
       "hash": "28134914D721E0FE",
       "metallic_constant": 1,
       "normal": "assets/ingested/28134914D721E0FE_normal_OTH_Normal.n.rtex.dds",
       "notes": "gamePath/renderCategory/alphaMode must be filled from Q3 shader/renderer knowledge",
       "remixConstants": {
         "emissive_color_constant": "(1, 0.11196911, 0.11196911)",
-        "emissive_intensity": "982.55994",
+        "emissive_intensity": "3.0",
         "enable_emission": "1",
         "metallic_constant": "1",
         "reflection_roughness_constant": "0.385"
@@ -23786,6 +23786,35 @@
       "surfaceparm_sky": false,
       "surfaceparm_trans": false
     },
+    "models/weapons2/bfg/bfg_e": {
+      "_comment": "Stage55: no authored bfg_e/envmapbfg PBR sidecars found in assets/ingested; explicit classic fallback prevents bfg alias from applying generic shotgun normal.",
+      "albedo": null,
+      "emissive": null,
+      "emissive_color": null,
+      "emissive_intensity": 0.0,
+      "hash": "0468E02FBF195DAC",
+      "height": null,
+      "inMaterialTable": false,
+      "metallic": null,
+      "normal": null,
+      "roughness": null,
+      "source": "stage55-needs-authoring",
+      "sourceTexture": "models/weapons2/bfg/bfg_e.tga"
+    },
+    "models/weapons2/bfg/bfg_k": {
+      "_comment": "Stage55: no authored bfg_k PBR DDS found in assets/ingested; explicit classic fallback documents needs-authoring instead of inheriting an unrelated material.",
+      "albedo": null,
+      "emissive": null,
+      "emissive_color": null,
+      "emissive_intensity": 0.0,
+      "height": null,
+      "inMaterialTable": false,
+      "metallic": null,
+      "normal": null,
+      "roughness": null,
+      "source": "stage55-needs-authoring",
+      "sourceTexture": "models/weapons2/bfg/bfg_k.tga"
+    },
     "models/weapons2/gauntlet/gauntlet1": {
       "albedo": "assets/ingested/7FAEB44A7670B7CD_albedo.a.rtex.dds",
       "emissive": null,
@@ -23955,13 +23984,14 @@
       "sourceTexture": "models/weapons2/machinegun/machinegun.jpg"
     },
     "models/weapons2/plasma/plasma": {
-      "albedo": "assets/ingested/463362F486A211D0_albedo.a.rtex.dds",
+      "_comment": "Stage55: no authored plasma normal DDS found in assets/ingested; disable PBR albedo so plasma.tga uses vanilla texture + flat normal instead of generic shotgun normal fallback.",
+      "albedo": null,
       "emissive": null,
       "emissive_color": null,
-      "emissive_intensity": null,
+      "emissive_intensity": 0.0,
       "hash": "463362F486A211D0",
       "height": null,
-      "inMaterialTable": true,
+      "inMaterialTable": false,
       "matchScore": 0.9808,
       "metallic": null,
       "normal": null,
@@ -24110,7 +24140,7 @@
         0.11196911,
         0.11196911
       ],
-      "emissive_intensity": 982.55994,
+      "emissive_intensity": 3.0,
       "hash": "28134914D721E0FE",
       "height": null,
       "inMaterialTable": true,
