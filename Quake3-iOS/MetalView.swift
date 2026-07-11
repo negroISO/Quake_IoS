@@ -457,6 +457,9 @@ struct MetalView: UIViewRepresentable {
             var _pad1: UInt32 = 0
             // xyz = normalized refEntity tint fallback; w reserved.
             var color: SIMD4<Float> = SIMD4(1, 1, 1, 1)
+            // x = alphaTestThreshold (same sign convention as world/entity
+            // raster uniforms), y/z/w reserved for later fidelity stages.
+            var params: SIMD4<Float> = SIMD4(0, 0, 0, 0)
         }
 
         struct WorldDrawUniforms {
@@ -5287,6 +5290,7 @@ struct MetalView: UIViewRepresentable {
                 uint _pad0;
                 uint _pad1;
                 float4 color;
+                float4 params; // x=alphaTestThreshold, y/z/w reserved
             };
 
             struct RTEntityVertex {
@@ -5394,20 +5398,31 @@ struct MetalView: UIViewRepresentable {
                 return normalize(tangent * cos(phi) * sinTheta + bitangent * sin(phi) * sinTheta + n * cosTheta);
             }
 
-            float3 rtShadeEntityReflection(uint primitiveID,
-                                           float hitDistance,
-                                           float3 rayOrigin,
-                                           float3 rayDir,
-                                           float2 bary,
-                                           const device uint *entityIndices,
-                                           const device RTEntityVertex *entityVertices,
-                                           const device RTEntityPrimitiveMaterial *entityMaterials,
-                                           const device RTTexTable& texTable,
-                                           sampler textureSampler) {
+            struct RTEntityShadeResult {
+                float3 color;
+                float alpha;
+                uint flags; // bit0=valid material, bit1=alpha test passed
+            };
+
+            RTEntityShadeResult rtShadeEntityReflection(uint primitiveID,
+                                                        float hitDistance,
+                                                        float3 rayOrigin,
+                                                        float3 rayDir,
+                                                        float2 bary,
+                                                        const device uint *entityIndices,
+                                                        const device RTEntityVertex *entityVertices,
+                                                        const device RTEntityPrimitiveMaterial *entityMaterials,
+                                                        const device RTTexTable& texTable,
+                                                        sampler textureSampler) {
+                RTEntityShadeResult result;
+                result.color = float3(0.03);
+                result.alpha = 0.0;
+                result.flags = 0u;
                 RTEntityPrimitiveMaterial mat = entityMaterials[primitiveID];
                 if ((mat.flags & 1u) == 0u) {
-                    return float3(0.03);
+                    return result;
                 }
+                result.flags = 1u;
                 uint i0 = entityIndices[primitiveID * 3u + 0u];
                 uint i1 = entityIndices[primitiveID * 3u + 1u];
                 uint i2 = entityIndices[primitiveID * 3u + 2u];
@@ -5424,6 +5439,15 @@ struct MetalView: UIViewRepresentable {
                 if ((mat.flags & 2u) != 0u && mat.albedoSlot < 176u) {
                     texel = texTable.albedo[mat.albedoSlot].sample(textureSampler, uv);
                 }
+                float alpha = saturate(texel.a);
+                result.alpha = alpha;
+                float alphaThreshold = mat.params.x;
+                if (alphaThreshold > 0.0) {
+                    if (alpha < alphaThreshold) { return result; }
+                } else if (alphaThreshold < 0.0) {
+                    if (alpha >= -alphaThreshold) { return result; }
+                }
+                result.flags |= 2u;
                 float3 N = entityVertices[i0].normal * w +
                            entityVertices[i1].normal * bary.x +
                            entityVertices[i2].normal * bary.y;
@@ -5439,9 +5463,9 @@ struct MetalView: UIViewRepresentable {
                     N = normalize(-rayDir);
                 }
                 float facing = 0.35 + 0.65 * saturate(abs(dot(N, -rayDir)));
-                float alpha = saturate(texel.a);
                 float3 albedo = texel.rgb * max(c, float3(0.08)) * tint;
-                return max(albedo * facing * max(alpha, 0.15), float3(0.01));
+                result.color = max(albedo * facing * max(alpha, 0.15), float3(0.01));
+                return result;
             }
 
             kernel void rtKernel(texture2d<float, access::write> output [[texture(0)]],
@@ -5982,24 +6006,34 @@ struct MetalView: UIViewRepresentable {
                                     float3 reflColor;
                                     bool useEntityReflectionHit = false;
                                     if (entityReflectionEnabled) {
-                                        auto erh = i.intersect(rray, entityAS);
-                                        useEntityReflectionHit = erh.type == intersection_type::triangle;
-                                        if (useEntityReflectionHit) {
-                                            RTEntityPrimitiveMaterial emat = entityPrimitiveMaterials[erh.primitive_id];
-                                            useEntityReflectionHit = ((emat.flags & 1u) != 0u) &&
-                                                (rh.type != intersection_type::triangle || erh.distance < rh.distance);
-                                        }
-                                        if (useEntityReflectionHit) {
-                                            reflColor = rtShadeEntityReflection(erh.primitive_id,
-                                                                                erh.distance,
-                                                                                hitPos + N * 0.75,
-                                                                                R,
-                                                                                erh.triangle_barycentric_coord,
-                                                                                entityIndices,
-                                                                                entityVertices,
-                                                                                entityPrimitiveMaterials,
-                                                                                texTable,
-                                                                                repeatSampler);
+                                        float entityMaxDistance = (rh.type == intersection_type::triangle) ? rh.distance : 20000.0;
+                                        float entityMinDistance = 0.1;
+                                        for (uint entityStep = 0u; entityStep < 8u && entityMinDistance < entityMaxDistance; ++entityStep) {
+                                            ray eray(hitPos + N * 0.75, R, entityMinDistance, entityMaxDistance);
+                                            auto erh = i.intersect(eray, entityAS);
+                                            if (erh.type != intersection_type::triangle) {
+                                                break;
+                                            }
+                                            RTEntityShadeResult es = rtShadeEntityReflection(erh.primitive_id,
+                                                                                             erh.distance,
+                                                                                             hitPos + N * 0.75,
+                                                                                             R,
+                                                                                             erh.triangle_barycentric_coord,
+                                                                                             entityIndices,
+                                                                                             entityVertices,
+                                                                                             entityPrimitiveMaterials,
+                                                                                             texTable,
+                                                                                             repeatSampler);
+                                            entityMinDistance = max(erh.distance + 0.05, entityMinDistance + 0.05);
+                                            if ((es.flags & 1u) == 0u) {
+                                                continue;
+                                            }
+                                            if ((es.flags & 2u) == 0u) {
+                                                continue;
+                                            }
+                                            reflColor = es.color;
+                                            useEntityReflectionHit = true;
+                                            break;
                                         }
                                     }
                                     if (!useEntityReflectionHit) {
@@ -6942,7 +6976,8 @@ struct MetalView: UIViewRepresentable {
                 flags: 0,
                 _pad0: 0,
                 _pad1: 0,
-                color: SIMD4<Float>(1, 1, 1, 1))
+                color: SIMD4<Float>(1, 1, 1, 1),
+                params: SIMD4<Float>(0, 0, 0, 0))
             let materials = buffer.contents().bindMemory(to: RTEntityPrimitiveMaterial.self,
                                                           capacity: primitiveCount)
             for i in 0..<primitiveCount {
@@ -6956,6 +6991,7 @@ struct MetalView: UIViewRepresentable {
             let filterBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_FILTER)
             let subtractBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_SUBTRACT)
             let thirdPersonBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_THIRD_PERSON)
+            let aTestGT0Bit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ATEST_GT0)
             let nonOpaqueMask = additiveBit | additiveFullBit | alphaBit | filterBit | subtractBit
             var assignedTriangles = 0
             var assignedHandles = Set<UInt32>()
@@ -6972,12 +7008,21 @@ struct MetalView: UIViewRepresentable {
                 var flags: UInt32 = 1
                 if slot != invalid { flags |= 2 }
                 let ec = draw.entityColor
+                var info = Q3MetalTextureInfo()
+                var alphaThreshold: Float = 0
+                if Q3MetalRenderer_GetTextureInfo(draw.textureHandle, &info) == 1 {
+                    alphaThreshold = Self.alphaTestThreshold(for: info.alphaFunc)
+                }
+                if (draw.flags & aTestGT0Bit) != 0 && alphaThreshold == 0 {
+                    alphaThreshold = 0.004
+                }
                 let material = RTEntityPrimitiveMaterial(
                     albedoSlot: slot,
                     flags: flags,
                     _pad0: 0,
                     _pad1: 0,
-                    color: SIMD4<Float>(ec.0, ec.1, ec.2, ec.3))
+                    color: SIMD4<Float>(ec.0, ec.1, ec.2, ec.3),
+                    params: SIMD4<Float>(alphaThreshold, 0, 0, 0))
                 for tri in triFirst..<triEnd {
                     materials[tri] = material
                 }
