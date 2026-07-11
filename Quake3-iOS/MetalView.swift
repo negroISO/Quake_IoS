@@ -278,14 +278,17 @@ struct MetalView: UIViewRepresentable {
             displayLink?.invalidate()
 
             let link = CADisplayLink(target: self, selector: #selector(displayLinkDidFire(_:)))
-            #if os(iOS)
+            #if os(iOS) && !targetEnvironment(macCatalyst)
             if #available(iOS 15.0, *) {
-                let minimum = Float(min(60, preferredFPS))
-                let maximum = Float(preferredFPS)
+                let rtPacingActive = Q3RTMix.current != .off
+                let rtTargetFPS = preferredFPS >= 120 ? 40 : 30
+                let minimum = Float(rtPacingActive ? rtTargetFPS : min(60, preferredFPS))
+                let maximum = Float(rtPacingActive ? rtTargetFPS : preferredFPS)
+                let target = Float(rtPacingActive ? rtTargetFPS : preferredFPS)
                 link.preferredFrameRateRange = CAFrameRateRange(minimum: minimum,
                                                                 maximum: maximum,
-                                                                preferred: maximum)
-                print("[Metal] display link range min=\(minimum) max=\(maximum) preferred=\(maximum)")
+                                                                preferred: target)
+                print("[Metal] display link range min=\(minimum) max=\(maximum) preferred=\(target) rtPacing=\(rtPacingActive ? 1 : 0)")
             } else {
                 link.preferredFramesPerSecond = preferredFPS
                 print("[Metal] display link preferredFPS=\(link.preferredFramesPerSecond)")
