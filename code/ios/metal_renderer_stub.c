@@ -716,6 +716,19 @@ static qboolean AuditSeen(char seen[][MAX_QPATH], int *count, int maxCount, cons
     return qfalse;
 }
 
+static qboolean AuditAlreadySeen(char seen[][MAX_QPATH], int count, const char *key) {
+    int i;
+    if (key == NULL || key[0] == '\0') {
+        return qtrue;
+    }
+    for (i = 0; i < count; ++i) {
+        if (!Q_stricmp(seen[i], key)) {
+            return qtrue;
+        }
+    }
+    return qfalse;
+}
+
 static const char *MetalCullName(int cullMode) {
     switch (cullMode) {
         case METAL_SHADER_CULL_DISABLE: return "none";
@@ -2638,6 +2651,56 @@ static qboolean IsPickupEntityShaderName(const char *name) {
          !Q_stricmpn(name, "models/powerups/ammo/", 21));
 }
 
+/* Entity submission asks the shader map for the same MD3 shader names every
+ * frame: once while measuring draw capacity, again while emitting draws, and
+ * again from one-shot diagnostics. ShaderMap_LookupEntry is a linear scan over
+ * the parsed scripts table, so repeated pickup/audit queries showed up as
+ * Q_stricmp-heavy RE_RenderScene samples in Stage62. Keep a tiny direct-mapped
+ * cache for entity-side lookups. The shader map is loaded once per process
+ * (LoadAllShaders guards s_shaderMapLoaded), so cached entry pointers remain
+ * stable across maps and vid_restart. */
+#define ENTITY_SHADER_LOOKUP_CACHE_SIZE 512
+typedef struct entityShaderLookupCache_s {
+    qboolean valid;
+    char name[MAX_QPATH];
+    const metalShaderMap_t *entry;
+} entityShaderLookupCache_t;
+
+static entityShaderLookupCache_t s_entityShaderLookupCache[ENTITY_SHADER_LOOKUP_CACHE_SIZE];
+
+static unsigned int EntityShaderLookupHash(const char *name) {
+    unsigned int h = 2166136261u;
+    const unsigned char *p = (const unsigned char *)name;
+    while (p != NULL && *p != '\0') {
+        unsigned char c = *p++;
+        if (c >= 'A' && c <= 'Z') {
+            c = (unsigned char)(c + ('a' - 'A'));
+        }
+        h ^= (unsigned int)c;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static const metalShaderMap_t *EntityShaderLookupEntryCached(const char *name) {
+    unsigned int slot;
+    entityShaderLookupCache_t *cached;
+    const metalShaderMap_t *entry;
+    if (name == NULL || name[0] == '\0') {
+        return NULL;
+    }
+    slot = EntityShaderLookupHash(name) & (ENTITY_SHADER_LOOKUP_CACHE_SIZE - 1);
+    cached = &s_entityShaderLookupCache[slot];
+    if (cached->valid && !Q_stricmp(cached->name, name)) {
+        return cached->entry;
+    }
+    entry = ShaderMap_LookupEntry(name);
+    cached->valid = qtrue;
+    Q_strncpyz(cached->name, name, sizeof(cached->name));
+    cached->entry = entry;
+    return entry;
+}
+
 static qboolean WorldMapPathIsClassicEffectLayer(const char *path) {
     if (path == NULL || path[0] == '\0') return qfalse;
     return (!Q_stricmpn(path, "textures/sfx/", 13) ||
@@ -2691,7 +2754,7 @@ static int EntityPickupStageDrawCount(const char *shaderName) {
     const metalShaderMap_t *entry;
     int i, count = 0;
     if (!IsPickupEntityShaderName(shaderName)) return 0;
-    entry = ShaderMap_LookupEntry(shaderName);
+    entry = EntityShaderLookupEntryCached(shaderName);
     if (entry == NULL || entry->stageCount <= 1) return 0;
     for (i = 0; i < entry->stageCount; ++i) {
         if (!entry->stages[i].useLightmap && entry->stages[i].mapPath[0] != '\0') count++;
@@ -2733,7 +2796,7 @@ static void CopyStageMetadataToTexture(metalTexture_t *texture, const Q3MetalSta
 }
 
 static qhandle_t RegisterEntityStageTexture(const char *shaderName, int stageIndex) {
-    const metalShaderMap_t *entry = ShaderMap_LookupEntry(shaderName);
+    const metalShaderMap_t *entry = EntityShaderLookupEntryCached(shaderName);
     const Q3MetalStage *stage;
     char alias[MAX_QPATH];
     qhandle_t baseHandle;
@@ -2769,7 +2832,7 @@ static qboolean EntityTextureWantsExplicitIdentityFullbright(qhandle_t textureHa
     const metalShaderMap_t *entry;
     if (tex == NULL || tex->rgbGen != 0 || !tex->rgbGenExplicit) return qfalse;
     if (shaderName != NULL && shaderName[0] != '\0') {
-        entry = ShaderMap_LookupEntry(shaderName);
+        entry = EntityShaderLookupEntryCached(shaderName);
         if (entry != NULL && entry->stageCount > 1) return qfalse;
     }
     return qtrue;
@@ -2804,11 +2867,14 @@ static void EmitMetalEntityStageAudit(const char *shaderName, const char *source
     if (!s_worldMapAuditActive || shaderName == NULL || shaderName[0] == '\0') {
         return;
     }
-    entry = ShaderMap_LookupEntry(shaderName);
+    MetalAuditShaderName(shaderName, auditName, sizeof(auditName));
+    if (AuditAlreadySeen(s_entityStageAuditSeen, s_entityStageAuditSeenCount, auditName)) {
+        return;
+    }
+    entry = EntityShaderLookupEntryCached(shaderName);
     if (entry == NULL || entry->stageCount <= 0) {
         return;
     }
-    MetalAuditShaderName(shaderName, auditName, sizeof(auditName));
     if (AuditSeen(s_entityStageAuditSeen, &s_entityStageAuditSeenCount,
                   METAL_ENTITY_STAGE_AUDIT_MAX, auditName)) {
         return;
@@ -10314,7 +10380,7 @@ static void RE_RenderScene(const refdef_t *fd) {
 
                     if (shaderNameForStages != NULL &&
                         EntityPickupStageDrawCount(shaderNameForStages) > 0) {
-                        const metalShaderMap_t *entry = ShaderMap_LookupEntry(shaderNameForStages);
+                        const metalShaderMap_t *entry = EntityShaderLookupEntryCached(shaderNameForStages);
                         int si;
                         for (si = 0; entry != NULL && si < entry->stageCount; ++si) {
                             qhandle_t stageHandle = RegisterEntityStageTexture(shaderNameForStages, si);
