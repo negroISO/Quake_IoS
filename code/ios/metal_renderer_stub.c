@@ -1709,6 +1709,25 @@ static qboolean shaderShouldInjectImplicitLightmap(const metalShaderMap_t *entry
     return qtrue;
 }
 
+static qboolean MetalStageCanCarryCollapsedLightmap(const Q3MetalStage *stage) {
+    if (stage == NULL || stage->useLightmap) {
+        return qfalse;
+    }
+    if (stage->blendMode == 0) {
+        return qtrue;
+    }
+    /* Alpha-blended world decals/glass often author a trailing lightmap
+     * filter stage only to darken the decal source. With the global pass
+     * order running alpha before filter, keeping that as a later pass
+     * modulates the whole destination rectangle. Collapse the lightmap
+     * into the alpha source instead; additive/filter/subtract FX stay
+     * explicit/fullbright. */
+    if (stage->blendMode == 2) {
+        return qtrue;
+    }
+    return qfalse;
+}
+
 static int MetalShaderCombinedLightmapBaseStage(const metalShaderMap_t *entry,
                                                 qboolean hasLightmap,
                                                 qhandle_t lightmapHandle) {
@@ -1726,7 +1745,7 @@ static int MetalShaderCombinedLightmapBaseStage(const metalShaderMap_t *entry,
     }
     if (entry->stageCount >= 2 &&
         !entry->stages[0].useLightmap &&
-        entry->stages[0].blendMode == 0 &&
+        MetalStageCanCarryCollapsedLightmap(&entry->stages[0]) &&
         entry->stages[1].useLightmap &&
         entry->stages[1].blendMode == 3) {
         return 0;
