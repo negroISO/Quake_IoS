@@ -384,6 +384,8 @@ typedef struct {
     uint32_t *indices;
     Q3MetalWorldDrawCmd *draws;
     Q3MetalWorldDrawCmd *visibleDraws;
+    Q3MetalWorldDrawCmd *probeDraws;
+    uint32_t *probeDrawStamps;
     Q3MetalWorldBatchCmd *batches;
     uint32_t batchCount;
     uint32_t batchCapacity;
@@ -398,6 +400,9 @@ typedef struct {
     uint32_t visibleDrawCount;
     uint32_t visibleDrawCapacity;
     qboolean visibleDrawsValid;
+    uint32_t probeDrawCount;
+    uint32_t probeDrawCapacity;
+    uint32_t probeDrawStamp;
     Q3MetalSurfaceDrawRange *surfaceDrawRanges;
     int surfaceDrawRangeCount;
     int lastViewCluster;
@@ -3101,6 +3106,12 @@ static void FreeWorldMapData(void) {
     if (s_world.visibleDraws != NULL) {
         ri.Free(s_world.visibleDraws);
     }
+    if (s_world.probeDraws != NULL) {
+        ri.Free(s_world.probeDraws);
+    }
+    if (s_world.probeDrawStamps != NULL) {
+        ri.Free(s_world.probeDrawStamps);
+    }
     if (s_world.batches != NULL) {
         ri.Free(s_world.batches);
     }
@@ -4969,6 +4980,18 @@ static uint32_t MetalWorldNextSurfaceStamp(void) {
     return s_world.visibleSurfaceStamp;
 }
 
+static uint32_t MetalWorldNextProbeDrawStamp(void) {
+    s_world.probeDrawStamp += 1;
+    if (s_world.probeDrawStamp == 0) {
+        if (s_world.probeDrawStamps != NULL && s_world.probeDrawCapacity > 0) {
+            Com_Memset(s_world.probeDrawStamps, 0,
+                       s_world.probeDrawCapacity * sizeof(s_world.probeDrawStamps[0]));
+        }
+        s_world.probeDrawStamp = 1;
+    }
+    return s_world.probeDrawStamp;
+}
+
 static void MetalWorldMarkAllLeaves(void) {
     int i;
     MetalWorldBumpVisCount();
@@ -5202,6 +5225,156 @@ static void MetalWorldAppendFogOverlayDraws(void) {
         }
         s_world.visibleDraws[s_world.visibleDrawCount++] = *draw;
     }
+}
+
+static qboolean MetalWorldBoundsWithinDistanceSq(const vec3_t mins,
+                                                 const vec3_t maxs,
+                                                 const vec3_t origin,
+                                                 float maxDistanceSq) {
+    float distSq;
+    float delta;
+    int i;
+
+    if (maxDistanceSq <= 0.0f) {
+        return qtrue;
+    }
+
+    distSq = 0.0f;
+    for (i = 0; i < 3; ++i) {
+        if (origin[i] < mins[i]) {
+            delta = mins[i] - origin[i];
+        } else if (origin[i] > maxs[i]) {
+            delta = origin[i] - maxs[i];
+        } else {
+            delta = 0.0f;
+        }
+        distSq += delta * delta;
+        if (distSq > maxDistanceSq) {
+            return qfalse;
+        }
+    }
+    return qtrue;
+}
+
+static qboolean MetalWorldSurfaceWithinProbeRadius(bspMsurface_t *surf,
+                                                   const vec3_t vieworg,
+                                                   float maxDistanceSq) {
+    if (maxDistanceSq <= 0.0f) {
+        return qtrue;
+    }
+    if (surf == NULL || !surf->boundsValid) {
+        return qtrue;
+    }
+    return MetalWorldBoundsWithinDistanceSq(surf->bounds[0], surf->bounds[1],
+                                            vieworg, maxDistanceSq);
+}
+
+static void MetalWorldAppendProbeSurfaceDraws(bspMsurface_t *surf,
+                                              uint32_t surfaceStamp,
+                                              const vec3_t vieworg,
+                                              float maxDistanceSq) {
+    intptr_t surfaceIndex;
+    Q3MetalSurfaceDrawRange range;
+    uint32_t drawIndex;
+    qboolean surfaceInRadius;
+
+    if (surf == NULL || s_bspWorld.surfaces == NULL) return;
+    if (surf->metalVisibleStamp == surfaceStamp) return;
+
+    surfaceIndex = surf - s_bspWorld.surfaces;
+    if (surfaceIndex < 0 || surfaceIndex >= s_world.surfaceDrawRangeCount) return;
+    if (s_world.surfaceDrawRanges == NULL || s_world.probeDraws == NULL) return;
+
+    range = s_world.surfaceDrawRanges[surfaceIndex];
+    if (range.drawCount == 0) return;
+    if (range.firstDraw >= s_world.drawCount) return;
+    if (range.firstDraw + range.drawCount > s_world.drawCount) {
+        range.drawCount = s_world.drawCount - range.firstDraw;
+    }
+    if (MetalWorldCullFaceSurface(surf, range, vieworg)) return;
+
+    surf->metalVisibleStamp = surfaceStamp;
+    surfaceInRadius = MetalWorldSurfaceWithinProbeRadius(surf, vieworg, maxDistanceSq);
+
+    for (drawIndex = 0; drawIndex < range.drawCount; ++drawIndex) {
+        uint32_t globalDrawIndex = range.firstDraw + drawIndex;
+        const Q3MetalWorldDrawCmd *draw = &s_world.draws[globalDrawIndex];
+        if (!surfaceInRadius &&
+            (draw->flags & Q3_METAL_WORLD_DRAWFLAG_SKY) == 0) {
+            continue;
+        }
+        if (globalDrawIndex < s_world.probeDrawCapacity &&
+            s_world.probeDrawStamps != NULL &&
+            s_world.probeDrawStamps[globalDrawIndex] == s_world.probeDrawStamp) {
+            continue;
+        }
+        if ((draw->flags & (Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY | (1u << 6))) != 0) {
+            continue;
+        }
+        if (s_world.probeDrawCount >= s_world.probeDrawCapacity) {
+            return;
+        }
+        if (globalDrawIndex < s_world.probeDrawCapacity &&
+            s_world.probeDrawStamps != NULL) {
+            s_world.probeDrawStamps[globalDrawIndex] = s_world.probeDrawStamp;
+        }
+        s_world.probeDraws[s_world.probeDrawCount++] = *draw;
+    }
+}
+
+static void MetalWorldRecursiveProbeNode(bspMnode_t *node,
+                                         const vec3_t vieworg,
+                                         uint32_t surfaceStamp,
+                                         float maxDistanceSq) {
+    if (node == NULL) return;
+    if (node->visframe != (int)s_world.visibleVisCount) return;
+    if (maxDistanceSq > 0.0f &&
+        !MetalWorldBoundsWithinDistanceSq(node->mins, node->maxs,
+                                          vieworg, maxDistanceSq)) {
+        return;
+    }
+
+    if (node->contents != CONTENTS_NODE) {
+        bspMsurface_t **mark = node->firstmarksurface;
+        int c = node->nummarksurfaces;
+        while (c-- > 0 && mark != NULL) {
+            MetalWorldAppendProbeSurfaceDraws(*mark, surfaceStamp, vieworg, maxDistanceSq);
+            mark++;
+        }
+        return;
+    }
+
+    MetalWorldRecursiveProbeNode(node->children[0], vieworg, surfaceStamp, maxDistanceSq);
+    MetalWorldRecursiveProbeNode(node->children[1], vieworg, surfaceStamp, maxDistanceSq);
+}
+
+static uint32_t MetalWorldBuildProbeDraws(const vec3_t vieworg,
+                                          float maxDistance) {
+    uint32_t surfaceStamp;
+    uint32_t drawStamp;
+    float maxDistanceSq;
+
+    s_world.probeDrawCount = 0;
+
+    if (!s_world.loaded || !s_bspWorld.loaded || s_bspWorld.nodes == NULL ||
+        s_world.draws == NULL || s_world.probeDraws == NULL ||
+        s_world.probeDrawStamps == NULL ||
+        s_world.surfaceDrawRanges == NULL || s_world.probeDrawCapacity == 0) {
+        return 0;
+    }
+
+    MetalWorldMarkLeaves(vieworg, NULL);
+    if (s_world.visibleVisCount == 0) {
+        return 0;
+    }
+
+    if (maxDistance < 0.0f) maxDistance = 0.0f;
+    maxDistanceSq = (maxDistance > 0.0f) ? (maxDistance * maxDistance) : 0.0f;
+    surfaceStamp = MetalWorldNextSurfaceStamp();
+    drawStamp = MetalWorldNextProbeDrawStamp();
+    (void)drawStamp;
+    MetalWorldRecursiveProbeNode(s_bspWorld.nodes, vieworg, surfaceStamp, maxDistanceSq);
+    return s_world.probeDrawCount;
 }
 
 static void MetalWorldRecursiveNode(bspMnode_t *node,
@@ -5788,6 +5961,29 @@ uint32_t Q3MetalRenderer_BuildWorldBatches(uint32_t passMask) {
 
 uint32_t Q3MetalRenderer_BuildWorldAllBatches(uint32_t passMask) {
     return MetalWorldBuildBatchesForDraws(s_world.draws, s_world.drawCount, passMask);
+}
+
+uint32_t Q3MetalRenderer_BuildWorldProbeBatches(float originX,
+                                                float originY,
+                                                float originZ,
+                                                float maxDistance,
+                                                uint32_t passMask) {
+    vec3_t origin;
+    origin[0] = originX;
+    origin[1] = originY;
+    origin[2] = originZ;
+    MetalWorldBuildProbeDraws(origin, maxDistance);
+    return MetalWorldBuildBatchesForDraws(s_world.probeDraws,
+                                          s_world.probeDrawCount,
+                                          passMask);
+}
+
+uint32_t Q3MetalRenderer_GetWorldProbeDrawCount(void) {
+    return s_world.probeDrawCount;
+}
+
+const Q3MetalWorldDrawCmd *Q3MetalRenderer_GetWorldProbeDrawCommands(void) {
+    return s_world.probeDraws;
 }
 
 const Q3MetalWorldBatchCmd *Q3MetalRenderer_GetWorldBatches(void) {
@@ -6408,9 +6604,14 @@ static qboolean LoadWorldMapData(const char *name) {
     s_world.indices = ri.Malloc(totalIndices * sizeof(*s_world.indices));
     s_world.draws = ri.Malloc(totalDraws * sizeof(*s_world.draws));
     s_world.visibleDraws = ri.Malloc(totalDraws * sizeof(*s_world.visibleDraws));
+    s_world.probeDraws = ri.Malloc(totalDraws * sizeof(*s_world.probeDraws));
+    s_world.probeDrawStamps = ri.Malloc(totalDraws * sizeof(*s_world.probeDrawStamps));
     s_world.visibleDrawCapacity = totalDraws;
     s_world.visibleDrawCount = 0;
     s_world.visibleDrawsValid = qfalse;
+    s_world.probeDrawCapacity = totalDraws;
+    s_world.probeDrawCount = 0;
+    s_world.probeDrawStamp = 0;
     s_world.surfaceDrawRanges = ri.Malloc(surfaceCount * sizeof(*s_world.surfaceDrawRanges));
     s_world.surfaceDrawRangeCount = surfaceCount;
     s_world.lastViewCluster = -9999;
@@ -6423,8 +6624,12 @@ static qboolean LoadWorldMapData(const char *name) {
         uint32_t _i;
         for (_i = 0; _i < totalDraws; ++_i) s_world.animShaderSlots[_i] = -1;
     }
+    if (s_world.probeDrawStamps != NULL) {
+        Com_Memset(s_world.probeDrawStamps, 0, totalDraws * sizeof(*s_world.probeDrawStamps));
+    }
     if (s_world.vertices == NULL || s_world.indices == NULL ||
         s_world.draws == NULL || s_world.visibleDraws == NULL ||
+        s_world.probeDraws == NULL || s_world.probeDrawStamps == NULL ||
         s_world.surfaceDrawRanges == NULL) {
         ri.Printf(PRINT_WARNING, "Metal world: allocation failed for '%s'\n", name);
         FreeWorldMapData();
@@ -11832,6 +12037,21 @@ int Q3_PBREnvCubeLive(void) {
     if (ri.Cvar_Get == NULL) return 1;
     cvar_t *cv = ri.Cvar_Get("r_pbr_envcube_live", "1", CVAR_ARCHIVE);
     return (cv && cv->integer != 0) ? 1 : 0;
+}
+
+/* r_pbr_envcube_probe_radius (default 384) — live envcube probe draw-set
+ * LOD radius in Q3 world units. The probe still uses the BSP PVS at the
+ * camera origin and still renders sky; this radius only drops distant local
+ * BSP surfaces that a 128px blurry IBL probe cannot resolve. 0 disables the
+ * distance cap while keeping the PVS cut. */
+float Q3_PBREnvCubeProbeRadius(void) {
+    float v;
+    if (ri.Cvar_Get == NULL) return 384.0f;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_envcube_probe_radius", "384", CVAR_ARCHIVE);
+    v = cv ? cv->value : 384.0f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 8192.0f) v = 8192.0f;
+    return v;
 }
 
 /* r_pbr_emissive_intensity_max (default 3.0, CVAR_ARCHIVE, clamped

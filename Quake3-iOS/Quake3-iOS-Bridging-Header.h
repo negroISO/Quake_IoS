@@ -4,9 +4,19 @@
 #include "../code/ios/metal_renderer_shared.h"
 
 /* Builds world batches against the full BSP draw table, not the current
- * main-view visible draw list. Used by Swift's live PBR env-cube capture,
- * whose six 90° cameras cannot reuse the main camera's frustum/PVS subset. */
+ * main-view visible draw list. Retained for diagnostics/fallbacks. */
 uint32_t Q3MetalRenderer_BuildWorldAllBatches(uint32_t passMask);
+/* Builds live-envcube probe batches from the BSP PVS at the probe origin,
+ * optionally capped by maxDistance world units. This is separate from the
+ * main-view visible draw list so cubemap refreshes do not corrupt the main
+ * camera's culling state. */
+uint32_t Q3MetalRenderer_BuildWorldProbeBatches(float originX,
+                                                float originY,
+                                                float originZ,
+                                                float maxDistance,
+                                                uint32_t passMask);
+uint32_t Q3MetalRenderer_GetWorldProbeDrawCount(void);
+const Q3MetalWorldDrawCmd *Q3MetalRenderer_GetWorldProbeDrawCommands(void);
 
 /* Stage25 portal-entity visibility bit. Carried in Q3MetalEntityDrawCmd.flags
  * for draws sourced from refEntity_t.renderfx & RF_THIRD_PERSON. Kept here
@@ -210,6 +220,7 @@ float Q3_PBREnvCubeGreyRequested(void);
  * with a small camera-position world cubemap refreshed over several frames.
  * 0 restores the legacy procedural envCube path exactly. */
 int Q3_PBREnvCubeLive(void);
+float Q3_PBREnvCubeProbeRadius(void);
 /* r_pbr_emissive_intensity_max (default 64.0, archived, clamped 0..1024) —
  * hard ceiling on the per-material emissive intensity that
  * `emissiveParamsForPBRMaterial` writes into `EntityUniforms.emissive

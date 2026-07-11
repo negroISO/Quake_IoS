@@ -8954,13 +8954,13 @@ struct MetalView: UIViewRepresentable {
             encoder.setFragmentTexture(pbrEmissiveDefault(), index: 9)
             Self.bindDlightBlock(snapshot: snapshot, encoder: encoder, device: device, index: 2, extra: currentBakedDlights())
 
-            let worldDraws = UnsafeBufferPointer(start: worldDrawsPointer, count: drawCount)
             let skyFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
             let fogOnlyBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY)
             let portalBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_PORTAL)
             let envCaptureSkipMask = fogOnlyBit | UInt32(1 << 6)
             let combinedLightmapBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_COMBINED_LIGHTMAP)
             let timeSeconds = snapshot.shaderTime
+            let worldDraws = UnsafeBufferPointer(start: worldDrawsPointer, count: drawCount)
             var entriesByPass = Array(repeating: [WorldPassEntry](), count: 5)
             for drawIndex in 0..<worldDraws.count {
                 let draw = worldDraws[drawIndex]
@@ -9531,6 +9531,10 @@ struct MetalView: UIViewRepresentable {
         private var pbrLiveEnvNextFace: Int = 0
         private var pbrLiveEnvFrameCounter: UInt64 = 0
         private var pbrLiveEnvLoggedActive = false
+        private var pbrLiveEnvLastProbeRadius: Float = 0
+        private var pbrLiveEnvLastProbeDrawCount: Int = 0
+        private var pbrLiveEnvLastBatchCount: Int = 0
+        private var pbrLiveEnvLastBatchIndexCount: Int = 0
         private var pbrLiveEnvBatchIndexBuffers: [MTLBuffer?] = Array(repeating: nil, count: 3)
         private var pbrLiveEnvBatchIndexBufferCapacities: [Int] = Array(repeating: 0, count: 3)
         private var pbrTriedAndMissed: Set<UInt32> = []
@@ -10952,6 +10956,10 @@ struct MetalView: UIViewRepresentable {
             pbrLiveEnvNextFace = 0
             pbrLiveEnvFrameCounter = 0
             pbrLiveEnvLoggedActive = false
+            pbrLiveEnvLastProbeRadius = 0
+            pbrLiveEnvLastProbeDrawCount = 0
+            pbrLiveEnvLastBatchCount = 0
+            pbrLiveEnvLastBatchIndexCount = 0
             return (color, depth)
         }
 
@@ -11040,7 +11048,6 @@ struct MetalView: UIViewRepresentable {
             encoder.setFragmentTexture(pbrEmissiveDefault(), index: 9)
             Self.bindDlightBlock(snapshot: snapshot, encoder: encoder, device: device, index: 2, extra: currentBakedDlights())
 
-            let worldDraws = UnsafeBufferPointer(start: worldDrawsPointer, count: drawCount)
             let skyFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
             let fogOnlyBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY)
             let portalBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_PORTAL)
@@ -11052,8 +11059,35 @@ struct MetalView: UIViewRepresentable {
 
             var envWorldBatches = UnsafeBufferPointer<Q3MetalWorldBatchCmd>(start: nil, count: 0)
             var envWorldBatchIndexBuffer: MTLBuffer?
-            let envBatchCount = Int(Q3MetalRenderer_BuildWorldAllBatches((1 << 0) | (1 << 1)))
+            let envProbeRadius = Q3_PBREnvCubeProbeRadius()
+            var envBatchCount = Int(Q3MetalRenderer_BuildWorldProbeBatches(origin.x,
+                                                                           origin.y,
+                                                                           origin.z,
+                                                                           envProbeRadius,
+                                                                           (1 << 0) | (1 << 1)))
+            var envProbeDrawCount = Int(Q3MetalRenderer_GetWorldProbeDrawCount())
+            var envUsingFullWorldFallback = false
+            if envBatchCount == 0 || envProbeDrawCount == 0 {
+                // Safety fallback: preserve the Stage63 batched full-world
+                // path if the probe cull cannot produce a valid draw set.
+                envBatchCount = Int(Q3MetalRenderer_BuildWorldAllBatches((1 << 0) | (1 << 1)))
+                envProbeDrawCount = drawCount
+                envUsingFullWorldFallback = true
+            }
+            let envDrawsPointer: UnsafePointer<Q3MetalWorldDrawCmd>
+            if envUsingFullWorldFallback {
+                envDrawsPointer = worldDrawsPointer
+            } else {
+                envDrawsPointer = Q3MetalRenderer_GetWorldProbeDrawCommands() ?? worldDrawsPointer
+            }
+            let envDrawCount = max(0, envProbeDrawCount)
+            let worldDraws = UnsafeBufferPointer(start: envDrawsPointer,
+                                                 count: envDrawCount)
             let envBatchIndexCount = Int(Q3MetalRenderer_GetWorldBatchIndexCount())
+            pbrLiveEnvLastProbeRadius = envProbeRadius
+            pbrLiveEnvLastProbeDrawCount = envProbeDrawCount
+            pbrLiveEnvLastBatchCount = envBatchCount
+            pbrLiveEnvLastBatchIndexCount = envBatchIndexCount
             if envBatchCount > 0,
                envBatchIndexCount > 0,
                let cBatchPointer = Q3MetalRenderer_GetWorldBatches(),
@@ -11216,7 +11250,8 @@ struct MetalView: UIViewRepresentable {
             if pbrLiveEnvFacesValidMask == Self.livePBREnvCubeCompleteMask,
                !pbrLiveEnvLoggedActive {
                 pbrLiveEnvLoggedActive = true
-                let msg = "[Q3-PBR-IBL] live envcube active size=\(size)x\(size) refresh=bootstrap-6faces-then-one-face-every-\(Self.livePBREnvCubeRefreshInterval)-frames"
+                let radiusText = String(format: "%.0f", pbrLiveEnvLastProbeRadius)
+                let msg = "[Q3-PBR-IBL] live envcube active size=\(size)x\(size) refresh=bootstrap-6faces-then-one-face-every-\(Self.livePBREnvCubeRefreshInterval)-frames probe=pvs+radius radius=\(radiusText) lastDraws=\(pbrLiveEnvLastProbeDrawCount) lastBatches=\(pbrLiveEnvLastBatchCount) lastIndices=\(pbrLiveEnvLastBatchIndexCount)"
                 print(msg)
                 pbrLog(msg)
             }
