@@ -419,6 +419,11 @@ struct MetalView: UIViewRepresentable {
             // x = r_rt_shadow_budget, y = emissive NEE light count,
             // z = r_rt_emissive_nee enabled, w = r_rt_debug_view.
             var rtBudgetParams: SIMD4<Float> = SIMD4(2, 0, 0, 0)
+            // Stage 60 append-only entity-reflection controls:
+            // x = r_rt_entity_refl_roughness_max, y = r_rt_perf_hud 2 attribution enabled,
+            // z/w reserved. Gates ENTITY-AS traversal only; world reflections
+            // still use rtLightParams.w.
+            var rtEntityReflectionParams: SIMD4<Float> = SIMD4(0.25, 0, 0, 0)
         }
 
         struct RTPrimitiveMaterial {
@@ -4313,6 +4318,8 @@ struct MetalView: UIViewRepresentable {
         private var rtShadowCounterBuffers: [MTLBuffer] = []
         private var rtShadowCounterCursor: Int = 0
         private var rtLastShadowCounterLog: String = ""
+        private var rtLastEntityReflectionCounterLog: String = ""
+        private var rtEntityReflectionCounterLogSerial: UInt64 = 0
         // CPU copy for raster-side dlight injection (currentBakedDlights).
         private var rtLightsCPU: [RTLightGPU] = []
         // Authored lights sorted for RT truncation: slot-0 sun first, then locals by intensity.
@@ -4749,13 +4756,13 @@ struct MetalView: UIViewRepresentable {
         }
 
         private func nextRTShadowCounterBuffer(device: MTLDevice) -> MTLBuffer? {
-            let counterCount = 4
+            let counterCount = 18
             let length = counterCount * MemoryLayout<UInt32>.stride
             while rtShadowCounterBuffers.count < 3 {
                 guard let buf = device.makeBuffer(length: length, options: .storageModeShared) else {
                     return nil
                 }
-                buf.label = "Q3.RT.sunShadowCounters.\(rtShadowCounterBuffers.count)"
+                buf.label = "Q3.RT.perFrameCounters.\(rtShadowCounterBuffers.count)"
                 memset(buf.contents(), 0, length)
                 rtShadowCounterBuffers.append(buf)
             }
@@ -4772,6 +4779,49 @@ struct MetalView: UIViewRepresentable {
                     let msg = "[RT] sun shadow rays map='\(rtLightMapName)' sunPixels=\(sunPixels) candidates=\(candidates) occluded=\(occluded) unoccluded=\(unoccluded)"
                     print(msg)
                     pbrLog(msg)
+                }
+            }
+            if Q3_RTPerfHUD() > 1 {
+                let reflRays = ptr[4]
+                let entityCandidateRays = ptr[5]
+                let entityGatePassRays = ptr[6]
+                let entityGateSkipRays = ptr[7]
+                let entityASQueries = ptr[8]
+                let entityASRawHits = ptr[9]
+                let entityASOpaqueHits = ptr[10]
+                let entityASAdditiveHits = ptr[11]
+                let roughBin0 = ptr[12]
+                let roughBin1 = ptr[13]
+                let roughBin2 = ptr[14]
+                let roughBin3 = ptr[15]
+                let roughBinMetal = ptr[16]
+                let worldReflectionHits = ptr[17]
+                if reflRays != 0 || entityCandidateRays != 0 || entityASQueries != 0 {
+                    rtEntityReflectionCounterLogSerial &+= 1
+                    if rtEntityReflectionCounterLogSerial == 1 || rtEntityReflectionCounterLogSerial % 60 == 0 {
+                        let gateRoughMax = Q3_RTEntityReflRoughnessMax()
+                        let msg = String(format: "[RT-PERF] entityRefl rays=%u entityCandidates=%u gatePass=%u gateSkip=%u entityASQueries=%u entityASHits=%u opaqueHits=%u additiveHits=%u worldHits=%u roughBins=<.10:%u,<.20:%u,<.30:%u,<.45:%u,metal:%u roughMax=%.2f",
+                                         reflRays,
+                                         entityCandidateRays,
+                                         entityGatePassRays,
+                                         entityGateSkipRays,
+                                         entityASQueries,
+                                         entityASRawHits,
+                                         entityASOpaqueHits,
+                                         entityASAdditiveHits,
+                                         worldReflectionHits,
+                                         roughBin0,
+                                         roughBin1,
+                                         roughBin2,
+                                         roughBin3,
+                                         roughBinMetal,
+                                         gateRoughMax)
+                        if msg != rtLastEntityReflectionCounterLog {
+                            rtLastEntityReflectionCounterLog = msg
+                            print(msg)
+                            pbrLog(msg)
+                        }
+                    }
                 }
             }
             rtShadowCounterCursor = (rtShadowCounterCursor + 1) % rtShadowCounterBuffers.count
@@ -5253,6 +5303,10 @@ struct MetalView: UIViewRepresentable {
                 // x = local-light shadow budget, y = emissive NEE light count,
                 // z = emissive NEE enabled, w = r_rt_debug_view.
                 float4 rtBudgetParams;
+                // Stage 60 append-only controls:
+                // x = r_rt_entity_refl_roughness_max, y = r_rt_perf_hud 2 attribution enabled,
+                // z/w reserved. Gates ENTITY-AS traversal only.
+                float4 rtEntityReflectionParams;
             };
 
             // P1: RTX Remix authored per-map light (baked from
@@ -6035,18 +6089,60 @@ struct MetalView: UIViewRepresentable {
                                     R = normalize(mix(R, jdir, rough * rough));
                                     ray rray(hitPos + N * 0.75, R, 0.1, 20000.0);
                                     auto rh = i.intersect(rray, worldAS);
+                                    bool entityReflPerf = uniforms.rtEntityReflectionParams.y > 0.5;
+                                    if (entityReflectionEnabled && entityReflPerf) {
+                                        atomic_fetch_add_explicit(&rtShadowCounters[4], 1u, memory_order_relaxed);
+                                        if (rh.type == intersection_type::triangle) {
+                                            atomic_fetch_add_explicit(&rtShadowCounters[17], 1u, memory_order_relaxed);
+                                        }
+                                    }
                                     float3 reflColor;
                                     bool useEntityReflectionHit = false;
                                     bool hasEntityAdditiveReflection = false;
                                     float3 entityAdditiveReflection = float3(0.0);
+                                    bool entityReflGatePass = false;
                                     if (entityReflectionEnabled) {
+                                        float entityReflRoughMax = clamp(uniforms.rtEntityReflectionParams.x, 0.0, 1.0);
+                                        // Stage60: rough surfaces skip ENTITY-AS traversal, but keep a
+                                        // narrow reflectivity escape for authored metal/mirror-like
+                                        // surfaces whose Q3/PBR roughness lands around 0.35-0.45.
+                                        entityReflGatePass = rough <= entityReflRoughMax ||
+                                            (metal > 0.50 && rough < max(entityReflRoughMax, 0.45));
+                                        if (entityReflPerf) {
+                                            atomic_fetch_add_explicit(&rtShadowCounters[5], 1u, memory_order_relaxed);
+                                            if (rough < 0.10) {
+                                                atomic_fetch_add_explicit(&rtShadowCounters[12], 1u, memory_order_relaxed);
+                                            } else if (rough < 0.20) {
+                                                atomic_fetch_add_explicit(&rtShadowCounters[13], 1u, memory_order_relaxed);
+                                            } else if (rough < 0.30) {
+                                                atomic_fetch_add_explicit(&rtShadowCounters[14], 1u, memory_order_relaxed);
+                                            } else if (rough < 0.45) {
+                                                atomic_fetch_add_explicit(&rtShadowCounters[15], 1u, memory_order_relaxed);
+                                            }
+                                            if (metal > 0.5) {
+                                                atomic_fetch_add_explicit(&rtShadowCounters[16], 1u, memory_order_relaxed);
+                                            }
+                                            if (entityReflGatePass) {
+                                                atomic_fetch_add_explicit(&rtShadowCounters[6], 1u, memory_order_relaxed);
+                                            } else {
+                                                atomic_fetch_add_explicit(&rtShadowCounters[7], 1u, memory_order_relaxed);
+                                            }
+                                        }
+                                    }
+                                    if (entityReflGatePass) {
                                         float entityMaxDistance = (rh.type == intersection_type::triangle) ? rh.distance : 20000.0;
                                         float entityMinDistance = 0.1;
                                         for (uint entityStep = 0u; entityStep < 8u && entityMinDistance < entityMaxDistance; ++entityStep) {
                                             ray eray(hitPos + N * 0.75, R, entityMinDistance, entityMaxDistance);
+                                            if (entityReflPerf) {
+                                                atomic_fetch_add_explicit(&rtShadowCounters[8], 1u, memory_order_relaxed);
+                                            }
                                             auto erh = i.intersect(eray, entityAS);
                                             if (erh.type != intersection_type::triangle) {
                                                 break;
+                                            }
+                                            if (entityReflPerf) {
+                                                atomic_fetch_add_explicit(&rtShadowCounters[9], 1u, memory_order_relaxed);
                                             }
                                             RTEntityShadeResult es = rtShadeEntityReflection(erh.primitive_id,
                                                                                              erh.distance,
@@ -6068,7 +6164,13 @@ struct MetalView: UIViewRepresentable {
                                             if ((es.flags & 4u) != 0u) {
                                                 entityAdditiveReflection += es.color;
                                                 hasEntityAdditiveReflection = true;
+                                                if (entityReflPerf) {
+                                                    atomic_fetch_add_explicit(&rtShadowCounters[11], 1u, memory_order_relaxed);
+                                                }
                                                 continue;
+                                            }
+                                            if (entityReflPerf) {
+                                                atomic_fetch_add_explicit(&rtShadowCounters[10], 1u, memory_order_relaxed);
                                             }
                                             reflColor = es.color + entityAdditiveReflection;
                                             useEntityReflectionHit = true;
@@ -8022,6 +8124,10 @@ struct MetalView: UIViewRepresentable {
                                                    emissiveNEEEnabled ? Float(emissiveInfo.count) : 0,
                                                    emissiveNEEEnabled ? 1.0 : 0.0,
                                                    Float(rtDebugView))
+            uniforms.rtEntityReflectionParams = SIMD4<Float>(Q3_RTEntityReflRoughnessMax(),
+                                                             Q3_RTPerfHUD() > 1 ? 1.0 : 0.0,
+                                                             0.0,
+                                                             0.0)
             if rtDebugView != 0 {
                 let debugMap = currentRTMapName()
                 let sig = "\(debugMap):\(worldGeneration):\(rtDebugView)"

@@ -265,6 +265,11 @@ int   Q3_RTEntities(void);
  * When enabled, Swift may build the entity AS for reflection rays while
  * primary RT visibility still ignores entities unless Q3_RTEntities() is on. */
 int   Q3_RTEntityReflections(void);
+/* Stage60: roughness ceiling for ENTITY-AS traversal on secondary reflection
+ * rays only. World reflection rays remain controlled by Q3_RTReflections() /
+ * Q3_RTReflRoughnessMax(). Default 0.25 keeps mirror-like reflected entities
+ * and skips rough/blurry reflected-entity lookups. */
+float Q3_RTEntityReflRoughnessMax(void);
 /* P0.2 — RT composite entity preservation (see
  * docs/2026-06-10-rt-gap-analysis-vs-rtx-remix.md).
  * Q3_RTPreserveEntities: 1 (default) = composite before entity/HUD passes

@@ -12054,9 +12054,12 @@ int Q3_RTDenoise(void) {
 int Q3_RTPerfHUD(void) {
     if (ri.Cvar_Get == NULL) return 0;
     /* Stage 19: session-only GPU timing diagnostics. Do not archive; leaving
-     * counter sampling enabled across sessions would perturb perf captures. */
+     * counter sampling enabled across sessions would perturb perf captures.
+     * Stage 60 uses value 2 for high-overhead per-reflection-ray attribution;
+     * value 1 stays the normal timing HUD so perf matrices are not perturbed
+     * by per-ray atomics. */
     cvar_t *cv = ri.Cvar_Get("r_rt_perf_hud", "0", 0);
-    return (cv && cv->integer != 0) ? 1 : 0;
+    return (cv && cv->integer > 0) ? cv->integer : 0;
 }
 
 int Q3_RTShadowBudget(void) {
@@ -12127,6 +12130,19 @@ int Q3_RTEntityReflections(void) {
      * governed by r_rt_entities so preserved raster compositing is untouched. */
     cvar_t *cv = ri.Cvar_Get("r_rt_entity_reflections", "0", CVAR_ARCHIVE);
     return (cv && cv->integer != 0) ? 1 : 0;
+}
+
+float Q3_RTEntityReflRoughnessMax(void) {
+    if (ri.Cvar_Get == NULL) return 0.25f;
+    /* Stage60: gate ENTITY-AS traversal for secondary reflection rays to
+     * mirror-like surfaces. World reflection rays are unchanged and still use
+     * r_rt_refl_roughness_max; this only decides whether the secondary ray
+     * additionally traverses the entity AS. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_entity_refl_roughness_max", "0.25", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.25f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    return v;
 }
 
 int Q3_RTPreserveEntities(void) {
