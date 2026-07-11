@@ -253,6 +253,10 @@ int   Q3_RTDenoise(void);
 /* Stage 19 RT perf: r_rt_perf_hud is session-only instrumentation; shadow
  * budget is archived and defaults to the shipped Stage19 sun-only budget. */
 int   Q3_RTPerfHUD(void);
+/* Stage 63 frame-spike diagnostics. Session-only bitmask:
+ *   1 = log spike frames, 2 = log every frame.
+ * Default 0 keeps the hot path free of diagnostic locks/completion logging. */
+int   Q3_MetalFrameDiag(void);
 int   Q3_RTShadowBudget(void);
 /* Stage 17 RT G-buffer debug visualization. Session-only:
  * 0=off, 1=motion, 2=normal, 3=depth. */

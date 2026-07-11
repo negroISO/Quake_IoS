@@ -1,4 +1,5 @@
 import SwiftUI
+import Foundation
 import MetalKit
 import ImageIO
 #if canImport(MetalFX)
@@ -10947,34 +10948,34 @@ struct MetalView: UIViewRepresentable {
                                           snapshot: Q3MetalFrameSnapshot,
                                           sceneView: Q3MetalSceneView,
                                           worldVertexBuffer: MTLBuffer,
-                                          worldIndexBuffer: MTLBuffer) {
+                                          worldIndexBuffer: MTLBuffer) -> Int? {
             guard Q3_PBREnvCubeLive() != 0,
                   snapshot.worldCommandCount > 0,
                   Q3MetalRenderer_IsWorldLoaded() != 0,
                   let worldPipelineState,
                   let worldFilterPipelineState,
                   let worldDrawsPointer = Q3MetalRenderer_GetWorldAllDrawCommands() else {
-                return
+                return nil
             }
 
             let staticCube = ensurePBRStaticEnvCube()
             // Authored skybox env assets, when available, are already the best
             // IBL source. Live capture replaces only the non-map fallback
             // cases (procedural grey or stock env/space1 fallback).
-            if pbrEnvCubeAuthoredMapSkybox { return }
+            if pbrEnvCubeAuthoredMapSkybox { return nil }
             guard let fallbackEnvCube = staticCube,
                   let targets = ensureLivePBREnvCubeTargets(device: device,
                                                             generation: snapshot.worldGeneration) else {
-                return
+                return nil
             }
 
             let drawCount = Int(Q3MetalRenderer_GetWorldAllDrawCommandCount())
-            guard drawCount > 0 else { return }
+            guard drawCount > 0 else { return nil }
 
             let bootstrapping = pbrLiveEnvFacesValidMask != Self.livePBREnvCubeCompleteMask
             pbrLiveEnvFrameCounter &+= 1
             if !bootstrapping && (pbrLiveEnvFrameCounter % Self.livePBREnvCubeRefreshInterval) != 0 {
-                return
+                return nil
             }
 
             let face = max(0, min(5, pbrLiveEnvNextFace))
@@ -10993,7 +10994,7 @@ struct MetalView: UIViewRepresentable {
             pass.depthAttachment.storeAction = .dontCare
             pass.depthAttachment.clearDepth = 1.0
 
-            guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else { return }
+            guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else { return nil }
             encoder.label = "Q3.pbr.envcube.live.face\(face)"
             let size = Self.livePBREnvCubeSize
             encoder.setViewport(MTLViewport(originX: 0,
@@ -11138,6 +11139,7 @@ struct MetalView: UIViewRepresentable {
                 print(msg)
                 pbrLog(msg)
             }
+            return face
         }
 
         /// Phase 6 — env-cube sampler. Always `.clampToEdge` on all axes to
@@ -11711,6 +11713,30 @@ struct MetalView: UIViewRepresentable {
         private let frameInflightSemaphore = DispatchSemaphore(value: Coordinator.maxInflightFrames)
         private var nextFrameSlot = 0
         private var didLogMetalSync = false
+        private struct FrameSpikeDiagSubmission {
+            let serial: UInt64
+            let inFlightAfterSubmit: Int
+        }
+        private struct FrameSpikeDiagRecord {
+            let flags: Int32
+            let serial: UInt64
+            let frameCounter: UInt32
+            let frameSlot: Int
+            let inFlightBeforeWait: Int
+            let inFlightAfterSubmit: Int
+            let drawableAcquireMs: Double
+            let semaphoreWaitMs: Double
+            let q3FrameMs: Double
+            let frameCpuCommitMs: Double
+            let worldDraws: UInt32
+            let entityDraws: UInt32
+            let rtMix: Float
+            let liveEnvFace: Int
+            let commitWallTime: CFTimeInterval
+        }
+        private let frameSpikeDiagLock = NSLock()
+        private var frameSpikeDiagInFlight = 0
+        private var frameSpikeDiagSerial: UInt64 = 0
         private var vertexBuffers: [MTLBuffer?] = Array(repeating: nil, count: Coordinator.maxInflightFrames)
         private var vertexBufferCapacities: [Int] = Array(repeating: 0, count: Coordinator.maxInflightFrames)
         private var worldVertexBuffer: MTLBuffer?
@@ -11729,6 +11755,72 @@ struct MetalView: UIViewRepresentable {
 
         override init() {
             super.init()
+        }
+
+        private func frameSpikeDiagCurrentInFlight() -> Int {
+            frameSpikeDiagLock.lock()
+            let value = frameSpikeDiagInFlight
+            frameSpikeDiagLock.unlock()
+            return value
+        }
+
+        private func frameSpikeDiagBeginSubmission() -> FrameSpikeDiagSubmission {
+            frameSpikeDiagLock.lock()
+            frameSpikeDiagSerial &+= 1
+            frameSpikeDiagInFlight += 1
+            let result = FrameSpikeDiagSubmission(serial: frameSpikeDiagSerial,
+                                                  inFlightAfterSubmit: frameSpikeDiagInFlight)
+            frameSpikeDiagLock.unlock()
+            return result
+        }
+
+        private func frameSpikeDiagFinishSubmission() -> Int {
+            frameSpikeDiagLock.lock()
+            if frameSpikeDiagInFlight > 0 {
+                frameSpikeDiagInFlight -= 1
+            }
+            let value = frameSpikeDiagInFlight
+            frameSpikeDiagLock.unlock()
+            return value
+        }
+
+        private func frameSpikeDiagLogIfNeeded(record: FrameSpikeDiagRecord,
+                                               commandBuffer: MTLCommandBuffer,
+                                               inFlightAfterComplete: Int) {
+            let gpuMs = (commandBuffer.gpuEndTime > commandBuffer.gpuStartTime)
+                ? (commandBuffer.gpuEndTime - commandBuffer.gpuStartTime) * 1000.0
+                : 0.0
+            let completionWallMs = (CACurrentMediaTime() - record.commitWallTime) * 1000.0
+            let spikeReasons: [String] = [
+                record.frameCpuCommitMs >= 50.0 ? "cpu" : nil,
+                record.semaphoreWaitMs >= 8.0 ? "sem" : nil,
+                record.drawableAcquireMs >= 8.0 ? "drawable" : nil,
+                gpuMs >= 25.0 ? "gpu" : nil
+            ].compactMap { $0 }
+            let shouldLogEveryFrame = (record.flags & 2) != 0
+            let shouldLogSpike = (record.flags & 1) != 0 && !spikeReasons.isEmpty
+            guard shouldLogEveryFrame || shouldLogSpike else { return }
+            let envFaceText = record.liveEnvFace >= 0 ? "\(record.liveEnvFace)" : "-"
+            let spikeText = spikeReasons.isEmpty ? "-" : spikeReasons.joined(separator: "+")
+            print(String(format: "[MTL-FRAME] frame=%llu dbg=%u slot=%d inflight=%d/%d/%d sem=%.2fms drawable=%.2fms q3=%.2fms cpuCommit=%.2fms gpu=%.2fms completeWall=%.2fms world=%u entity=%u rt=%.2f envFace=%@ spike=%@ status=%ld",
+                         record.serial,
+                         record.frameCounter,
+                         record.frameSlot,
+                         record.inFlightBeforeWait,
+                         record.inFlightAfterSubmit,
+                         inFlightAfterComplete,
+                         record.semaphoreWaitMs,
+                         record.drawableAcquireMs,
+                         record.q3FrameMs,
+                         record.frameCpuCommitMs,
+                         gpuMs,
+                         completionWallMs,
+                         record.worldDraws,
+                         record.entityDraws,
+                         record.rtMix,
+                         envFaceText,
+                         spikeText,
+                         Int(commandBuffer.status.rawValue)))
         }
 
         func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
@@ -12567,8 +12659,16 @@ struct MetalView: UIViewRepresentable {
             let drawableAcquireMs = (CACurrentMediaTime() - drawableAcquireStart) * 1000.0
             commandBuffer.label = "Q3.frame"
             var rtPerfFrame: RTPerfFrame? = nil
+            var frameDiagLiveEnvFace: Int? = nil
 
+            let frameDiagFlags = Int32(Q3_MetalFrameDiag())
+            let frameDiagEnabled = frameDiagFlags != 0
+            let frameDiagInFlightBeforeWait = frameDiagEnabled ? frameSpikeDiagCurrentInFlight() : 0
+            let frameDiagSemaphoreWaitStart = frameDiagEnabled ? CACurrentMediaTime() : 0.0
             frameInflightSemaphore.wait()
+            let frameDiagSemaphoreWaitMs = frameDiagEnabled
+                ? (CACurrentMediaTime() - frameDiagSemaphoreWaitStart) * 1000.0
+                : 0.0
             var frameSemaphoreNeedsSignal = true
             func signalFrameSemaphoreIfNeeded() {
                 if frameSemaphoreNeedsSignal {
@@ -12892,12 +12992,12 @@ struct MetalView: UIViewRepresentable {
                let liveWorldVertexBuffer = uploadWorldBuffers(device: device,
                                                                generation: snapshot.worldGeneration),
                let liveWorldIndexBuffer = worldIndexBuffer {
-                updateLivePBREnvCube(commandBuffer: commandBuffer,
-                                     device: device,
-                                     snapshot: snapshot,
-                                     sceneView: sceneViewForEnvCube,
-                                     worldVertexBuffer: liveWorldVertexBuffer,
-                                     worldIndexBuffer: liveWorldIndexBuffer)
+                frameDiagLiveEnvFace = updateLivePBREnvCube(commandBuffer: commandBuffer,
+                                                            device: device,
+                                                            snapshot: snapshot,
+                                                            sceneView: sceneViewForEnvCube,
+                                                            worldVertexBuffer: liveWorldVertexBuffer,
+                                                            worldIndexBuffer: liveWorldIndexBuffer)
             }
 
             attachRTPerfSamples(to: descriptor, frame: rtPerfFrame, start: .rasterStart, end: .rasterEnd)
@@ -14632,8 +14732,39 @@ struct MetalView: UIViewRepresentable {
             // drawable.texture accessor complains.
             let tex = drawable.texture
             let frameSemaphore = frameInflightSemaphore
-            commandBuffer.addCompletedHandler { _ in
-                frameSemaphore.signal()
+            let frameDiagRecord: FrameSpikeDiagRecord?
+            if frameDiagEnabled {
+                let submission = frameSpikeDiagBeginSubmission()
+                let commitWallTime = CACurrentMediaTime()
+                frameDiagRecord = FrameSpikeDiagRecord(
+                    flags: frameDiagFlags,
+                    serial: submission.serial,
+                    frameCounter: debugFrameCounter,
+                    frameSlot: frameSlot,
+                    inFlightBeforeWait: frameDiagInFlightBeforeWait,
+                    inFlightAfterSubmit: submission.inFlightAfterSubmit,
+                    drawableAcquireMs: drawableAcquireMs,
+                    semaphoreWaitMs: frameDiagSemaphoreWaitMs,
+                    q3FrameMs: q3FrameMs,
+                    frameCpuCommitMs: (commitWallTime - drawFrameStart) * 1000.0,
+                    worldDraws: snapshot.worldCommandCount,
+                    entityDraws: snapshot.entityCommandCount,
+                    rtMix: Q3_RTMix(),
+                    liveEnvFace: frameDiagLiveEnvFace ?? -1,
+                    commitWallTime: commitWallTime)
+            } else {
+                frameDiagRecord = nil
+            }
+            commandBuffer.addCompletedHandler { cb in
+                if let frameDiagRecord {
+                    let inFlightAfterComplete = self.frameSpikeDiagFinishSubmission()
+                    frameSemaphore.signal()
+                    self.frameSpikeDiagLogIfNeeded(record: frameDiagRecord,
+                                                   commandBuffer: cb,
+                                                   inFlightAfterComplete: inFlightAfterComplete)
+                } else {
+                    frameSemaphore.signal()
+                }
             }
             frameSemaphoreNeedsSignal = false
             noteFrameInterpolationPresented(renderedRealFrame: true)

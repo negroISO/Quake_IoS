@@ -12128,6 +12128,21 @@ int Q3_RTPerfHUD(void) {
     return (cv && cv->integer > 0) ? cv->integer : 0;
 }
 
+int Q3_MetalFrameDiag(void) {
+    if (ri.Cvar_Get == NULL) return 0;
+    /* Stage63: frame-spike timing diagnostics. Session-only: this gates Swift
+     * semaphore/drawable/in-flight/command-buffer completion logging and must
+     * not persist into normal gameplay/perf captures.
+     *   bit 0 (1): log frames that look like spikes
+     *   bit 1 (2): log every submitted frame
+     */
+    cvar_t *cv = ri.Cvar_Get("r_metal_frame_diag", "0", 0);
+    int v = cv ? cv->integer : 0;
+    if (v < 0) v = 0;
+    if (v > 3) v = 3;
+    return v;
+}
+
 int Q3_RTShadowBudget(void) {
     static qboolean migrationChecked = qfalse;
     if (ri.Cvar_Get == NULL) return 2;
