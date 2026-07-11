@@ -459,7 +459,8 @@ struct MetalView: UIViewRepresentable {
             var color: SIMD4<Float> = SIMD4(1, 1, 1, 1)
             // x = alphaTestThreshold (same sign convention as world/entity
             // raster uniforms), y = reflected blendMode (0 opaque, 1 additive
-            // src-alpha, 2 alpha-tested alpha, 5 additive-full), z/w reserved.
+            // src-alpha, 2 alpha-tested alpha, 5 additive-full), z = authored
+            // PBR albedo bound in texTable, w reserved.
             var params: SIMD4<Float> = SIMD4(0, 0, 0, 0)
         }
 
@@ -5287,11 +5288,11 @@ struct MetalView: UIViewRepresentable {
 
             struct RTEntityPrimitiveMaterial {
                 uint albedoSlot;
-                uint flags; // bit0=valid, bit1=sample albedo slot, bit2=tcGen env
+                uint flags; // bit0=valid, bit1=sample albedo slot, bit2=tcGen env, bit3=PBR albedo
                 uint _pad0;
                 uint _pad1;
                 float4 color;
-                float4 params; // x=alphaTestThreshold, y=blendMode, z/w reserved
+                float4 params; // x=alphaTestThreshold, y=blendMode, z=PBR albedo, w reserved
             };
 
             struct RTEntityVertex {
@@ -6957,19 +6958,31 @@ struct MetalView: UIViewRepresentable {
             return accel
         }
 
+        private struct RTEntityAlbedoBinding {
+            var slot: UInt32
+            var usesPBRAlbedo: Bool
+        }
+
         @MainActor
-        private func rtAlbedoSlotForEntityHandle(_ handle: UInt32, device: MTLDevice) -> UInt32 {
+        private func rtAlbedoSlotForEntityHandle(_ handle: UInt32, device: MTLDevice) -> RTEntityAlbedoBinding {
             let invalid = UInt32.max
-            guard handle != 0 else { return invalid }
+            guard handle != 0 else { return RTEntityAlbedoBinding(slot: invalid, usesPBRAlbedo: false) }
+            // Stage57: resolve authored entity PBR albedo while building the
+            // per-frame primitive-material table, not in the RT shader. The C
+            // bridge uses Stage44's cached handle/name material lookup, so this
+            // is one O(1) probe per unique entity handle and zero per-hit walks.
+            let pbrTexture = pbrAlbedoTexture(for: handle)
             if let existing = rtAlbedoHandles.firstIndex(of: handle) {
-                return UInt32(existing)
+                return RTEntityAlbedoBinding(slot: UInt32(existing), usesPBRAlbedo: pbrTexture != nil)
             }
             guard let spare = rtAlbedoHandles.firstIndex(of: 0) else {
-                return invalid
+                return RTEntityAlbedoBinding(slot: invalid, usesPBRAlbedo: false)
             }
             rtAlbedoHandles[spare] = handle
-            _ = texture(for: handle, device: device)
-            return UInt32(spare)
+            if pbrTexture == nil {
+                _ = texture(for: handle, device: device)
+            }
+            return RTEntityAlbedoBinding(slot: UInt32(spare), usesPBRAlbedo: pbrTexture != nil)
         }
 
         @MainActor
@@ -7019,7 +7032,10 @@ struct MetalView: UIViewRepresentable {
             let tcGenEnvBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_TCGEN_ENV)
             var assignedTriangles = 0
             var assignedHandles = Set<UInt32>()
+            var assignedPBRTriangles = 0
+            var assignedPBRHandles = Set<UInt32>()
             assignedHandles.reserveCapacity(min(entityDrawCount, 64))
+            assignedPBRHandles.reserveCapacity(min(entityDrawCount, 64))
 
             for draw in draws where draw.indexCount >= 3 {
                 if (draw.flags & thirdPersonBit) != 0 { continue }
@@ -7042,10 +7058,12 @@ struct MetalView: UIViewRepresentable {
                 let triCount = Int(draw.indexCount / 3)
                 guard triFirst >= 0, triCount > 0, triFirst < primitiveCount else { continue }
                 let triEnd = min(primitiveCount, triFirst + triCount)
-                let slot = rtAlbedoSlotForEntityHandle(draw.textureHandle, device: device)
+                let binding = rtAlbedoSlotForEntityHandle(draw.textureHandle, device: device)
+                let slot = binding.slot
                 var flags: UInt32 = 1
                 if slot != invalid { flags |= 2 }
                 if (draw.flags & tcGenEnvBit) != 0 { flags |= 4 }
+                if binding.usesPBRAlbedo { flags |= 8 }
                 let blendMode: UInt32 = isAdditiveFull ? 5 : (isAdditive ? 1 : (isAlpha ? 2 : 0))
                 let ec = draw.entityColor
                 let material = RTEntityPrimitiveMaterial(
@@ -7054,18 +7072,22 @@ struct MetalView: UIViewRepresentable {
                     _pad0: 0,
                     _pad1: 0,
                     color: SIMD4<Float>(ec.0, ec.1, ec.2, ec.3),
-                    params: SIMD4<Float>(alphaThreshold, Float(blendMode), 0, 0))
+                    params: SIMD4<Float>(alphaThreshold, Float(blendMode), binding.usesPBRAlbedo ? 1 : 0, 0))
                 for tri in triFirst..<triEnd {
                     materials[tri] = material
                 }
                 assignedTriangles += triEnd - triFirst
                 if draw.textureHandle != 0 { assignedHandles.insert(draw.textureHandle) }
+                if binding.usesPBRAlbedo {
+                    assignedPBRTriangles += triEnd - triFirst
+                    assignedPBRHandles.insert(draw.textureHandle)
+                }
             }
 
             rtEntityPrimitiveMaterialBuffer = buffer
             rtEntityReflectionMaterialLogCounter &+= 1
             if rtEntityReflectionMaterialLogCounter == 1 || rtEntityReflectionMaterialLogCounter % 120 == 0 {
-                print("[RT] entity reflection materials tris=\(assignedTriangles)/\(primitiveCount) handles=\(assignedHandles.count)")
+                print("[RT] entity reflection materials tris=\(assignedTriangles)/\(primitiveCount) handles=\(assignedHandles.count) pbrAlbedoTris=\(assignedPBRTriangles) pbrHandles=\(assignedPBRHandles.count)")
             }
             return assignedTriangles > 0 ? buffer : nil
         }
