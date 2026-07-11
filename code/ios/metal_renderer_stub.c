@@ -11862,9 +11862,24 @@ float Q3_SetRTMix(float mix) {
 }
 
 float Q3_RTExposure(void) {
-    if (ri.Cvar_Get == NULL) return 0.65f;
-    cvar_t *cv = ri.Cvar_Get("r_rt_exposure", "0.65", CVAR_ARCHIVE);
-    float v = cv ? cv->value : 0.65f;
+    static qboolean migrationChecked = qfalse;
+    if (ri.Cvar_Get == NULL) return 1.0f;
+    /* Stage52: retire the legacy 0.65 RT pre-exposure. The pre-darken was
+     * useful before RT/raster post-chain unification; after cce80966 it
+     * just writes an artificially dark HDR buffer before the shared post
+     * pass. Default 1.0 is neutral/correct, not a look-tuning boost. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_exposure", "1.0", CVAR_ARCHIVE);
+    if (!migrationChecked) {
+        migrationChecked = qtrue;
+        if (cv && cv->value > 0.649f && cv->value < 0.651f &&
+            cv->resetString && !Q_stricmp(cv->resetString, "1.0")) {
+            if (ri.Cvar_Set != NULL) {
+                ri.Cvar_Set("r_rt_exposure", "1.0");
+            }
+            return 1.0f;
+        }
+    }
+    float v = cv ? cv->value : 1.0f;
     if (v < 0.05f) v = 0.05f;
     if (v > 4.0f) v = 4.0f;
     return v;
