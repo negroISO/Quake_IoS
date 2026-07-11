@@ -3,6 +3,11 @@
 
 #include "../code/ios/metal_renderer_shared.h"
 
+/* Builds world batches against the full BSP draw table, not the current
+ * main-view visible draw list. Used by Swift's live PBR env-cube capture,
+ * whose six 90° cameras cannot reuse the main camera's frustum/PVS subset. */
+uint32_t Q3MetalRenderer_BuildWorldAllBatches(uint32_t passMask);
+
 /* Stage25 portal-entity visibility bit. Carried in Q3MetalEntityDrawCmd.flags
  * for draws sourced from refEntity_t.renderfx & RF_THIRD_PERSON. Kept here
  * (rather than changing the shared ABI struct layout) so Swift can skip these

@@ -5673,9 +5673,9 @@ static uint32_t MetalWorldFindOrCreateBatch(const Q3MetalWorldDrawCmd *draw,
     return i;
 }
 
-uint32_t Q3MetalRenderer_BuildWorldBatches(uint32_t passMask) {
-    const Q3MetalWorldDrawCmd *draws;
-    uint32_t drawCount;
+static uint32_t MetalWorldBuildBatchesForDraws(const Q3MetalWorldDrawCmd *draws,
+                                                uint32_t drawCount,
+                                                uint32_t passMask) {
     uint32_t maxEntries;
     uint32_t maxBatches;
     uint32_t drawIndex;
@@ -5692,10 +5692,6 @@ uint32_t Q3MetalRenderer_BuildWorldBatches(uint32_t passMask) {
         return 0;
     }
 
-    draws = (s_world.visibleDrawsValid && s_world.visibleDraws != NULL)
-        ? s_world.visibleDraws
-        : s_world.draws;
-    drawCount = MetalWorldCurrentDrawCount();
     if (draws == NULL || drawCount == 0) {
         return 0;
     }
@@ -5780,6 +5776,18 @@ uint32_t Q3MetalRenderer_BuildWorldBatches(uint32_t passMask) {
     }
 
     return s_world.batchCount;
+}
+
+uint32_t Q3MetalRenderer_BuildWorldBatches(uint32_t passMask) {
+    const Q3MetalWorldDrawCmd *draws = (s_world.visibleDrawsValid && s_world.visibleDraws != NULL)
+        ? s_world.visibleDraws
+        : s_world.draws;
+    uint32_t drawCount = MetalWorldCurrentDrawCount();
+    return MetalWorldBuildBatchesForDraws(draws, drawCount, passMask);
+}
+
+uint32_t Q3MetalRenderer_BuildWorldAllBatches(uint32_t passMask) {
+    return MetalWorldBuildBatchesForDraws(s_world.draws, s_world.drawCount, passMask);
 }
 
 const Q3MetalWorldBatchCmd *Q3MetalRenderer_GetWorldBatches(void) {

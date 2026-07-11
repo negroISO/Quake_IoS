@@ -749,6 +749,16 @@ struct MetalView: UIViewRepresentable {
             return worldBatchIndexBuffers[clampedSlot]
         }
 
+        private func ensureLivePBREnvBatchIndexBuffer(device: MTLDevice, indexCount: Int, slot: Int) -> MTLBuffer? {
+            let byteCount = max(4, indexCount * MemoryLayout<UInt32>.stride)
+            let clampedSlot = max(0, min(slot, pbrLiveEnvBatchIndexBuffers.count - 1))
+            if pbrLiveEnvBatchIndexBuffers[clampedSlot] == nil || pbrLiveEnvBatchIndexBufferCapacities[clampedSlot] < byteCount {
+                pbrLiveEnvBatchIndexBuffers[clampedSlot] = device.makeBuffer(length: byteCount, options: .storageModeShared)
+                pbrLiveEnvBatchIndexBufferCapacities[clampedSlot] = byteCount
+            }
+            return pbrLiveEnvBatchIndexBuffers[clampedSlot]
+        }
+
         private static func tcModEqual(_ a: Q3TcMod, _ b: Q3TcMod) -> Bool {
             a.type == b.type &&
             a.params.0 == b.params.0 &&
@@ -8948,6 +8958,7 @@ struct MetalView: UIViewRepresentable {
             let skyFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
             let fogOnlyBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY)
             let portalBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_PORTAL)
+            let envCaptureSkipMask = fogOnlyBit | UInt32(1 << 6)
             let combinedLightmapBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_COMBINED_LIGHTMAP)
             let timeSeconds = snapshot.shaderTime
             var entriesByPass = Array(repeating: [WorldPassEntry](), count: 5)
@@ -9520,6 +9531,8 @@ struct MetalView: UIViewRepresentable {
         private var pbrLiveEnvNextFace: Int = 0
         private var pbrLiveEnvFrameCounter: UInt64 = 0
         private var pbrLiveEnvLoggedActive = false
+        private var pbrLiveEnvBatchIndexBuffers: [MTLBuffer?] = Array(repeating: nil, count: 3)
+        private var pbrLiveEnvBatchIndexBufferCapacities: [Int] = Array(repeating: 0, count: 3)
         private var pbrTriedAndMissed: Set<UInt32> = []
         private var pbrNormalTried: Set<UInt32> = []
         private var pbrRoughnessTried: Set<UInt32> = []
@@ -10948,7 +10961,8 @@ struct MetalView: UIViewRepresentable {
                                           snapshot: Q3MetalFrameSnapshot,
                                           sceneView: Q3MetalSceneView,
                                           worldVertexBuffer: MTLBuffer,
-                                          worldIndexBuffer: MTLBuffer) -> Int? {
+                                          worldIndexBuffer: MTLBuffer,
+                                          frameSlot: Int) -> Int? {
             guard Q3_PBREnvCubeLive() != 0,
                   snapshot.worldCommandCount > 0,
                   Q3MetalRenderer_IsWorldLoaded() != 0,
@@ -11030,12 +11044,139 @@ struct MetalView: UIViewRepresentable {
             let skyFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
             let fogOnlyBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY)
             let portalBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_PORTAL)
+            let envCaptureSkipMask = fogOnlyBit | UInt32(1 << 6)
             let combinedLightmapBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_COMBINED_LIGHTMAP)
             let timeSeconds = snapshot.shaderTime
             var pbrWorldParams = SIMD4<Float>(0, 0, 0, 0)
             encoder.setFragmentBytes(&pbrWorldParams, length: 16, index: 3)
 
+            var envWorldBatches = UnsafeBufferPointer<Q3MetalWorldBatchCmd>(start: nil, count: 0)
+            var envWorldBatchIndexBuffer: MTLBuffer?
+            let envBatchCount = Int(Q3MetalRenderer_BuildWorldAllBatches((1 << 0) | (1 << 1)))
+            let envBatchIndexCount = Int(Q3MetalRenderer_GetWorldBatchIndexCount())
+            if envBatchCount > 0,
+               envBatchIndexCount > 0,
+               let cBatchPointer = Q3MetalRenderer_GetWorldBatches(),
+               let cBatchIndexPointer = Q3MetalRenderer_GetWorldBatchIndices(),
+               let batchBuffer = ensureLivePBREnvBatchIndexBuffer(device: device,
+                                                                  indexCount: envBatchIndexCount,
+                                                                  slot: frameSlot) {
+                memcpy(batchBuffer.contents(),
+                       cBatchIndexPointer,
+                       envBatchIndexCount * MemoryLayout<UInt32>.stride)
+                envWorldBatches = UnsafeBufferPointer(start: cBatchPointer, count: envBatchCount)
+                envWorldBatchIndexBuffer = batchBuffer
+            }
+
+            func encodeEnvSkyDraw(_ draw: Q3MetalWorldDrawCmd) {
+                guard let skyPipelineState,
+                      let skyDepthStencilState else { return }
+                let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+                guard stageCount > 0 else { return }
+                let stage = Self.worldStage(draw, 0)
+                guard Self.worldBlendClass(for: stage) == 0,
+                      let skyTexture = texture(for: stage.textureHandle, device: device) else { return }
+                encoder.setRenderPipelineState(skyPipelineState)
+                encoder.setDepthStencilState(skyDepthStencilState)
+                encoder.setCullMode(Self.metalCullMode(for: stage.cullMode))
+                var skyUniforms = makeWorldDrawUniforms(draw: draw,
+                                                        stage: stage,
+                                                        timeSeconds: timeSeconds,
+                                                        combinedLightmapBit: combinedLightmapBit,
+                                                        forcePortalSample: false,
+                                                        renderSize: SIMD2<Float>(0, 0))
+                skyUniforms.debugMode = 0
+                skyUniforms.forceWhiteVertColor = 0
+                skyUniforms.alphaTestThreshold = 0
+                encoder.setFragmentTexture(skyTexture, index: 0)
+                encoder.setFragmentBytes(&skyUniforms,
+                                         length: MemoryLayout<WorldDrawUniforms>.stride,
+                                         index: 0)
+                encoder.setVertexBytes(&skyUniforms,
+                                       length: MemoryLayout<WorldDrawUniforms>.stride,
+                                       index: 2)
+                encoder.drawIndexedPrimitives(type: .triangle,
+                                              indexCount: Int(draw.indexCount),
+                                              indexType: .uint32,
+                                              indexBuffer: worldIndexBuffer,
+                                              indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride)
+            }
+
+            func encodeEnvNormalDraw(_ draw: Q3MetalWorldDrawCmd,
+                                     _ stage: Q3MetalWorldStage,
+                                     _ worldPass: Int,
+                                     _ activeIndexBuffer: MTLBuffer,
+                                     _ activeIndexOffset: Int,
+                                     _ activeIndexCount: Int) {
+                guard draw.indexCount > 0,
+                      activeIndexCount > 0,
+                      (draw.flags & (envCaptureSkipMask | skyFlagBit)) == 0,
+                      Self.worldRenderPass(for: stage) == worldPass,
+                      let baseTexture = texture(for: stage.textureHandle, device: device),
+                      let lightmapTexture = texture(for: draw.lightmapTextureHandle, device: device) else {
+                    return
+                }
+
+                if worldPass == 1 {
+                    encoder.setRenderPipelineState(worldFilterPipelineState)
+                    encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: device))
+                } else {
+                    encoder.setRenderPipelineState(worldPipelineState)
+                    encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: device))
+                }
+                encoder.setCullMode(Self.metalCullMode(for: stage.cullMode))
+                encoder.setFragmentTexture(baseTexture, index: 0)
+                encoder.setFragmentTexture(lightmapTexture, index: 1)
+
+                var drawUniforms = makeWorldDrawUniforms(draw: draw,
+                                                          stage: stage,
+                                                          timeSeconds: timeSeconds,
+                                                          combinedLightmapBit: combinedLightmapBit,
+                                                          forcePortalSample: false,
+                                                          renderSize: SIMD2<Float>(0, 0))
+                drawUniforms.debugMode = 0
+                drawUniforms.emissiveParams = SIMD4<Float>(1, 1, 1, 0)
+                drawUniforms.parallaxParams = SIMD4<Float>(0, 0, 0, 0)
+                encoder.setFragmentBytes(&drawUniforms,
+                                         length: MemoryLayout<WorldDrawUniforms>.stride,
+                                         index: 0)
+                encoder.setVertexBytes(&drawUniforms,
+                                       length: MemoryLayout<WorldDrawUniforms>.stride,
+                                       index: 2)
+                encoder.drawIndexedPrimitives(type: .triangle,
+                                              indexCount: activeIndexCount,
+                                              indexType: .uint32,
+                                              indexBuffer: activeIndexBuffer,
+                                              indexBufferOffset: activeIndexOffset)
+            }
+
             for worldPass in [0, 1] {
+                if worldPass == 0 {
+                    for draw in worldDraws where draw.indexCount > 0 &&
+                        (draw.flags & skyFlagBit) != 0 &&
+                        (draw.flags & envCaptureSkipMask) == 0 {
+                        encodeEnvSkyDraw(draw)
+                    }
+                }
+
+                if let envWorldBatchIndexBuffer {
+                    for batch in envWorldBatches where Int(batch.renderPass) == worldPass && batch.indexCount > 0 {
+                        let stageIndex = Int(batch.stageIndex)
+                        guard stageIndex >= 0,
+                              stageIndex < min(Int(batch.draw.stageCount), Int(Q3_METAL_MAX_STAGES)) else {
+                            continue
+                        }
+                        let stage = Self.worldStage(batch.draw, stageIndex)
+                        encodeEnvNormalDraw(batch.draw,
+                                            stage,
+                                            worldPass,
+                                            envWorldBatchIndexBuffer,
+                                            Int(batch.firstIndex) * MemoryLayout<UInt32>.stride,
+                                            Int(batch.indexCount))
+                    }
+                    continue
+                }
+
                 for draw in worldDraws {
                     guard draw.indexCount > 0,
                           (draw.flags & (fogOnlyBit | portalBit)) == 0 else {
@@ -11043,38 +11184,9 @@ struct MetalView: UIViewRepresentable {
                     }
 
                     if (draw.flags & skyFlagBit) != 0 {
-                        guard worldPass == 0,
-                              let skyPipelineState,
-                              let skyDepthStencilState else { continue }
-                        let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
-                        guard stageCount > 0 else { continue }
-                        let stage = Self.worldStage(draw, 0)
-                        guard Self.worldBlendClass(for: stage) == 0,
-                              let skyTexture = texture(for: stage.textureHandle, device: device) else { continue }
-                        encoder.setRenderPipelineState(skyPipelineState)
-                        encoder.setDepthStencilState(skyDepthStencilState)
-                        encoder.setCullMode(Self.metalCullMode(for: stage.cullMode))
-                        var skyUniforms = makeWorldDrawUniforms(draw: draw,
-                                                                stage: stage,
-                                                                timeSeconds: timeSeconds,
-                                                                combinedLightmapBit: combinedLightmapBit,
-                                                                forcePortalSample: false,
-                                                                renderSize: SIMD2<Float>(0, 0))
-                        skyUniforms.debugMode = 0
-                        skyUniforms.forceWhiteVertColor = 0
-                        skyUniforms.alphaTestThreshold = 0
-                        encoder.setFragmentTexture(skyTexture, index: 0)
-                        encoder.setFragmentBytes(&skyUniforms,
-                                                 length: MemoryLayout<WorldDrawUniforms>.stride,
-                                                 index: 0)
-                        encoder.setVertexBytes(&skyUniforms,
-                                               length: MemoryLayout<WorldDrawUniforms>.stride,
-                                               index: 2)
-                        encoder.drawIndexedPrimitives(type: .triangle,
-                                                      indexCount: Int(draw.indexCount),
-                                                      indexType: .uint32,
-                                                      indexBuffer: worldIndexBuffer,
-                                                      indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride)
+                        if worldPass == 0 {
+                            encodeEnvSkyDraw(draw)
+                        }
                         continue
                     }
 
@@ -11082,43 +11194,12 @@ struct MetalView: UIViewRepresentable {
                     guard stageCount > 0 else { continue }
                     for stageIndex in 0..<stageCount {
                         let stage = Self.worldStage(draw, stageIndex)
-                        guard Self.worldRenderPass(for: stage) == worldPass,
-                              let baseTexture = texture(for: stage.textureHandle, device: device),
-                              let lightmapTexture = texture(for: draw.lightmapTextureHandle, device: device) else {
-                            continue
-                        }
-
-                        if worldPass == 1 {
-                            encoder.setRenderPipelineState(worldFilterPipelineState)
-                            encoder.setDepthStencilState(ensuredDepthStencilState(additiveDepthStencilState, device: device))
-                        } else {
-                            encoder.setRenderPipelineState(worldPipelineState)
-                            encoder.setDepthStencilState(ensuredDepthStencilState(depthStencilState, device: device))
-                        }
-                        encoder.setCullMode(Self.metalCullMode(for: stage.cullMode))
-                        encoder.setFragmentTexture(baseTexture, index: 0)
-                        encoder.setFragmentTexture(lightmapTexture, index: 1)
-
-                        var drawUniforms = makeWorldDrawUniforms(draw: draw,
-                                                                  stage: stage,
-                                                                  timeSeconds: timeSeconds,
-                                                                  combinedLightmapBit: combinedLightmapBit,
-                                                                  forcePortalSample: false,
-                                                                  renderSize: SIMD2<Float>(0, 0))
-                        drawUniforms.debugMode = 0
-                        drawUniforms.emissiveParams = SIMD4<Float>(1, 1, 1, 0)
-                        drawUniforms.parallaxParams = SIMD4<Float>(0, 0, 0, 0)
-                        encoder.setFragmentBytes(&drawUniforms,
-                                                 length: MemoryLayout<WorldDrawUniforms>.stride,
-                                                 index: 0)
-                        encoder.setVertexBytes(&drawUniforms,
-                                               length: MemoryLayout<WorldDrawUniforms>.stride,
-                                               index: 2)
-                        encoder.drawIndexedPrimitives(type: .triangle,
-                                                      indexCount: Int(draw.indexCount),
-                                                      indexType: .uint32,
-                                                      indexBuffer: worldIndexBuffer,
-                                                      indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride)
+                        encodeEnvNormalDraw(draw,
+                                            stage,
+                                            worldPass,
+                                            worldIndexBuffer,
+                                            Int(draw.firstIndex) * MemoryLayout<UInt32>.stride,
+                                            Int(draw.indexCount))
                     }
                 }
             }
@@ -12997,7 +13078,8 @@ struct MetalView: UIViewRepresentable {
                                                             snapshot: snapshot,
                                                             sceneView: sceneViewForEnvCube,
                                                             worldVertexBuffer: liveWorldVertexBuffer,
-                                                            worldIndexBuffer: liveWorldIndexBuffer)
+                                                            worldIndexBuffer: liveWorldIndexBuffer,
+                                                            frameSlot: frameSlot)
             }
 
             attachRTPerfSamples(to: descriptor, frame: rtPerfFrame, start: .rasterStart, end: .rasterEnd)
