@@ -11563,9 +11563,25 @@ float Q3_ExposureMin(void) {
 }
 
 float Q3_ExposureMax(void) {
-    if (ri.Cvar_Get == NULL) return 2.4f;
-    cvar_t *cv = ri.Cvar_Get("r_exposure_max", "2.4", CVAR_ARCHIVE);
-    float v = cv ? cv->value : 2.4f;
+    static qboolean migrationChecked = qfalse;
+    if (ri.Cvar_Get == NULL) return 1.6f;
+    /* Stage53: post-Stage52 RT scenes no longer need the old 2.4 ceiling.
+     * q3dm0 RT normal-post opened to ~2.4 and blew out (luma 175 vs
+     * raster 106 on Catalyst; 140 vs 77 on iPhone). A 1.6 ceiling matched
+     * the raster counterpart on both platforms while leaving the measured
+     * control set below the ceiling. */
+    cvar_t *cv = ri.Cvar_Get("r_exposure_max", "1.6", CVAR_ARCHIVE);
+    if (!migrationChecked) {
+        migrationChecked = qtrue;
+        if (cv && cv->value > 2.399f && cv->value < 2.401f &&
+            cv->resetString && !Q_stricmp(cv->resetString, "1.6")) {
+            if (ri.Cvar_Set != NULL) {
+                ri.Cvar_Set("r_exposure_max", "1.6");
+            }
+            return 1.6f;
+        }
+    }
+    float v = cv ? cv->value : 1.6f;
     if (v < 0.05f) v = 0.05f;
     if (v > 8.0f) v = 8.0f;
     return v;

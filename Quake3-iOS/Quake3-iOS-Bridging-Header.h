@@ -96,7 +96,7 @@ void Q3DebugTelemetry_Log(const char *type, const char *message);
  * r_postprocess_intensity (default 2.2, range [0.5, 4.0]) and
  * r_postprocess_gamma (default 0.95, range [0.5, 2.5]) control the curve.
  * r_postprocess_autoexposure (default 1) replaces the fixed intensity with
- * scene-adaptive exposure clamped by r_exposure_min / r_exposure_max.
+ * scene-adaptive exposure clamped by r_exposure_min / r_exposure_max (default max 1.6).
  * r_exposure_highlight_limit (default 0.9, 0 disables) caps auto exposure
  * from a full-frame P95-ish highlight sample before ACES.
  * Encoded after world+entity+UI passes; skipped when disabled. */
