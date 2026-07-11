@@ -270,6 +270,13 @@ int   Q3_RTEntityReflections(void);
  * Q3_RTReflRoughnessMax(). Default 0.25 keeps mirror-like reflected entities
  * and skips rough/blurry reflected-entity lookups. */
 float Q3_RTEntityReflRoughnessMax(void);
+/* Stage61: demand-driven secondary entity-reflection AS maintenance.
+ * If gated reflected-entity rays stay below suspend threshold for N frames,
+ * Swift stops maintaining/binding the entity AS until the resume threshold is
+ * reached again. Defaults affect only the r_rt_entity_reflections=1 path. */
+int   Q3_RTEntityReflASSuspendThreshold(void);
+int   Q3_RTEntityReflASResumeThreshold(void);
+int   Q3_RTEntityReflASSuspendFrames(void);
 /* P0.2 — RT composite entity preservation (see
  * docs/2026-06-10-rt-gap-analysis-vs-rtx-remix.md).
  * Q3_RTPreserveEntities: 1 (default) = composite before entity/HUD passes

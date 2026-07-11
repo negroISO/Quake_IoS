@@ -419,10 +419,12 @@ struct MetalView: UIViewRepresentable {
             // x = r_rt_shadow_budget, y = emissive NEE light count,
             // z = r_rt_emissive_nee enabled, w = r_rt_debug_view.
             var rtBudgetParams: SIMD4<Float> = SIMD4(2, 0, 0, 0)
-            // Stage 60 append-only entity-reflection controls:
-            // x = r_rt_entity_refl_roughness_max, y = r_rt_perf_hud 2 attribution enabled,
-            // z/w reserved. Gates ENTITY-AS traversal only; world reflections
-            // still use rtLightParams.w.
+            // Stage 60/61 append-only entity-reflection controls:
+            // x = r_rt_entity_refl_roughness_max,
+            // y = entity-reflection counter enabled (perf HUD 2 or AS demand feedback),
+            // z = r_rt_entity_reflections requested even if AS maintenance is suspended,
+            // w reserved. Gates ENTITY-AS traversal only; world reflections still use
+            // rtLightParams.w.
             var rtEntityReflectionParams: SIMD4<Float> = SIMD4(0.25, 0, 0, 0)
         }
 
@@ -4290,6 +4292,16 @@ struct MetalView: UIViewRepresentable {
         private var entityASTopologySignature: UInt64 = 0
         private var entityASVertexSignature: UInt64 = 0
         private var entityASBufferSlot: Int = 0
+        private var entityASDemandSuspended = false
+        private var entityASDemandLowFrames = 0
+        private var entityASDemandSuspendCount: UInt64 = 0
+        private var entityASDemandResumeCount: UInt64 = 0
+        private var entityASDemandLastGatePass: UInt32 = 0
+        private var entityASDemandLastCandidates: UInt32 = 0
+        private var entityASDemandLastFrameId: UInt64 = 0
+        private var entityASDemandFrameSerial: UInt64 = 0
+        private var entityASDemandLogSerial: UInt64 = 0
+        private let entityASDemandReadback = RTEntityASDemandReadback()
         private var rtPrimitiveMaterialBuffer: MTLBuffer?
         private var rtEntityPrimitiveMaterialBuffer: MTLBuffer?
         private var rtEntityReflectionMaterialLogCounter: UInt64 = 0
@@ -4388,11 +4400,40 @@ struct MetalView: UIViewRepresentable {
             var entityASBuilt = false
             var entityASRefit = false
             var entityASSkipped = false
+            var entityASDemandSuspended = false
+            var entityASDemandGatePass: UInt32 = 0
+            var entityASDemandSuspendCount: UInt64 = 0
+            var entityASDemandResumeCount: UInt64 = 0
 
             init(sampleBuffer: MTLCounterSampleBuffer, frameId: UInt64, fpsEstimate: Double) {
                 self.sampleBuffer = sampleBuffer
                 self.frameId = frameId
                 self.fpsEstimate = fpsEstimate
+            }
+        }
+
+        private final class RTEntityASDemandReadback: @unchecked Sendable {
+            private let lock = NSLock()
+            private var hasValue = false
+            private var gatePass: UInt32 = 0
+            private var candidates: UInt32 = 0
+            private var frameId: UInt64 = 0
+
+            func store(gatePass: UInt32, candidates: UInt32, frameId: UInt64) {
+                lock.lock()
+                self.gatePass = gatePass
+                self.candidates = candidates
+                self.frameId = frameId
+                self.hasValue = true
+                lock.unlock()
+            }
+
+            func take() -> (gatePass: UInt32, candidates: UInt32, frameId: UInt64)? {
+                lock.lock()
+                defer { lock.unlock() }
+                guard hasValue else { return nil }
+                hasValue = false
+                return (gatePass, candidates, frameId)
             }
         }
 
@@ -4580,11 +4621,16 @@ struct MetalView: UIViewRepresentable {
                     }
                 }
                 let fps = frame.fpsEstimate > 0.0 ? frame.fpsEstimate : (total > 0.0 ? 1000.0 / total : 0.0)
-                print(String(format: "[RT-PERF] trace=%.1fms entityAS=%.1fms denoise=%.1fms blend=%.1fms raster=%.1fms entity=%.1fms post=%.1fms ui=%.1fms total=%.1fms fps=%.0f cpuUpload=%.2fms cpuASEncode=%.2fms cpuMaterials=%.2fms entityASBuilt=%d entityASRefit=%d entityASSkipped=%d frame=%llu",
+                print(String(format: "[RT-PERF] trace=%.1fms entityAS=%.1fms denoise=%.1fms blend=%.1fms raster=%.1fms entity=%.1fms post=%.1fms ui=%.1fms total=%.1fms fps=%.0f cpuUpload=%.2fms cpuASEncode=%.2fms cpuMaterials=%.2fms entityASBuilt=%d entityASRefit=%d entityASSkipped=%d entityASSuspended=%d entityASGatePass=%u entityASSuspends=%llu entityASResumes=%llu frame=%llu",
                              trace, entityASBuild, denoise, blend, raster, entity, post, ui, total, fps,
                              frame.cpuEntityUploadMs, frame.cpuEntityASEncodeMs, frame.cpuEntityMaterialMs,
                              frame.entityASBuilt ? 1 : 0, frame.entityASRefit ? 1 : 0,
-                             frame.entityASSkipped ? 1 : 0, frame.frameId))
+                             frame.entityASSkipped ? 1 : 0,
+                             frame.entityASDemandSuspended ? 1 : 0,
+                             frame.entityASDemandGatePass,
+                             frame.entityASDemandSuspendCount,
+                             frame.entityASDemandResumeCount,
+                             frame.frameId))
             }
         }
 
@@ -4753,6 +4799,116 @@ struct MetalView: UIViewRepresentable {
                 pbrLog(msg)
             }
             return (rtEmissiveLightBuffer, rtEmissiveLightCount)
+        }
+
+        @MainActor
+        private func entityASDemandEnabled() -> Bool {
+            Q3_RTEntityReflections() != 0 &&
+            Q3_RTEntities() == 0 &&
+            Q3_RTEntityReflASSuspendThreshold() > 0 &&
+            Q3_RTEntityReflASSuspendFrames() > 0
+        }
+
+        @MainActor
+        private func refreshEntityASDemandEligibility() {
+            if !entityASDemandEnabled() {
+                entityASDemandSuspended = false
+                entityASDemandLowFrames = 0
+                entityASDemandLastGatePass = 0
+                entityASDemandLastCandidates = 0
+            }
+        }
+
+        @MainActor
+        private func drainEntityASDemandReadback() {
+            if let sample = entityASDemandReadback.take() {
+                observeEntityASDemandCounters(gatePass: sample.gatePass,
+                                              candidates: sample.candidates,
+                                              frameId: sample.frameId)
+            }
+        }
+
+        @MainActor
+        private func entityASDemandMaintenanceSuspended() -> Bool {
+            drainEntityASDemandReadback()
+            refreshEntityASDemandEligibility()
+            return entityASDemandSuspended
+        }
+
+        @MainActor
+        private func annotateEntityASDemandPerf(_ frame: RTPerfFrame?) {
+            guard let frame else { return }
+            frame.entityASDemandSuspended = entityASDemandSuspended
+            frame.entityASDemandGatePass = entityASDemandLastGatePass
+            frame.entityASDemandSuspendCount = entityASDemandSuspendCount
+            frame.entityASDemandResumeCount = entityASDemandResumeCount
+        }
+
+        @MainActor
+        private func observeEntityASDemandCounters(gatePass: UInt32,
+                                                   candidates: UInt32,
+                                                   frameId: UInt64) {
+            entityASDemandLastGatePass = gatePass
+            entityASDemandLastCandidates = candidates
+            entityASDemandLastFrameId = frameId
+            guard entityASDemandEnabled() else {
+                refreshEntityASDemandEligibility()
+                return
+            }
+
+            let suspendThreshold = max(1, Q3_RTEntityReflASSuspendThreshold())
+            let resumeThreshold = max(suspendThreshold + 1, Q3_RTEntityReflASResumeThreshold())
+            let suspendFrames = max(1, Q3_RTEntityReflASSuspendFrames())
+            let gatePassInt = Int(gatePass)
+
+            if entityASDemandSuspended {
+                if gatePassInt >= resumeThreshold {
+                    entityASDemandSuspended = false
+                    entityASDemandLowFrames = 0
+                    entityASDemandResumeCount &+= 1
+                    let msg = "[RT-AS-DEMAND] resume gatePass=\(gatePass) candidates=\(candidates) threshold=\(resumeThreshold) suspends=\(entityASDemandSuspendCount) resumes=\(entityASDemandResumeCount) frame=\(frameId)"
+                    print(msg)
+                    pbrLog(msg)
+                }
+            } else {
+                if gatePassInt < suspendThreshold {
+                    entityASDemandLowFrames += 1
+                    if entityASDemandLowFrames >= suspendFrames {
+                        entityASDemandSuspended = true
+                        entityASDemandLowFrames = 0
+                        entityASDemandSuspendCount &+= 1
+                        rtEntityPrimitiveMaterialBuffer = nil
+                        let msg = "[RT-AS-DEMAND] suspend gatePass=\(gatePass) candidates=\(candidates) threshold=\(suspendThreshold) frames=\(suspendFrames) suspends=\(entityASDemandSuspendCount) resumes=\(entityASDemandResumeCount) frame=\(frameId)"
+                        print(msg)
+                        pbrLog(msg)
+                    }
+                } else {
+                    entityASDemandLowFrames = 0
+                }
+            }
+
+            entityASDemandLogSerial &+= 1
+            if Q3_RTPerfHUD() > 0 && (entityASDemandLogSerial == 1 || entityASDemandLogSerial % 120 == 0) {
+                let msg = "[RT-AS-DEMAND] state suspended=\(entityASDemandSuspended ? 1 : 0) gatePass=\(gatePass) candidates=\(candidates) lowFrames=\(entityASDemandLowFrames) enter=\(suspendThreshold) exit=\(resumeThreshold) suspends=\(entityASDemandSuspendCount) resumes=\(entityASDemandResumeCount) frame=\(frameId)"
+                print(msg)
+                pbrLog(msg)
+            }
+        }
+
+        @MainActor
+        private func attachEntityASDemandCounterCompletion(commandBuffer: MTLCommandBuffer,
+                                                           counterBuffer: MTLBuffer,
+                                                           frame: RTPerfFrame?) {
+            guard entityASDemandEnabled() else { return }
+            entityASDemandFrameSerial &+= 1
+            let frameId = frame?.frameId ?? entityASDemandFrameSerial
+            let readback = entityASDemandReadback
+            commandBuffer.addCompletedHandler { [counterBuffer, readback] _ in
+                let ptr = counterBuffer.contents().bindMemory(to: UInt32.self, capacity: 18)
+                let candidates = ptr[5]
+                let gatePass = ptr[6]
+                readback.store(gatePass: gatePass, candidates: candidates, frameId: frameId)
+            }
         }
 
         private func nextRTShadowCounterBuffer(device: MTLDevice) -> MTLBuffer? {
@@ -5303,9 +5459,11 @@ struct MetalView: UIViewRepresentable {
                 // x = local-light shadow budget, y = emissive NEE light count,
                 // z = emissive NEE enabled, w = r_rt_debug_view.
                 float4 rtBudgetParams;
-                // Stage 60 append-only controls:
-                // x = r_rt_entity_refl_roughness_max, y = r_rt_perf_hud 2 attribution enabled,
-                // z/w reserved. Gates ENTITY-AS traversal only.
+                // Stage 60/61 append-only controls:
+                // x = r_rt_entity_refl_roughness_max,
+                // y = entity-reflection counter enabled,
+                // z = r_rt_entity_reflections requested even if AS maintenance is suspended,
+                // w reserved. Gates ENTITY-AS traversal only.
                 float4 rtEntityReflectionParams;
             };
 
@@ -6089,8 +6247,10 @@ struct MetalView: UIViewRepresentable {
                                     R = normalize(mix(R, jdir, rough * rough));
                                     ray rray(hitPos + N * 0.75, R, 0.1, 20000.0);
                                     auto rh = i.intersect(rray, worldAS);
-                                    bool entityReflPerf = uniforms.rtEntityReflectionParams.y > 0.5;
-                                    if (entityReflectionEnabled && entityReflPerf) {
+                                    bool entityReflCounter = uniforms.rtEntityReflectionParams.y > 0.5;
+                                    bool entityReflectionRequested = entityReflectionEnabled ||
+                                        uniforms.rtEntityReflectionParams.z > 0.5;
+                                    if (entityReflectionRequested && entityReflCounter) {
                                         atomic_fetch_add_explicit(&rtShadowCounters[4], 1u, memory_order_relaxed);
                                         if (rh.type == intersection_type::triangle) {
                                             atomic_fetch_add_explicit(&rtShadowCounters[17], 1u, memory_order_relaxed);
@@ -6101,14 +6261,14 @@ struct MetalView: UIViewRepresentable {
                                     bool hasEntityAdditiveReflection = false;
                                     float3 entityAdditiveReflection = float3(0.0);
                                     bool entityReflGatePass = false;
-                                    if (entityReflectionEnabled) {
+                                    if (entityReflectionRequested) {
                                         float entityReflRoughMax = clamp(uniforms.rtEntityReflectionParams.x, 0.0, 1.0);
                                         // Stage60: rough surfaces skip ENTITY-AS traversal, but keep a
                                         // narrow reflectivity escape for authored metal/mirror-like
                                         // surfaces whose Q3/PBR roughness lands around 0.35-0.45.
                                         entityReflGatePass = rough <= entityReflRoughMax ||
                                             (metal > 0.50 && rough < max(entityReflRoughMax, 0.45));
-                                        if (entityReflPerf) {
+                                        if (entityReflCounter) {
                                             atomic_fetch_add_explicit(&rtShadowCounters[5], 1u, memory_order_relaxed);
                                             if (rough < 0.10) {
                                                 atomic_fetch_add_explicit(&rtShadowCounters[12], 1u, memory_order_relaxed);
@@ -6129,19 +6289,19 @@ struct MetalView: UIViewRepresentable {
                                             }
                                         }
                                     }
-                                    if (entityReflGatePass) {
+                                    if (entityReflectionEnabled && entityReflGatePass) {
                                         float entityMaxDistance = (rh.type == intersection_type::triangle) ? rh.distance : 20000.0;
                                         float entityMinDistance = 0.1;
                                         for (uint entityStep = 0u; entityStep < 8u && entityMinDistance < entityMaxDistance; ++entityStep) {
                                             ray eray(hitPos + N * 0.75, R, entityMinDistance, entityMaxDistance);
-                                            if (entityReflPerf) {
+                                            if (entityReflCounter) {
                                                 atomic_fetch_add_explicit(&rtShadowCounters[8], 1u, memory_order_relaxed);
                                             }
                                             auto erh = i.intersect(eray, entityAS);
                                             if (erh.type != intersection_type::triangle) {
                                                 break;
                                             }
-                                            if (entityReflPerf) {
+                                            if (entityReflCounter) {
                                                 atomic_fetch_add_explicit(&rtShadowCounters[9], 1u, memory_order_relaxed);
                                             }
                                             RTEntityShadeResult es = rtShadeEntityReflection(erh.primitive_id,
@@ -6164,12 +6324,12 @@ struct MetalView: UIViewRepresentable {
                                             if ((es.flags & 4u) != 0u) {
                                                 entityAdditiveReflection += es.color;
                                                 hasEntityAdditiveReflection = true;
-                                                if (entityReflPerf) {
+                                                if (entityReflCounter) {
                                                     atomic_fetch_add_explicit(&rtShadowCounters[11], 1u, memory_order_relaxed);
                                                 }
                                                 continue;
                                             }
-                                            if (entityReflPerf) {
+                                            if (entityReflCounter) {
                                                 atomic_fetch_add_explicit(&rtShadowCounters[10], 1u, memory_order_relaxed);
                                             }
                                             reflColor = es.color + entityAdditiveReflection;
@@ -7077,6 +7237,13 @@ struct MetalView: UIViewRepresentable {
             }
             guard Q3_RTEntities() != 0 || Q3_RTEntityReflections() != 0 else {
                 resetEntityASCache()
+                return nil
+            }
+            if entityASDemandMaintenanceSuspended() {
+                perfFrame?.entityASDemandSuspended = true
+                perfFrame?.entityASDemandGatePass = entityASDemandLastGatePass
+                perfFrame?.entityASDemandSuspendCount = entityASDemandSuspendCount
+                perfFrame?.entityASDemandResumeCount = entityASDemandResumeCount
                 return nil
             }
             let clampedSlot = max(0, min(slot, Self.maxInflightFrames - 1))
@@ -8051,7 +8218,8 @@ struct MetalView: UIViewRepresentable {
                 ? SIMD2<Float>((halton(rtJitterFrame, 2) - 0.5) / Float(max(traceW, 1)),
                                (halton(rtJitterFrame, 3) - 0.5) / Float(max(traceH, 1)))
                 : SIMD2<Float>(0, 0)
-            let entityASAvailable = entityAccelerationStructure != nil
+            let entityASMaintenanceSuspended = entityASDemandMaintenanceSuspended()
+            let entityASAvailable = entityAccelerationStructure != nil && !entityASMaintenanceSuspended
             let entityPrimaryRequested = Q3_RTEntities() != 0
             let entityReflectionRequested = Q3_RTEntityReflections() != 0
             var entityASMode: Float = 0
@@ -8071,6 +8239,10 @@ struct MetalView: UIViewRepresentable {
                 if entityPrimitiveMaterialBufferForRT == nil {
                     entityReflectionActive = false
                 }
+            } else if entityASMaintenanceSuspended {
+                rtEntityPrimitiveMaterialBuffer = nil
+                perfFrame?.cpuEntityMaterialMs = 0
+                perfFrame?.entityASDemandSuspended = true
             } else {
                 let materialCPUStart = CACurrentMediaTime()
                 _ = buildRTEntityPrimitiveMaterials(device: device, active: false)
@@ -8124,10 +8296,12 @@ struct MetalView: UIViewRepresentable {
                                                    emissiveNEEEnabled ? Float(emissiveInfo.count) : 0,
                                                    emissiveNEEEnabled ? 1.0 : 0.0,
                                                    Float(rtDebugView))
+            let entityDemandCounterEnabled = entityASDemandEnabled()
             uniforms.rtEntityReflectionParams = SIMD4<Float>(Q3_RTEntityReflRoughnessMax(),
-                                                             Q3_RTPerfHUD() > 1 ? 1.0 : 0.0,
-                                                             0.0,
+                                                             (Q3_RTPerfHUD() > 1 || entityDemandCounterEnabled) ? 1.0 : 0.0,
+                                                             entityReflectionRequested ? 1.0 : 0.0,
                                                              0.0)
+            annotateEntityASDemandPerf(perfFrame)
             if rtDebugView != 0 {
                 let debugMap = currentRTMapName()
                 let sig = "\(debugMap):\(worldGeneration):\(rtDebugView)"
@@ -8168,6 +8342,9 @@ struct MetalView: UIViewRepresentable {
             let traceGroups = MTLSize(width: (traceW + 15) / 16, height: (traceH + 15) / 16, depth: 1)
             let compositeGroups = MTLSize(width: (renderW + 15) / 16, height: (renderH + 15) / 16, depth: 1)
             guard let shadowCounterBuffer = nextRTShadowCounterBuffer(device: device) else { return nil }
+            attachEntityASDemandCounterCompletion(commandBuffer: commandBuffer,
+                                                  counterBuffer: shadowCounterBuffer,
+                                                  frame: perfFrame)
             if let blit = commandBuffer.makeBlitCommandEncoder() {
                 blit.label = "Q3.RT.clearSunShadowCounters"
                 blit.fill(buffer: shadowCounterBuffer,
@@ -8261,7 +8438,8 @@ struct MetalView: UIViewRepresentable {
                 enc.setBuffer(rtASIndexBuffer, offset: 0, index: 2)
                 enc.setBuffer(rtASVertexBuffer, offset: 0, index: 3)
                 enc.setBuffer(primitiveMaterialBuffer, offset: 0, index: 4)
-                enc.setAccelerationStructure(entityAccelerationStructure ?? worldAS, bufferIndex: 5)
+                let entityASForTrace = (entityASMode != 0) ? entityAccelerationStructure : nil
+                enc.setAccelerationStructure(entityASForTrace ?? worldAS, bufferIndex: 5)
                 enc.setBuffer(lightInfo.buffer, offset: 0, index: 6)
                 enc.setBuffer(shadowCounterBuffer, offset: 0, index: 7)
                 enc.setBuffer(emissiveInfo.buffer, offset: 0, index: 9)
@@ -13962,12 +14140,20 @@ struct MetalView: UIViewRepresentable {
                         print("[RT] preserve entities mask active size=\(renderW)x\(renderH) (composite-before-entities)")
                         pbrLog("[RT] preserve entities mask active size=\(renderW)x\(renderH) (composite-before-entities)")
                     }
-                    let entityUploadCPUStart = CACurrentMediaTime()
-                    _ = uploadEntityBuffers(device: device, slot: frameSlot)
-                    rtPerfFrame?.cpuEntityUploadMs = (CACurrentMediaTime() - entityUploadCPUStart) * 1000.0
+                    let entityASMaintenanceSuspended = entityASDemandMaintenanceSuspended()
+                    if entityASMaintenanceSuspended {
+                        rtPerfFrame?.cpuEntityUploadMs = 0
+                        rtPerfFrame?.entityASDemandSuspended = true
+                    } else {
+                        let entityUploadCPUStart = CACurrentMediaTime()
+                        _ = uploadEntityBuffers(device: device, slot: frameSlot)
+                        rtPerfFrame?.cpuEntityUploadMs = (CACurrentMediaTime() - entityUploadCPUStart) * 1000.0
+                    }
                     encoder.endEncoding()
                     encodeRTPerfPoint(commandBuffer: commandBuffer, frame: rtPerfFrame, sample: .entityASBuildStart)
-                    _ = encodeEntityAccelerationStructureBuild(device: device, commandBuffer: commandBuffer, slot: frameSlot, perfFrame: rtPerfFrame)
+                    if !entityASMaintenanceSuspended {
+                        _ = encodeEntityAccelerationStructureBuild(device: device, commandBuffer: commandBuffer, slot: frameSlot, perfFrame: rtPerfFrame)
+                    }
                     encodeRTPerfPoint(commandBuffer: commandBuffer, frame: rtPerfFrame, sample: .entityASBuildEnd)
                     _ = encodeRTOverlay(commandBuffer: commandBuffer,
                                         rasterTexture: rtTargetTexture,
@@ -14192,12 +14378,20 @@ struct MetalView: UIViewRepresentable {
                 // Parity with the preserve path: ensure entity buffers are
                 // valid even when the entity pass above was skipped
                 // (entityCommandCount == 0) and r_rt_entities is enabled.
-                let entityUploadCPUStart = CACurrentMediaTime()
-                _ = uploadEntityBuffers(device: device, slot: frameSlot)
-                rtPerfFrame?.cpuEntityUploadMs = (CACurrentMediaTime() - entityUploadCPUStart) * 1000.0
+                let entityASMaintenanceSuspended = entityASDemandMaintenanceSuspended()
+                if entityASMaintenanceSuspended {
+                    rtPerfFrame?.cpuEntityUploadMs = 0
+                    rtPerfFrame?.entityASDemandSuspended = true
+                } else {
+                    let entityUploadCPUStart = CACurrentMediaTime()
+                    _ = uploadEntityBuffers(device: device, slot: frameSlot)
+                    rtPerfFrame?.cpuEntityUploadMs = (CACurrentMediaTime() - entityUploadCPUStart) * 1000.0
+                }
                 encoder.endEncoding()
                 encodeRTPerfPoint(commandBuffer: commandBuffer, frame: rtPerfFrame, sample: .entityASBuildStart)
-                _ = encodeEntityAccelerationStructureBuild(device: device, commandBuffer: commandBuffer, slot: frameSlot, perfFrame: rtPerfFrame)
+                if !entityASMaintenanceSuspended {
+                    _ = encodeEntityAccelerationStructureBuild(device: device, commandBuffer: commandBuffer, slot: frameSlot, perfFrame: rtPerfFrame)
+                }
                 encodeRTPerfPoint(commandBuffer: commandBuffer, frame: rtPerfFrame, sample: .entityASBuildEnd)
                 _ = encodeRTOverlay(commandBuffer: commandBuffer,
                                     rasterTexture: rtTargetTexture,
@@ -15139,6 +15333,10 @@ struct MetalView: UIViewRepresentable {
             textureCache.removeAll(keepingCapacity: false)
             rtASVertexBuffer = nil
             rtASIndexBuffer = nil
+            entityASDemandSuspended = false
+            entityASDemandLowFrames = 0
+            entityASDemandLastGatePass = 0
+            entityASDemandLastCandidates = 0
             return worldVertexBuffer
         }
 

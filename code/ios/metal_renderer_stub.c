@@ -12145,6 +12145,39 @@ float Q3_RTEntityReflRoughnessMax(void) {
     return v;
 }
 
+int Q3_RTEntityReflASSuspendThreshold(void) {
+    if (ri.Cvar_Get == NULL) return 1024;
+    /* Stage61: enter-suspend hysteresis threshold. 0 disables demand suspend
+     * without changing the default-off r_rt_entity_reflections path. Chosen
+     * between Stage60 NV15 (~626 gated rays) and q3tourney5 mirror (~1967). */
+    cvar_t *cv = ri.Cvar_Get("r_rt_entity_refl_as_suspend_threshold", "1024", CVAR_ARCHIVE);
+    int v = cv ? cv->integer : 1024;
+    if (v < 0) v = 0;
+    if (v > 1000000) v = 1000000;
+    return v;
+}
+
+int Q3_RTEntityReflASResumeThreshold(void) {
+    if (ri.Cvar_Get == NULL) return 1536;
+    /* Stage61: exit-suspend hysteresis threshold. Must exceed the suspend
+     * threshold in practice; Swift enforces at least suspend+1. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_entity_refl_as_resume_threshold", "1536", CVAR_ARCHIVE);
+    int v = cv ? cv->integer : 1536;
+    if (v < 0) v = 0;
+    if (v > 1000000) v = 1000000;
+    return v;
+}
+
+int Q3_RTEntityReflASSuspendFrames(void) {
+    if (ri.Cvar_Get == NULL) return 30;
+    /* Stage61: consecutive below-threshold frames before suspend. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_entity_refl_as_suspend_frames", "30", CVAR_ARCHIVE);
+    int v = cv ? cv->integer : 30;
+    if (v < 0) v = 0;
+    if (v > 600) v = 600;
+    return v;
+}
+
 int Q3_RTPreserveEntities(void) {
     if (ri.Cvar_Get == NULL) return 1;
     /* 1 (default): RT composite is encoded BEFORE the raster entity/HUD
