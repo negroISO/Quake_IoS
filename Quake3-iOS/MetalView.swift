@@ -458,7 +458,8 @@ struct MetalView: UIViewRepresentable {
             // xyz = normalized refEntity tint fallback; w reserved.
             var color: SIMD4<Float> = SIMD4(1, 1, 1, 1)
             // x = alphaTestThreshold (same sign convention as world/entity
-            // raster uniforms), y/z/w reserved for later fidelity stages.
+            // raster uniforms), y = reflected blendMode (0 opaque, 1 additive
+            // src-alpha, 2 alpha-tested alpha, 5 additive-full), z/w reserved.
             var params: SIMD4<Float> = SIMD4(0, 0, 0, 0)
         }
 
@@ -5286,11 +5287,11 @@ struct MetalView: UIViewRepresentable {
 
             struct RTEntityPrimitiveMaterial {
                 uint albedoSlot;
-                uint flags; // bit0=valid, bit1=sample albedo slot
+                uint flags; // bit0=valid, bit1=sample albedo slot, bit2=tcGen env
                 uint _pad0;
                 uint _pad1;
                 float4 color;
-                float4 params; // x=alphaTestThreshold, y/z/w reserved
+                float4 params; // x=alphaTestThreshold, y=blendMode, z/w reserved
             };
 
             struct RTEntityVertex {
@@ -5401,7 +5402,7 @@ struct MetalView: UIViewRepresentable {
             struct RTEntityShadeResult {
                 float3 color;
                 float alpha;
-                uint flags; // bit0=valid material, bit1=alpha test passed
+                uint flags; // bit0=valid material, bit1=alpha passed, bit2=additive
             };
 
             RTEntityShadeResult rtShadeEntityReflection(uint primitiveID,
@@ -5435,19 +5436,6 @@ struct MetalView: UIViewRepresentable {
                            entityVertices[i2].color.rgb * bary.y;
                 float3 tint = max(mat.color.rgb, float3(0.0));
                 if (dot(tint, tint) < 1.0e-6) { tint = float3(1.0); }
-                float4 texel = float4(1.0);
-                if ((mat.flags & 2u) != 0u && mat.albedoSlot < 176u) {
-                    texel = texTable.albedo[mat.albedoSlot].sample(textureSampler, uv);
-                }
-                float alpha = saturate(texel.a);
-                result.alpha = alpha;
-                float alphaThreshold = mat.params.x;
-                if (alphaThreshold > 0.0) {
-                    if (alpha < alphaThreshold) { return result; }
-                } else if (alphaThreshold < 0.0) {
-                    if (alpha >= -alphaThreshold) { return result; }
-                }
-                result.flags |= 2u;
                 float3 N = entityVertices[i0].normal * w +
                            entityVertices[i1].normal * bary.x +
                            entityVertices[i2].normal * bary.y;
@@ -5462,9 +5450,35 @@ struct MetalView: UIViewRepresentable {
                 } else {
                     N = normalize(-rayDir);
                 }
-                float facing = 0.35 + 0.65 * saturate(abs(dot(N, -rayDir)));
-                float3 albedo = texel.rgb * max(c, float3(0.08)) * tint;
-                result.color = max(albedo * facing * max(alpha, 0.15), float3(0.01));
+                if ((mat.flags & 4u) != 0u) {
+                    float3 hitPosEntity = rayOrigin + rayDir * hitDistance;
+                    float3 viewer = normalize(rayOrigin - hitPosEntity);
+                    float d = 2.0 * dot(viewer, N);
+                    float3 refl = N * d - viewer;
+                    uv = float2(0.5 + refl.y * 0.5, 0.5 - refl.z * 0.5);
+                }
+                float4 texel = float4(1.0);
+                if ((mat.flags & 2u) != 0u && mat.albedoSlot < 176u) {
+                    texel = texTable.albedo[mat.albedoSlot].sample(textureSampler, uv);
+                }
+                float alpha = saturate(texel.a);
+                result.alpha = alpha;
+                float alphaThreshold = mat.params.x;
+                if (alphaThreshold > 0.0) {
+                    if (alpha < alphaThreshold) { return result; }
+                } else if (alphaThreshold < 0.0) {
+                    if (alpha >= -alphaThreshold) { return result; }
+                }
+                result.flags |= 2u;
+                uint blendMode = uint(max(mat.params.y + 0.5, 0.0));
+                bool additive = (blendMode == 1u || blendMode == 5u);
+                if (additive) { result.flags |= 4u; }
+                float facing = additive ? 1.0 : (0.35 + 0.65 * saturate(abs(dot(N, -rayDir))));
+                float alphaWeight = (blendMode == 5u) ? 1.0 : (additive ? alpha : max(alpha, 0.15));
+                float3 vertexColor = additive ? max(c, float3(0.35)) : max(c, float3(0.08));
+                float3 albedo = texel.rgb * vertexColor * tint;
+                result.color = additive ? max(albedo * alphaWeight, float3(0.0))
+                                        : max(albedo * facing * alphaWeight, float3(0.01));
                 return result;
             }
 
@@ -6005,6 +6019,8 @@ struct MetalView: UIViewRepresentable {
                                     auto rh = i.intersect(rray, worldAS);
                                     float3 reflColor;
                                     bool useEntityReflectionHit = false;
+                                    bool hasEntityAdditiveReflection = false;
+                                    float3 entityAdditiveReflection = float3(0.0);
                                     if (entityReflectionEnabled) {
                                         float entityMaxDistance = (rh.type == intersection_type::triangle) ? rh.distance : 20000.0;
                                         float entityMinDistance = 0.1;
@@ -6031,7 +6047,12 @@ struct MetalView: UIViewRepresentable {
                                             if ((es.flags & 2u) == 0u) {
                                                 continue;
                                             }
-                                            reflColor = es.color;
+                                            if ((es.flags & 4u) != 0u) {
+                                                entityAdditiveReflection += es.color;
+                                                hasEntityAdditiveReflection = true;
+                                                continue;
+                                            }
+                                            reflColor = es.color + entityAdditiveReflection;
                                             useEntityReflectionHit = true;
                                             break;
                                         }
@@ -6098,6 +6119,9 @@ struct MetalView: UIViewRepresentable {
                                             reflColor = envCube.sample(envSampler, R).rgb;
                                         } else {
                                             reflColor = float3(0.03);
+                                        }
+                                        if (hasEntityAdditiveReflection) {
+                                            reflColor += entityAdditiveReflection;
                                         }
                                     }
                                     // Fresnel-Schlick; F0 0.04 dielectric → albedo for metal.
@@ -6992,22 +7016,19 @@ struct MetalView: UIViewRepresentable {
             let subtractBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_SUBTRACT)
             let thirdPersonBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_THIRD_PERSON)
             let aTestGT0Bit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ATEST_GT0)
-            let nonOpaqueMask = additiveBit | additiveFullBit | alphaBit | filterBit | subtractBit
+            let tcGenEnvBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_TCGEN_ENV)
             var assignedTriangles = 0
             var assignedHandles = Set<UInt32>()
             assignedHandles.reserveCapacity(min(entityDrawCount, 64))
 
             for draw in draws where draw.indexCount >= 3 {
-                if (draw.flags & nonOpaqueMask) != 0 { continue }
                 if (draw.flags & thirdPersonBit) != 0 { continue }
-                let triFirst = Int(draw.firstIndex / 3)
-                let triCount = Int(draw.indexCount / 3)
-                guard triFirst >= 0, triCount > 0, triFirst < primitiveCount else { continue }
-                let triEnd = min(primitiveCount, triFirst + triCount)
-                let slot = rtAlbedoSlotForEntityHandle(draw.textureHandle, device: device)
-                var flags: UInt32 = 1
-                if slot != invalid { flags |= 2 }
-                let ec = draw.entityColor
+                let isAdditive = (draw.flags & additiveBit) != 0
+                let isAdditiveFull = (draw.flags & additiveFullBit) != 0
+                let isAlpha = (draw.flags & alphaBit) != 0
+                let isFilter = (draw.flags & filterBit) != 0
+                let isSubtract = (draw.flags & subtractBit) != 0
+                if isFilter || isSubtract { continue }
                 var info = Q3MetalTextureInfo()
                 var alphaThreshold: Float = 0
                 if Q3MetalRenderer_GetTextureInfo(draw.textureHandle, &info) == 1 {
@@ -7016,13 +7037,24 @@ struct MetalView: UIViewRepresentable {
                 if (draw.flags & aTestGT0Bit) != 0 && alphaThreshold == 0 {
                     alphaThreshold = 0.004
                 }
+                if isAlpha && alphaThreshold == 0 { continue }
+                let triFirst = Int(draw.firstIndex / 3)
+                let triCount = Int(draw.indexCount / 3)
+                guard triFirst >= 0, triCount > 0, triFirst < primitiveCount else { continue }
+                let triEnd = min(primitiveCount, triFirst + triCount)
+                let slot = rtAlbedoSlotForEntityHandle(draw.textureHandle, device: device)
+                var flags: UInt32 = 1
+                if slot != invalid { flags |= 2 }
+                if (draw.flags & tcGenEnvBit) != 0 { flags |= 4 }
+                let blendMode: UInt32 = isAdditiveFull ? 5 : (isAdditive ? 1 : (isAlpha ? 2 : 0))
+                let ec = draw.entityColor
                 let material = RTEntityPrimitiveMaterial(
                     albedoSlot: slot,
                     flags: flags,
                     _pad0: 0,
                     _pad1: 0,
                     color: SIMD4<Float>(ec.0, ec.1, ec.2, ec.3),
-                    params: SIMD4<Float>(alphaThreshold, 0, 0, 0))
+                    params: SIMD4<Float>(alphaThreshold, Float(blendMode), 0, 0))
                 for tri in triFirst..<triEnd {
                     materials[tri] = material
                 }
