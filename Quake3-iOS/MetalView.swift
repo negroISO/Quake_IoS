@@ -8218,10 +8218,17 @@ struct MetalView: UIViewRepresentable {
                 ? SIMD2<Float>((halton(rtJitterFrame, 2) - 0.5) / Float(max(traceW, 1)),
                                (halton(rtJitterFrame, 3) - 0.5) / Float(max(traceH, 1)))
                 : SIMD2<Float>(0, 0)
-            let entityASMaintenanceSuspended = entityASDemandMaintenanceSuspended()
-            let entityASAvailable = entityAccelerationStructure != nil && !entityASMaintenanceSuspended
             let entityPrimaryRequested = Q3_RTEntities() != 0
             let entityReflectionRequested = Q3_RTEntityReflections() != 0
+            let entityASMaintenanceRequested = entityPrimaryRequested || entityReflectionRequested
+            let entityASMaintenanceSuspended = entityASMaintenanceRequested && entityASDemandMaintenanceSuspended()
+            if !entityASMaintenanceRequested {
+                resetEntityASCache()
+                rtEntityPrimitiveMaterialBuffer = nil
+            }
+            let entityASAvailable = entityASMaintenanceRequested &&
+                                    entityAccelerationStructure != nil &&
+                                    !entityASMaintenanceSuspended
             var entityASMode: Float = 0
             var entityPrimitiveMaterialBufferForRT: MTLBuffer? = nil
             let entitySlot = max(0, min(entityASBufferSlot, Self.maxInflightFrames - 1))
@@ -8243,6 +8250,8 @@ struct MetalView: UIViewRepresentable {
                 rtEntityPrimitiveMaterialBuffer = nil
                 perfFrame?.cpuEntityMaterialMs = 0
                 perfFrame?.entityASDemandSuspended = true
+            } else if !entityASMaintenanceRequested {
+                perfFrame?.cpuEntityMaterialMs = 0
             } else {
                 let materialCPUStart = CACurrentMediaTime()
                 _ = buildRTEntityPrimitiveMaterials(device: device, active: false)
@@ -14140,8 +14149,20 @@ struct MetalView: UIViewRepresentable {
                         print("[RT] preserve entities mask active size=\(renderW)x\(renderH) (composite-before-entities)")
                         pbrLog("[RT] preserve entities mask active size=\(renderW)x\(renderH) (composite-before-entities)")
                     }
-                    let entityASMaintenanceSuspended = entityASDemandMaintenanceSuspended()
-                    if entityASMaintenanceSuspended {
+                    let entityASMaintenanceRequested = Q3_RTEntities() != 0 || Q3_RTEntityReflections() != 0
+                    let entityASMaintenanceSuspended = entityASMaintenanceRequested && entityASDemandMaintenanceSuspended()
+                    if !entityASMaintenanceRequested {
+                        /* Stage61 delta: default RT has neither primary RT
+                         * entities nor secondary entity reflections enabled.
+                         * The AS builder's own cvar guard bails before encoding,
+                         * but this call site used to upload the full entity
+                         * vertex/index stream first. Match the demand-suspended
+                         * path: keep preserved raster entities untouched and
+                         * skip only the RT entity-AS maintenance prepass. */
+                        resetEntityASCache()
+                        rtEntityPrimitiveMaterialBuffer = nil
+                        rtPerfFrame?.cpuEntityUploadMs = 0
+                    } else if entityASMaintenanceSuspended {
                         rtPerfFrame?.cpuEntityUploadMs = 0
                         rtPerfFrame?.entityASDemandSuspended = true
                     } else {
@@ -14151,7 +14172,7 @@ struct MetalView: UIViewRepresentable {
                     }
                     encoder.endEncoding()
                     encodeRTPerfPoint(commandBuffer: commandBuffer, frame: rtPerfFrame, sample: .entityASBuildStart)
-                    if !entityASMaintenanceSuspended {
+                    if entityASMaintenanceRequested && !entityASMaintenanceSuspended {
                         _ = encodeEntityAccelerationStructureBuild(device: device, commandBuffer: commandBuffer, slot: frameSlot, perfFrame: rtPerfFrame)
                     }
                     encodeRTPerfPoint(commandBuffer: commandBuffer, frame: rtPerfFrame, sample: .entityASBuildEnd)
@@ -14378,8 +14399,13 @@ struct MetalView: UIViewRepresentable {
                 // Parity with the preserve path: ensure entity buffers are
                 // valid even when the entity pass above was skipped
                 // (entityCommandCount == 0) and r_rt_entities is enabled.
-                let entityASMaintenanceSuspended = entityASDemandMaintenanceSuspended()
-                if entityASMaintenanceSuspended {
+                let entityASMaintenanceRequested = Q3_RTEntities() != 0 || Q3_RTEntityReflections() != 0
+                let entityASMaintenanceSuspended = entityASMaintenanceRequested && entityASDemandMaintenanceSuspended()
+                if !entityASMaintenanceRequested {
+                    resetEntityASCache()
+                    rtEntityPrimitiveMaterialBuffer = nil
+                    rtPerfFrame?.cpuEntityUploadMs = 0
+                } else if entityASMaintenanceSuspended {
                     rtPerfFrame?.cpuEntityUploadMs = 0
                     rtPerfFrame?.entityASDemandSuspended = true
                 } else {
@@ -14389,7 +14415,7 @@ struct MetalView: UIViewRepresentable {
                 }
                 encoder.endEncoding()
                 encodeRTPerfPoint(commandBuffer: commandBuffer, frame: rtPerfFrame, sample: .entityASBuildStart)
-                if !entityASMaintenanceSuspended {
+                if entityASMaintenanceRequested && !entityASMaintenanceSuspended {
                     _ = encodeEntityAccelerationStructureBuild(device: device, commandBuffer: commandBuffer, slot: frameSlot, perfFrame: rtPerfFrame)
                 }
                 encodeRTPerfPoint(commandBuffer: commandBuffer, frame: rtPerfFrame, sample: .entityASBuildEnd)
