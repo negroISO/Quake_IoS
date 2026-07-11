@@ -11840,9 +11840,22 @@ float Q3_RTAmbient(void) {
 }
 
 float Q3_RTNormalMix(void) {
-    if (ri.Cvar_Get == NULL) return 0.06f;
-    cvar_t *cv = ri.Cvar_Get("r_rt_normal_mix", "0.06", CVAR_ARCHIVE);
-    float v = cv ? cv->value : 0.06f;
+    if (ri.Cvar_Get == NULL) return 0.0f;
+    /* Stage47: this was a developer normal-visualization overlay with an
+     * archived 0.06 default. On dark RT scenes (NV15/q3dm0) that 6% normal
+     * color dominated the real albedo*lightmap term and produced the
+     * magenta/green/blue orientation palette. Keep the cvar for explicit
+     * debugging, but default/migrate it off; r_rt_debug_view 4 is the normal
+     * diagnostic path now. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_normal_mix", "0", 0);
+    if (cv && cv->value > 0.059f && cv->value < 0.061f &&
+        cv->resetString && !Q_stricmp(cv->resetString, "0")) {
+        if (ri.Cvar_Set != NULL) {
+            ri.Cvar_Set("r_rt_normal_mix", "0");
+        }
+        return 0.0f;
+    }
+    float v = cv ? cv->value : 0.0f;
     if (v < 0.0f) v = 0.0f;
     if (v > 1.0f) v = 1.0f;
     return v;
@@ -11987,6 +12000,18 @@ int Q3_RTDebugGBuffer(void) {
     int v = cv ? cv->integer : 0;
     if (v < 0) v = 0;
     if (v > 3) v = 3;
+    return v;
+}
+
+int Q3_RTDebugView(void) {
+    if (ri.Cvar_Get == NULL) return 0;
+    /* Stage 47 session-only RT color diagnostic:
+     * 0 off, 1 raw albedo, 2 sampled lightmap, 3 material slot color,
+     * 4 world normal. Do not archive. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_debug_view", "0", 0);
+    int v = cv ? cv->integer : 0;
+    if (v < 0) v = 0;
+    if (v > 4) v = 4;
     return v;
 }
 

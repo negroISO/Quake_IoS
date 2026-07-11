@@ -226,6 +226,9 @@ float Q3_SetRTMix(float mix);
 float Q3_RTExposure(void);
 float Q3_RTGamma(void);
 float Q3_RTAmbient(void);
+/* r_rt_normal_mix (default 0, session-only) explicitly blends normal debug
+ * color into RT output. Keep off for production; use r_rt_debug_view 4 for
+ * captures. */
 float Q3_RTNormalMix(void);
 /* r_rt_normal_scale (default 0.0 = OFF) — RT normal-map perturbation strength
  * (Step 2c). 0 = no-op; tune up to 4 live to dial in RT bump mapping. */
@@ -254,6 +257,9 @@ int   Q3_RTShadowBudget(void);
 /* Stage 17 RT G-buffer debug visualization. Session-only:
  * 0=off, 1=motion, 2=normal, 3=depth. */
 int   Q3_RTDebugGBuffer(void);
+/* Stage 47 RT color diagnostic. Session-only:
+ * 0=off, 1=raw albedo, 2=sampled lightmap, 3=material slot, 4=normal. */
+int   Q3_RTDebugView(void);
 int   Q3_RTEntities(void);
 /* P0.2 — RT composite entity preservation (see
  * docs/2026-06-10-rt-gap-analysis-vs-rtx-remix.md).

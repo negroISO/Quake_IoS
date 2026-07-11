@@ -415,9 +415,9 @@ struct MetalView: UIViewRepresentable {
             // Stage 17: append-only tail field. Do not insert fields above this:
             // Swift and MSL RayTracingUniforms are bound as raw bytes.
             var prevViewProjection: simd_float4x4 = matrix_identity_float4x4
-            // Stage 19/24 append-only budget controls:
+            // Stage 19/24 append-only budget/debug controls:
             // x = r_rt_shadow_budget, y = emissive NEE light count,
-            // z = r_rt_emissive_nee enabled, w = reserved.
+            // z = r_rt_emissive_nee enabled, w = r_rt_debug_view.
             var rtBudgetParams: SIMD4<Float> = SIMD4(2, 0, 0, 0)
         }
 
@@ -645,6 +645,19 @@ struct MetalView: UIViewRepresentable {
 
         private static func worldPBRMaterialHandle(for stage: Q3MetalWorldStage) -> UInt32 {
             (stage.pbrMaterialHandle != 0) ? stage.pbrMaterialHandle : stage.textureHandle
+        }
+
+        private static func rtDebugSlotColor(slot: UInt32) -> SIMD3<Float> {
+            var x = slot &+ 1
+            x ^= x >> 16
+            x &*= 0x7feb352d
+            x ^= x >> 15
+            x &*= 0x846ca68b
+            x ^= x >> 16
+            return SIMD3<Float>(
+                Float((x >> 0) & 0xff) / 255.0,
+                Float((x >> 8) & 0xff) / 255.0,
+                Float((x >> 16) & 0xff) / 255.0)
         }
 
         private static func rtRepresentativeStage(for draw: Q3MetalWorldDrawCmd) -> Q3MetalWorldStage? {
@@ -4264,6 +4277,7 @@ struct MetalView: UIViewRepresentable {
         private var rtLightmapHandles = [UInt32](repeating: 0, count: 64)
         private var rtLogPrintedOnce = false
         private var rtOverlayLogPrintedOnce = false
+        private var rtDebugViewLogSignature = ""
         private var rtEmissiveTableLogPrintedOnce = false
         // P0.2: one-shot log gate for the r_rt_preserve_entities mode line.
         private var rtPreserveEntitiesLogged = false
@@ -5201,7 +5215,7 @@ struct MetalView: UIViewRepresentable {
                 float4x4 prevViewProjection;
                 // Stage 19/24 append-only controls:
                 // x = local-light shadow budget, y = emissive NEE light count,
-                // z = emissive NEE enabled, w = reserved.
+                // z = emissive NEE enabled, w = r_rt_debug_view.
                 float4 rtBudgetParams;
             };
 
@@ -5326,6 +5340,21 @@ struct MetalView: UIViewRepresentable {
                 return fract((p3.x + p3.y) * p3.z);
             }
 
+            float3 rtDebugSlotColor(uint slot) {
+                if (slot >= 176u) {
+                    return float3(0.0);
+                }
+                uint x = slot + 1u;
+                x ^= x >> 16u;
+                x *= 0x7feb352du;
+                x ^= x >> 15u;
+                x *= 0x846ca68bu;
+                x ^= x >> 16u;
+                return float3(float((x >> 0u) & 0xffu),
+                              float((x >> 8u) & 0xffu),
+                              float((x >> 16u) & 0xffu)) / 255.0;
+            }
+
             float3 rtCosineHemisphere(float3 n, float2 randv) {
                 float phi = 6.2831853 * randv.x;
                 float cosTheta = sqrt(max(0.0, 1.0 - randv.y));
@@ -5386,9 +5415,12 @@ struct MetalView: UIViewRepresentable {
                 float primaryDistance = uniforms.jitterNearFar.w;
                 float3 gNormalValue = float3(0.0, 0.0, 1.0);
                 float3 gAlbedoValue = float3(0.0);
+                float3 gLightmapValue = float3(0.0);
                 float2 gMotionValue = float2(0.0);
                 float gRoughnessValue = 0.55;
                 float gDenoiseMaskValue = 0.0;
+                uint gMaterialSlotValue = 0xFFFFFFFFu;
+                float rtDebugViewMode = round(uniforms.rtBudgetParams.w);
                 bool gHasPrimaryHit = false;
                 if (useEntityHit) {
                     gDenoiseMaskValue = 1.0;
@@ -5428,6 +5460,7 @@ struct MetalView: UIViewRepresentable {
                     float3 normalColor = N * 0.5 + 0.5;
 
                     RTPrimitiveMaterial mat = primitiveMaterials[tri];
+                    gMaterialSlotValue = mat.albedoSlot;
                     constexpr sampler envSampler(filter::linear, address::clamp_to_edge);
                     if (mat.materialFlags.x != 0) {
                         if (!is_null_texture(envCube)) {
@@ -5563,6 +5596,7 @@ struct MetalView: UIViewRepresentable {
                             if (mat.lightmapSlot < 64) {
                                 lightmap = texTable.lightmap[mat.lightmapSlot].sample(clampSampler, lmuv).rgb;
                             }
+                            gLightmapValue = lightmap;
                             float ambientFloor = uniforms.rtToneParams.z;
                             // RT lighting rebalance: rtPBRGlobal.z dims the baked
                             // lightmap (toward RT-direct/RTX look); ambient floor preserved.
@@ -5578,6 +5612,7 @@ struct MetalView: UIViewRepresentable {
                             if (mat.lightmapSlot < 64) {
                                 lightmap = texTable.lightmap[mat.lightmapSlot].sample(clampSampler, lmuv).rgb;
                             }
+                            gLightmapValue = lightmap;
                             float ambientFloor = uniforms.rtToneParams.z;
                             // RT lighting rebalance: rtPBRGlobal.z dims the baked
                             // lightmap (toward RT-direct/RTX look); ambient floor preserved.
@@ -5962,6 +5997,21 @@ struct MetalView: UIViewRepresentable {
                 gMotion.write(float4(gMotionValue, 0.0, 1.0), tid);
                 gRoughness.write(float4(gRoughnessValue, 0.0, 0.0, 1.0), tid);
                 gDenoiseMask.write(float4(gDenoiseMaskValue, 0.0, 0.0, 1.0), tid);
+
+                if (rtDebugViewMode > 0.5) {
+                    float3 debugColor = float3(0.0);
+                    if (rtDebugViewMode < 1.5) {
+                        debugColor = gAlbedoValue;
+                    } else if (rtDebugViewMode < 2.5) {
+                        debugColor = gLightmapValue;
+                    } else if (rtDebugViewMode < 3.5) {
+                        debugColor = rtDebugSlotColor(gMaterialSlotValue);
+                    } else {
+                        debugColor = gNormalValue * 0.5 + 0.5;
+                    }
+                    output.write(float4(saturate(debugColor), 1.0), tid);
+                    return;
+                }
 
                 float debugMode = round(uniforms.rtPBRGlobal.y);
                 if (debugMode > 0.5) {
@@ -7331,6 +7381,8 @@ struct MetalView: UIViewRepresentable {
             let rtTAAEnabled = Q3_RTTAA() > 0.5
             let rtTAAAlpha = Q3_RTTAAAlpha()
             let rtDenoiseEnabled = Q3_RTDenoise() != 0
+            let rtDebugView = Q3_RTDebugView()
+            let rtDebugGBuffer = Q3_RTDebugGBuffer()
             let traceW = max(1, Int((Float(renderW) * rtResolutionScale).rounded(.toNearestOrAwayFromZero)))
             let traceH = max(1, Int((Float(renderH) * rtResolutionScale).rounded(.toNearestOrAwayFromZero)))
             guard ensureRTTextures(device: device,
@@ -7436,7 +7488,7 @@ struct MetalView: UIViewRepresentable {
                 Q3_RTAtmosphereMax())
             // rtPBRGlobal: x=normal scale (Step 2c), y=r_rt_debug_gbuffer,
             // z=lightmap scale, w=direct-light scale (RT lighting rebalance; both 1=current).
-            uniforms.rtPBRGlobal = SIMD4<Float>(Q3_RTNormalScale(), Float(Q3_RTDebugGBuffer()),
+            uniforms.rtPBRGlobal = SIMD4<Float>(Q3_RTNormalScale(), Float(rtDebugGBuffer),
                                                 Q3_RTLightmapScale(), Q3_RTDirectScale())
             uniforms.prevViewProjection = prevViewProjectionForMV
             let emissiveInfo = ensureRTEmissiveLightBuffer(device: device)
@@ -7444,11 +7496,27 @@ struct MetalView: UIViewRepresentable {
                 emissiveInfo.buffer != nil && emissiveInfo.count > 0
             // rtBudgetParams append-only use:
             // x = local-light shadow budget, y = emissive light count,
-            // z = r_rt_emissive_nee enable, w = reserved.
+            // z = r_rt_emissive_nee enable, w = r_rt_debug_view.
             uniforms.rtBudgetParams = SIMD4<Float>(Float(Q3_RTShadowBudget()),
                                                    emissiveNEEEnabled ? Float(emissiveInfo.count) : 0,
                                                    emissiveNEEEnabled ? 1.0 : 0.0,
-                                                   0)
+                                                   Float(rtDebugView))
+            if rtDebugView != 0 {
+                let debugMap = currentRTMapName()
+                let sig = "\(debugMap):\(worldGeneration):\(rtDebugView)"
+                if sig != rtDebugViewLogSignature {
+                    rtDebugViewLogSignature = sig
+                    print("[RT-DEBUG-VIEW] map=\(debugMap) mode=\(rtDebugView) cvar=r_rt_debug_view views=1:albedo 2:lightmap 3:slot 4:normal")
+                    if rtDebugView == 3 {
+                        for (slot, handle) in rtAlbedoHandles.enumerated() where handle != 0 {
+                            let c = Self.rtDebugSlotColor(slot: UInt32(slot))
+                            print("[RT-DEBUG-SLOT] slot=\(slot) handle=\(handle) color=(\(String(format: "%.3f", Double(c.x))),\(String(format: "%.3f", Double(c.y))),\(String(format: "%.3f", Double(c.z)))) name='\(textureNameForLog(handle))'")
+                        }
+                    }
+                }
+            } else if !rtDebugViewLogSignature.isEmpty {
+                rtDebugViewLogSignature = ""
+            }
             rtPrevViewProjection = viewProj
             rtPrevViewProjectionWorldGeneration = worldGeneration
             fiLastRTMotionWasReset = forcePrevCurrentForMV
@@ -7663,7 +7731,7 @@ struct MetalView: UIViewRepresentable {
             #endif
             encodeRTPerfPoint(commandBuffer: commandBuffer, frame: perfFrame, sample: .denoiseEnd)
             var blendUniforms = RTBlendUniforms(mixAmount: mixValue,
-                                                bloomIntensity: Q3_RTBloom(),
+                                                bloomIntensity: (rtDebugView != 0 || rtDebugGBuffer != 0) ? 0 : Q3_RTBloom(),
                                                 bloomThreshold: Q3_RTBloomThreshold(),
                                                 bloomRadius: Q3_RTBloomRadius())
             if let enc = makeRTPerfComputeEncoder(commandBuffer: commandBuffer,
