@@ -4279,6 +4279,11 @@ struct MetalView: UIViewRepresentable {
         private var entityAccelerationStructure: MTLAccelerationStructure?
         private var entityASSize = 0
         private var entityASLogCounter: UInt64 = 0
+        private var entityASRefitLogCounter: UInt64 = 0
+        private var entityASSkipLogCounter: UInt64 = 0
+        private var entityASDynamicFrameSerial: UInt64 = 0
+        private var entityASTopologySignature: UInt64 = 0
+        private var entityASVertexSignature: UInt64 = 0
         private var entityASBufferSlot: Int = 0
         private var rtPrimitiveMaterialBuffer: MTLBuffer?
         private var rtEntityPrimitiveMaterialBuffer: MTLBuffer?
@@ -4374,6 +4379,7 @@ struct MetalView: UIViewRepresentable {
             var cpuEntityASEncodeMs: Double = 0
             var cpuEntityMaterialMs: Double = 0
             var entityASBuilt = false
+            var entityASRefit = false
             var entityASSkipped = false
 
             init(sampleBuffer: MTLCounterSampleBuffer, frameId: UInt64, fpsEstimate: Double) {
@@ -4567,10 +4573,11 @@ struct MetalView: UIViewRepresentable {
                     }
                 }
                 let fps = frame.fpsEstimate > 0.0 ? frame.fpsEstimate : (total > 0.0 ? 1000.0 / total : 0.0)
-                print(String(format: "[RT-PERF] trace=%.1fms entityAS=%.1fms denoise=%.1fms blend=%.1fms raster=%.1fms entity=%.1fms post=%.1fms ui=%.1fms total=%.1fms fps=%.0f cpuUpload=%.2fms cpuASEncode=%.2fms cpuMaterials=%.2fms entityASBuilt=%d entityASSkipped=%d frame=%llu",
+                print(String(format: "[RT-PERF] trace=%.1fms entityAS=%.1fms denoise=%.1fms blend=%.1fms raster=%.1fms entity=%.1fms post=%.1fms ui=%.1fms total=%.1fms fps=%.0f cpuUpload=%.2fms cpuASEncode=%.2fms cpuMaterials=%.2fms entityASBuilt=%d entityASRefit=%d entityASSkipped=%d frame=%llu",
                              trace, entityASBuild, denoise, blend, raster, entity, post, ui, total, fps,
                              frame.cpuEntityUploadMs, frame.cpuEntityASEncodeMs, frame.cpuEntityMaterialMs,
-                             frame.entityASBuilt ? 1 : 0, frame.entityASSkipped ? 1 : 0, frame.frameId))
+                             frame.entityASBuilt ? 1 : 0, frame.entityASRefit ? 1 : 0,
+                             frame.entityASSkipped ? 1 : 0, frame.frameId))
             }
         }
 
@@ -6903,6 +6910,58 @@ struct MetalView: UIViewRepresentable {
             return h
         }
 
+        private func entityASMix(_ hash: inout UInt64, _ value: UInt64) {
+            hash ^= value
+            hash &*= 1099511628211
+        }
+
+        private func entityASMixFloat(_ hash: inout UInt64, _ value: Float) {
+            entityASMix(&hash, UInt64(value.bitPattern))
+        }
+
+        private func entityASTopologyHash(indices: UnsafePointer<UInt32>,
+                                          indexCount: Int,
+                                          vertexCount: Int) -> UInt64 {
+            var h: UInt64 = 1469598103934665603
+            entityASMix(&h, UInt64(vertexCount))
+            entityASMix(&h, UInt64(indexCount))
+            let src = UnsafeBufferPointer(start: indices, count: indexCount)
+            for value in src {
+                entityASMix(&h, UInt64(value))
+            }
+            return h
+        }
+
+        private func entityASVertexHash(vertices: UnsafePointer<Q3MetalEntityVertex>,
+                                        vertexCount: Int,
+                                        topologyHash: UInt64) -> UInt64 {
+            var h = topologyHash
+            let src = UnsafeBufferPointer(start: vertices, count: vertexCount)
+            for v in src {
+                entityASMixFloat(&h, v.position.0)
+                entityASMixFloat(&h, v.position.1)
+                entityASMixFloat(&h, v.position.2)
+                entityASMixFloat(&h, v.texCoord.0)
+                entityASMixFloat(&h, v.texCoord.1)
+                entityASMixFloat(&h, v.color.0)
+                entityASMixFloat(&h, v.color.1)
+                entityASMixFloat(&h, v.color.2)
+                entityASMixFloat(&h, v.color.3)
+                entityASMixFloat(&h, v.normal.0)
+                entityASMixFloat(&h, v.normal.1)
+                entityASMixFloat(&h, v.normal.2)
+            }
+            return h
+        }
+
+        private func resetEntityASCache() {
+            entityAccelerationStructure = nil
+            entityASSize = 0
+            entityASDynamicFrameSerial = 0
+            entityASTopologySignature = 0
+            entityASVertexSignature = 0
+        }
+
         @MainActor
         private func encodeEntityAccelerationStructureBuild(device: MTLDevice,
                                                             commandBuffer: MTLCommandBuffer,
@@ -6915,27 +6974,31 @@ struct MetalView: UIViewRepresentable {
                 }
             }
             guard Q3_RTEntities() != 0 || Q3_RTEntityReflections() != 0 else {
-                entityAccelerationStructure = nil
-                entityASSize = 0
+                resetEntityASCache()
                 return nil
             }
             let clampedSlot = max(0, min(slot, Self.maxInflightFrames - 1))
-            entityASBufferSlot = clampedSlot
             guard device.supportsRaytracing,
                   let snapshot = Q3MetalRenderer_GetFrameSnapshot()?.pointee,
                   let vb = entityVertexBuffers[clampedSlot],
-                  let ib = entityIndexBuffers[clampedSlot] else {
-                entityAccelerationStructure = nil
-                entityASSize = 0
+                  let ib = entityIndexBuffers[clampedSlot],
+                  let sourceVertices = Q3MetalRenderer_GetEntityVertices(),
+                  let sourceIndices = Q3MetalRenderer_GetEntityIndices() else {
+                resetEntityASCache()
                 return nil
             }
             let vertexCount = Int(snapshot.entityVertexCount)
             let indexCount = Int(snapshot.entityIndexCount)
             guard vertexCount > 0, indexCount >= 3 else {
-                entityAccelerationStructure = nil
-                entityASSize = 0
+                resetEntityASCache()
                 return nil
             }
+            let topologySignature = entityASTopologyHash(indices: sourceIndices,
+                                                         indexCount: indexCount,
+                                                         vertexCount: vertexCount)
+            let vertexSignature = entityASVertexHash(vertices: sourceVertices,
+                                                     vertexCount: vertexCount,
+                                                     topologyHash: topologySignature)
 
             let geomDesc = MTLAccelerationStructureTriangleGeometryDescriptor()
             geomDesc.vertexBuffer = vb
@@ -6950,28 +7013,77 @@ struct MetalView: UIViewRepresentable {
 
             let asDesc = MTLPrimitiveAccelerationStructureDescriptor()
             asDesc.geometryDescriptors = [geomDesc]
+            asDesc.usage = [.refit]
             let sizes = device.accelerationStructureSizes(descriptor: asDesc)
-            if entityAccelerationStructure == nil || entityASSize < sizes.accelerationStructureSize {
+            let topologyChanged = entityASTopologySignature != topologySignature
+            let vertexUnchanged = entityASVertexSignature == vertexSignature
+            let needsNewAllocation = entityAccelerationStructure == nil || entityASSize < sizes.accelerationStructureSize
+            if !needsNewAllocation,
+               !topologyChanged,
+               vertexUnchanged,
+               entityAccelerationStructure != nil {
+                perfFrame?.entityASSkipped = true
+                entityASSkipLogCounter &+= 1
+                if entityASSkipLogCounter == 1 || entityASSkipLogCounter % 120 == 0 {
+                    print("[RT] skipped entity AS rebuild: slot=\(entityASBufferSlot) vertices=\(vertexCount) indices=\(indexCount)")
+                }
+                return entityAccelerationStructure
+            }
+            if needsNewAllocation {
                 entityAccelerationStructure = device.makeAccelerationStructure(size: sizes.accelerationStructureSize)
                 entityAccelerationStructure?.label = "Q3.RT.entityAS"
                 entityASSize = sizes.accelerationStructureSize
             }
+            entityASDynamicFrameSerial &+= 1
+            let canRefit = !needsNewAllocation &&
+                           !topologyChanged &&
+                           entityAccelerationStructure != nil &&
+                           entityASDynamicFrameSerial % 2 == 0
+            let scratchLength = canRefit ? sizes.refitScratchBufferSize : sizes.buildScratchBufferSize
             guard let accel = entityAccelerationStructure,
-                  let scratch = device.makeBuffer(length: sizes.buildScratchBufferSize, options: .storageModePrivate),
+                  let scratch = device.makeBuffer(length: max(1, scratchLength), options: .storageModePrivate),
                   let enc = commandBuffer.makeAccelerationStructureCommandEncoder() else {
                 return nil
             }
-            scratch.label = "Q3.RT.entityAS.scratch"
-            enc.label = "Q3.RT.buildEntityAS"
-            enc.build(accelerationStructure: accel,
-                      descriptor: asDesc,
-                      scratchBuffer: scratch,
-                      scratchBufferOffset: 0)
+            scratch.label = canRefit ? "Q3.RT.entityAS.refitScratch" : "Q3.RT.entityAS.scratch"
+            if canRefit {
+                enc.label = "Q3.RT.refitEntityAS"
+                if #available(iOS 16.0, macOS 13.0, tvOS 16.0, *) {
+                    enc.refit(sourceAccelerationStructure: accel,
+                              descriptor: asDesc,
+                              destinationAccelerationStructure: accel,
+                              scratchBuffer: scratch,
+                              scratchBufferOffset: 0,
+                              options: .vertexData)
+                } else {
+                    enc.refit(sourceAccelerationStructure: accel,
+                              descriptor: asDesc,
+                              destinationAccelerationStructure: accel,
+                              scratchBuffer: scratch,
+                              scratchBufferOffset: 0)
+                }
+                perfFrame?.entityASRefit = true
+            } else {
+                enc.label = "Q3.RT.buildEntityAS"
+                enc.build(accelerationStructure: accel,
+                          descriptor: asDesc,
+                          scratchBuffer: scratch,
+                          scratchBufferOffset: 0)
+                perfFrame?.entityASBuilt = true
+            }
             enc.endEncoding()
-            perfFrame?.entityASBuilt = true
+            entityASBufferSlot = clampedSlot
+            entityASTopologySignature = topologySignature
+            entityASVertexSignature = vertexSignature
             entityASLogCounter &+= 1
-            if entityASLogCounter == 1 || entityASLogCounter % 120 == 0 {
+            if !canRefit && (entityASLogCounter == 1 || entityASLogCounter % 120 == 0) {
                 print("[RT] built entity AS: slot=\(clampedSlot) vertices=\(vertexCount) indices=\(indexCount) tris=\(indexCount / 3) size=\(sizes.accelerationStructureSize)")
+            }
+            if canRefit {
+                entityASRefitLogCounter &+= 1
+                if entityASRefitLogCounter == 1 || entityASRefitLogCounter % 120 == 0 {
+                    print("[RT] refit entity AS: slot=\(clampedSlot) vertices=\(vertexCount) indices=\(indexCount) tris=\(indexCount / 3) size=\(sizes.accelerationStructureSize)")
+                }
             }
             return accel
         }
