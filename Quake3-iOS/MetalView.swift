@@ -397,7 +397,7 @@ struct MetalView: UIViewRepresentable {
             var cameraRight: SIMD4<Float>
             var cameraUp: SIMD4<Float>
             var jitterNearFar: SIMD4<Float> // xy=jitter, z=near, w=far
-            var fovParams: SIMD4<Float>     // x=tanHalfFovX, y=tanHalfFovY, z=time
+            var fovParams: SIMD4<Float>     // x=tanHalfFovX, y=tanHalfFovY, z=time, w=entity AS mode
             var rtToneParams: SIMD4<Float>  // x=exposure, y=gamma exponent, z=ambient floor, w=normal mix
             var rtControlParams: SIMD4<Float> // x=resolutionScale, y=bounces, z=taaAlpha, w=taaEnabled
             // P1/P3 (must mirror MSL): x=lightCount, y=r_rt_light_scale,
@@ -448,6 +448,15 @@ struct MetalView: UIViewRepresentable {
             // the kernel should sample texTable.emissive[albedoSlot]. w = 0 keeps
             // the legacy additive-stage albedo fallback used by r_rt_emissive 0.
             var emissiveTintMode: SIMD4<Float> = SIMD4(1, 1, 1, 0)
+        }
+
+        struct RTEntityPrimitiveMaterial {
+            var albedoSlot: UInt32
+            var flags: UInt32
+            var _pad0: UInt32 = 0
+            var _pad1: UInt32 = 0
+            // xyz = normalized refEntity tint fallback; w reserved.
+            var color: SIMD4<Float> = SIMD4(1, 1, 1, 1)
         }
 
         struct WorldDrawUniforms {
@@ -4265,7 +4274,10 @@ struct MetalView: UIViewRepresentable {
         private var entityAccelerationStructure: MTLAccelerationStructure?
         private var entityASSize = 0
         private var entityASLogCounter: UInt64 = 0
+        private var entityASBufferSlot: Int = 0
         private var rtPrimitiveMaterialBuffer: MTLBuffer?
+        private var rtEntityPrimitiveMaterialBuffer: MTLBuffer?
+        private var rtEntityReflectionMaterialLogCounter: UInt64 = 0
         private var rtPrimitiveMaterialBufferCache: [UInt64: MTLBuffer] = [:]
         private let rtMaxAlbedoSlots = 176
         private let rtMaxLightmapSlots = 64
@@ -5269,6 +5281,21 @@ struct MetalView: UIViewRepresentable {
                 float4 emissiveTintMode; // xyz=tint, w=1 sample texTable.emissive[albedoSlot]
             };
 
+            struct RTEntityPrimitiveMaterial {
+                uint albedoSlot;
+                uint flags; // bit0=valid, bit1=sample albedo slot
+                uint _pad0;
+                uint _pad1;
+                float4 color;
+            };
+
+            struct RTEntityVertex {
+                float3 position;
+                float2 texCoord;
+                float4 color;
+                float3 normal;
+            };
+
             // Step 2a: RT texture table moved into an argument buffer so the
             // 128 direct-binding limit no longer caps the table. Albedo gets
             // [[id(0..175)]], lightmap [[id(176..239)]], then sidecars.
@@ -5367,6 +5394,56 @@ struct MetalView: UIViewRepresentable {
                 return normalize(tangent * cos(phi) * sinTheta + bitangent * sin(phi) * sinTheta + n * cosTheta);
             }
 
+            float3 rtShadeEntityReflection(uint primitiveID,
+                                           float hitDistance,
+                                           float3 rayOrigin,
+                                           float3 rayDir,
+                                           float2 bary,
+                                           const device uint *entityIndices,
+                                           const device RTEntityVertex *entityVertices,
+                                           const device RTEntityPrimitiveMaterial *entityMaterials,
+                                           const device RTTexTable& texTable,
+                                           sampler textureSampler) {
+                RTEntityPrimitiveMaterial mat = entityMaterials[primitiveID];
+                if ((mat.flags & 1u) == 0u) {
+                    return float3(0.03);
+                }
+                uint i0 = entityIndices[primitiveID * 3u + 0u];
+                uint i1 = entityIndices[primitiveID * 3u + 1u];
+                uint i2 = entityIndices[primitiveID * 3u + 2u];
+                float w = 1.0 - bary.x - bary.y;
+                float2 uv = entityVertices[i0].texCoord * w +
+                            entityVertices[i1].texCoord * bary.x +
+                            entityVertices[i2].texCoord * bary.y;
+                float3 c = entityVertices[i0].color.rgb * w +
+                           entityVertices[i1].color.rgb * bary.x +
+                           entityVertices[i2].color.rgb * bary.y;
+                float3 tint = max(mat.color.rgb, float3(0.0));
+                if (dot(tint, tint) < 1.0e-6) { tint = float3(1.0); }
+                float4 texel = float4(1.0);
+                if ((mat.flags & 2u) != 0u && mat.albedoSlot < 176u) {
+                    texel = texTable.albedo[mat.albedoSlot].sample(textureSampler, uv);
+                }
+                float3 N = entityVertices[i0].normal * w +
+                           entityVertices[i1].normal * bary.x +
+                           entityVertices[i2].normal * bary.y;
+                if (dot(N, N) < 1.0e-6) {
+                    float3 p0 = entityVertices[i0].position;
+                    float3 p1 = entityVertices[i1].position;
+                    float3 p2 = entityVertices[i2].position;
+                    N = cross(p1 - p0, p2 - p0);
+                }
+                if (dot(N, N) > 1.0e-6) {
+                    N = normalize(N);
+                } else {
+                    N = normalize(-rayDir);
+                }
+                float facing = 0.35 + 0.65 * saturate(abs(dot(N, -rayDir)));
+                float alpha = saturate(texel.a);
+                float3 albedo = texel.rgb * max(c, float3(0.08)) * tint;
+                return max(albedo * facing * max(alpha, 0.15), float3(0.01));
+            }
+
             kernel void rtKernel(texture2d<float, access::write> output [[texture(0)]],
                                  texturecube<float> envCube [[texture(1)]],
                                  texture2d<float, access::write> gNormal [[texture(2)]],
@@ -5385,6 +5462,9 @@ struct MetalView: UIViewRepresentable {
                                  const device RTLight *rtLights [[buffer(6)]],
                                  device atomic_uint *rtShadowCounters [[buffer(7)]],
                                  const device RTEmissiveLight *rtEmissiveLights [[buffer(9)]],
+                                 const device uint *entityIndices [[buffer(10)]],
+                                 const device RTEntityVertex *entityVertices [[buffer(11)]],
+                                 const device RTEntityPrimitiveMaterial *entityPrimitiveMaterials [[buffer(12)]],
                                  uint2 tid [[thread_position_in_grid]]) {
                 if (tid.x >= output.get_width() || tid.y >= output.get_height()) return;
                 float2 curUv = (float2(tid) + 0.5) / float2(output.get_width(), output.get_height());
@@ -5407,10 +5487,16 @@ struct MetalView: UIViewRepresentable {
                 // iOS toolchain update.
                 intersector<triangle_data> i;
                 auto hit = i.intersect(r, worldAS);
-                auto entityHit = i.intersect(r, entityAS);
-                bool useEntityHit = uniforms.fovParams.w > 0.5 &&
-                                    entityHit.type == intersection_type::triangle &&
-                                    (hit.type != intersection_type::triangle || entityHit.distance < hit.distance);
+                float entityASMode = round(uniforms.fovParams.w);
+                bool entityPrimaryEnabled = (entityASMode == 1.0 || entityASMode == 3.0);
+                bool entityReflectionEnabled = (entityASMode == 2.0 || entityASMode == 3.0);
+                auto entityHit = hit;
+                bool useEntityHit = false;
+                if (entityPrimaryEnabled) {
+                    entityHit = i.intersect(r, entityAS);
+                    useEntityHit = entityHit.type == intersection_type::triangle &&
+                        (hit.type != intersection_type::triangle || entityHit.distance < hit.distance);
+                }
 
                 float3 color;
                 float outputAlpha = 1.0;
@@ -5894,67 +5980,91 @@ struct MetalView: UIViewRepresentable {
                                     ray rray(hitPos + N * 0.75, R, 0.1, 20000.0);
                                     auto rh = i.intersect(rray, worldAS);
                                     float3 reflColor;
-                                    if (rh.type == intersection_type::triangle) {
-                                        uint rtri = rh.primitive_id;
-                                        RTPrimitiveMaterial rmat = primitiveMaterials[rtri];
-                                        float3 reflHitOrigin = hitPos + N * 0.75;
-                                        float3 reflHitPos = reflHitOrigin + R * rh.distance;
-                                        if (rmat.albedoSlot < 176) {
-                                            uint ri0 = indices[rtri * 3 + 0];
-                                            uint ri1 = indices[rtri * 3 + 1];
-                                            uint ri2 = indices[rtri * 3 + 2];
-                                            float2 rb = rh.triangle_barycentric_coord;
-                                            float rw = 1.0 - rb.x - rb.y;
-                                            float2 ruv = vertices[ri0].texCoord * rw +
-                                                         vertices[ri1].texCoord * rb.x +
-                                                         vertices[ri2].texCoord * rb.y;
-                                            float2 rlm = vertices[ri0].lightmapTexCoord * rw +
-                                                         vertices[ri1].lightmapTexCoord * rb.x +
-                                                         vertices[ri2].lightmapTexCoord * rb.y;
-                                            uint rtcCount = min(rmat.tcModCount, 4u);
-                                            for (uint mi = 0; mi < rtcCount; ++mi) {
-                                                uint rtype = rmat.tcModTypes[mi];
-                                                if (rtype == 0) { continue; }
-                                                float4 rparams = rmat.tcModParams0;
-                                                if (mi == 1) { rparams = rmat.tcModParams1; }
-                                                else if (mi == 2) { rparams = rmat.tcModParams2; }
-                                                else if (mi == 3) { rparams = rmat.tcModParams3; }
-                                                ruv = rtApplyTcMod(ruv, reflHitPos, int(rtype), rparams, uniforms.fovParams.z);
-                                                rlm = rtApplyTcMod(rlm, reflHitPos, int(rtype), rparams, uniforms.fovParams.z);
-                                            }
-                                            if (rmat.spriteAtlasParams.x > 0.5) {
-                                                float rCols = rmat.spriteAtlasParams.x;
-                                                float rRows = rmat.spriteAtlasParams.y;
-                                                float rFps = rmat.spriteAtlasParams.z;
-                                                float rTotal = max(1.0, rCols * rRows);
-                                                float rFrame = (rFps > 0.0) ? floor(uniforms.fovParams.z * rFps) : 0.0;
-                                                float rIdx = fmod(rFrame, rTotal);
-                                                if (rIdx < 0.0) { rIdx += rTotal; }
-                                                float rCol = fmod(rIdx, rCols);
-                                                float rRow = floor(rIdx / rCols);
-                                                float2 rLocalUV = fract(ruv);
-                                                ruv = float2((rLocalUV.x + rCol) / rCols,
-                                                             (rLocalUV.y + rRow) / rRows);
-                                            }
-                                            float3 ralb = texTable.albedo[rmat.albedoSlot].sample(repeatSampler, ruv).rgb;
-                                            float3 rlight = float3(1.0);
-                                            if (rmat.lightmapSlot < 64) {
-                                                rlight = texTable.lightmap[rmat.lightmapSlot].sample(clampSampler, rlm).rgb;
-                                            }
-                                            reflColor = ralb * max(rlight * 1.25, float3(uniforms.rtToneParams.z));
-                                            if (rmat.materialFlags.y != 0) {
-                                                float3 remitSample = rtEmissionSample(texTable, rmat, ralb, repeatSampler, ruv);
-                                                reflColor += remitSample * rmat.materialParams.x;
+                                    bool useEntityReflectionHit = false;
+                                    if (entityReflectionEnabled) {
+                                        auto erh = i.intersect(rray, entityAS);
+                                        useEntityReflectionHit = erh.type == intersection_type::triangle;
+                                        if (useEntityReflectionHit) {
+                                            RTEntityPrimitiveMaterial emat = entityPrimitiveMaterials[erh.primitive_id];
+                                            useEntityReflectionHit = ((emat.flags & 1u) != 0u) &&
+                                                (rh.type != intersection_type::triangle || erh.distance < rh.distance);
+                                        }
+                                        if (useEntityReflectionHit) {
+                                            reflColor = rtShadeEntityReflection(erh.primitive_id,
+                                                                                erh.distance,
+                                                                                hitPos + N * 0.75,
+                                                                                R,
+                                                                                erh.triangle_barycentric_coord,
+                                                                                entityIndices,
+                                                                                entityVertices,
+                                                                                entityPrimitiveMaterials,
+                                                                                texTable,
+                                                                                repeatSampler);
+                                        }
+                                    }
+                                    if (!useEntityReflectionHit) {
+                                        if (rh.type == intersection_type::triangle) {
+                                            uint rtri = rh.primitive_id;
+                                            RTPrimitiveMaterial rmat = primitiveMaterials[rtri];
+                                            float3 reflHitOrigin = hitPos + N * 0.75;
+                                            float3 reflHitPos = reflHitOrigin + R * rh.distance;
+                                            if (rmat.albedoSlot < 176) {
+                                                uint ri0 = indices[rtri * 3 + 0];
+                                                uint ri1 = indices[rtri * 3 + 1];
+                                                uint ri2 = indices[rtri * 3 + 2];
+                                                float2 rb = rh.triangle_barycentric_coord;
+                                                float rw = 1.0 - rb.x - rb.y;
+                                                float2 ruv = vertices[ri0].texCoord * rw +
+                                                             vertices[ri1].texCoord * rb.x +
+                                                             vertices[ri2].texCoord * rb.y;
+                                                float2 rlm = vertices[ri0].lightmapTexCoord * rw +
+                                                             vertices[ri1].lightmapTexCoord * rb.x +
+                                                             vertices[ri2].lightmapTexCoord * rb.y;
+                                                uint rtcCount = min(rmat.tcModCount, 4u);
+                                                for (uint mi = 0; mi < rtcCount; ++mi) {
+                                                    uint rtype = rmat.tcModTypes[mi];
+                                                    if (rtype == 0) { continue; }
+                                                    float4 rparams = rmat.tcModParams0;
+                                                    if (mi == 1) { rparams = rmat.tcModParams1; }
+                                                    else if (mi == 2) { rparams = rmat.tcModParams2; }
+                                                    else if (mi == 3) { rparams = rmat.tcModParams3; }
+                                                    ruv = rtApplyTcMod(ruv, reflHitPos, int(rtype), rparams, uniforms.fovParams.z);
+                                                    rlm = rtApplyTcMod(rlm, reflHitPos, int(rtype), rparams, uniforms.fovParams.z);
+                                                }
+                                                if (rmat.spriteAtlasParams.x > 0.5) {
+                                                    float rCols = rmat.spriteAtlasParams.x;
+                                                    float rRows = rmat.spriteAtlasParams.y;
+                                                    float rFps = rmat.spriteAtlasParams.z;
+                                                    float rTotal = max(1.0, rCols * rRows);
+                                                    float rFrame = (rFps > 0.0) ? floor(uniforms.fovParams.z * rFps) : 0.0;
+                                                    float rIdx = fmod(rFrame, rTotal);
+                                                    if (rIdx < 0.0) { rIdx += rTotal; }
+                                                    float rCol = fmod(rIdx, rCols);
+                                                    float rRow = floor(rIdx / rCols);
+                                                    float2 rLocalUV = fract(ruv);
+                                                    ruv = float2((rLocalUV.x + rCol) / rCols,
+                                                                 (rLocalUV.y + rRow) / rRows);
+                                                }
+                                                float3 ralb = texTable.albedo[rmat.albedoSlot].sample(repeatSampler, ruv).rgb;
+                                                float3 rlight = float3(1.0);
+                                                if (rmat.lightmapSlot < 64) {
+                                                    rlight = texTable.lightmap[rmat.lightmapSlot].sample(clampSampler, rlm).rgb;
+                                                }
+                                                reflColor = ralb * max(rlight * 1.25, float3(uniforms.rtToneParams.z));
+                                                if (rmat.materialFlags.y != 0) {
+                                                    float3 remitSample = rtEmissionSample(texTable, rmat, ralb, repeatSampler, ruv);
+                                                    reflColor += remitSample * rmat.materialParams.x;
+                                                }
+                                            } else if (!is_null_texture(envCube)) {
+                                                reflColor = envCube.sample(envSampler, R).rgb;
+                                            } else {
+                                                reflColor = float3(0.03);
                                             }
                                         } else if (!is_null_texture(envCube)) {
                                             reflColor = envCube.sample(envSampler, R).rgb;
                                         } else {
                                             reflColor = float3(0.03);
                                         }
-                                    } else if (!is_null_texture(envCube)) {
-                                        reflColor = envCube.sample(envSampler, R).rgb;
-                                    } else {
-                                        reflColor = float3(0.03);
                                     }
                                     // Fresnel-Schlick; F0 0.04 dielectric → albedo for metal.
                                     float ndv = max(dot(N, V), 0.0);
@@ -6728,12 +6838,13 @@ struct MetalView: UIViewRepresentable {
         private func encodeEntityAccelerationStructureBuild(device: MTLDevice,
                                                             commandBuffer: MTLCommandBuffer,
                                                             slot: Int) -> MTLAccelerationStructure? {
-            guard Q3_RTEntities() != 0 else {
+            guard Q3_RTEntities() != 0 || Q3_RTEntityReflections() != 0 else {
                 entityAccelerationStructure = nil
                 entityASSize = 0
                 return nil
             }
             let clampedSlot = max(0, min(slot, Self.maxInflightFrames - 1))
+            entityASBufferSlot = clampedSlot
             guard device.supportsRaytracing,
                   let snapshot = Q3MetalRenderer_GetFrameSnapshot()?.pointee,
                   let vb = entityVertexBuffers[clampedSlot],
@@ -6786,6 +6897,100 @@ struct MetalView: UIViewRepresentable {
                 print("[RT] built entity AS: slot=\(clampedSlot) vertices=\(vertexCount) indices=\(indexCount) tris=\(indexCount / 3) size=\(sizes.accelerationStructureSize)")
             }
             return accel
+        }
+
+        @MainActor
+        private func rtAlbedoSlotForEntityHandle(_ handle: UInt32, device: MTLDevice) -> UInt32 {
+            let invalid = UInt32.max
+            guard handle != 0 else { return invalid }
+            if let existing = rtAlbedoHandles.firstIndex(of: handle) {
+                return UInt32(existing)
+            }
+            guard let spare = rtAlbedoHandles.firstIndex(of: 0) else {
+                return invalid
+            }
+            rtAlbedoHandles[spare] = handle
+            _ = texture(for: handle, device: device)
+            return UInt32(spare)
+        }
+
+        @MainActor
+        private func buildRTEntityPrimitiveMaterials(device: MTLDevice,
+                                                     active: Bool) -> MTLBuffer? {
+            guard active,
+                  let snapshot = Q3MetalRenderer_GetFrameSnapshot()?.pointee,
+                  let drawsPtr = Q3MetalRenderer_GetEntityDrawCommands() else {
+                rtEntityPrimitiveMaterialBuffer = nil
+                return nil
+            }
+            let entityIndexCount = Int(snapshot.entityIndexCount)
+            let entityDrawCount = Int(snapshot.entityCommandCount)
+            let primitiveCount = entityIndexCount / 3
+            guard primitiveCount > 0, entityDrawCount > 0 else {
+                rtEntityPrimitiveMaterialBuffer = nil
+                return nil
+            }
+            let bufferLength = primitiveCount * MemoryLayout<RTEntityPrimitiveMaterial>.stride
+            guard let buffer = device.makeBuffer(length: max(1, bufferLength), options: .storageModeShared) else {
+                rtEntityPrimitiveMaterialBuffer = nil
+                return nil
+            }
+            buffer.label = "Q3.RT.entityPrimitiveMaterials"
+            let invalid = UInt32.max
+            let invalidMaterial = RTEntityPrimitiveMaterial(
+                albedoSlot: invalid,
+                flags: 0,
+                _pad0: 0,
+                _pad1: 0,
+                color: SIMD4<Float>(1, 1, 1, 1))
+            let materials = buffer.contents().bindMemory(to: RTEntityPrimitiveMaterial.self,
+                                                          capacity: primitiveCount)
+            for i in 0..<primitiveCount {
+                materials[i] = invalidMaterial
+            }
+
+            let draws = UnsafeBufferPointer(start: drawsPtr, count: entityDrawCount)
+            let additiveBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE)
+            let additiveFullBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE_FULL)
+            let alphaBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ALPHA)
+            let filterBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_FILTER)
+            let subtractBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_SUBTRACT)
+            let thirdPersonBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_THIRD_PERSON)
+            let nonOpaqueMask = additiveBit | additiveFullBit | alphaBit | filterBit | subtractBit
+            var assignedTriangles = 0
+            var assignedHandles = Set<UInt32>()
+            assignedHandles.reserveCapacity(min(entityDrawCount, 64))
+
+            for draw in draws where draw.indexCount >= 3 {
+                if (draw.flags & nonOpaqueMask) != 0 { continue }
+                if (draw.flags & thirdPersonBit) != 0 { continue }
+                let triFirst = Int(draw.firstIndex / 3)
+                let triCount = Int(draw.indexCount / 3)
+                guard triFirst >= 0, triCount > 0, triFirst < primitiveCount else { continue }
+                let triEnd = min(primitiveCount, triFirst + triCount)
+                let slot = rtAlbedoSlotForEntityHandle(draw.textureHandle, device: device)
+                var flags: UInt32 = 1
+                if slot != invalid { flags |= 2 }
+                let ec = draw.entityColor
+                let material = RTEntityPrimitiveMaterial(
+                    albedoSlot: slot,
+                    flags: flags,
+                    _pad0: 0,
+                    _pad1: 0,
+                    color: SIMD4<Float>(ec.0, ec.1, ec.2, ec.3))
+                for tri in triFirst..<triEnd {
+                    materials[tri] = material
+                }
+                assignedTriangles += triEnd - triFirst
+                if draw.textureHandle != 0 { assignedHandles.insert(draw.textureHandle) }
+            }
+
+            rtEntityPrimitiveMaterialBuffer = buffer
+            rtEntityReflectionMaterialLogCounter &+= 1
+            if rtEntityReflectionMaterialLogCounter == 1 || rtEntityReflectionMaterialLogCounter % 120 == 0 {
+                print("[RT] entity reflection materials tris=\(assignedTriangles)/\(primitiveCount) handles=\(assignedHandles.count)")
+            }
+            return assignedTriangles > 0 ? buffer : nil
         }
 
         @MainActor
@@ -7515,6 +7720,36 @@ struct MetalView: UIViewRepresentable {
                 ? SIMD2<Float>((halton(rtJitterFrame, 2) - 0.5) / Float(max(traceW, 1)),
                                (halton(rtJitterFrame, 3) - 0.5) / Float(max(traceH, 1)))
                 : SIMD2<Float>(0, 0)
+            let entityASAvailable = entityAccelerationStructure != nil
+            let entityPrimaryRequested = Q3_RTEntities() != 0
+            let entityReflectionRequested = Q3_RTEntityReflections() != 0
+            var entityASMode: Float = 0
+            var entityPrimitiveMaterialBufferForRT: MTLBuffer? = nil
+            let entitySlot = max(0, min(entityASBufferSlot, Self.maxInflightFrames - 1))
+            let entityIndexBufferForRT = entityIndexBuffers[entitySlot]
+            let entityVertexBufferForRT = entityVertexBuffers[entitySlot]
+            var entityReflectionActive = entityASAvailable &&
+                                         entityReflectionRequested &&
+                                         entityIndexBufferForRT != nil &&
+                                         entityVertexBufferForRT != nil
+            if entityReflectionActive {
+                entityPrimitiveMaterialBufferForRT = buildRTEntityPrimitiveMaterials(device: device,
+                                                                                     active: true)
+                if entityPrimitiveMaterialBufferForRT == nil {
+                    entityReflectionActive = false
+                }
+            } else {
+                _ = buildRTEntityPrimitiveMaterials(device: device, active: false)
+            }
+            if entityASAvailable {
+                if entityPrimaryRequested && entityReflectionActive {
+                    entityASMode = 3
+                } else if entityPrimaryRequested {
+                    entityASMode = 1
+                } else if entityReflectionActive {
+                    entityASMode = 2
+                }
+            }
             var uniforms = RayTracingUniforms(viewProjection: viewProj,
                                               invViewProjection: simd_inverse(viewProj),
                                               cameraPos: SIMD4<Float>(cameraPos.x, cameraPos.y, cameraPos.z, 0),
@@ -7522,7 +7757,7 @@ struct MetalView: UIViewRepresentable {
                                               cameraRight: SIMD4<Float>(right.x, right.y, right.z, 0),
                                               cameraUp: SIMD4<Float>(up.x, up.y, up.z, 0),
                                               jitterNearFar: SIMD4<Float>(jitter.x, jitter.y, 4.0, 8192.0),
-                                              fovParams: SIMD4<Float>(tan(sceneView.fovX * .pi / 360.0), tan(sceneView.fovY * .pi / 360.0), Float(CACurrentMediaTime() - frameTimeOrigin), (entityAccelerationStructure == nil || Q3_RTEntities() == 0) ? 0 : 1),
+                                              fovParams: SIMD4<Float>(tan(sceneView.fovX * .pi / 360.0), tan(sceneView.fovY * .pi / 360.0), Float(CACurrentMediaTime() - frameTimeOrigin), entityASMode),
                                               rtToneParams: SIMD4<Float>(Q3_RTExposure(), Q3_RTGamma(), Q3_RTAmbient(), Q3_RTNormalMix()),
                                               rtControlParams: SIMD4<Float>(rtResolutionScale, rtBounceCount, rtTAAAlpha, temporalSamplingEnabled ? 1.0 : 0.0))
             // P1/P3: per-map authored light set + reflection controls.
@@ -7691,6 +7926,9 @@ struct MetalView: UIViewRepresentable {
                 enc.setBuffer(lightInfo.buffer, offset: 0, index: 6)
                 enc.setBuffer(shadowCounterBuffer, offset: 0, index: 7)
                 enc.setBuffer(emissiveInfo.buffer, offset: 0, index: 9)
+                enc.setBuffer(entityIndexBufferForRT ?? rtASIndexBuffer, offset: 0, index: 10)
+                enc.setBuffer(entityVertexBufferForRT ?? rtASVertexBuffer, offset: 0, index: 11)
+                enc.setBuffer(entityPrimitiveMaterialBufferForRT ?? primitiveMaterialBuffer, offset: 0, index: 12)
                 enc.dispatchThreadgroups(traceGroups, threadsPerThreadgroup: tg)
                 if let rtDenoiseFence {
                     enc.updateFence(rtDenoiseFence)

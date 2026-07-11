@@ -261,6 +261,10 @@ int   Q3_RTDebugGBuffer(void);
  * 0=off, 1=raw albedo, 2=sampled lightmap, 3=material slot, 4=normal. */
 int   Q3_RTDebugView(void);
 int   Q3_RTEntities(void);
+/* Stage56: secondary-ray-only entity reflections. Default/off = no-op.
+ * When enabled, Swift may build the entity AS for reflection rays while
+ * primary RT visibility still ignores entities unless Q3_RTEntities() is on. */
+int   Q3_RTEntityReflections(void);
 /* P0.2 — RT composite entity preservation (see
  * docs/2026-06-10-rt-gap-analysis-vs-rtx-remix.md).
  * Q3_RTPreserveEntities: 1 (default) = composite before entity/HUD passes

@@ -12120,6 +12120,15 @@ int Q3_RTEntities(void) {
     return (cv && cv->integer != 0) ? 1 : 0;
 }
 
+int Q3_RTEntityReflections(void) {
+    if (ri.Cvar_Get == NULL) return 0;
+    /* Stage56 feature spike: default OFF. 1 builds/samples the entity AS for
+     * secondary reflection rays only; primary RT entity visibility remains
+     * governed by r_rt_entities so preserved raster compositing is untouched. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_entity_reflections", "0", CVAR_ARCHIVE);
+    return (cv && cv->integer != 0) ? 1 : 0;
+}
+
 int Q3_RTPreserveEntities(void) {
     if (ri.Cvar_Get == NULL) return 1;
     /* 1 (default): RT composite is encoded BEFORE the raster entity/HUD
