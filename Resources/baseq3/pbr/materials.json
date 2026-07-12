@@ -28667,55 +28667,6 @@
       "source": "lmstudio",
       "sourceTexture": "textures/base_wall/metaltech08final"
     },
-    "textures/base_wall/metaltech12darkfinal": {
-      "albedo": "assets/ingested/AE62F56762C83861_albedo.a.rtex.dds",
-      "aliasOf": "textures/base_wall/metaltech12final",
-      "emissive": null,
-      "emissive_color": null,
-      "emissive_intensity": null,
-      "gamePath": "textures/base_wall/metaltech12darkfinal",
-      "hash": "AE62F56762C83861",
-      "height": "assets/ingested/AE62F56762C83861_height.h.rtex.dds",
-      "inMaterialTable": true,
-      "matchScore": 0.9866,
-      "metallic": null,
-      "normal": "assets/ingested/AE62F56762C83861_normal_OTH_Normal.n.rtex.dds",
-      "roughness": null,
-      "source": "capture",
-      "sourceTexture": "textures/base_wall/metaltech12darkfinal"
-    },
-    "textures/base_wall/metaltech12darkfinal.tga": {
-      "albedo": "assets/ingested/AE62F56762C83861_albedo.a.rtex.dds",
-      "aliasOf": "textures/base_wall/metaltech12final",
-      "emissive": null,
-      "emissive_color": null,
-      "emissive_intensity": null,
-      "gamePath": "textures/base_wall/metaltech12darkfinal",
-      "hash": "AE62F56762C83861",
-      "height": "assets/ingested/AE62F56762C83861_height.h.rtex.dds",
-      "inMaterialTable": true,
-      "matchScore": 0.9866,
-      "metallic": null,
-      "normal": "assets/ingested/AE62F56762C83861_normal_OTH_Normal.n.rtex.dds",
-      "roughness": null,
-      "source": "capture",
-      "sourceTexture": "textures/base_wall/metaltech12darkfinal.tga"
-    },
-    "textures/base_wall/metaltech12final": {
-      "albedo": "assets/ingested/AE62F56762C83861_albedo.a.rtex.dds",
-      "emissive": null,
-      "emissive_color": null,
-      "emissive_intensity": null,
-      "hash": "AE62F56762C83861",
-      "height": "assets/ingested/AE62F56762C83861_height.h.rtex.dds",
-      "inMaterialTable": true,
-      "matchScore": 0.9866,
-      "metallic": null,
-      "normal": "assets/ingested/AE62F56762C83861_normal_OTH_Normal.n.rtex.dds",
-      "roughness": null,
-      "source": "capture",
-      "sourceTexture": "textures/base_wall/metaltech12final.jpg"
-    },
     "textures/base_wall/metaltech13final": {
       "albedo": "assets/ingested/1D97F62E62772B4E_albedo.a.rtex.dds",
       "emissive": null,
@@ -36393,6 +36344,24 @@
       "metallic": null,
       "normal": null,
       "roughness": null
+    },
+    "textures/base_wall/patch10_beatup4_alpha": {
+      "albedo": "assets/ingested/205DD3FA1537B447_albedo.a.rtex.dds",
+      "emissive": null,
+      "emissive_color": null,
+      "emissive_intensity": null,
+      "hash": "205DD3FA1537B447",
+      "height": "assets/ingested/205DD3FA1537B447_height.h.rtex.dds",
+      "inMaterialTable": true,
+      "matchScore": 0.9903,
+      "metallic": null,
+      "normal": "assets/ingested/205DD3FA1537B447_normal_OTH_Normal.n.rtex.dds",
+      "roughness": null,
+      "source": "verified_alias",
+      "sourceTexture": "textures/base_wall/patch10_beatup4_alpha.tga",
+      "_comment": "Stage70: verified alias for patch10shiny stage image; pak0 shader maps patch10_beatup4_alpha.tga, source PBR entry is patch10_beatup4.jpg. Correct DDS opened from assets/ingested before aliasing.",
+      "aliasOf": "textures/base_wall/patch10_beatup4",
+      "gamePath": "textures/base_wall/patch10_beatup4_alpha"
     }
   },
   "metadata": {
@@ -36438,8 +36407,16 @@
       "source": "/Volumes/d$/export_for_mac"
     },
     "recovered_auto": 16,
-    "total_named": 860,
-    "with_pbr_material": 762
+    "total_named": 857,
+    "with_pbr_material": 762,
+    "stage70_removed_bad_nv15_albedo_entries": [
+      "textures/base_wall/metaltech12darkfinal",
+      "textures/base_wall/metaltech12darkfinal.tga",
+      "textures/base_wall/metaltech12final"
+    ],
+    "stage70_added_verified_aliases": [
+      "textures/base_wall/patch10_beatup4_alpha"
+    ]
   },
   "source": "<bundled>"
 }
