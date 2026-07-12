@@ -6740,14 +6740,27 @@ struct MetalView: UIViewRepresentable {
             }
 
             kernel void accumulateRT(texture2d<float, access::read> current [[texture(0)]],
-                                     texture2d<float, access::read> history [[texture(1)]],
+                                     texture2d<float, access::sample> history [[texture(1)]],
                                      texture2d<float, access::write> output [[texture(2)]],
+                                     texture2d<float, access::read> motion [[texture(3)]],
                                      constant float &alpha [[buffer(0)]],
                                      uint2 tid [[thread_position_in_grid]]) {
                 if (tid.x >= output.get_width() || tid.y >= output.get_height()) return;
                 float4 c = current.read(tid);
-                float4 h = history.read(tid);
                 float a = saturate(alpha);
+                float2 dims = float2(output.get_width(), output.get_height());
+                float2 uv = (float2(tid) + 0.5) / dims;
+                // Stage 17 motion is UV-space cur-prev, so previous history lives at cur-motion.
+                float2 mv = motion.read(tid).xy;
+                float2 prevUv = uv - mv;
+                bool historyInside = all(prevUv >= float2(0.0)) && all(prevUv <= float2(1.0));
+                if (!historyInside) { a = 1.0; }
+                // Low alpha is needed at rest for 1spp GI convergence; raise current weight
+                // during camera motion so disocclusions do not turn into visible trails.
+                float motionPixels = length(mv * dims);
+                a = max(a, saturate((motionPixels - 0.5) / 12.0) * 0.10);
+                constexpr sampler historySampler(filter::linear, address::clamp_to_edge);
+                float4 h = history.sample(historySampler, saturate(prevUv));
                 float3 rgb = mix(h.rgb, c.rgb, a);
                 output.write(float4(rgb, c.a), tid);
             }
@@ -8426,9 +8439,6 @@ struct MetalView: UIViewRepresentable {
             let forwardNorm = forward / forwardLen
             var gbufferCut = false
             if let lastPos = rtLastCameraPos, let lastForward = rtLastCameraForward {
-                let moved = simd_length_squared(cameraPos - lastPos) > 0.25
-                let turned = simd_dot(forwardNorm, lastForward) < 0.9995
-                if !rtDenoiseActive && (moved || turned) { rtHistoryValid = false }
                 // Stage 17 G-buffer MVs should persist through normal camera
                 // motion; only true cuts/teleports reset prev=current so MV=0.
                 gbufferCut = simd_length_squared(cameraPos - lastPos) > (256.0 * 256.0) ||
@@ -8438,6 +8448,9 @@ struct MetalView: UIViewRepresentable {
             rtLastCameraForward = forwardNorm
             let prevGeneration = rtPrevViewProjectionWorldGeneration
             let generationChanged = prevGeneration.map { $0 != worldGeneration } ?? false
+            if !rtDenoiseActive && (gbufferCut || generationChanged) {
+                rtHistoryValid = false
+            }
             let prevWasMissing = rtPrevViewProjection == nil
             let forcePrevCurrentForMV = prevWasMissing || gbufferCut || generationChanged
             let prevViewProjectionForMV = forcePrevCurrentForMV ? viewProj : (rtPrevViewProjection ?? viewProj)
@@ -8752,6 +8765,7 @@ struct MetalView: UIViewRepresentable {
                     enc.setTexture(rtTex, index: 0)
                     enc.setTexture(historyTex, index: 1)
                     enc.setTexture(accumTex, index: 2)
+                    enc.setTexture(motionTex, index: 3)
                     enc.setBytes(&accumAlpha, length: MemoryLayout<Float>.stride, index: 0)
                     enc.dispatchThreadgroups(traceGroups, threadsPerThreadgroup: tg)
                     enc.endEncoding()
@@ -8775,6 +8789,7 @@ struct MetalView: UIViewRepresentable {
                 enc.setTexture(rtTex, index: 0)
                 enc.setTexture(historyTex, index: 1)
                 enc.setTexture(accumTex, index: 2)
+                enc.setTexture(motionTex, index: 3)
                 enc.setBytes(&accumAlpha, length: MemoryLayout<Float>.stride, index: 0)
                 enc.dispatchThreadgroups(traceGroups, threadsPerThreadgroup: tg)
                 enc.endEncoding()
