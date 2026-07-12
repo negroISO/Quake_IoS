@@ -272,6 +272,9 @@ float Q3_RTGICeiling(void);
 float Q3_RTTAA(void);
 int   Q3_SetRTTAA(int enabled);
 float Q3_RTTAAAlpha(void);
+/* Stage71: light upscale-domain sharpness compensation for RT+TAA only.
+ * Native/upscale-off, raster-only, and r_rt_taa 0 paths bind zero in Swift. */
+float Q3_RTTAASharpen(void);
 /* Stage 18 RT denoiser. 1 = MetalFX temporal denoised scaler path when
  * available; 0 = exact pre-Stage18 RT accumulate/upscale behavior. */
 int   Q3_RTDenoise(void);

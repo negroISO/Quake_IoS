@@ -12412,6 +12412,18 @@ float Q3_RTTAAAlpha(void) {
     return v;
 }
 
+float Q3_RTTAASharpen(void) {
+    if (ri.Cvar_Get == NULL) return 0.20f;
+    /* Stage71: light upscale-domain sharpening for the default RT+TAA path.
+     * Swift applies this only when r_rt_mix > 0, r_rt_taa is on, and the
+     * spatial upscale path is active; raster/native/TAA-off stay zero. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_taa_sharpen", "0.20", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.20f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    return v;
+}
+
 int Q3_RTDenoise(void) {
     if (ri.Cvar_Get == NULL) return 1;
     /* Stage 18: master denoiser toggle. 0 must preserve the pre-Stage18

@@ -5127,6 +5127,7 @@ struct MetalView: UIViewRepresentable {
             var exposureKey: Float
             var exposureHighlightLimit: Float
             var deltaTime: Float
+            var taaSharpen: Float
         }
 
         private struct RTBlendUniforms {
@@ -5153,6 +5154,7 @@ struct MetalView: UIViewRepresentable {
                 float exposureKey;
                 float exposureHighlightLimit;
                 float deltaTime;
+                float taaSharpen;
             };
 
             inline float q3_active_exposure(constant PPUniforms &u,
@@ -5283,6 +5285,20 @@ struct MetalView: UIViewRepresentable {
                 constexpr sampler s(filter::linear, address::clamp_to_edge);
                 float2 uv = (float2(tid) + 0.5) / float2(max(w, 1u), max(h, 1u));
                 float4 c = source.sample(s, uv);
+                float sharpen = saturate(u.taaSharpen);
+                if (sharpen > 0.001) {
+                    float2 texel = 1.0 / float2(max(source.get_width(), 1u),
+                                                max(source.get_height(), 1u));
+                    float3 c0 = c.rgb;
+                    float3 cL = source.sample(s, uv + float2(-texel.x, 0.0)).rgb;
+                    float3 cR = source.sample(s, uv + float2( texel.x, 0.0)).rgb;
+                    float3 cU = source.sample(s, uv + float2(0.0, -texel.y)).rgb;
+                    float3 cD = source.sample(s, uv + float2(0.0,  texel.y)).rgb;
+                    float3 boxMin = min(c0, min(min(cL, cR), min(cU, cD)));
+                    float3 boxMax = max(c0, max(max(cL, cR), max(cU, cD)));
+                    float3 blur = (cL + cR + cU + cD) * 0.25;
+                    c.rgb = clamp(c0 + (c0 - blur) * sharpen, boxMin, boxMax);
+                }
                 float exposure = q3_active_exposure(u, exposureBuffer);
                 float3 rgb = max(c.rgb * exposure, float3(0.0));
                 if (u.tonemap > 0.5) {
@@ -5336,7 +5352,8 @@ struct MetalView: UIViewRepresentable {
                                        exposureMax: exposureMax,
                                        exposureKey: 0.18,
                                        exposureHighlightLimit: Q3_ExposureHighlightLimit(),
-                                       deltaTime: delta)
+                                       deltaTime: delta,
+                                       taaSharpen: 0.0)
         }
 
         @MainActor
@@ -5471,6 +5488,7 @@ struct MetalView: UIViewRepresentable {
                   let pso = ensureSpatialUpscalePipeline(device: device) else { return }
             var u = makePostprocessUniforms()
             u.tonemap = 1.0
+            u.taaSharpen = (Q3_RTMix() > 0.001 && Q3_RTTAA() > 0.5) ? Q3_RTTAASharpen() : 0.0
             let exposureBuffer = ensureExposureBuffer(device: device, initialExposure: u.intensity)
             if let exposureBuffer {
                 encodeExposureReduction(commandBuffer: commandBuffer,
@@ -6816,9 +6834,39 @@ struct MetalView: UIViewRepresentable {
                 // during camera motion so disocclusions do not turn into visible trails.
                 float motionPixels = length(mv * dims);
                 a = max(a, saturate((motionPixels - 0.5) / 12.0) * 0.10);
+                if (a >= 0.999) {
+                    output.write(c, tid);
+                    return;
+                }
                 constexpr sampler historySampler(filter::linear, address::clamp_to_edge);
                 float4 h = history.sample(historySampler, saturate(prevUv));
-                float3 rgb = mix(h.rgb, c.rgb, a);
+
+                /* Stage71: clamp reprojected history to the current-frame
+                 * 3x3 color box before blending. The old MV-TAA path accepted
+                 * any history value; residual jitter/reprojection error could
+                 * average high-frequency texture detail into a soft rest
+                 * image, and it left no anti-ghosting guard for disocclusion
+                 * edges. The box clamp is the standard bounded TAA rejection:
+                 * it preserves the low 0.02 noise-convergence default while
+                 * preventing history from drifting outside what the current
+                 * frame's local neighborhood can support. */
+                uint2 maxTid = uint2(output.get_width() - 1, output.get_height() - 1);
+                float3 boxMin = c.rgb;
+                float3 boxMax = c.rgb;
+                for (int oy = -1; oy <= 1; ++oy) {
+                    for (int ox = -1; ox <= 1; ++ox) {
+                        int2 ip = int2(tid) + int2(ox, oy);
+                        uint2 p = uint2(clamp(ip, int2(0), int2(maxTid)));
+                        float3 n = current.read(p).rgb;
+                        boxMin = min(boxMin, n);
+                        boxMax = max(boxMax, n);
+                    }
+                }
+                float3 boxRange = max(boxMax - boxMin, float3(0.0));
+                float3 boxPad = max(boxRange * 1.5, float3(0.08));
+                float3 hRGB = clamp(h.rgb, boxMin - boxPad, boxMax + boxPad);
+
+                float3 rgb = mix(hRGB, c.rgb, a);
                 output.write(float4(rgb, c.a), tid);
             }
 
