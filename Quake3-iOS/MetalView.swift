@@ -5572,6 +5572,29 @@ struct MetalView: UIViewRepresentable {
                 return legacyRGB;
             }
 
+            float rtMax3(float3 v) {
+                return max(v.x, max(v.y, v.z));
+            }
+
+            float3 rtSoftMaxCap(float3 value, float cap, float knee) {
+                value = max(value, float3(0.0));
+                float peak = rtMax3(value);
+                if (peak <= cap) { return value; }
+                float excess = peak - cap;
+                float softPeak = cap + (excess * knee) / max(excess + knee, 1.0e-4);
+                return value * (softPeak / max(peak, 1.0e-4));
+            }
+
+            float3 rtSoftEmissiveCap(float3 value, float3 emitSample, float intensity) {
+                float ePeak = rtMax3(max(emitSample, float3(0.0)));
+                float eMin = min(emitSample.x, min(emitSample.y, emitSample.z));
+                float neutral = 1.0 - saturate(((ePeak - eMin) / max(ePeak, 1.0e-4)) * 3.0);
+                float fixtureGate = neutral * saturate(ePeak * max(intensity, 0.0) * 2.0);
+                float cap = mix(1.25, 0.45, fixtureGate);
+                float knee = mix(0.75, 0.20, fixtureGate);
+                return rtSoftMaxCap(value, cap, knee);
+            }
+
             float2 rtApplyTcMod(float2 uv, float3 worldPos, int type, float4 params, float timeSeconds) {
                 if (type == 1) {
                     float2 adj = params.xy * timeSeconds;
@@ -5974,7 +5997,7 @@ struct MetalView: UIViewRepresentable {
                             if (mat.materialFlags.y != 0) {
                                 float3 emitSample = rtEmissionSample(texTable, mat, albedoSample.rgb, repeatSampler, uv);
                                 color += emitSample * mat.materialParams.x * effectiveAlpha;
-                                color = min(color, float3(2.0));
+                                color = rtSoftEmissiveCap(color, emitSample, mat.materialParams.x * effectiveAlpha);
                             }
                             outputAlpha = clamp(effectiveAlpha, 0.0, 0.70);
                         } else {
@@ -5990,7 +6013,7 @@ struct MetalView: UIViewRepresentable {
                             if (mat.materialFlags.y != 0) {
                                 float3 emitSample = rtEmissionSample(texTable, mat, albedoSample.rgb, repeatSampler, uv);
                                 color += emitSample * mat.materialParams.x;
-                                color = min(color, float3(2.0));
+                                color = rtSoftEmissiveCap(color, emitSample, mat.materialParams.x);
                             }
                             bool emissiveNEEEnabled = uniforms.rtBudgetParams.z > 0.5 &&
                                                        uniforms.rtBudgetParams.y > 0.5;
