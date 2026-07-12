@@ -12319,15 +12319,52 @@ float Q3_RTBounces(void) {
     return v;
 }
 
+static void Q3_RTStage69DefaultsMigration(void) {
+    static qboolean migrationChecked = qfalse;
+    if (migrationChecked || ri.Cvar_Get == NULL) {
+        return;
+    }
+    migrationChecked = qtrue;
+
+    cvar_t *marker = ri.Cvar_Get("r_rt_stage69_gi_taa_defaults_migrated", "0", CVAR_ARCHIVE);
+    cvar_t *gi = ri.Cvar_Get("r_rt_gi", "1", CVAR_ARCHIVE);
+    cvar_t *taa = ri.Cvar_Get("r_rt_taa", "1", CVAR_ARCHIVE);
+    cvar_t *taaAlpha = ri.Cvar_Get("r_rt_taa_alpha", "0.02", CVAR_ARCHIVE);
+    if (marker && marker->integer != 0) {
+        return;
+    }
+
+    /* Stage69 archived-default migration. Stage67/68 shipped GI+TAA default
+     * off while validation/user approval were pending. Move only stale
+     * archived old-default values to the new approved defaults, then mark the
+     * migration done so a user can later turn GI/TAA off and keep it off. */
+    if (ri.Cvar_Set != NULL) {
+        if (gi && gi->value == 0.0f &&
+            gi->resetString && !Q_stricmp(gi->resetString, "1")) {
+            ri.Cvar_Set("r_rt_gi", "1");
+        }
+        if (taa && taa->integer == 0 &&
+            taa->resetString && !Q_stricmp(taa->resetString, "1")) {
+            ri.Cvar_Set("r_rt_taa", "1");
+        }
+        if (taaAlpha && taaAlpha->value > 0.099f && taaAlpha->value < 0.101f &&
+            taaAlpha->resetString && !Q_stricmp(taaAlpha->resetString, "0.02")) {
+            ri.Cvar_Set("r_rt_taa_alpha", "0.02");
+        }
+        ri.Cvar_Set("r_rt_stage69_gi_taa_defaults_migrated", "1");
+    }
+}
+
 float Q3_RTGI(void) {
-    if (ri.Cvar_Get == NULL) return 0.0f;
-    /* Stage67: real colored single-bounce transport. 0 is an exact no-op and
-     * leaves the legacy r_rt_bounces path unchanged; >0 uses the one secondary
-     * ray for albedo-colored bounce radiance and suppresses the legacy scalar
-     * bounce add to avoid double-counting. The Metal kernel maps value 1 to
-     * the calibrated visible transport strength for the truth-pair gate. */
-    cvar_t *cv = ri.Cvar_Get("r_rt_gi", "0", CVAR_ARCHIVE);
-    float v = cv ? cv->value : 0.0f;
+    if (ri.Cvar_Get == NULL) return 1.0f;
+    Q3_RTStage69DefaultsMigration();
+    /* Stage67/69: real colored single-bounce transport. 0 is an exact no-op
+     * and leaves the legacy r_rt_bounces path unchanged; >0 uses the one
+     * secondary ray for albedo-colored bounce radiance and suppresses the
+     * legacy scalar bounce add to avoid double-counting. The Metal kernel maps
+     * value 1 to the approved calibrated visible transport strength. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_gi", "1", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 1.0f;
     if (v < 0.0f) v = 0.0f;
     if (v > 2.0f) v = 2.0f;
     return v;
@@ -12346,18 +12383,19 @@ float Q3_RTGICeiling(void) {
 }
 
 float Q3_RTTAA(void) {
-    if (ri.Cvar_Get == NULL) return 0.0f;
-    // Default OFF until motion vectors / robust reprojection exist.
-    // The old default accumulated stale history while moving and produced
-    // the reported fever-dream smear. Users can still opt in with r_rt_taa 1.
-    cvar_t *cv = ri.Cvar_Get("r_rt_taa", "0", CVAR_ARCHIVE);
+    if (ri.Cvar_Get == NULL) return 1.0f;
+    Q3_RTStage69DefaultsMigration();
+    // Stage68 MV-TAA fixed the legacy same-pixel smear/noise failure; Stage69
+    // makes the approved temporal AA default-on. r_rt_taa 0 remains exact off.
+    cvar_t *cv = ri.Cvar_Get("r_rt_taa", "1", CVAR_ARCHIVE);
     return (cv && cv->integer == 0) ? 0.0f : 1.0f;
 }
 
 float Q3_RTTAAAlpha(void) {
-    if (ri.Cvar_Get == NULL) return 0.10f;
-    cvar_t *cv = ri.Cvar_Get("r_rt_taa_alpha", "0.10", CVAR_ARCHIVE);
-    float v = cv ? cv->value : 0.10f;
+    if (ri.Cvar_Get == NULL) return 0.02f;
+    Q3_RTStage69DefaultsMigration();
+    cvar_t *cv = ri.Cvar_Get("r_rt_taa_alpha", "0.02", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.02f;
     if (v < 0.02f) v = 0.02f;
     if (v > 1.0f) v = 1.0f;
     return v;
