@@ -12319,6 +12319,32 @@ float Q3_RTBounces(void) {
     return v;
 }
 
+float Q3_RTGI(void) {
+    if (ri.Cvar_Get == NULL) return 0.0f;
+    /* Stage67: real colored single-bounce transport. 0 is an exact no-op and
+     * leaves the legacy r_rt_bounces path unchanged; >0 uses the one secondary
+     * ray for albedo-colored bounce radiance and suppresses the legacy scalar
+     * bounce add to avoid double-counting. The Metal kernel maps value 1 to
+     * the calibrated visible transport strength for the truth-pair gate. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_gi", "0", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.0f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 2.0f) v = 2.0f;
+    return v;
+}
+
+float Q3_RTGICeiling(void) {
+    if (ri.Cvar_Get == NULL) return 1.25f;
+    /* Per-pixel clamp on the Stage67 one-sample GI add. This is deliberately
+     * independent of r_rt_gi so validation can raise/lower the firefly guard
+     * without changing the transport strength. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_gi_clamp", "1.25", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 1.25f;
+    if (v < 0.05f) v = 0.05f;
+    if (v > 8.0f) v = 8.0f;
+    return v;
+}
+
 float Q3_RTTAA(void) {
     if (ri.Cvar_Get == NULL) return 0.0f;
     // Default OFF until motion vectors / robust reprojection exist.

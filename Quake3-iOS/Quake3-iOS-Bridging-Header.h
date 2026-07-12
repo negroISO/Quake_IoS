@@ -261,6 +261,11 @@ float Q3_RTEntityAdditiveMax(void);
 float Q3_RTResolutionScale(void);
 float Q3_RTTraceScale(void);
 float Q3_RTBounces(void);
+/* Stage67 colored GI. r_rt_gi is an archived strength scalar (0 = exact
+ * legacy/no-op, 1 = calibrated single colored bounce). r_rt_gi_clamp caps the
+ * per-pixel GI contribution before composite to guard fireflies from one-sample NEE. */
+float Q3_RTGI(void);
+float Q3_RTGICeiling(void);
 float Q3_RTTAA(void);
 float Q3_RTTAAAlpha(void);
 /* Stage 18 RT denoiser. 1 = MetalFX temporal denoised scaler path when

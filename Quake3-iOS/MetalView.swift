@@ -430,6 +430,11 @@ struct MetalView: UIViewRepresentable {
             // w reserved. Gates ENTITY-AS traversal only; world reflections still use
             // rtLightParams.w.
             var rtEntityReflectionParams: SIMD4<Float> = SIMD4(0.25, 0, 0, 0)
+            // Stage 67 append-only colored GI controls:
+            // x = r_rt_gi user strength (0 = exact legacy/no-op; 1 =
+            // calibrated single-bounce visible transport), y = r_rt_gi_clamp
+            // per-pixel firefly ceiling, z/w reserved.
+            var rtGIParams: SIMD4<Float> = SIMD4(0, 1.25, 0, 0)
         }
 
         struct RTPrimitiveMaterial {
@@ -5479,6 +5484,10 @@ struct MetalView: UIViewRepresentable {
                 // z = r_rt_entity_reflections requested even if AS maintenance is suspended,
                 // w reserved. Gates ENTITY-AS traversal only.
                 float4 rtEntityReflectionParams;
+                // Stage 67 append-only controls:
+                // x = r_rt_gi strength, y = r_rt_gi_clamp firefly ceiling,
+                // z/w reserved.
+                float4 rtGIParams;
             };
 
             // P1: RTX Remix authored per-map light (baked from
@@ -6017,8 +6026,192 @@ struct MetalView: UIViewRepresentable {
                             }
                             bool emissiveNEEEnabled = uniforms.rtBudgetParams.z > 0.5 &&
                                                        uniforms.rtBudgetParams.y > 0.5;
-                            // First-pass one-bounce indirect: gated by r_rt_bounces.
-                            if (uniforms.rtControlParams.y > 0.5) {
+                            /* Stage67 colored GI: r_rt_gi owns the single
+                             * secondary diffuse bounce when enabled. The old
+                             * r_rt_bounces path below is left byte-for-byte in
+                             * the r_rt_gi==0 case for exact legacy A/B. */
+                            /* Q3's LDR lightmaps + one stochastic secondary
+                             * ray under-estimate the Remix truth set's
+                             * higher-order diffuse recirculation by ~3x at
+                             * NV15 dark ROIs. Keep the user cvar simple:
+                             * r_rt_gi 1 = calibrated Stage67 visible
+                             * single-bounce transport; r_rt_gi 0 remains an
+                             * exact no-op and leaves legacy r_rt_bounces. */
+                            const float stage67GIScale = 3.0;
+                            float giStrength = max(uniforms.rtGIParams.x, 0.0) * stage67GIScale;
+                            if (giStrength > 0.0) {
+                                float rnd0 = rtHash12(float2(tid) + uniforms.fovParams.zz * float2(17.0, 31.0));
+                                float rnd1 = rtHash12(float2(tid.yx) + uniforms.fovParams.zz * float2(47.0, 11.0));
+                                float3 bounceDir = rtCosineHemisphere(N, float2(rnd0, rnd1));
+                                float3 bounceOrigin = hitPos + N * 0.75;
+                                ray bounceRay(bounceOrigin, bounceDir, 0.1, 2048.0);
+                                auto bounceHit = i.intersect(bounceRay, worldAS);
+                                float3 bounceRadiance = float3(0.0);
+                                if (bounceHit.type == intersection_type::triangle) {
+                                    uint btri = bounceHit.primitive_id;
+                                    RTPrimitiveMaterial bounceMat = primitiveMaterials[btri];
+                                    if (bounceMat.materialFlags.x != 0) {
+                                        if (!is_null_texture(envCube)) {
+                                            bounceRadiance = envCube.sample(envSampler, bounceDir).rgb * 0.06;
+                                        }
+                                    } else if (bounceMat.albedoSlot < 176) {
+                                        uint bi0 = indices[btri * 3 + 0];
+                                        uint bi1 = indices[btri * 3 + 1];
+                                        uint bi2 = indices[btri * 3 + 2];
+                                        float2 bb = bounceHit.triangle_barycentric_coord;
+                                        float bw = 1.0 - bb.x - bb.y;
+                                        float3 bp0 = float3(vertices[bi0].position);
+                                        float3 bp1 = float3(vertices[bi1].position);
+                                        float3 bp2 = float3(vertices[bi2].position);
+                                        float3 bN = float3(vertices[bi0].normal) * bw +
+                                                    float3(vertices[bi1].normal) * bb.x +
+                                                    float3(vertices[bi2].normal) * bb.y;
+                                        if (dot(bN, bN) < 1.0e-6) {
+                                            bN = cross(bp1 - bp0, bp2 - bp0);
+                                        }
+                                        if (dot(bN, bN) > 1.0e-8) {
+                                            bN = normalize(bN);
+                                            if (dot(bN, -bounceDir) < 0.0) { bN = -bN; }
+                                        } else {
+                                            bN = -bounceDir;
+                                        }
+                                        float3 bHitPos = bounceOrigin + bounceDir * bounceHit.distance;
+                                        float2 buv = vertices[bi0].texCoord * bw +
+                                                     vertices[bi1].texCoord * bb.x +
+                                                     vertices[bi2].texCoord * bb.y;
+                                        float2 blm = vertices[bi0].lightmapTexCoord * bw +
+                                                     vertices[bi1].lightmapTexCoord * bb.x +
+                                                     vertices[bi2].lightmapTexCoord * bb.y;
+                                        uint btcCount = min(bounceMat.tcModCount, 4u);
+                                        for (uint mi = 0; mi < btcCount; ++mi) {
+                                            uint btype = bounceMat.tcModTypes[mi];
+                                            if (btype == 0) { continue; }
+                                            float4 bparams = bounceMat.tcModParams0;
+                                            if (mi == 1) { bparams = bounceMat.tcModParams1; }
+                                            else if (mi == 2) { bparams = bounceMat.tcModParams2; }
+                                            else if (mi == 3) { bparams = bounceMat.tcModParams3; }
+                                            buv = rtApplyTcMod(buv, bHitPos, int(btype), bparams, uniforms.fovParams.z);
+                                            blm = rtApplyTcMod(blm, bHitPos, int(btype), bparams, uniforms.fovParams.z);
+                                        }
+                                        if (bounceMat.spriteAtlasParams.x > 0.5) {
+                                            float bCols = bounceMat.spriteAtlasParams.x;
+                                            float bRows = bounceMat.spriteAtlasParams.y;
+                                            float bFps = bounceMat.spriteAtlasParams.z;
+                                            float bTotal = max(1.0, bCols * bRows);
+                                            float bFrame = (bFps > 0.0) ? floor(uniforms.fovParams.z * bFps) : 0.0;
+                                            float bIdx = fmod(bFrame, bTotal);
+                                            if (bIdx < 0.0) { bIdx += bTotal; }
+                                            float bCol = fmod(bIdx, bCols);
+                                            float bRow = floor(bIdx / bCols);
+                                            float2 bLocalUV = fract(buv);
+                                            buv = float2((bLocalUV.x + bCol) / bCols,
+                                                         (bLocalUV.y + bRow) / bRows);
+                                        }
+                                        float4 bAlbedoSample = texTable.albedo[bounceMat.albedoSlot].sample(repeatSampler, buv);
+                                        float bBlendMode = bounceMat.materialParams.y;
+                                        bool bAdditive = (abs(bBlendMode - 1.0) < 0.5 || abs(bBlendMode - 5.0) < 0.5);
+                                        bool bAlphaSensitive = (bounceMat.materialFlags.z != 0 || bounceMat.materialFlags.w != 0 || bAdditive);
+                                        float bLumaAlpha = max(max(bAlbedoSample.r, bAlbedoSample.g), bAlbedoSample.b);
+                                        float bEffectiveAlpha = (bAlphaSensitive && bAlbedoSample.a >= 0.995) ? bLumaAlpha : bAlbedoSample.a;
+                                        float bAlphaThreshold = bounceMat.alphaTcModControl.x;
+                                        bool bAlphaReject = (bAlphaThreshold > 0.0 && bEffectiveAlpha < bAlphaThreshold) ||
+                                                            (bAlphaThreshold < 0.0 && bEffectiveAlpha >= -bAlphaThreshold);
+                                        if (!bAlphaReject) {
+                                            if (!bAdditive) {
+                                                float3 bLightmap = float3(1.0);
+                                                if (bounceMat.lightmapSlot < 64) {
+                                                    bLightmap = texTable.lightmap[bounceMat.lightmapSlot].sample(clampSampler, blm).rgb;
+                                                }
+                                                /* Renderer-space lightmaps are already the
+                                                 * surface's baked exitant light term in the
+                                                 * primary RT path (`albedo * lightmap*2`).
+                                                 * Carry that colored surface radiance as-is;
+                                                 * only the live one-sample direct term below
+                                                 * is an irradiance estimate that needs the
+                                                 * diffuse 1/pi BRDF factor. */
+                                                float3 bLightmapExitant = max(bLightmap * 2.0 * uniforms.rtPBRGlobal.z,
+                                                                              float3(ambientFloor));
+                                                float3 bDirectIncident = float3(0.0);
+                                                uint lightCountGI = (uint)uniforms.rtLightParams.x;
+                                                if (lightCountGI > 0) {
+                                                    float lightScaleGI = uniforms.rtLightParams.y;
+                                                    uint firstLocalGI = (rtLights[0].dirType.w < 0.5) ? 1u : 0u;
+                                                    uint bestLocal = 0xFFFFFFFFu;
+                                                    float bestLocalScore = 0.0;
+                                                    for (uint li = firstLocalGI; li < lightCountGI; ++li) {
+                                                        float3 toL = rtLights[li].posRadius.xyz - bHitPos;
+                                                        float d2 = max(dot(toL, toL), 1.0);
+                                                        float ndl = max(dot(bN, toL * rsqrt(d2)), 0.0);
+                                                        float r = rtLights[li].posRadius.w;
+                                                        float score = rtLights[li].colorIntensity.w * ndl /
+                                                                      (d2 + r * r + 1.0);
+                                                        if (score > bestLocalScore) {
+                                                            bestLocalScore = score;
+                                                            bestLocal = li;
+                                                        }
+                                                    }
+                                                    bool useSunGI = (bestLocal == 0xFFFFFFFFu && firstLocalGI == 1u);
+                                                    uint chosenGI = useSunGI ? 0u : bestLocal;
+                                                    if (chosenGI != 0xFFFFFFFFu) {
+                                                        float3 L;
+                                                        float maxDistance;
+                                                        float3 directGI = float3(0.0);
+                                                        if (useSunGI) {
+                                                            L = -normalize(rtLights[0].dirType.xyz);
+                                                            maxDistance = 20000.0;
+                                                            float ndl = max(dot(bN, L), 0.0);
+                                                            if (ndl > 0.0) {
+                                                                directGI = rtLights[0].colorIntensity.rgb *
+                                                                           (rtLights[0].colorIntensity.w * 0.3 * lightScaleGI) * ndl;
+                                                            }
+                                                        } else {
+                                                            RTLight Lgt = rtLights[chosenGI];
+                                                            float3 toL = Lgt.posRadius.xyz - bHitPos;
+                                                            float d2 = max(dot(toL, toL), 1.0);
+                                                            float dist = sqrt(d2);
+                                                            L = toL / dist;
+                                                            float ndl = max(dot(bN, L), 0.0);
+                                                            float r = Lgt.posRadius.w;
+                                                            float E = Lgt.colorIntensity.w * 60.0 * lightScaleGI /
+                                                                      (d2 + r * r + 1.0);
+                                                            maxDistance = max(dist - r - 1.0, 0.2);
+                                                            if (ndl > 0.0 && E * ndl > 0.004) {
+                                                                directGI = Lgt.colorIntensity.rgb * min(E * ndl, 3.0);
+                                                            }
+                                                        }
+                                                        if (rtMax3(directGI) > 0.0) {
+                                                            ray bsray(bHitPos + bN * 0.75, L, 0.1, maxDistance);
+                                                            auto bsh = i.intersect(bsray, worldAS);
+                                                            bool bShadowBlocked = bsh.type == intersection_type::triangle &&
+                                                                                  primitiveMaterials[bsh.primitive_id].materialFlags.x == 0;
+                                                            if (!bShadowBlocked) {
+                                                                bDirectIncident += directGI * uniforms.rtPBRGlobal.w;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                float bAlphaWeight = (bounceMat.materialFlags.w != 0) ? clamp(bEffectiveAlpha, 0.0, 1.0) : 1.0;
+                                                bounceRadiance = bAlbedoSample.rgb * bAlphaWeight *
+                                                                 (bLightmapExitant + bDirectIncident * 0.31830988618);
+                                            }
+                                            if (bounceMat.materialFlags.y != 0) {
+                                                float3 bEmitSample = rtEmissionSample(texTable, bounceMat, bAlbedoSample.rgb, repeatSampler, buv);
+                                                bounceRadiance += bEmitSample * bounceMat.materialParams.x;
+                                            }
+                                        }
+                                    }
+                                } else if (!is_null_texture(envCube)) {
+                                    bounceRadiance = envCube.sample(envSampler, bounceDir).rgb * 0.06;
+                                }
+                                /* The bounce direction is cosine-hemisphere sampled at the
+                                 * primary hit, so diffuse throughput collapses to the primary
+                                 * albedo term (BRDF*cos/pdf = albedo). Clamp only the final
+                                 * one-sample add; this guards fireflies without desaturating
+                                 * normal colored bleed. */
+                                float giCeiling = max(uniforms.rtGIParams.y, 0.05);
+                                float3 gi = albedoSample.rgb * bounceRadiance * giStrength;
+                                color += min(gi, float3(giCeiling));
+                            } else if (uniforms.rtControlParams.y > 0.5) {
                                 float rnd0 = rtHash12(float2(tid) + uniforms.fovParams.zz * float2(17.0, 31.0));
                                 float rnd1 = rtHash12(float2(tid.yx) + uniforms.fovParams.zz * float2(47.0, 11.0));
                                 float3 bounceDir = rtCosineHemisphere(N, float2(rnd0, rnd1));
@@ -8347,6 +8540,7 @@ struct MetalView: UIViewRepresentable {
                                                              (Q3_RTPerfHUD() > 1 || entityDemandCounterEnabled) ? 1.0 : 0.0,
                                                              entityReflectionRequested ? 1.0 : 0.0,
                                                              0.0)
+            uniforms.rtGIParams = SIMD4<Float>(Q3_RTGI(), Q3_RTGICeiling(), 0.0, 0.0)
             annotateEntityASDemandPerf(perfFrame)
             if rtDebugView != 0 {
                 let debugMap = currentRTMapName()
