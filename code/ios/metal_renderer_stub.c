@@ -12391,6 +12391,17 @@ float Q3_RTTAA(void) {
     return (cv && cv->integer == 0) ? 0.0f : 1.0f;
 }
 
+int Q3_SetRTTAA(int enabled) {
+    enabled = enabled ? 1 : 0;
+    if (ri.Cvar_Get == NULL) return enabled;
+    Q3_RTStage69DefaultsMigration();
+    ri.Cvar_Get("r_rt_taa", "1", CVAR_ARCHIVE);
+    if (ri.Cvar_Set != NULL) {
+        ri.Cvar_Set("r_rt_taa", enabled ? "1" : "0");
+    }
+    return (Q3_RTTAA() > 0.5f) ? 1 : 0;
+}
+
 float Q3_RTTAAAlpha(void) {
     if (ri.Cvar_Get == NULL) return 0.02f;
     Q3_RTStage69DefaultsMigration();

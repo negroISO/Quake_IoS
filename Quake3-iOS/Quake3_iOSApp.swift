@@ -136,6 +136,12 @@ struct Quake3_iOSApp: App {
                             let frameInterp = Q3FrameInterpolation.current
                             NSLog("[Q3-BOOT] MetalFX frame interpolation = %@", frameInterp.label)
 
+                            // Log RT temporal-AA choice. Applied after
+                            // Quake3_Init, same as r_rt_mix, because the cvar
+                            // system does not exist before engine startup.
+                            let temporalAA = Q3TemporalAA.current
+                            NSLog("[Q3-BOOT] Temporal AA = %@", temporalAA.label)
+
                             /* Parse "mod:<name>|<command>" prefix from
                              * launchCommand (LaunchMenuView mod rows
                              * encode this). When present, call
@@ -199,6 +205,8 @@ struct Quake3_iOSApp: App {
                             print("[Swift] Engine initialized")
                             let appliedRTMix = Q3_SetRTMix(rtMix.value)
                             NSLog("[Q3-BOOT] applied RT cvar: %@ (actual %.3f)", rtMix.consoleCommand, appliedRTMix)
+                            let appliedTemporalAA = Q3_SetRTTAA(temporalAA.enabledInt)
+                            NSLog("[Q3-BOOT] applied TAA cvar: %@ (actual %d)", temporalAA.consoleCommand, appliedTemporalAA)
                             if let cmd = launchCommand {
                                 let line = cmd + "\n"
                                 NSLog("[Q3-BOOT] queuing command: %@", cmd)

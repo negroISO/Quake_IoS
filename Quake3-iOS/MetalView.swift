@@ -142,6 +142,63 @@ enum Q3FrameInterpolation: String, CaseIterable {
     }
 }
 
+/// RT temporal anti-aliasing toggle. This is a launch-menu convenience around
+/// `r_rt_taa`: .on queues `r_rt_taa 1`, .off queues `r_rt_taa 0` after engine
+/// init. Environment overrides win so capture scripts can force either path.
+enum Q3TemporalAA: String, CaseIterable {
+    case on  = "on"
+    case off = "off"
+
+    static let userDefaultsKey = "q3_temporal_aa"
+
+    static var current: Q3TemporalAA {
+        if let envRaw = ProcessInfo.processInfo.environment["Q3_TEMPORAL_AA"]?.lowercased() {
+            if let envQ = Q3TemporalAA(rawValue: envRaw) {
+                NSLog("[Q3-TAA] using env var Q3_TEMPORAL_AA=%@", envRaw)
+                return envQ
+            }
+            let envAlias: Q3TemporalAA?
+            switch envRaw {
+            case "on", "1", "true", "yes":
+                envAlias = .on
+            case "off", "0", "false", "no":
+                envAlias = .off
+            default:
+                envAlias = nil
+            }
+            if let envAlias {
+                NSLog("[Q3-TAA] using env var Q3_TEMPORAL_AA=%@ (alias mapped)", envRaw)
+                return envAlias
+            }
+            NSLog("[Q3-TAA] unrecognized Q3_TEMPORAL_AA=%@", envRaw)
+        }
+        let raw = UserDefaults.standard.string(forKey: userDefaultsKey) ?? "on"
+        return Q3TemporalAA(rawValue: raw) ?? .on
+    }
+
+    static func save(_ q: Q3TemporalAA) {
+        UserDefaults.standard.set(q.rawValue, forKey: userDefaultsKey)
+        UserDefaults.standard.synchronize()
+    }
+
+    var label: String {
+        switch self {
+        case .on:  return "On"
+        case .off: return "Off"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .on:  return "r_rt_taa 1"
+        case .off: return "r_rt_taa 0"
+        }
+    }
+
+    var enabledInt: CInt { self == .on ? 1 : 0 }
+    var consoleCommand: String { "r_rt_taa \(self == .on ? "1" : "0")" }
+}
+
 
 /// Runtime ray-tracing overlay mix. This is a launch-menu convenience
 /// around the existing `r_rt_mix` cvar: 0 = raster only, 0.5 = blended

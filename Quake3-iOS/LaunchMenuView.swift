@@ -24,6 +24,7 @@ struct LaunchMenuView: View {
     @State private var selectedRTMix: Q3RTMix = Q3RTMix.current
     @State private var selectedQuality: Q3UpscaleQuality = Q3UpscaleQuality.current
     @State private var selectedFrameInterp: Q3FrameInterpolation = Q3FrameInterpolation.current
+    @State private var selectedTemporalAA: Q3TemporalAA = Q3TemporalAA.current
 
     struct DemoEntry: Identifiable, Hashable {
         let id = UUID()
@@ -205,6 +206,49 @@ struct LaunchMenuView: View {
                 .padding(.horizontal, 24)
 
                 Text("Frame Interpolation (experimental)")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.45))
+                    .padding(.top, -10)
+
+                // RT Temporal AA toggle. Same two-button launcher row as
+                // frame interpolation, but it drives the engine cvar
+                // r_rt_taa at boot (env var Q3_TEMPORAL_AA still wins).
+                HStack(spacing: 8) {
+                    ForEach(Q3TemporalAA.allCases, id: \.self) { taa in
+                        let isSelected = (selectedTemporalAA == taa)
+                        Button(action: {
+                            selectedTemporalAA = taa
+                            Q3TemporalAA.save(taa)
+                            NSLog("[Q3-MENU] temporal AA = %@", taa.label)
+                        }) {
+                            VStack(spacing: 2) {
+                                Text(taa.label)
+                                    .font(.system(size: 13, weight: .heavy, design: .monospaced))
+                                    .foregroundColor(.white)
+                                Text(taa == .on ? "MV-TAA" : "No TAA")
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundColor(.white.opacity(0.6))
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 5)
+                            .background(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .fill(isSelected ? Color(red: 0.7, green: 0.15, blue: 0.1).opacity(0.85)
+                                                     : Color.black.opacity(0.55))
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .stroke(Color(red: 0.7, green: 0.15, blue: 0.1).opacity(isSelected ? 1.0 : 0.5),
+                                            lineWidth: isSelected ? 2 : 1)
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .frame(maxWidth: 560)
+                .padding(.horizontal, 24)
+
+                Text("Temporal Anti-Aliasing")
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundColor(.white.opacity(0.45))
                     .padding(.top, -10)

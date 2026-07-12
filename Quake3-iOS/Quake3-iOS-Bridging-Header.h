@@ -270,6 +270,7 @@ float Q3_RTGICeiling(void);
 /* Stage68/69 legacy RT temporal AA. Default 1; 0 remains exact no-op/off.
  * r_rt_taa_alpha default 0.02 is the approved MV-TAA history blend. */
 float Q3_RTTAA(void);
+int   Q3_SetRTTAA(int enabled);
 float Q3_RTTAAAlpha(void);
 /* Stage 18 RT denoiser. 1 = MetalFX temporal denoised scaler path when
  * available; 0 = exact pre-Stage18 RT accumulate/upscale behavior. */
