@@ -1123,12 +1123,17 @@ struct MetalView: UIViewRepresentable {
             var atlasTexture: MTLTexture?
         }
 
-        private struct EntityFrameContext {
-            var atlasByHandle: [UInt32: EntityAtlasResolution] = [:]
+        private struct EntityAtlasCacheKey: Hashable {
+            var handle: UInt32
+            var allowsIndirectRedirect: Bool
         }
 
-        private var entityAtlasResolutionCache: [UInt32: EntityAtlasResolution] = [:]
-        private var entityAtlasResolutionMisses: Set<UInt32> = []
+        private struct EntityFrameContext {
+            var atlasByKey: [EntityAtlasCacheKey: EntityAtlasResolution] = [:]
+        }
+
+        private var entityAtlasResolutionCache: [EntityAtlasCacheKey: EntityAtlasResolution] = [:]
+        private var entityAtlasResolutionMisses: Set<EntityAtlasCacheKey> = []
 
         /// Returns the atlas albedo MTLTexture to bind at fragment slot 0
         /// when the entity draw resolved to an animated atlas material.
@@ -1144,7 +1149,8 @@ struct MetalView: UIViewRepresentable {
         ///      mapped to the underlying envmap source path
         ///      (`textures/effects/envmapyel`) whose hash-keyed materials.json
         ///      block carries the sprite_sheet_* fields and the atlas DDS.
-        private func resolveEntityAtlas(handle: UInt32) -> EntityAtlasResolution? {
+        private func resolveEntityAtlas(handle: UInt32,
+                                        allowsIndirectRedirect: Bool) -> EntityAtlasResolution? {
             var sprite_cols: Int32 = 0
             var sprite_rows: Int32 = 0
             var sprite_fps: Float = 0
@@ -1172,11 +1178,16 @@ struct MetalView: UIViewRepresentable {
                 }
             }
             // Tier 2 — indirect-name fallback for envmap pickups
-            // (health/armor/ammo + quad/regen/battlesuit/bfg). Skipped
-            // when Tier 1 already found a material with authored albedo —
-            // the authored asset wins over the catch-all envmap atlas.
+            // (health/armor/ammo + quad/regen/battlesuit/bfg). This class
+            // fallback is legal only for a draw carrying TCGEN_ENV; a base-
+            // skin stage from the same composite shader must keep its own Q3
+            // diffuse texture. Tier 1 direct atlas metadata remains valid for
+            // non-environment stages such as authored billboard sprites.
+            // Also skip when Tier 1 already found authored albedo — the
+            // authored asset wins over the catch-all envmap atlas.
             var isSingleFrameCapture = false
             if sprite_cols == 0,
+               allowsIndirectRedirect,
                !hasAuthoredAlbedo,
                let cName = Q3MetalRenderer_GetTextureName(handle) {
                 let name = String(cString: cName).lowercased()
@@ -1267,23 +1278,30 @@ struct MetalView: UIViewRepresentable {
             return resolution.atlasTexture
         }
 
-        private func packEntityAtlas(handle: UInt32, into uniforms: inout EntityUniforms) -> MTLTexture? {
-            let resolution = cachedEntityAtlasResolution(handle: handle)
+        private func packEntityAtlas(handle: UInt32,
+                                     allowsIndirectRedirect: Bool,
+                                     into uniforms: inout EntityUniforms) -> MTLTexture? {
+            let resolution = cachedEntityAtlasResolution(handle: handle,
+                                                         allowsIndirectRedirect: allowsIndirectRedirect)
             return applyEntityAtlas(resolution, into: &uniforms)
         }
 
-        private func cachedEntityAtlasResolution(handle: UInt32) -> EntityAtlasResolution? {
-            if let cached = entityAtlasResolutionCache[handle] {
+        private func cachedEntityAtlasResolution(handle: UInt32,
+                                                 allowsIndirectRedirect: Bool) -> EntityAtlasResolution? {
+            let key = EntityAtlasCacheKey(handle: handle,
+                                          allowsIndirectRedirect: allowsIndirectRedirect)
+            if let cached = entityAtlasResolutionCache[key] {
                 return cached
             }
-            if entityAtlasResolutionMisses.contains(handle) {
+            if entityAtlasResolutionMisses.contains(key) {
                 return nil
             }
-            if let resolved = resolveEntityAtlas(handle: handle) {
-                entityAtlasResolutionCache[handle] = resolved
+            if let resolved = resolveEntityAtlas(handle: handle,
+                                                 allowsIndirectRedirect: allowsIndirectRedirect) {
+                entityAtlasResolutionCache[key] = resolved
                 return resolved
             }
-            entityAtlasResolutionMisses.insert(handle)
+            entityAtlasResolutionMisses.insert(key)
             return nil
         }
 
@@ -1291,14 +1309,20 @@ struct MetalView: UIViewRepresentable {
                                              first: Int,
                                              end: Int) -> EntityFrameContext {
             var context = EntityFrameContext()
-            var seenHandles = Set<UInt32>()
-            seenHandles.reserveCapacity(max(0, end - first))
-            context.atlasByHandle.reserveCapacity(min(max(0, end - first), 128))
+            let tcGenEnvBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_TCGEN_ENV)
+            var seenKeys = Set<EntityAtlasCacheKey>()
+            seenKeys.reserveCapacity(max(0, end - first))
+            context.atlasByKey.reserveCapacity(min(max(0, end - first), 128))
             for drawIdx in first..<end {
-                let handle = draws[drawIdx].textureHandle
-                guard handle != 0, seenHandles.insert(handle).inserted else { continue }
-                if let resolution = cachedEntityAtlasResolution(handle: handle) {
-                    context.atlasByHandle[handle] = resolution
+                let draw = draws[drawIdx]
+                let key = EntityAtlasCacheKey(
+                    handle: draw.textureHandle,
+                    allowsIndirectRedirect: (draw.flags & tcGenEnvBit) != 0)
+                guard key.handle != 0, seenKeys.insert(key).inserted else { continue }
+                if let resolution = cachedEntityAtlasResolution(
+                    handle: key.handle,
+                    allowsIndirectRedirect: key.allowsIndirectRedirect) {
+                    context.atlasByKey[key] = resolution
                 }
             }
             return context
@@ -12936,8 +12960,11 @@ struct MetalView: UIViewRepresentable {
                         // frame. Per draw, only copy prepacked atlas params and
                         // return the atlas albedo override when an indirect
                         // name hit landed (e.g. yellow health → envmapyel).
+                        let entityAtlasKey = EntityAtlasCacheKey(
+                            handle: draw.textureHandle,
+                            allowsIndirectRedirect: (draw.flags & tcGenEnvBit) != 0)
                         let entityAtlasAlbedoOverride = applyEntityAtlas(
-                            entityFrameContext.atlasByHandle[draw.textureHandle],
+                            entityFrameContext.atlasByKey[entityAtlasKey],
                             into: &entityUniforms)
                         /* Per-draw refEntity_t.shaderRGBA fed through to MSL
                          * for rgbGen=entity / oneMinusEntity (5/6) and
