@@ -346,6 +346,12 @@ static int q3_pbr_material_has_existing_path(const q3_pbr_material_t *m) {
 
 static int q3_pbr_named_material_is_usable(const q3_pbr_material_t *m) {
     if (m == NULL) return 0;
+    /* Scalar constants are self-contained material data. The staged iOS
+     * bundle can omit a Remix DDS while still carrying inherited
+     * roughness/metallic constants in materials.json. Keep those named
+     * entries usable so RT/raster can consume the constants with the
+     * classic Q3 albedo instead of dropping to the global fallback. */
+    if (m->roughness_constant >= 0.0f || m->metallic_constant >= 0.0f) return 1;
     /* Explicit all-null named entries are intentional "classic fallback"
      * entries. They must remain usable so they can suppress stale/missing
      * hash-material sidecars for high-rotation weapons such as machinegun
