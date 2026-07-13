@@ -1952,6 +1952,56 @@ struct MetalView: UIViewRepresentable {
             return lit + accum;
         }
 
+        /* GGX specular from the same local-light block used by applyDlights.
+         * The legacy Q3 contribution above is deliberately retained as the
+         * entity's diffuse carrier; this helper adds only the missing
+         * view-dependent response, which is essential for metallic=1
+         * viewmodels in maps without a distant sun. */
+        float3 entityDlightSpecular(float3 worldPos,
+                                    float3 worldNormal,
+                                    float3 viewDir,
+                                    float roughness,
+                                    float3 F0,
+                                    constant DLightBlock &block) {
+            uint count = min(block.count, 128u);
+            float3 N = normalize(worldNormal);
+            float3 V = normalize(viewDir);
+            float NdotV = max(dot(N, V), 0.001);
+            float alpha = max(roughness * roughness, 0.0625);
+            float alpha2 = alpha * alpha;
+            float3 accum = float3(0.0);
+            for (uint i = 0; i < count; ++i) {
+                MSLLight light = block.lights[i];
+                float3 toLight = float3(light.origin) - worldPos;
+                float dist = length(toLight);
+                float radius = max(light.radius, 1.0);
+                if (dist <= 1e-4 || dist >= radius) continue;
+                float3 L = toLight / dist;
+                float NdotL = max(dot(N, L), 0.0);
+                if (NdotL <= 0.0) continue;
+                float3 halfVector = V + L;
+                float halfLength = length(halfVector);
+                if (halfLength <= 1e-4) continue;
+                float3 H = halfVector / halfLength;
+                float NdotH = max(dot(N, H), 0.0);
+                float VdotH = max(dot(V, H), 0.0);
+
+                float d = (NdotH * alpha2 - NdotH) * NdotH + 1.0;
+                float D = alpha2 / (M_PI_F * d * d + 1e-6);
+                float Vis_SmithV = NdotL * (NdotV * (1.0 - alpha) + alpha);
+                float Vis_SmithL = NdotV * (NdotL * (1.0 - alpha) + alpha);
+                float G = 0.5 / max(Vis_SmithV + Vis_SmithL, 1e-6);
+                float3 F = F0 + (float3(1.0) - F0) * pow(1.0 - VdotH, 5.0);
+
+                float atten = saturate(1.0 - dist / radius);
+                atten *= atten;
+                atten *= (0.15 + 0.85 * NdotL);
+                float3 radiance = float3(light.color) * atten * 0.65;
+                accum += D * F * G * radiance * NdotL;
+            }
+            return min(accum, float3(1.0));
+        }
+
         struct WorldDrawUniforms {
             float tcGen;
             int tcModCount;
@@ -3563,7 +3613,7 @@ struct MetalView: UIViewRepresentable {
                     float NdotV = max(dot(worldN, V), 0.0);
 
                     if (hasFullPBR) {
-                        /* PBR Phase 5 — Cook-Torrance GGX with Burley diffuse.
+                        /* PBR Phase 5 — Cook-Torrance GGX specular.
                          *
                          * Ported from SomaZ/OpenJK rend2 lightall.glsl —
                          * the gold-standard Q3-engine PBR reference. Adapted
@@ -3577,18 +3627,19 @@ struct MetalView: UIViewRepresentable {
                          *   2. Single fake sun was so narrow that few pixels
                          *      hit the peak
                          *
-                         * Phase 5 fix: use a brighter sun + AMBIENT diffuse
-                         * floor so even unlit-by-sun pixels get baseline
-                         * shading. Plus we keep the Fresnel rim as additive
-                         * accent on top — no longer a replacement, now a
-                         * supplement.
+                         * The preserved Q3-lit base now supplies diffuse and
+                         * ambient response; this block supplements it with
+                         * direct, local-light and environment specular.
                          */
                         float3 L = sunDir;  // already normalized above
                         float3 H = normalize(V + L);
                         float NdotL = max(dot(worldN, L), 0.0);
                         float NdotH = max(dot(worldN, H), 0.0);
                         float VdotH = max(dot(V, H), 0.0);
-                        float LdotH = max(dot(L, H), 0.0);
+                        /* Preserve the complete legacy lighting result before
+                         * adding PBR. It already contains the BSP lightgrid,
+                         * authored/local dlights, fog, and normal relief. */
+                        float3 q3LitBase = base.rgb;
 
                         // D — GGX normal distribution (OpenJK D_GGX)
                         float alpha  = max(roughness * roughness, 0.0625);
@@ -3602,21 +3653,11 @@ struct MetalView: UIViewRepresentable {
                         float G = 0.5 / max(Vis_SmithV + Vis_SmithL, 1e-6);
 
                         // F — Schlick Fresnel (OpenJK F_Schlick variant)
-                        float3 F0 = mix(float3(0.04), base.rgb, metallic);
+                        float3 F0 = mix(float3(0.04), texel.rgb, metallic);
                         float3 F  = F0 + (float3(1.0) - F0) * pow(1.0 - VdotH, 5.0);
 
                         // Specular (D * F * G), pre-multiplied by NdotL
                         float3 spec = D * F * G;
-
-                        // Burley diffuse (OpenJK Diff_Burley)
-                        float f90 = 0.5 + 2.0 * roughness * LdotH * LdotH;
-                        float diffScatterL = 1.0 + (f90 - 1.0) * pow(1.0 - NdotL, 5.0);
-                        float diffScatterV = 1.0 + (f90 - 1.0) * pow(1.0 - NdotV, 5.0);
-                        float3 burley = base.rgb * diffScatterL * diffScatterV * (1.0 / M_PI_F);
-
-                        // Diffuse energy: dielectric contributes all
-                        // unreflected light, metal contributes none
-                        float3 kD = (float3(1.0) - F) * (1.0 - metallic);
 
                         // Sun intensity scaled UP to compensate for our
                         // single-light no-IBL setup. Real PBR rigs have
@@ -3626,21 +3667,22 @@ struct MetalView: UIViewRepresentable {
                             ? uniforms.sunColor.rgb * (2.4 * clamp(uniforms.sunIntensity, 0.25, 4.0))
                             : float3(2.4, 2.2, 1.9);  // warmish white sun
 
-                        // Per-light radiance
-                        float3 radiance = (kD * burley + spec) * sunColor * NdotL;
+                        /* The Q3-lit base is the sole diffuse carrier. Add
+                         * only direct specular here; retaining a second
+                         * Burley diffuse term would double-light dielectrics,
+                         * while multiplying the legacy base by (1-metallic)
+                         * would make authored metals black again. */
+                        float3 radiance = spec * sunColor * NdotL;
 
-                        /* PBR Phase 6 — IBL ambient + specular reflection.
+                        /* PBR Phase 6 — IBL specular reflection.
                          *
-                         * Replaces the flat `ambient = base.rgb * 0.35`
-                         * floor with environment-cube-driven irradiance
-                         * (diffuse) + roughness-mip pre-filter (specular).
+                         * The Q3 lightgrid/local-light result above is the
+                         * diffuse/ambient carrier. The environment cube adds
+                         * only its roughness-filtered specular response here.
                          * envCube is the 64²×6 procedural sky-gradient
                          * generated by ensurePBREnvCube() on first entity
                          * draw; mip chain via blit `generateMipmaps`.
                          *
-                         * Diffuse: sample at world normal, highest mip
-                         *   (smallest, most-blurred — approximates
-                         *   integrated irradiance over the hemisphere).
                          * Specular: sample at reflection vector R = reflect(-V, N),
                          *   mip = roughness * maxMip (Epic split-sum
                          *   pre-filter approximation: rough surfaces sample
@@ -3648,15 +3690,11 @@ struct MetalView: UIViewRepresentable {
                          * Fresnel at NdotV (Karis simplification — no half
                          *   vector for env sampling). max(1-roughness, F0)
                          *   guards against over-bright dim metals at rough=1.
-                         * kD energy split: dielectric gets (1-F)*1 of the
-                         *   diffuse term, metal gets (1-F)*0.
-                         *
                          * Null-guard: when envCube is unbound (cvar off or
-                         * cube alloc failed), fall through to the legacy
-                         * 0.35 ambient floor so the rocket doesn't render
-                         * pitch black on shadow side.
+                         * cube alloc failed), the specular term is zero while
+                         * q3LitBase remains intact.
                          */
-                        float3 iblTerm;
+                        float3 iblTerm = float3(0.0);
                         // Skip IBL specular on stages that use tcGen
                         // environment — vanilla Q3 already samples a 2D
                         // envmap-source texture (envmapyel/gold etc.) via
@@ -3664,27 +3702,29 @@ struct MetalView: UIViewRepresentable {
                         // on top double-stacks the reflection and renders
                         // health/yellow + ammo pickups as mirror chrome of
                         // env/space1 instead of the intended yellow-tinted
-                        // chrome. Keep diffuse-IBL ambient lift via the
-                        // legacy 0.35 floor so the shadow side doesn't
-                        // crater to black.
+                        // chrome. The Q3-lit base remains intact either way.
                         if (!is_null_texture(envCube) && entTcGenMode != 1) {
                             float maxMipF = float(envCube.get_num_mip_levels() - 1);
-                            float3 diffuseIBL = envCube.sample(envSampler, worldN, level(maxMipF)).rgb;
                             float3 R = reflect(-V, worldN);
                             float specMip = roughness * maxMipF;
                             float3 specularIBL = envCube.sample(envSampler, R, level(specMip)).rgb;
                             // Karis NdotV Fresnel with roughness floor
                             float3 F_v = F0 + (max(float3(1.0 - roughness), F0) - F0)
                                               * pow(1.0 - NdotV, 5.0);
-                            float3 kD_v = (float3(1.0) - F_v) * (1.0 - metallic);
-                            iblTerm = kD_v * diffuseIBL * base.rgb + F_v * specularIBL;
-                        } else {
-                            iblTerm = base.rgb * 0.35;  // legacy ambient floor
+                            /* Diffuse environment fill already exists in
+                             * q3LitBase via the lightgrid/local-light path. */
+                            iblTerm = F_v * specularIBL;
                         }
 
-                        // Direct sun radiance PEAKS over IBL fill — bright
-                        // highlights on top of the env-driven base shading.
-                        base.rgb = iblTerm + radiance;
+                        float3 localSpecular = float3(0.0);
+                        if (uniforms.suppressDlights == 0u) {
+                            localSpecular = entityDlightSpecular(
+                                in.worldPos, worldN, V, roughness, F0, dlights);
+                        }
+
+                        // Preserve Q3 lightgrid + local diffuse, then layer
+                        // sun, local-light and environment specular on top.
+                        base.rgb = q3LitBase + radiance + localSpecular + iblTerm;
                     }
 
                     // Fresnel rim — fires for ALL entities (including the
