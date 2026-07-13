@@ -23508,7 +23508,7 @@
    "surfaceparm_trans": false
   },
   "models/powerups/ammo/shotammo2": {
-   "albedo": "assets/ingested/shotgun.n.rtex.dds",
+   "albedo": null,
    "alphaMode": "OPAQUE",
    "animMaps": [],
    "emissive": null,
