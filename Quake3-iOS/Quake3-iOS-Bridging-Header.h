@@ -270,6 +270,9 @@ float Q3_RTBounces(void);
 float Q3_RTGI(void);
 float Q3_RTGICeiling(void);
 int   Q3_RTGIBounces(void);
+/* Stage79: rough-metal specular GI. Reuses the existing GI sample; 0 is an
+ * exact kernel no-op and 1 routes metallic primary-hit GI through Fresnel. */
+float Q3_RTSpecularGI(void);
 float Q3_RTDarkDesatStrength(void);
 float Q3_RTDarkDesatLuma(void);
 /* Stage68/69 legacy RT temporal AA. Default 1; 0 remains exact no-op/off.

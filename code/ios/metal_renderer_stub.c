@@ -12391,6 +12391,18 @@ int Q3_RTGIBounces(void) {
     return v;
 }
 
+float Q3_RTSpecularGI(void) {
+    if (ri.Cvar_Get == NULL) return 1.0f;
+    /* Stage79: correctness fix for metallic surfaces that should receive
+     * indirect energy through the specular lobe. 0 is an exact kernel no-op
+     * for A/B; 1 enables the Fresnel-routed term. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_specular_gi", "1", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 1.0f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    return v;
+}
+
 float Q3_RTDarkDesatStrength(void) {
     if (ri.Cvar_Get == NULL) return 1.0f;
     /* Stage72: RT direct-light chroma damping for dark, direct-dominated

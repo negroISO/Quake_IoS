@@ -495,7 +495,7 @@ struct MetalView: UIViewRepresentable {
             var rtGIParams: SIMD4<Float> = SIMD4(0, 1.25, 0, 0)
             // Stage 75 append-only GI controls:
             // x = r_rt_gi_bounces (1=current path, 2=one extra diffuse bounce),
-            // yzw reserved.
+            // y = r_rt_specular_gi (Stage79 rough-metal Fresnel GI), zw reserved.
             var rtGIExtraParams: SIMD4<Float> = SIMD4(1, 0, 0, 0)
         }
 
@@ -521,7 +521,9 @@ struct MetalView: UIViewRepresentable {
             // sidecar for that channel. The RT kernel samples rough/metal maps
             // only when y/z are valid; otherwise it keeps materialParams.z/.w.
             var pbrSlots: SIMD4<UInt32> = SIMD4(UInt32.max, UInt32.max, UInt32.max, UInt32.max)
-            // x = parallax scale (reserved), y = normal scale, z/w = pad.
+            // x = parallax scale (reserved), y = normal scale.
+            // z/w = Stage79 shader-class roughness/metallic fallback used only
+            // by cvar-gated specular GI when the RT material constants are absent.
             var rtPBRParams: SIMD4<Float> = SIMD4(0, 1, 0, 0)
             // RT emissive Increment 2: xyz = authored emissive tint, w = 1 when
             // the kernel should sample texTable.emissive[albedoSlot]. w = 0 keeps
@@ -1775,7 +1777,7 @@ struct MetalView: UIViewRepresentable {
 
         float3 q3ResolvedFogColor(float3 fogRGB) {
             /* Task #19: pass the AUTHORED fogparms color through unmodified.
-             * The old `< 0.001 → float3(0.36)` grey fallback assumed black
+             * The old `< 0.001 → float3(0.18)` grey fallback assumed black
              * fog meant "parse failed", but vanilla shaders genuinely author
              * black fog (nvidia.shader `fogparms ( 0 0 0 ) 1024`, sfx.shader
              * xblackfog/xfinalfog/darkness) — the fallback turned those into
@@ -2579,6 +2581,7 @@ struct MetalView: UIViewRepresentable {
                                           constant WorldUniforms &uniforms [[buffer(1)]],
                                           constant DLightBlock &dlights [[buffer(2)]],
                                           constant float4 &pbrWorldParams [[buffer(3)]],
+                                          constant float4 &rtWorldSpecGIParams [[buffer(4)]],
                                           texture2d<float> colorTexture [[texture(0)]],
                                           texture2d<float> lightmapTexture [[texture(1)]],
                                           texture2d<float> worldNormalMap [[texture(2)]],
@@ -3047,6 +3050,23 @@ struct MetalView: UIViewRepresentable {
                     lit = lit
                         + kD_v * diffuseIBL * fillScale
                         + F_v  * specularIBL * specMask;
+
+                    if (rtWorldSpecGIParams.x > 0.0 && metallic > 0.08) {
+                        float3 F0_gi = mix(float3(0.04), max(texel.rgb, float3(0.02)), metallic);
+                        float3 F_gi = F0_gi + (float3(1.0) - F0_gi) * pow(oneMinusNdotV, 5.0);
+                        float metalGate = smoothstep(0.08, 0.35, metallic) * saturate(rtWorldSpecGIParams.x);
+                        float reflCut = clamp(rtWorldSpecGIParams.y, 0.0, 1.0);
+                        float smoothReflectionShare = 0.0;
+                        if (rtWorldSpecGIParams.z > 0.5 && reflCut > 0.001) {
+                            smoothReflectionShare = saturate((reflCut - roughness) / reflCut);
+                        }
+                        float roughSpecularShare = 1.0 - smoothReflectionShare;
+                        float roughLobeGain = mix(1.30, 0.95, saturate(roughness));
+                        float3 incidentProxy = max(diffuseIBL, lit) + lit;
+                        float3 roughSpecGI = F_gi * incidentProxy *
+                                             (roughSpecularShare * roughLobeGain * 1.05);
+                        lit += min(roughSpecGI * metalGate, float3(0.24));
+                    }
                 }
             }
             // Emissive accumulation (additive, post-lighting). intensity == 0
@@ -5571,7 +5591,8 @@ struct MetalView: UIViewRepresentable {
                 // z = r_rt_dark_desat_strength, w = r_rt_dark_desat_luma.
                 float4 rtGIParams;
                 // Stage 75 append-only controls:
-                // x = r_rt_gi_bounces (1=current, 2=one extra diffuse bounce).
+                // x = r_rt_gi_bounces (1=current, 2=one extra diffuse bounce),
+                // y = r_rt_specular_gi (rough-metal Fresnel GI).
                 float4 rtGIExtraParams;
             };
 
@@ -5619,7 +5640,7 @@ struct MetalView: UIViewRepresentable {
                 float4 spriteAtlasParams; // x=cols, y=rows, z=fps, w=pad; 0 cols = not an atlas
                 // Step 1 (RT PBR sidecars) — must mirror the Swift struct exactly.
                 uint4 pbrSlots;      // x=normal y=roughness z=metallic w=height slot; 0xFFFFFFFF = none
-                float4 rtPBRParams;  // x=parallaxScale, y=normalScale, z/w=pad
+                float4 rtPBRParams;  // x=parallaxScale, y=normalScale, z/w=Stage79 rough/metal fallback
                 float4 emissiveTintMode; // xyz=tint, w=1 sample texTable.emissive[albedoSlot]
             };
 
@@ -6153,6 +6174,16 @@ struct MetalView: UIViewRepresentable {
                         gAlbedoValue = albedoSample.rgb;
                         float rough = rtMaterialRoughness(texTable, mat, repeatSampler, uv);
                         float metal = rtMaterialMetallic(texTable, mat, repeatSampler, uv);
+                        float specGIRough = rough;
+                        float specGIMetal = metal;
+                        if (mat.materialParams.w > specGIMetal && mat.materialParams.w > 0.5) {
+                            specGIMetal = clamp(mat.materialParams.w, 0.0, 1.0);
+                            specGIRough = clamp(mat.materialParams.z, 0.0, 1.0);
+                        }
+                        if (mat.rtPBRParams.w > specGIMetal && mat.rtPBRParams.w > 0.5) {
+                            specGIMetal = clamp(mat.rtPBRParams.w, 0.0, 1.0);
+                            specGIRough = clamp(mat.rtPBRParams.z, 0.0, 1.0);
+                        }
                         gRoughnessValue = rough;
                         // Step 2c: RT normal mapping. Gated by r_rt_normal_scale
                         // (rtPBRGlobal.x); 0 = exact no-op. Samples the per-material
@@ -6601,6 +6632,37 @@ struct MetalView: UIViewRepresentable {
                                  * normal colored bleed. */
                                 float giCeiling = max(uniforms.rtGIParams.y, 0.05);
                                 float3 gi = albedoSample.rgb * bounceRadiance * giStrength;
+                                if (uniforms.rtGIExtraParams.y > 0.0 && specGIMetal > 0.08) {
+                                    /* Stage79 specular GI: keep the calibrated
+                                     * Stage67 diffuse GI baseline intact, then
+                                     * add the missing metallic rough-specular
+                                     * share from the same bounce sample. No new
+                                     * rays: the cosine GI sample is the rough
+                                     * glossy proxy. Reflection rays own the
+                                     * smooth share below the roughness cap; this
+                                     * term owns the complementary rough share so
+                                     * the two paths do not overlap. Dielectrics
+                                     * and cvar=0 keep the exact Stage67 line. */
+                                    float3 V = -rayDir;
+                                    float ndv = max(dot(N, V), 0.0);
+                                    float3 F0 = mix(float3(0.04), albedoSample.rgb, specGIMetal);
+                                    float3 F = F0 + (float3(1.0) - F0) * pow(1.0 - ndv, 5.0);
+                                    float metalGate = smoothstep(0.08, 0.35, specGIMetal) *
+                                                      saturate(uniforms.rtGIExtraParams.y);
+                                    float reflCut = clamp(uniforms.rtLightParams.w, 0.0, 1.0);
+                                    float smoothReflectionShare = 0.0;
+                                    if (uniforms.rtLightParams.z > 0.5 && reflCut > 0.001) {
+                                        smoothReflectionShare = saturate((reflCut - specGIRough) / reflCut);
+                                    }
+                                    float roughSpecularShare = 1.0 - smoothReflectionShare;
+                                    float roughLobeGain = mix(1.30, 0.95, saturate(specGIRough));
+                                    float3 specularIncident =
+                                        bounceRadiance * giStrength +
+                                        baseLight * (0.75 * saturate(giStrength));
+                                    float3 specularGI = F * specularIncident *
+                                                        (roughSpecularShare * roughLobeGain);
+                                    gi += specularGI * metalGate;
+                                }
                                 color += min(gi, float3(giCeiling));
                             } else if (uniforms.rtControlParams.y > 0.5) {
                                 float rnd0 = rtHash12(float2(tid) + uniforms.fovParams.zz * float2(17.0, 31.0));
@@ -7714,6 +7776,10 @@ struct MetalView: UIViewRepresentable {
                             tcModParams3: chain.p3,
                             spriteAtlasParams: rtAtlasParams,
                             pbrSlots: SIMD4<UInt32>(invalid, roughnessSlot, metallicSlot, invalid),
+                            rtPBRParams: SIMD4<Float>(0,
+                                                       1,
+                                                       stage.pbrRoughness,
+                                                       stage.pbrMetallic > 0.5 ? stage.pbrMetallic : 0),
                             emissiveTintMode: rtEmissiveTintMode)
                         if rtAuthoredEmissiveForNEE {
                             appendEmissiveCandidate(tri: tri,
@@ -9028,7 +9094,7 @@ struct MetalView: UIViewRepresentable {
                                                              0.0)
             uniforms.rtGIParams = SIMD4<Float>(Q3_RTGI(), Q3_RTGICeiling(),
                                                Q3_RTDarkDesatStrength(), Q3_RTDarkDesatLuma())
-            uniforms.rtGIExtraParams = SIMD4<Float>(Float(Q3_RTGIBounces()), 0, 0, 0)
+            uniforms.rtGIExtraParams = SIMD4<Float>(Float(Q3_RTGIBounces()), Q3_RTSpecularGI(), 0, 0)
             annotateEntityASDemandPerf(perfFrame)
             if rtDebugView != 0 {
                 let debugMap = currentRTMapName()
@@ -9774,6 +9840,8 @@ struct MetalView: UIViewRepresentable {
                                            index: 2)
                     var pbrWorldParams = pbrOff
                     encoder.setFragmentBytes(&pbrWorldParams, length: 16, index: 3)
+                    var rtWorldSpecGIParams = SIMD4<Float>(0, 0, 0, 0)
+                    encoder.setFragmentBytes(&rtWorldSpecGIParams, length: 16, index: 4)
                     encoder.drawIndexedPrimitives(type: .triangle,
                                                   indexCount: Int(draw.indexCount),
                                                   indexType: .uint32,
@@ -9890,6 +9958,8 @@ struct MetalView: UIViewRepresentable {
                 encoder.setFragmentTexture(portalTexture, index: 9)
                 var pbrWorldParams = SIMD4<Float>(0, 0, 0, 0)
                 encoder.setFragmentBytes(&pbrWorldParams, length: 16, index: 3)
+                var rtWorldSpecGIParams = SIMD4<Float>(0, 0, 0, 0)
+                encoder.setFragmentBytes(&rtWorldSpecGIParams, length: 16, index: 4)
                 var drawUniforms = makeWorldDrawUniforms(draw: draw,
                                                           stage: stage,
                                                           timeSeconds: timeSeconds,
@@ -11808,6 +11878,8 @@ struct MetalView: UIViewRepresentable {
             let timeSeconds = snapshot.shaderTime
             var pbrWorldParams = SIMD4<Float>(0, 0, 0, 0)
             encoder.setFragmentBytes(&pbrWorldParams, length: 16, index: 3)
+            var rtWorldSpecGIParams = SIMD4<Float>(0, 0, 0, 0)
+            encoder.setFragmentBytes(&rtWorldSpecGIParams, length: 16, index: 4)
 
             var envWorldBatches = UnsafeBufferPointer<Q3MetalWorldBatchCmd>(start: nil, count: 0)
             var envWorldBatchIndexBuffer: MTLBuffer?
@@ -12282,6 +12354,20 @@ struct MetalView: UIViewRepresentable {
             _ = pbrMetallicTexture(for: handle)
             guard pbrMetallicAuthoredLoaded.contains(handle) else { return nil }
             return pbrMetallicCache[handle]
+        }
+
+        private func pbrSpecGIMetalGate(handle: UInt32, stage: Q3MetalWorldStage) -> Bool {
+            var metallic = stage.pbrMetallic
+            if let matPtr = Q3MetalRenderer_GetPBRMaterial(handle) {
+                let mat = matPtr.pointee
+                if mat.metallic_constant >= 0.0 {
+                    metallic = max(metallic, mat.metallic_constant)
+                }
+                if Self.hasNonEmptyPBRPath(mat.metallic) {
+                    metallic = max(metallic, 1.0)
+                }
+            }
+            return metallic > 0.5
         }
 
         // MARK: - Emissive
@@ -14350,6 +14436,12 @@ struct MetalView: UIViewRepresentable {
                             Q3_PBRWorldSpecBoost(),
                             Q3_PBRWorldClassMatchEnabled() != 0 ? 1.0 : 0.0)
                         encoder.setFragmentBytes(&pbrWorldParams, length: 16, index: 3)
+                        var rtWorldSpecGIParams = SIMD4<Float>(
+                            (worldSelection.useWorldPBR && pbrSpecGIMetalGate(handle: worldSelection.materialHandle, stage: stage) && Q3_RTMix() > 0.001) ? Q3_RTSpecularGI() : 0.0,
+                            Q3_RTReflRoughnessMax(),
+                            Q3_RTReflections() != 0 ? 1.0 : 0.0,
+                            0.0)
+                        encoder.setFragmentBytes(&rtWorldSpecGIParams, length: 16, index: 4)
                         // Phase 2 atlas wiring. When the bound world handle
                         // has RTX Remix sprite-sheet metadata (or a targeted
                         // compatibility fallback), surface cols/rows/fps to the
@@ -14996,6 +15088,12 @@ struct MetalView: UIViewRepresentable {
                                 Q3_PBRWorldSpecBoost(),
                                 Q3_PBRWorldClassMatchEnabled() != 0 ? 1.0 : 0.0)
                             encoder.setFragmentBytes(&pbrWorldParams, length: 16, index: 3)
+                            var rtWorldSpecGIParams = SIMD4<Float>(
+                                (worldSelection.useWorldPBR && pbrSpecGIMetalGate(handle: worldSelection.materialHandle, stage: stage) && Q3_RTMix() > 0.001) ? Q3_RTSpecularGI() : 0.0,
+                                Q3_RTReflRoughnessMax(),
+                                Q3_RTReflections() != 0 ? 1.0 : 0.0,
+                                0.0)
+                            encoder.setFragmentBytes(&rtWorldSpecGIParams, length: 16, index: 4)
                             // Phase 2 atlas wiring (mirror of the primary
                             // draw site — see comment above the other copy).
                             drawUniforms.spriteAtlasParams = worldSelection.atlasParams
