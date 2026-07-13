@@ -7215,15 +7215,12 @@ struct MetalView: UIViewRepresentable {
                 constexpr sampler historySampler(filter::linear, address::clamp_to_edge);
                 float4 h = history.sample(historySampler, saturate(prevUv));
 
-                /* Stage71: clamp reprojected history to the current-frame
-                 * 3x3 color box before blending. The old MV-TAA path accepted
-                 * any history value; residual jitter/reprojection error could
-                 * average high-frequency texture detail into a soft rest
-                 * image, and it left no anti-ghosting guard for disocclusion
-                 * edges. The box clamp is the standard bounded TAA rejection:
-                 * it preserves the low 0.02 noise-convergence default while
-                 * preventing history from drifting outside what the current
-                 * frame's local neighborhood can support. */
+                /* Stage82: strictly clamp reprojected history to the current
+                 * frame's 3x3 color box before blending. Stage71 expanded the
+                 * box by max(1.5x its range, 0.08), which admitted out-of-box
+                 * history and kept both soft rest detail and disocclusion
+                 * trails. The strict local min/max keeps accepted history
+                 * bounded to detail present in the current neighborhood. */
                 uint2 maxTid = uint2(output.get_width() - 1, output.get_height() - 1);
                 float3 boxMin = c.rgb;
                 float3 boxMax = c.rgb;
@@ -7236,9 +7233,7 @@ struct MetalView: UIViewRepresentable {
                         boxMax = max(boxMax, n);
                     }
                 }
-                float3 boxRange = max(boxMax - boxMin, float3(0.0));
-                float3 boxPad = max(boxRange * 1.5, float3(0.08));
-                float3 hRGB = clamp(h.rgb, boxMin - boxPad, boxMax + boxPad);
+                float3 hRGB = clamp(h.rgb, boxMin, boxMax);
 
                 float3 rgb = mix(hRGB, c.rgb, a);
                 output.write(float4(rgb, c.a), tid);
@@ -7327,7 +7322,7 @@ struct MetalView: UIViewRepresentable {
             guard let lib = makeRTLibrary(device: device), let fn = lib.makeFunction(name: "accumulateRT") else {
                 print("[RT] failed to create accumulateRT"); return nil
             }
-            do { let pso = try device.makeComputePipelineState(function: fn); rtAccumPipelineState = pso; print("[RT] accumulateRT pipeline ready"); return pso }
+            do { let pso = try device.makeComputePipelineState(function: fn); rtAccumPipelineState = pso; print("[RT] accumulateRT pipeline ready clamp=3x3-strict"); return pso }
             catch { print("[RT] accumulate pipeline state error: \(error)"); return nil }
         }
 
