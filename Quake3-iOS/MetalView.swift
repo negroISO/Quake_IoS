@@ -5856,6 +5856,7 @@ struct MetalView: UIViewRepresentable {
 
             struct RTEntityShadeResult {
                 float3 color;
+                float3 albedo;
                 float alpha;
                 uint flags; // bit0=valid material, bit1=alpha passed, bit2=additive
             };
@@ -5872,6 +5873,7 @@ struct MetalView: UIViewRepresentable {
                                                         sampler textureSampler) {
                 RTEntityShadeResult result;
                 result.color = float3(0.03);
+                result.albedo = float3(0.0);
                 result.alpha = 0.0;
                 result.flags = 0u;
                 RTEntityPrimitiveMaterial mat = entityMaterials[primitiveID];
@@ -5932,6 +5934,7 @@ struct MetalView: UIViewRepresentable {
                 float alphaWeight = (blendMode == 5u) ? 1.0 : (additive ? alpha : max(alpha, 0.15));
                 float3 vertexColor = additive ? max(c, float3(0.35)) : max(c, float3(0.08));
                 float3 albedo = texel.rgb * vertexColor * tint;
+                result.albedo = max(albedo * alphaWeight, float3(0.0));
                 result.color = additive ? max(albedo * alphaWeight, float3(0.0))
                                         : max(albedo * facing * alphaWeight, float3(0.01));
                 return result;
@@ -6688,6 +6691,8 @@ struct MetalView: UIViewRepresentable {
                                         }
                                     }
                                     float3 reflColor;
+                                    float3 reflectionGIAlbedo = float3(0.0);
+                                    bool reflectionGIEligible = false;
                                     bool useEntityReflectionHit = false;
                                     bool hasEntityAdditiveReflection = false;
                                     float3 entityAdditiveReflection = float3(0.0);
@@ -6764,6 +6769,8 @@ struct MetalView: UIViewRepresentable {
                                                 atomic_fetch_add_explicit(&rtShadowCounters[10], 1u, memory_order_relaxed);
                                             }
                                             reflColor = es.color + entityAdditiveReflection;
+                                            reflectionGIAlbedo = es.albedo;
+                                            reflectionGIEligible = true;
                                             useEntityReflectionHit = true;
                                             break;
                                         }
@@ -6821,6 +6828,10 @@ struct MetalView: UIViewRepresentable {
                                                     float3 remitSample = rtEmissionSample(texTable, rmat, ralb, repeatSampler, ruv);
                                                     reflColor += remitSample * rmat.materialParams.x;
                                                 }
+                                                if (rmat.materialFlags.x == 0) {
+                                                    reflectionGIAlbedo = ralb;
+                                                    reflectionGIEligible = true;
+                                                }
                                             } else if (!is_null_texture(envCube)) {
                                                 reflColor = envCube.sample(envSampler, R).rgb;
                                             } else {
@@ -6834,6 +6845,18 @@ struct MetalView: UIViewRepresentable {
                                         if (hasEntityAdditiveReflection) {
                                             reflColor += entityAdditiveReflection;
                                         }
+                                    }
+                                    if (reflectionGIEligible && giStrength > 0.0 && rtMax3(reflectionGIAlbedo) > 0.0) {
+                                        /* Stage73: the measured one-ray replay of
+                                         * Stage67 GI from reflection hits was too
+                                         * expensive in reflective-heavy scenes.
+                                         * Use the cheap chosen path instead:
+                                         * inject the calibrated ambient share of
+                                         * primary GI into reflected hit shading.
+                                         * No extra rays, no recursive tree. */
+                                        float giCeiling = max(uniforms.rtGIParams.y, 0.05);
+                                        float3 reflGI = reflectionGIAlbedo * (ambientFloor * giStrength);
+                                        reflColor += min(reflGI, float3(giCeiling));
                                     }
                                     // Fresnel-Schlick; F0 0.04 dielectric → albedo for metal.
                                     float ndv = max(dot(N, V), 0.0);
