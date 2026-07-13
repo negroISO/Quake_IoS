@@ -24821,7 +24821,10 @@
       "normal": "assets/ingested/B9D9C41F08399E6E_normal_OTH_Normal.n.rtex.dds",
       "roughness": null,
       "source": "capture",
-      "sourceTexture": "textures/base_floor/diamond2c.jpg"
+      "sourceTexture": "textures/base_floor/diamond2c.jpg",
+      "roughness_constant": 0.45,
+      "metallic_constant": 0.75,
+      "stage78_note": "stage78 q3dm0 corridor truth: diamond plate floor reads worn semi-metal, not dielectric or mirror"
     },
     "textures/base_floor/diamond2c_ow": {
       "albedo": "assets/ingested/1DBC0B2D276E681A_albedo.a.rtex.dds",
@@ -25005,7 +25008,10 @@
       "normal": "assets/ingested/41C19A274DB0937F_normal_OTH_Normal.n.rtex.dds",
       "roughness": null,
       "source": "albedo",
-      "sourceTexture": "textures/base_floor/metaltechfloor01final.jpg"
+      "sourceTexture": "textures/base_floor/metaltechfloor01final.jpg",
+      "roughness_constant": 0.42,
+      "metallic_constant": 0.9,
+      "stage78_note": "stage78 q3dm0 corridor truth: tech floor/trim should catch metal energy without mirror finish"
     },
     "textures/base_floor/pjgrate1": {
       "albedo": "assets/ingested/4415062155FA12C1_albedo.a.rtex.dds",
@@ -26405,7 +26411,10 @@
       "normal": "assets/ingested/78052C32D3217624_normal_OTH_Normal.n.rtex.dds",
       "roughness": null,
       "source": "capture",
-      "sourceTexture": "textures/base_trim/basemetalsupport.jpg"
+      "sourceTexture": "textures/base_trim/basemetalsupport.jpg",
+      "roughness_constant": 0.58,
+      "metallic_constant": 0.85,
+      "stage78_note": "stage78 q3dm0 corridor truth: base metal support is duller trim but still metallic"
     },
     "textures/base_trim/border11": {
       "albedo": "assets/ingested/47CCB6F6C54C43FF_albedo.a.rtex.dds",
@@ -26891,7 +26900,10 @@
       "normal": "assets/ingested/94B4EACC74E71005_normal_OTH_Normal.n.rtex.dds",
       "roughness": null,
       "source": "albedo",
-      "sourceTexture": "textures/base_trim/pewter.jpg"
+      "sourceTexture": "textures/base_trim/pewter.jpg",
+      "roughness_constant": 0.48,
+      "metallic_constant": 0.9,
+      "stage78_note": "stage78 q3dm0 corridor truth: large pewter wall/trim panels show broad semi-gloss metal response; parent rough=0.70 was too dull"
     },
     "textures/base_trim/pewter_shiney": {
       "albedo": "assets/ingested/66E9B966FAB6960F_albedo.a.rtex.dds",
@@ -27767,7 +27779,10 @@
       "sourceTexture": "textures/base_wall/bluemetal1b_shiny",
       "srcBlend": "GL_DST_COLOR",
       "surfaceparm_sky": false,
-      "surfaceparm_trans": false
+      "surfaceparm_trans": false,
+      "roughness_constant": 0.39,
+      "metallic_constant": 1.0,
+      "stage78_note": "stage78 q3dm0 corridor truth: inherited shiny blue-metal constants are correct; direct entry locks inheritance into the staged bundle"
     },
     "textures/base_wall/bluemetal1light": {
       "albedo": "assets/ingested/BB6C0088155E9961_albedo.a.rtex.dds",
@@ -27828,7 +27843,10 @@
       "sourceTexture": "textures/base_wall/bluemetal2_shiny.tga",
       "srcBlend": "GL_DST_COLOR",
       "surfaceparm_sky": false,
-      "surfaceparm_trans": false
+      "surfaceparm_trans": false,
+      "roughness_constant": 0.38,
+      "metallic_constant": 0.95,
+      "stage78_note": "stage78 q3dm0 corridor truth: shiny blue wall panels should read semi-gloss metal, not rough dielectric"
     },
     "textures/base_wall/bluemetal3": {
       "albedo": "assets/ingested/613C97C48C8E829F_albedo.a.rtex.dds",
@@ -27843,7 +27861,10 @@
       "normal": "assets/ingested/613C97C48C8E829F_normal_OTH_Normal.n.rtex.dds",
       "roughness": null,
       "source": "albedo",
-      "sourceTexture": "textures/base_wall/bluemetal3.jpg"
+      "sourceTexture": "textures/base_wall/bluemetal3.jpg",
+      "roughness_constant": 0.45,
+      "metallic_constant": 0.9,
+      "stage78_note": "stage78 q3dm0 corridor truth: blue metal wall family, slightly duller than shiny variants but still metallic"
     },
     "textures/base_wall/bluemetalsupport2c_1": {
       "albedo": "assets/ingested/ED32678187853EEC_albedo.a.rtex.dds",
@@ -36362,6 +36383,20 @@
       "_comment": "Stage70: verified alias for patch10shiny stage image; pak0 shader maps patch10_beatup4_alpha.tga, source PBR entry is patch10_beatup4.jpg. Correct DDS opened from assets/ingested before aliasing.",
       "aliasOf": "textures/base_wall/patch10_beatup4",
       "gamePath": "textures/base_wall/patch10_beatup4_alpha"
+    },
+    "textures/base_wall/bluemetal3b": {
+      "roughness_constant": 0.45,
+      "metallic_constant": 0.9,
+      "source": "stage78_truth_constants",
+      "stage78_note": "stage78 q3dm0 corridor truth: blue-metal family sibling of bluemetal3; constants only, no DDS/map assignment",
+      "notes": "q3dm0 blue-metal family sibling of bluemetal3; constants only, no DDS/map assignment"
+    },
+    "textures/base_wall/patch10shiny": {
+      "roughness_constant": 0.38,
+      "metallic_constant": 0.85,
+      "source": "stage78_truth_constants",
+      "stage78_note": "stage78 q3dm0 corridor truth: shiny patch/metal panel; constants only, no DDS/map assignment",
+      "notes": "q3dm0 shiny patch/metal panel; constants only, no DDS/map assignment"
     }
   },
   "metadata": {
@@ -36416,7 +36451,8 @@
     ],
     "stage70_added_verified_aliases": [
       "textures/base_wall/patch10_beatup4_alpha"
-    ]
+    ],
+    "stage78_metal_constants": "q3dm0 corridor truth-grounded scalar roughness/metallic constants; no new DDS/map assignments"
   },
   "source": "<bundled>"
 }
