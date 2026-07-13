@@ -12382,6 +12382,15 @@ float Q3_RTGICeiling(void) {
     return v;
 }
 
+int Q3_RTGIBounces(void) {
+    if (ri.Cvar_Get == NULL) return 1;
+    cvar_t *cv = ri.Cvar_Get("r_rt_gi_bounces", "1", CVAR_ARCHIVE);
+    int v = cv ? cv->integer : 1;
+    if (v < 1) v = 1;
+    if (v > 2) v = 2;
+    return v;
+}
+
 float Q3_RTDarkDesatStrength(void) {
     if (ri.Cvar_Get == NULL) return 1.0f;
     /* Stage72: RT direct-light chroma damping for dark, direct-dominated

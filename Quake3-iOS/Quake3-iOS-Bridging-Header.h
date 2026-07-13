@@ -269,6 +269,7 @@ float Q3_RTBounces(void);
  * color in low-luma, direct-dominated regions; strength 0 is exact no-op. */
 float Q3_RTGI(void);
 float Q3_RTGICeiling(void);
+int   Q3_RTGIBounces(void);
 float Q3_RTDarkDesatStrength(void);
 float Q3_RTDarkDesatLuma(void);
 /* Stage68/69 legacy RT temporal AA. Default 1; 0 remains exact no-op/off.

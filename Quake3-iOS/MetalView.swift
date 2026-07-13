@@ -493,6 +493,10 @@ struct MetalView: UIViewRepresentable {
             // per-pixel firefly ceiling, z = Stage72 dark-direct chroma
             // blend strength, w = pre-tonemap luma knee.
             var rtGIParams: SIMD4<Float> = SIMD4(0, 1.25, 0, 0)
+            // Stage 75 append-only GI controls:
+            // x = r_rt_gi_bounces (1=current path, 2=one extra diffuse bounce),
+            // yzw reserved.
+            var rtGIExtraParams: SIMD4<Float> = SIMD4(1, 0, 0, 0)
         }
 
         struct RTPrimitiveMaterial {
@@ -5564,6 +5568,9 @@ struct MetalView: UIViewRepresentable {
                 // x = r_rt_gi strength, y = r_rt_gi_clamp firefly ceiling,
                 // z = r_rt_dark_desat_strength, w = r_rt_dark_desat_luma.
                 float4 rtGIParams;
+                // Stage 75 append-only controls:
+                // x = r_rt_gi_bounces (1=current, 2=one extra diffuse bounce).
+                float4 rtGIExtraParams;
             };
 
             // P1: RTX Remix authored per-map light (baked from
@@ -6385,6 +6392,166 @@ struct MetalView: UIViewRepresentable {
                                                 float bAlphaWeight = (bounceMat.materialFlags.w != 0) ? clamp(bEffectiveAlpha, 0.0, 1.0) : 1.0;
                                                 bounceRadiance = bAlbedoSample.rgb * bAlphaWeight *
                                                                  (bLightmapExitant + bDirectIncident * 0.31830988618);
+                                                if (uniforms.rtGIExtraParams.x > 1.5) {
+                                                    float rnd2 = rtHash12(float2(tid) + uniforms.fovParams.zz * float2(71.0, 19.0) + bHitPos.xz * 0.013);
+                                                    float rnd3 = rtHash12(float2(tid.yx) + uniforms.fovParams.zz * float2(29.0, 83.0) + bHitPos.zy * 0.017);
+                                                    float3 secondDir = rtCosineHemisphere(bN, float2(rnd2, rnd3));
+                                                    ray secondRay(bHitPos + bN * 0.75, secondDir, 0.1, 2048.0);
+                                                    auto secondHit = i.intersect(secondRay, worldAS);
+                                                    float3 secondRadiance = float3(0.0);
+                                                    if (secondHit.type == intersection_type::triangle) {
+                                                        uint stri = secondHit.primitive_id;
+                                                        RTPrimitiveMaterial secondMat = primitiveMaterials[stri];
+                                                        if (secondMat.materialFlags.x != 0) {
+                                                            if (!is_null_texture(envCube)) {
+                                                                secondRadiance = envCube.sample(envSampler, secondDir).rgb * 0.06;
+                                                            }
+                                                        } else if (secondMat.albedoSlot < 176) {
+                                                            uint si0 = indices[stri * 3 + 0];
+                                                            uint si1 = indices[stri * 3 + 1];
+                                                            uint si2 = indices[stri * 3 + 2];
+                                                            float2 sbc = secondHit.triangle_barycentric_coord;
+                                                            float sw = 1.0 - sbc.x - sbc.y;
+                                                            float3 sp0 = float3(vertices[si0].position);
+                                                            float3 sp1 = float3(vertices[si1].position);
+                                                            float3 sp2 = float3(vertices[si2].position);
+                                                            float3 sN = float3(vertices[si0].normal) * sw +
+                                                                        float3(vertices[si1].normal) * sbc.x +
+                                                                        float3(vertices[si2].normal) * sbc.y;
+                                                            if (dot(sN, sN) < 1.0e-6) {
+                                                                sN = cross(sp1 - sp0, sp2 - sp0);
+                                                            }
+                                                            if (dot(sN, sN) > 1.0e-8) {
+                                                                sN = normalize(sN);
+                                                                if (dot(sN, -secondDir) < 0.0) { sN = -sN; }
+                                                            } else {
+                                                                sN = -secondDir;
+                                                            }
+                                                            float3 sHitPos = bHitPos + secondDir * secondHit.distance;
+                                                            float2 suv = vertices[si0].texCoord * sw +
+                                                                         vertices[si1].texCoord * sbc.x +
+                                                                         vertices[si2].texCoord * sbc.y;
+                                                            float2 slm = vertices[si0].lightmapTexCoord * sw +
+                                                                         vertices[si1].lightmapTexCoord * sbc.x +
+                                                                         vertices[si2].lightmapTexCoord * sbc.y;
+                                                            uint stcCount = min(secondMat.tcModCount, 4u);
+                                                            for (uint smi = 0; smi < stcCount; ++smi) {
+                                                                uint stype = secondMat.tcModTypes[smi];
+                                                                if (stype == 0) { continue; }
+                                                                float4 sparams = secondMat.tcModParams0;
+                                                                if (smi == 1) { sparams = secondMat.tcModParams1; }
+                                                                else if (smi == 2) { sparams = secondMat.tcModParams2; }
+                                                                else if (smi == 3) { sparams = secondMat.tcModParams3; }
+                                                                suv = rtApplyTcMod(suv, sHitPos, int(stype), sparams, uniforms.fovParams.z);
+                                                                slm = rtApplyTcMod(slm, sHitPos, int(stype), sparams, uniforms.fovParams.z);
+                                                            }
+                                                            if (secondMat.spriteAtlasParams.x > 0.5) {
+                                                                float sCols = secondMat.spriteAtlasParams.x;
+                                                                float sRows = secondMat.spriteAtlasParams.y;
+                                                                float sFps = secondMat.spriteAtlasParams.z;
+                                                                float sTotal = max(1.0, sCols * sRows);
+                                                                float sFrame = (sFps > 0.0) ? floor(uniforms.fovParams.z * sFps) : 0.0;
+                                                                float sIdx = fmod(sFrame, sTotal);
+                                                                if (sIdx < 0.0) { sIdx += sTotal; }
+                                                                float sCol = fmod(sIdx, sCols);
+                                                                float sRow = floor(sIdx / sCols);
+                                                                float2 sLocalUV = fract(suv);
+                                                                suv = float2((sLocalUV.x + sCol) / sCols,
+                                                                             (sLocalUV.y + sRow) / sRows);
+                                                            }
+                                                            float4 sAlbedoSample = texTable.albedo[secondMat.albedoSlot].sample(repeatSampler, suv);
+                                                            float sBlendMode = secondMat.materialParams.y;
+                                                            bool sAdditive = (abs(sBlendMode - 1.0) < 0.5 || abs(sBlendMode - 5.0) < 0.5);
+                                                            bool sAlphaSensitive = (secondMat.materialFlags.z != 0 || secondMat.materialFlags.w != 0 || sAdditive);
+                                                            float sLumaAlpha = max(max(sAlbedoSample.r, sAlbedoSample.g), sAlbedoSample.b);
+                                                            float sEffectiveAlpha = (sAlphaSensitive && sAlbedoSample.a >= 0.995) ? sLumaAlpha : sAlbedoSample.a;
+                                                            float sAlphaThreshold = secondMat.alphaTcModControl.x;
+                                                            bool sAlphaReject = (sAlphaThreshold > 0.0 && sEffectiveAlpha < sAlphaThreshold) ||
+                                                                                (sAlphaThreshold < 0.0 && sEffectiveAlpha >= -sAlphaThreshold);
+                                                            if (!sAlphaReject) {
+                                                                if (!sAdditive) {
+                                                                    float3 sLightmap = float3(1.0);
+                                                                    if (secondMat.lightmapSlot < 64) {
+                                                                        sLightmap = texTable.lightmap[secondMat.lightmapSlot].sample(clampSampler, slm).rgb;
+                                                                    }
+                                                                    float3 sLightmapExitant = max(sLightmap * 2.0 * uniforms.rtPBRGlobal.z,
+                                                                                                  float3(ambientFloor));
+                                                                    float3 sDirectIncident = float3(0.0);
+                                                                    uint lightCountSecond = (uint)uniforms.rtLightParams.x;
+                                                                    if (lightCountSecond > 0) {
+                                                                        float lightScaleSecond = uniforms.rtLightParams.y;
+                                                                        uint firstLocalSecond = (rtLights[0].dirType.w < 0.5) ? 1u : 0u;
+                                                                        uint bestSecond = 0xFFFFFFFFu;
+                                                                        float bestSecondScore = 0.0;
+                                                                        for (uint sli = firstLocalSecond; sli < lightCountSecond; ++sli) {
+                                                                            float3 stoL = rtLights[sli].posRadius.xyz - sHitPos;
+                                                                            float sd2 = max(dot(stoL, stoL), 1.0);
+                                                                            float sndl = max(dot(sN, stoL * rsqrt(sd2)), 0.0);
+                                                                            float sr = rtLights[sli].posRadius.w;
+                                                                            float sscore = rtLights[sli].colorIntensity.w * sndl /
+                                                                                           (sd2 + sr * sr + 1.0);
+                                                                            if (sscore > bestSecondScore) {
+                                                                                bestSecondScore = sscore;
+                                                                                bestSecond = sli;
+                                                                            }
+                                                                        }
+                                                                        bool useSunSecond = (bestSecond == 0xFFFFFFFFu && firstLocalSecond == 1u);
+                                                                        uint chosenSecond = useSunSecond ? 0u : bestSecond;
+                                                                        if (chosenSecond != 0xFFFFFFFFu) {
+                                                                            float3 sL;
+                                                                            float sMaxDistance;
+                                                                            float3 sDirect = float3(0.0);
+                                                                            if (useSunSecond) {
+                                                                                sL = -normalize(rtLights[0].dirType.xyz);
+                                                                                sMaxDistance = 20000.0;
+                                                                                float sndl = max(dot(sN, sL), 0.0);
+                                                                                if (sndl > 0.0) {
+                                                                                    sDirect = rtLights[0].colorIntensity.rgb *
+                                                                                              (rtLights[0].colorIntensity.w * 0.3 * lightScaleSecond) * sndl;
+                                                                                }
+                                                                            } else {
+                                                                                RTLight SLgt = rtLights[chosenSecond];
+                                                                                float3 stoL = SLgt.posRadius.xyz - sHitPos;
+                                                                                float sd2 = max(dot(stoL, stoL), 1.0);
+                                                                                float sdist = sqrt(sd2);
+                                                                                sL = stoL / sdist;
+                                                                                float sndl = max(dot(sN, sL), 0.0);
+                                                                                float sr = SLgt.posRadius.w;
+                                                                                float sE = SLgt.colorIntensity.w * 60.0 * lightScaleSecond /
+                                                                                           (sd2 + sr * sr + 1.0);
+                                                                                sMaxDistance = max(sdist - sr - 1.0, 0.2);
+                                                                                if (sndl > 0.0 && sE * sndl > 0.004) {
+                                                                                    sDirect = SLgt.colorIntensity.rgb * min(sE * sndl, 3.0);
+                                                                                }
+                                                                            }
+                                                                            if (rtMax3(sDirect) > 0.0) {
+                                                                                ray ssray(sHitPos + sN * 0.75, sL, 0.1, sMaxDistance);
+                                                                                auto ssh = i.intersect(ssray, worldAS);
+                                                                                bool sShadowBlocked = ssh.type == intersection_type::triangle &&
+                                                                                                      primitiveMaterials[ssh.primitive_id].materialFlags.x == 0;
+                                                                                if (!sShadowBlocked) {
+                                                                                    sDirectIncident += sDirect * uniforms.rtPBRGlobal.w;
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    float sAlphaWeight = (secondMat.materialFlags.w != 0) ? clamp(sEffectiveAlpha, 0.0, 1.0) : 1.0;
+                                                                    secondRadiance = sAlbedoSample.rgb * sAlphaWeight *
+                                                                                     (sLightmapExitant + sDirectIncident * 0.31830988618);
+                                                                }
+                                                                if (secondMat.materialFlags.y != 0) {
+                                                                    float3 sEmitSample = rtEmissionSample(texTable, secondMat, sAlbedoSample.rgb, repeatSampler, suv);
+                                                                    secondRadiance += sEmitSample * secondMat.materialParams.x;
+                                                                }
+                                                            }
+                                                        }
+                                                    } else if (!is_null_texture(envCube)) {
+                                                        secondRadiance = envCube.sample(envSampler, secondDir).rgb * 0.06;
+                                                    }
+                                                    float giCeilingInner = max(uniforms.rtGIParams.y, 0.05);
+                                                    bounceRadiance += min(bAlbedoSample.rgb * bAlphaWeight * secondRadiance,
+                                                                          float3(giCeilingInner));
+                                                }
                                             }
                                             if (bounceMat.materialFlags.y != 0) {
                                                 float3 bEmitSample = rtEmissionSample(texTable, bounceMat, bAlbedoSample.rgb, repeatSampler, buv);
@@ -8809,6 +8976,7 @@ struct MetalView: UIViewRepresentable {
                                                              0.0)
             uniforms.rtGIParams = SIMD4<Float>(Q3_RTGI(), Q3_RTGICeiling(),
                                                Q3_RTDarkDesatStrength(), Q3_RTDarkDesatLuma())
+            uniforms.rtGIExtraParams = SIMD4<Float>(Float(Q3_RTGIBounces()), 0, 0, 0)
             annotateEntityASDemandPerf(perfFrame)
             if rtDebugView != 0 {
                 let debugMap = currentRTMapName()
