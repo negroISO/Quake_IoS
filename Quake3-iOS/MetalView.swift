@@ -515,10 +515,11 @@ struct MetalView: UIViewRepresentable {
             // RT-only mirror of WorldDrawUniforms.spriteAtlasParams for PBR animation atlases.
             // x=cols, y=rows, z=fps, w=padding. 0 cols disables remap.
             var spriteAtlasParams: SIMD4<Float> = SIMD4(0, 0, 0, 0)
-            // Step 1 (RT PBR sidecars) — packed as a single uint4 (16-byte aligned,
-            // unambiguous Swift/MSL layout). x=normal, y=roughness, z=metallic, w=height
-            // texture-table slot index; UInt32.max = no sidecar for that channel.
-            // Kernel ignores these until Step 4; defaults make this a no-op layout change.
+            // RT PBR sidecars — packed as a single uint4 (16-byte aligned,
+            // unambiguous Swift/MSL layout). x=normal, y=roughness, z=metallic,
+            // w=height texture-table slot index; UInt32.max = no authored
+            // sidecar for that channel. The RT kernel samples rough/metal maps
+            // only when y/z are valid; otherwise it keeps materialParams.z/.w.
             var pbrSlots: SIMD4<UInt32> = SIMD4(UInt32.max, UInt32.max, UInt32.max, UInt32.max)
             // x = parallax scale (reserved), y = normal scale, z/w = pad.
             var rtPBRParams: SIMD4<Float> = SIMD4(0, 1, 0, 0)
@@ -4328,7 +4329,7 @@ struct MetalView: UIViewRepresentable {
         private var rtPipelineState: MTLComputePipelineState?
         // Step 2a: argument encoder for the rtKernel RTTexTable (buffer index 8).
         // Cached at pipeline creation; used per-frame to encode albedo/lightmap
-        // textures into an argument buffer (lifts the 128 direct-binding cap).
+        // plus RT PBR sidecar textures into one argument buffer.
         private var rtTexArgEncoder: MTLArgumentEncoder?
         private var rtBlendPipelineState: MTLComputePipelineState?
         private var rtAccumPipelineState: MTLComputePipelineState?
@@ -4391,15 +4392,16 @@ struct MetalView: UIViewRepresentable {
         private let rtMaxLightmapSlots = 64
         /* RT texture argument buffer tables. `rtAlbedoHandles[i]` is the
          * material handle for every parallel sidecar table slot: albedo,
-         * normal, height, and Increment-2 emissive. Do not reserve albedo
-         * slots for emissive maps; authored emission is sampled from the
-         * dedicated texTable.emissive[i] array. */
+         * normal, height, emissive, roughness, and metallic. Do not reserve
+         * albedo slots for sidecar-only maps; authored sidecars are sampled
+         * from their dedicated `texTable.*[i]` arrays. */
         private var rtAlbedoHandles = [UInt32](repeating: 0, count: 176)
         private var rtLightmapHandles = [UInt32](repeating: 0, count: 64)
         private var rtLogPrintedOnce = false
         private var rtOverlayLogPrintedOnce = false
         private var rtDebugViewLogSignature = ""
         private var rtEmissiveTableLogPrintedOnce = false
+        private var rtRoughMetalTableLogSignature = ""
         // P0.2: one-shot log gate for the r_rt_preserve_entities mode line.
         private var rtPreserveEntitiesLogged = false
         // P1: per-map RT light set (RTX Remix authored, baked to JSON).
@@ -5651,6 +5653,11 @@ struct MetalView: UIViewRepresentable {
                 // RT emissive Increment 2: real authored emissive maps, parallel
                 // to albedo. Missing authored maps bind a 1x1 black default.
                 array<texture2d<float>, 176> emissive;  // id 592..767
+                // Stage77: authored scalar maps, parallel to albedo. Missing
+                // maps bind 1x1 defaults, but the kernel samples them only
+                // when mat.pbrSlots.y/z mark a valid authored sidecar.
+                array<texture2d<float>, 176> roughness; // id 768..943
+                array<texture2d<float>, 176> metallic;  // id 944..1119
             };
 
             float3 rtEmissionSample(const device RTTexTable& texTable,
@@ -5662,6 +5669,28 @@ struct MetalView: UIViewRepresentable {
                     return texTable.emissive[mat.albedoSlot].sample(textureSampler, uv).rgb * mat.emissiveTintMode.xyz;
                 }
                 return legacyRGB;
+            }
+
+            float rtMaterialRoughness(const device RTTexTable& texTable,
+                                      RTPrimitiveMaterial mat,
+                                      sampler textureSampler,
+                                      float2 uv) {
+                float rough = mat.materialParams.z;
+                if (mat.pbrSlots.y < 176u) {
+                    rough = texTable.roughness[mat.pbrSlots.y].sample(textureSampler, uv).r;
+                }
+                return clamp(rough, 0.0, 1.0);
+            }
+
+            float rtMaterialMetallic(const device RTTexTable& texTable,
+                                     RTPrimitiveMaterial mat,
+                                     sampler textureSampler,
+                                     float2 uv) {
+                float metal = mat.materialParams.w;
+                if (mat.pbrSlots.z < 176u) {
+                    metal = texTable.metallic[mat.pbrSlots.z].sample(textureSampler, uv).r;
+                }
+                return clamp(metal, 0.0, 1.0);
             }
 
             float rtMax3(float3 v) {
@@ -6122,6 +6151,9 @@ struct MetalView: UIViewRepresentable {
                         }
                         float4 albedoSample = texTable.albedo[mat.albedoSlot].sample(repeatSampler, uv);
                         gAlbedoValue = albedoSample.rgb;
+                        float rough = rtMaterialRoughness(texTable, mat, repeatSampler, uv);
+                        float metal = rtMaterialMetallic(texTable, mat, repeatSampler, uv);
+                        gRoughnessValue = rough;
                         // Step 2c: RT normal mapping. Gated by r_rt_normal_scale
                         // (rtPBRGlobal.x); 0 = exact no-op. Samples the per-material
                         // normal DDS (parallel to albedo), builds an analytic TBN from
@@ -6831,12 +6863,10 @@ struct MetalView: UIViewRepresentable {
                                                                   uniforms.rtGIParams.z,
                                                                   uniforms.rtGIParams.w);
                             }
-                            float rough = mat.materialParams.z;
-                            float metal = mat.materialParams.w;
-                            gRoughnessValue = clamp(rough, 0.0, 1.0);
                             /* P3 — one-level specular reflection. Gated on
-                             * material roughness/metallic from the PBR table
-                             * (materialParams.z = roughness, .w = metallic). */
+                             * sampled roughness/metallic when authored RT
+                             * sidecar maps exist; otherwise falls back to
+                             * materialParams.z/.w scalar constants. */
                             if (uniforms.rtLightParams.z > 0.5) {
                                 if (metal > 0.5 || rough < uniforms.rtLightParams.w) {
                                     float3 V = -rayDir;
@@ -6986,6 +7016,14 @@ struct MetalView: UIViewRepresentable {
                                                                  (rLocalUV.y + rRow) / rRows);
                                                 }
                                                 float3 ralb = texTable.albedo[rmat.albedoSlot].sample(repeatSampler, ruv).rgb;
+                                                // Stage77: keep the Stage73 reflection-hit shading path
+                                                // on the same map-derived material inputs as primary hits.
+                                                // Current reflected-hit math only consumes albedo/light/emissive;
+                                                // these samples intentionally do not introduce a new BRDF.
+                                                float rrough = rtMaterialRoughness(texTable, rmat, repeatSampler, ruv);
+                                                float rmetal = rtMaterialMetallic(texTable, rmat, repeatSampler, ruv);
+                                                (void)rrough;
+                                                (void)rmetal;
                                                 float3 rlight = float3(1.0);
                                                 if (rmat.lightmapSlot < 64) {
                                                     rlight = texTable.lightmap[rmat.lightmapSlot].sample(clampSampler, rlm).rgb;
@@ -7492,6 +7530,17 @@ struct MetalView: UIViewRepresentable {
                 rtLightmapHandles[i] = h
                 _ = texture(for: h, device: device)
             }
+            var roughnessMapSlots = Set<UInt32>()
+            var metallicMapSlots = Set<UInt32>()
+            for (i, h) in topAlbedos.enumerated() {
+                let slot = UInt32(i)
+                if pbrAuthoredRoughnessTexture(for: h) != nil {
+                    roughnessMapSlots.insert(slot)
+                }
+                if pbrAuthoredMetallicTexture(for: h) != nil {
+                    metallicMapSlots.insert(slot)
+                }
+            }
             let albedoSlots = Dictionary(uniqueKeysWithValues: topAlbedos.enumerated().map { (UInt32($0.offset), $0.element) }.map { ($0.1, $0.0) })
             let lightmapSlots = Dictionary(uniqueKeysWithValues: topLightmaps.enumerated().map { (UInt32($0.offset), $0.element) }.map { ($0.1, $0.0) })
 
@@ -7515,6 +7564,8 @@ struct MetalView: UIViewRepresentable {
                 if !isSkyDraw && aSlotOptional == nil { continue }
                 let aSlot = aSlotOptional ?? 0
                 let lSlot = lSlotOptional ?? invalid
+                let roughnessSlot = roughnessMapSlots.contains(aSlot) ? aSlot : invalid
+                let metallicSlot = metallicMapSlots.contains(aSlot) ? aSlot : invalid
                 let blendMode = Self.worldBlendClass(for: stage)
                 let isEmissive = (blendMode == 1 || blendMode == 5)
                 // P3: per-material roughness/metallic for the kernel's
@@ -7662,6 +7713,7 @@ struct MetalView: UIViewRepresentable {
                             tcModParams2: chain.p2,
                             tcModParams3: chain.p3,
                             spriteAtlasParams: rtAtlasParams,
+                            pbrSlots: SIMD4<UInt32>(invalid, roughnessSlot, metallicSlot, invalid),
                             emissiveTintMode: rtEmissiveTintMode)
                         if rtAuthoredEmissiveForNEE {
                             appendEmissiveCandidate(tri: tri,
@@ -7734,7 +7786,7 @@ struct MetalView: UIViewRepresentable {
                         lightmapFallbacks += 1
                     }
                 }
-                print("[RT] material table: albedo=\(topAlbedos.count)/\(albedoWeights.count) lightmap=\(topLightmaps.count)/\(lightmapWeights.count) assigned=\(assigned)/\(primitiveCount) originalNoLightmap=\(lightmapFallbacks) skippedOverwrite=\(skippedOverwrite)")
+                print("[RT] material table: albedo=\(topAlbedos.count)/\(albedoWeights.count) lightmap=\(topLightmaps.count)/\(lightmapWeights.count) roughness=\(roughnessMapSlots.count)/\(rtMaxAlbedoSlots) metallic=\(metallicMapSlots.count)/\(rtMaxAlbedoSlots) assigned=\(assigned)/\(primitiveCount) originalNoLightmap=\(lightmapFallbacks) skippedOverwrite=\(skippedOverwrite)")
             }
         }
 
@@ -9052,13 +9104,14 @@ struct MetalView: UIViewRepresentable {
                 // Step 2a: encode the RT texture table into an argument buffer
                 // (buffer 8) instead of direct setTexture binds. Frees the
                 // 128-binding cap for albedo/lightmap/sidecar tables. The MSL
-                // RTTexTable lays out albedo at id 0..175, lightmap at id 176..239.
+                // RTTexTable lays out albedo at id 0..175, lightmap at id 176..239,
+                // then parallel sidecar arrays.
                 if let argEnc = rtTexArgEncoder, let fallbackTex = ensureRTWhiteTexture(device: device) {
                     var rtTexResident: [MTLTexture] = []
-                    rtTexResident.reserveCapacity(rtMaxAlbedoSlots * 4 + rtMaxLightmapSlots)
+                    rtTexResident.reserveCapacity(rtMaxAlbedoSlots * 6 + rtMaxLightmapSlots)
                     // Order MUST match RTTexTable id layout: albedo(0..175),
                     // lightmap(176..239), normal(240..415), height(416..591),
-                    // emissive(592..767).
+                    // emissive(592..767), roughness(768..943), metallic(944..1119).
                     for i in 0..<rtMaxAlbedoSlots {
                         let h = rtAlbedoHandles[i]
                         rtTexResident.append(pbrAlbedoTexture(for: h) ?? texture(for: h, device: device) ?? fallbackTex)
@@ -9096,8 +9149,39 @@ struct MetalView: UIViewRepresentable {
                         print("[RT] emissive table ready count=\(rtEmissiveResolved)/\(rtMaxAlbedoSlots)")
                         rtEmissiveTableLogPrintedOnce = true
                     }
+                    let roughnessDefault = pbrRoughnessDefault() ?? fallbackTex
+                    let metallicDefault = pbrMetallicDefault() ?? fallbackTex
+                    var rtRoughnessResolved = 0
+                    var rtMetallicResolved = 0
+                    for i in 0..<rtMaxAlbedoSlots {
+                        let h = rtAlbedoHandles[i]
+                        if let roughnessTex = pbrAuthoredRoughnessTexture(for: h) {
+                            rtTexResident.append(roughnessTex)
+                            rtRoughnessResolved += 1
+                        } else {
+                            rtTexResident.append(roughnessDefault)
+                        }
+                    }
+                    for i in 0..<rtMaxAlbedoSlots {
+                        let h = rtAlbedoHandles[i]
+                        if let metallicTex = pbrAuthoredMetallicTexture(for: h) {
+                            rtTexResident.append(metallicTex)
+                            rtMetallicResolved += 1
+                        } else {
+                            rtTexResident.append(metallicDefault)
+                        }
+                    }
+                    if rtAlbedoHandles.contains(where: { $0 != 0 }) {
+                        let mapName = currentRTMapName()
+                        let sig = "\(mapName):\(rtRoughnessResolved):\(rtMetallicResolved):\(rtMaxAlbedoSlots)"
+                        if sig != rtRoughMetalTableLogSignature {
+                            rtRoughMetalTableLogSignature = sig
+                            print("[RT] roughmetal table ready roughness=\(rtRoughnessResolved)/\(rtMaxAlbedoSlots) metallic=\(rtMetallicResolved)/\(rtMaxAlbedoSlots) map=\(mapName)")
+                        }
+                    }
                     // Fresh arg buffer each frame (avoids GPU-in-flight aliasing;
-                    // ~1 KB, cheap). Metal refcounts it until the dispatch drains.
+                    // 1120 texture refs = 8960 bytes). Metal refcounts it until
+                    // the dispatch drains.
                     let argBuf = device.makeBuffer(length: argEnc.encodedLength, options: .storageModeShared)
                     argBuf?.label = "Q3.RT.texTableArgBuffer"
                     if let argBuf {
@@ -10117,6 +10201,11 @@ struct MetalView: UIViewRepresentable {
         /// them populated in materials_by_name.
         private var pbrRoughnessCache: [UInt32: MTLTexture] = [:]
         private var pbrMetallicCache: [UInt32: MTLTexture] = [:]
+        // Tracks successful authored DDS loads only. Constant/default fallbacks
+        // also live in the caches above, but RT rough/metal map sampling must
+        // distinguish real sidecar maps from fallback scalars.
+        private var pbrRoughnessAuthoredLoaded: Set<UInt32> = []
+        private var pbrMetallicAuthoredLoaded: Set<UInt32> = []
         /// Phase 6+ extension — 1×1 R8Unorm constant fallback textures.
         /// When a material has albedo or normal but no explicit roughness
         /// or metallic DDS, these shim into the texture(3)/(4) bindings so
@@ -10614,6 +10703,11 @@ struct MetalView: UIViewRepresentable {
         private var pbrMaterialInfoMisses: Set<UInt32> = []
         private var pbrMaterialExistsCache: [UInt32: Bool] = [:]
         private var loggedBakedTcModHandles: Set<UInt32> = []
+
+        private static func hasNonEmptyPBRPath(_ ptr: UnsafePointer<CChar>?) -> Bool {
+            guard let ptr else { return false }
+            return ptr.pointee != 0
+        }
 
         private func pbrMaterialInfo(for handle: UInt32) -> PBRMaterialInfo? {
             if let cached = pbrMaterialInfoCache[handle] { return cached }
@@ -12072,6 +12166,7 @@ struct MetalView: UIViewRepresentable {
                                                              label: "Q3.pbr.roughness.h\(handle)",
                                                              srgb: false)
                         pbrRoughnessCache[handle] = tex
+                        pbrRoughnessAuthoredLoaded.insert(handle)
                         pbrLog("[Q3-PBR-SWIFT] loaded roughness handle=\(handle) size=\(tex.width)x\(tex.height) path=\(path)")
                         return tex
                     } catch {
@@ -12136,6 +12231,7 @@ struct MetalView: UIViewRepresentable {
                                                             label: "Q3.pbr.metallic.h\(handle)",
                                                             srgb: false)
                         pbrMetallicCache[handle] = tex
+                        pbrMetallicAuthoredLoaded.insert(handle)
                         pbrLog("[Q3-PBR-SWIFT] loaded metallic handle=\(handle) size=\(tex.width)x\(tex.height) path=\(path)")
                         return tex
                     } catch {
@@ -12161,6 +12257,31 @@ struct MetalView: UIViewRepresentable {
                 }
             }
             return nil
+        }
+
+        /// Authored-only scalar map accessors for the RT texture table.
+        /// `pbrRoughnessTexture` / `pbrMetallicTexture` may legally return
+        /// constant fallback textures for raster/entity shading. RT Stage77
+        /// needs a sentinel: sample a map only when Remix authored one and it
+        /// actually loaded; otherwise keep `materialParams.z/.w` scalars.
+        private func pbrAuthoredRoughnessTexture(for handle: UInt32) -> MTLTexture? {
+            guard let matPtr = Q3MetalRenderer_GetPBRMaterial(handle),
+                  Self.hasNonEmptyPBRPath(matPtr.pointee.roughness) else {
+                return nil
+            }
+            _ = pbrRoughnessTexture(for: handle)
+            guard pbrRoughnessAuthoredLoaded.contains(handle) else { return nil }
+            return pbrRoughnessCache[handle]
+        }
+
+        private func pbrAuthoredMetallicTexture(for handle: UInt32) -> MTLTexture? {
+            guard let matPtr = Q3MetalRenderer_GetPBRMaterial(handle),
+                  Self.hasNonEmptyPBRPath(matPtr.pointee.metallic) else {
+                return nil
+            }
+            _ = pbrMetallicTexture(for: handle)
+            guard pbrMetallicAuthoredLoaded.contains(handle) else { return nil }
+            return pbrMetallicCache[handle]
         }
 
         // MARK: - Emissive
@@ -16253,9 +16374,14 @@ struct MetalView: UIViewRepresentable {
             pbrNormalCache.removeAll(keepingCapacity: false)
             pbrRoughnessCache.removeAll(keepingCapacity: false)
             pbrMetallicCache.removeAll(keepingCapacity: false)
+            pbrRoughnessAuthoredLoaded.removeAll(keepingCapacity: false)
+            pbrMetallicAuthoredLoaded.removeAll(keepingCapacity: false)
             pbrEmissiveCache.removeAll(keepingCapacity: false)
             pbrHeightCache.removeAll(keepingCapacity: false)
             pbrTriedAndMissed.removeAll(keepingCapacity: false)
+            pbrNormalTried.removeAll(keepingCapacity: false)
+            pbrRoughnessTried.removeAll(keepingCapacity: false)
+            pbrMetallicTried.removeAll(keepingCapacity: false)
             entityAtlasAlbedoCache.removeAll(keepingCapacity: false)
             entityAtlasIsCaptureCache.removeAll(keepingCapacity: false)
             entityAtlasAlbedoMissed.removeAll(keepingCapacity: false)
