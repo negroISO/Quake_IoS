@@ -13713,7 +13713,7 @@ struct MetalView: UIViewRepresentable {
                 passEncoder.setFragmentTexture(pbrMetallicDefault(), index: 5)
                 passEncoder.setFragmentTexture(pbrFlatNormalDefault(), index: 6)
                 passEncoder.setFragmentTexture(pbrFlatNormalDefault(), index: 7)
-                passEncoder.setFragmentTexture(descriptor.depthAttachment.texture, index: 8)
+                passEncoder.setFragmentTexture(nil, index: 8)
                 passEncoder.setFragmentTexture(pbrFlatNormalDefault(), index: 9)
                 Self.bindDlightBlock(snapshot: snapshot,
                                      encoder: passEncoder,
