@@ -2732,6 +2732,103 @@ static qboolean TextureHandleHasWorldPBRSidecar(qhandle_t handle) {
     return PBRMaterialHasWorldSidecar((const q3_pbr_material_t *)tex->pbrMaterial);
 }
 
+static qhandle_t WorldShaderNamedPBRHandle(const char *shaderName,
+                                           const metalShaderMap_t *entry) {
+    const q3_pbr_material_t *material;
+    metalTexture_t *texture;
+    qhandle_t handle;
+
+    /* Multi-stage world materials must resolve by their owning shader before
+     * any shared stage texture. q3_pbr_lookup_by_name preserves the existing
+     * full-path -> full-path-alias -> stem/alias tiers. RegisterTexture keeps
+     * a distinct handle named for the owner; explicitly stamp the selected
+     * record so the stage texture's hash/name cannot replace it. */
+    if (shaderName == NULL || shaderName[0] == '\0' ||
+        entry == NULL || entry->stageCount <= 1) {
+        return 0;
+    }
+    material = q3_pbr_lookup_by_name(shaderName);
+    if (material == NULL) return 0;
+
+    handle = RegisterTexture(shaderName);
+    texture = FindTextureByHandle(handle);
+    if (texture == NULL || Q_stricmp(texture->name, shaderName) != 0) {
+        return 0;
+    }
+    texture->pbrMaterial = material;
+    return handle;
+}
+
+static const Q3MetalStage *WorldShaderClassicDiffuseStage(const metalShaderMap_t *entry) {
+    int s;
+    if (entry == NULL || entry->stageCount <= 1) return NULL;
+
+    /* A filter stage is the strongest generic signal for a concrete Q3
+     * diffuse layer: stock shaders commonly multiply it over an env/effect
+     * underlay and/or the lightmap. Prefer the last such layer. */
+    for (s = entry->stageCount - 1; s >= 0; --s) {
+        const Q3MetalStage *st = &entry->stages[s];
+        if (st->useLightmap || st->mapPath[0] == '\0' || st->tcGen == 1) continue;
+        if (st->blendMode == 3) return st;
+    }
+
+    /* Otherwise take the last non-additive concrete layer. Additive and
+     * subtractive stages are overlays, not a stable diffuse substitute. */
+    for (s = entry->stageCount - 1; s >= 0; --s) {
+        const Q3MetalStage *st = &entry->stages[s];
+        if (st->useLightmap || st->mapPath[0] == '\0' || st->tcGen == 1) continue;
+        if (st->blendMode == 1 || st->blendMode == 4 || st->blendMode == 5) continue;
+        return st;
+    }
+
+    return NULL;
+}
+
+static qhandle_t WorldShaderClassicDiffuseHandle(const char *shaderName,
+                                                 const metalShaderMap_t *entry,
+                                                 const char **outSourcePath) {
+    const Q3MetalStage *stage;
+    metalTexture_t *base;
+    metalTexture_t *aliasTexture;
+    qhandle_t baseHandle;
+    char alias[MAX_QPATH];
+
+    if (outSourcePath != NULL) *outSourcePath = NULL;
+    if (shaderName == NULL || shaderName[0] == '\0' ||
+        entry == NULL || entry->stageCount <= 1) {
+        return 0;
+    }
+    /* This fallback is only for an absent owner record. If an owner exists,
+     * its authored selection must win even if a later registration problem
+     * prevents WorldShaderNamedPBRHandle from returning its handle. */
+    if (q3_pbr_lookup_by_name(shaderName) != NULL) return 0;
+
+    stage = WorldShaderClassicDiffuseStage(entry);
+    if (stage == NULL) return 0;
+    baseHandle = RegisterTexture(stage->mapPath);
+    base = FindTextureByHandle(baseHandle);
+    if (base == NULL || base->rgbaBytes == NULL || base->isWhite) return 0;
+
+    /* Use a distinct material handle that shares the classic diffuse pixels
+     * but deliberately caches a PBR miss. Pointing at baseHandle directly
+     * would let that shared stage's name/hash select another owner's authored
+     * albedo, reproducing the hijack under a different stage name. */
+    Com_sprintf(alias, sizeof(alias), "*world-classic:%u", (unsigned)baseHandle);
+    aliasTexture = FindTextureByName(alias);
+    if (aliasTexture == NULL) {
+        aliasTexture = AllocTextureSlot();
+        if (aliasTexture == NULL) return 0;
+        Q_strncpyz(aliasTexture->name, alias, sizeof(aliasTexture->name));
+        aliasTexture->width = base->width;
+        aliasTexture->height = base->height;
+        aliasTexture->rgbaBytes = base->rgbaBytes;
+        aliasTexture->generation = base->generation;
+        aliasTexture->pbrMaterial = Q3_PBR_MATERIAL_MISS_SENTINEL;
+    }
+    if (outSourcePath != NULL) *outSourcePath = stage->mapPath;
+    return aliasTexture->handle;
+}
+
 static qhandle_t WorldShaderOwnerPBRHandle(const metalShaderMap_t *entry) {
     int s;
     if (entry == NULL || entry->stageCount <= 1) return 0;
@@ -6018,7 +6115,10 @@ static void MetalWorldEmitSurfaceStages(const char *shaderName,
     int _emitted;
     int _combinedLightmapBaseStage;
     qboolean _combinedLightmap;
+    qhandle_t _pbrShaderOwnerTex = 0;
+    qhandle_t _pbrClassicOwnerTex = 0;
     qhandle_t _pbrOwnerTex = 0;
+    const char *_pbrClassicSource = NULL;
 
     if (shaderName == NULL || drawCursorPtr == NULL || indexCountForDraw == 0) {
         return;
@@ -6067,6 +6167,11 @@ static void MetalWorldEmitSurfaceStages(const char *shaderName,
     }
 
     if (_e != NULL && _e->stageCount > 0) {
+        _pbrShaderOwnerTex = WorldShaderNamedPBRHandle(shaderName, _e);
+        if (_pbrShaderOwnerTex == 0) {
+            _pbrClassicOwnerTex = WorldShaderClassicDiffuseHandle(
+                shaderName, _e, &_pbrClassicSource);
+        }
         _pbrOwnerTex = WorldShaderOwnerPBRHandle(_e);
         for (_s = 0; _s < _e->stageCount; ++_s) {
             const Q3MetalStage *_st = &_e->stages[_s];
@@ -6166,12 +6271,21 @@ static void MetalWorldEmitSurfaceStages(const char *shaderName,
                 s_world.animatedDrawCount += 1;
             }
             AddWorldDrawStage(&s_world.draws[_dstIdx], _tex, &_drawStage);
-            if (_pbrOwnerTex != 0 &&
-                _pbrOwnerTex != _tex &&
-                WorldMapPathIsClassicEffectLayer(_st->mapPath) &&
-                s_world.draws[_dstIdx].stageCount > 0) {
+            if (_st->useLightmap == 0 &&
+                s_world.draws[_dstIdx].stageCount > 0 &&
+                ((_pbrShaderOwnerTex != 0 && _pbrShaderOwnerTex != _tex) ||
+                 (_pbrShaderOwnerTex == 0 && _pbrClassicOwnerTex != 0 &&
+                  _pbrClassicOwnerTex != _tex) ||
+                 (_pbrShaderOwnerTex == 0 && _pbrOwnerTex != 0 &&
+                  _pbrOwnerTex != _tex && WorldMapPathIsClassicEffectLayer(_st->mapPath)))) {
                 uint32_t _stageSlot = s_world.draws[_dstIdx].stageCount - 1;
-                s_world.draws[_dstIdx].stages[_stageSlot].pbrMaterialHandle = (uint32_t)_pbrOwnerTex;
+                qhandle_t _materialTex = (_pbrShaderOwnerTex != 0)
+                    ? _pbrShaderOwnerTex
+                    : ((_pbrClassicOwnerTex != 0) ? _pbrClassicOwnerTex : _pbrOwnerTex);
+                const char *_materialSource = (_pbrShaderOwnerTex != 0)
+                    ? "shader-name"
+                    : ((_pbrClassicOwnerTex != 0) ? "classic-diffuse" : "concrete-stage");
+                s_world.draws[_dstIdx].stages[_stageSlot].pbrMaterialHandle = (uint32_t)_materialTex;
                 if (MetalVerboseAuditEnabled()) {
                     static char s_ownerSeen[32][MAX_QPATH];
                     static int s_ownerSeenCount = 0;
@@ -6181,16 +6295,18 @@ static void MetalWorldEmitSurfaceStages(const char *shaderName,
                         if (!Q_stricmp(s_ownerSeen[oi], shaderName)) { seen = qtrue; break; }
                     }
                     if (!seen) {
-                        const metalTexture_t *ownerTex = FindTextureByHandle(_pbrOwnerTex);
+                        const metalTexture_t *ownerTex = FindTextureByHandle(_materialTex);
                         if (s_ownerSeenCount < (int)(sizeof(s_ownerSeen) / sizeof(s_ownerSeen[0]))) {
                             Q_strncpyz(s_ownerSeen[s_ownerSeenCount++], shaderName, MAX_QPATH);
                         }
                         MetalTelemetryPrintf("metal_pbr_owner", PRINT_ALL,
-                            "[Q3-PBR] world owner-material shader='%s' fx='%s' ownerHandle=%u owner='%s'\n",
+                            "[Q3-PBR] world owner-material shader='%s' stage='%s' ownerHandle=%u owner='%s' source=%s classicSource='%s'\n",
                             shaderName,
                             _st->mapPath,
-                            (unsigned)_pbrOwnerTex,
-                            ownerTex ? ownerTex->name : "(no-tex)");
+                            (unsigned)_materialTex,
+                            ownerTex ? ownerTex->name : "(no-tex)",
+                            _materialSource,
+                            _pbrClassicSource ? _pbrClassicSource : "-");
                     }
                 }
             }
