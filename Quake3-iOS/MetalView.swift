@@ -6039,6 +6039,24 @@ struct MetalView: UIViewRepresentable {
                 // iOS toolchain update.
                 intersector<triangle_data> i;
                 auto hit = i.intersect(r, worldAS);
+                // The triangle AS is opaque, but Q3 additive stages are
+                // transparent effect carriers. Walk past those intersections
+                // for primary camera rays so a beam/flare cannot replace the
+                // authored opaque surface behind it. The raster pass still
+                // composites the real GL_ONE blend when RT is mixed below 1;
+                // pure RT resolves the underlying material instead of shading
+                // the carrier as a solid slab. Eight steps cover the front/back
+                // faces of nested two-sided effect meshes without unbounded work.
+                for (uint skip = 0u; skip < 8u && hit.type == intersection_type::triangle; ++skip) {
+                    RTPrimitiveMaterial passMat = primitiveMaterials[hit.primitive_id];
+                    float passBlend = passMat.materialParams.y;
+                    bool passAdditive = (abs(passBlend - 1.0) < 0.5 || abs(passBlend - 5.0) < 0.5);
+                    if (!passAdditive) { break; }
+                    float nextMin = hit.distance + 0.5;
+                    if (nextMin >= uniforms.jitterNearFar.w) { break; }
+                    ray passRay(uniforms.cameraPos.xyz, rayDir, nextMin, uniforms.jitterNearFar.w);
+                    hit = i.intersect(passRay, worldAS);
+                }
                 float entityASMode = round(uniforms.fovParams.w);
                 bool entityPrimaryEnabled = (entityASMode == 1.0 || entityASMode == 3.0);
                 bool entityReflectionEnabled = (entityASMode == 2.0 || entityASMode == 3.0);
@@ -6221,17 +6239,15 @@ struct MetalView: UIViewRepresentable {
                             color = float3(0.0);
                             outputAlpha = 0.0;
                         } else if (additiveBlend) {
-                            // Additive Q3 stages (flares, smoke/energy sprites, portals) are
-                            // self-lit effect passes, not lightmapped world. Preserve raster via
-                            // alpha instead of turning RGB-only DDS effects into solid squares.
-                            float intensity = max(mat.materialParams.x, 1.0);
-                            float alphaForAdd = (abs(blendMode - 5.0) < 0.5) ? max(effectiveAlpha, 0.65) : effectiveAlpha;
-                            float3 emitSample = albedoSample.rgb;
-                            if (mat.materialFlags.y != 0) {
-                                emitSample = rtEmissionSample(texTable, mat, albedoSample.rgb, repeatSampler, uv);
-                            }
-                            color = emitSample * intensity * alphaForAdd;
-                            outputAlpha = clamp(alphaForAdd, 0.0, 0.85);
+                            // Additive Q3 stages are raster effect overlays, not opaque
+                            // primary-hit surfaces. The triangle AS cannot continue past
+                            // this hit without custom intersection traversal, so any RT
+                            // contribution here replaces the real geometry behind the
+                            // effect (projection beams become solid grey slabs). Preserve
+                            // the already-correct raster composite for the entire additive
+                            // class; opaque authored emissive fixtures remain RT-shaded.
+                            color = float3(0.0);
+                            outputAlpha = 0.0;
                         } else if (mat.materialFlags.w != 0) {
                             // First-pass translucency: shade blended surfaces but emit partial
                             // alpha so the composite pass preserves raster behind/through them.

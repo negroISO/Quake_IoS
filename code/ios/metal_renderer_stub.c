@@ -1306,9 +1306,11 @@ static qboolean IsBrandingTextureName(const char *name) {
 }
 
 static qboolean IsBrandingWorldShaderName(const char *name) {
-    return MetalPathMatchesImageBase(name, "textures/nvidia/geforce_banner") ||
-           MetalPathMatchesImageBase(name, "textures/nvidia/logo_alpha") ||
-           MetalPathMatchesImageBase(name, "textures/nvidia/nvidia_screen");
+    /* Keep geometry suppression in lockstep with the texture suppression
+     * list. Leaving a branded shader's surface alive after RegisterTexture
+     * substitutes its 1x1 transparent image still permits later lightmap or
+     * additive stages to draw the otherwise invisible carrier geometry. */
+    return IsBrandingTextureName(name);
 }
 
 static qhandle_t EnsureWhiteTexture(void) {
@@ -2808,6 +2810,17 @@ static qhandle_t WorldShaderClassicDiffuseHandle(const char *shaderName,
     baseHandle = RegisterTexture(stage->mapPath);
     base = FindTextureByHandle(baseHandle);
     if (base == NULL || base->rgbaBytes == NULL || base->isWhite) return 0;
+
+    /* The owner shader can be an un-authored intensity variant while its
+     * selected diffuse stage is a fully authored PBR surface (light1_3000
+     * -> light1, proto_light_2k -> proto_light, etc.). Preserve that stage's
+     * real handle so its albedo/normal/metallic/emissive remain reachable.
+     * Shared classic FX layers still require the isolated MISS alias below. */
+    if (!WorldMapPathIsClassicEffectLayer(stage->mapPath) &&
+        q3_pbr_lookup_by_name(stage->mapPath) != NULL) {
+        if (outSourcePath != NULL) *outSourcePath = stage->mapPath;
+        return baseHandle;
+    }
 
     /* Use a distinct material handle that shares the classic diffuse pixels
      * but deliberately caches a PBR miss. Pointing at baseHandle directly
