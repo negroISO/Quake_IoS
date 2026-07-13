@@ -490,7 +490,8 @@ struct MetalView: UIViewRepresentable {
             // Stage 67 append-only colored GI controls:
             // x = r_rt_gi user strength (0 = exact legacy/no-op; 1 =
             // calibrated single-bounce visible transport), y = r_rt_gi_clamp
-            // per-pixel firefly ceiling, z/w reserved.
+            // per-pixel firefly ceiling, z = Stage72 dark-direct chroma
+            // blend strength, w = pre-tonemap luma knee.
             var rtGIParams: SIMD4<Float> = SIMD4(0, 1.25, 0, 0)
         }
 
@@ -5561,7 +5562,7 @@ struct MetalView: UIViewRepresentable {
                 float4 rtEntityReflectionParams;
                 // Stage 67 append-only controls:
                 // x = r_rt_gi strength, y = r_rt_gi_clamp firefly ceiling,
-                // z/w reserved.
+                // z = r_rt_dark_desat_strength, w = r_rt_dark_desat_luma.
                 float4 rtGIParams;
             };
 
@@ -5658,6 +5659,109 @@ struct MetalView: UIViewRepresentable {
 
             float rtMax3(float3 v) {
                 return max(v.x, max(v.y, v.z));
+            }
+
+            float rtLuma(float3 v) {
+                return dot(max(v, float3(0.0)), float3(0.2126, 0.7152, 0.0722));
+            }
+
+            float rtSaturation(float3 v) {
+                v = max(v, float3(0.0));
+                float peak = rtMax3(v);
+                if (peak <= 1.0e-5) { return 0.0; }
+                float trough = min(v.x, min(v.y, v.z));
+                return saturate((peak - trough) / peak);
+            }
+
+            float rtCoolMagentaCastGate(float3 v) {
+                v = max(v, float3(0.0));
+                float peak = rtMax3(v);
+                if (peak <= 1.0e-5) { return 0.0; }
+                float3 h = v / peak;
+                float blueCast = saturate((h.z - min(h.x, h.y) * 0.80) * 2.0);
+                float cyanCast = saturate((min(h.y, h.z) - h.x) * 2.0);
+                float magentaCast = saturate((min(h.x, h.z) - h.y) * 2.0);
+                return max(blueCast, max(cyanCast, magentaCast));
+            }
+
+            float3 rtDarkDirectChromaBlend(float3 directTerm,
+                                           float3 fillColor,
+                                           float strength,
+                                           float lumaKnee) {
+                strength = saturate(strength);
+                if (strength <= 0.0) { return directTerm; }
+
+                float directLum = rtLuma(directTerm);
+                if (directLum <= 1.0e-6) { return directTerm; }
+
+                float fillLum = rtLuma(fillColor);
+                float finalLum = directLum + fillLum;
+                float knee = max(lumaKnee, 0.02);
+                float dark = 1.0 - smoothstep(knee, knee * 2.5, finalLum);
+                float directDominance = saturate(directLum / max(directLum + fillLum, 1.0e-5));
+                float w = strength * dark * directDominance;
+                if (w <= 1.0e-5) { return directTerm; }
+
+                float3 target = (fillLum > 1.0e-5)
+                    ? max(fillColor, float3(0.0)) * (directLum / fillLum)
+                    : float3(directLum);
+                return mix(directTerm, target, w);
+            }
+
+            float3 rtDarkLightingChromaBlend(float3 lightTerm,
+                                             float3 albedo,
+                                             float strength,
+                                             float lumaKnee) {
+                strength = saturate(strength);
+                if (strength <= 0.0) { return lightTerm; }
+
+                float litLum = rtLuma(albedo * lightTerm);
+                float knee = max(lumaKnee, 0.02);
+                float dark = 1.0 - smoothstep(knee, knee * 2.5, litLum);
+                if (dark <= 1.0e-5) { return lightTerm; }
+
+                float peak = rtMax3(max(lightTerm, float3(0.0)));
+                if (peak <= 1.0e-5) { return lightTerm; }
+                float trough = min(lightTerm.x, min(lightTerm.y, lightTerm.z));
+                float lightSat = saturate((peak - trough) / peak);
+                float chromaGate = saturate((lightSat - 0.04) * 3.0) *
+                                   rtCoolMagentaCastGate(lightTerm);
+                float w = strength * dark * chromaGate;
+                if (w <= 1.0e-5) { return lightTerm; }
+
+                float lightLum = rtLuma(lightTerm);
+                return mix(lightTerm, float3(lightLum), w);
+            }
+
+            float3 rtDarkMaterialChromaBlend(float3 shaded,
+                                             float3 albedo,
+                                             float strength,
+                                             float lumaKnee) {
+                strength = saturate(strength);
+                if (strength <= 0.0) { return shaded; }
+
+                float shadedLum = rtLuma(shaded);
+                if (shadedLum <= 1.0e-6) { return shaded; }
+
+                float knee = max(lumaKnee, 0.02);
+                float dark = 1.0 - smoothstep(knee, knee * 2.5, shadedLum);
+                if (dark <= 1.0e-5) { return shaded; }
+
+                /* Stage72: only neutral/low-chroma materials get strong
+                 * low-luma cast removal. This is the measured failure class
+                 * (neutral albedo, saturated lighting); high-chroma authored
+                 * surfaces keep their material hue/GI bleed. */
+                float albedoSat = rtSaturation(albedo);
+                float neutralMaterial = 1.0 - smoothstep(0.18, 0.62, albedoSat);
+                float castGate = saturate((rtSaturation(shaded) - max(albedoSat, 0.10)) * 2.5);
+                float w = strength * dark * neutralMaterial * castGate *
+                          rtCoolMagentaCastGate(shaded);
+                if (w <= 1.0e-5) { return shaded; }
+
+                float3 materialColor = max(albedo, float3(0.02));
+                float materialLum = rtLuma(materialColor);
+                float3 target = materialColor * (shadedLum / max(materialLum, 1.0e-5));
+                return mix(shaded, target, w);
             }
 
             float3 rtSoftMaxCap(float3 value, float cap, float knee) {
@@ -6077,7 +6181,12 @@ struct MetalView: UIViewRepresentable {
                             float ambientFloor = uniforms.rtToneParams.z;
                             // Match the raster world's Quake 3 2x lightmap overbright.
                             // rtPBRGlobal.z remains the user scale on top of that invariant.
-                            color = albedoSample.rgb * max(lightmap * 2.0 * uniforms.rtPBRGlobal.z, float3(ambientFloor));
+                            float3 baseLight = max(lightmap * 2.0 * uniforms.rtPBRGlobal.z, float3(ambientFloor));
+                            baseLight = rtDarkLightingChromaBlend(baseLight,
+                                                                  albedoSample.rgb,
+                                                                  uniforms.rtGIParams.z,
+                                                                  uniforms.rtGIParams.w);
+                            color = albedoSample.rgb * baseLight;
                             if (mat.materialFlags.y != 0) {
                                 float3 emitSample = rtEmissionSample(texTable, mat, albedoSample.rgb, repeatSampler, uv);
                                 color += emitSample * mat.materialParams.x * effectiveAlpha;
@@ -6093,7 +6202,12 @@ struct MetalView: UIViewRepresentable {
                             float ambientFloor = uniforms.rtToneParams.z;
                             // Match the raster world's Quake 3 2x lightmap overbright.
                             // rtPBRGlobal.z remains the user scale on top of that invariant.
-                            color = albedoSample.rgb * max(lightmap * 2.0 * uniforms.rtPBRGlobal.z, float3(ambientFloor));
+                            float3 baseLight = max(lightmap * 2.0 * uniforms.rtPBRGlobal.z, float3(ambientFloor));
+                            baseLight = rtDarkLightingChromaBlend(baseLight,
+                                                                  albedoSample.rgb,
+                                                                  uniforms.rtGIParams.z,
+                                                                  uniforms.rtGIParams.w);
+                            color = albedoSample.rgb * baseLight;
                             if (mat.materialFlags.y != 0) {
                                 float3 emitSample = rtEmissionSample(texTable, mat, albedoSample.rgb, repeatSampler, uv);
                                 color += emitSample * mat.materialParams.x;
@@ -6326,6 +6440,7 @@ struct MetalView: UIViewRepresentable {
                              * ray per sample. Two samples max per pixel:
                              * the sun (lights[0] when type==0, always), plus
                              * one stochastically picked local light. */
+                            float3 preDirectColor = color;
                             uint lightCount = (uint)uniforms.rtLightParams.x;
                             if (lightCount > 0) {
                                 float lightScale = uniforms.rtLightParams.y;
@@ -6414,7 +6529,12 @@ struct MetalView: UIViewRepresentable {
                                 }
                                 // RT lighting rebalance: rtPBRGlobal.w boosts the
                                 // ray-traced direct (sun + local NEE, shadowed) term.
-                                color += albedoSample.rgb * direct * uniforms.rtPBRGlobal.w;
+                                float3 directTerm = albedoSample.rgb * direct * uniforms.rtPBRGlobal.w;
+                                directTerm = rtDarkDirectChromaBlend(directTerm,
+                                                                     preDirectColor,
+                                                                     uniforms.rtGIParams.z,
+                                                                     uniforms.rtGIParams.w);
+                                color += directTerm;
                             }
                             if (emissiveNEEEnabled) {
                                 uint emissiveCount = min((uint)max(uniforms.rtBudgetParams.y, 0.0), 64u);
@@ -6534,6 +6654,12 @@ struct MetalView: UIViewRepresentable {
                                         }
                                     }
                                 }
+                            }
+                            if (mat.materialFlags.y == 0) {
+                                color = rtDarkMaterialChromaBlend(color,
+                                                                  albedoSample.rgb,
+                                                                  uniforms.rtGIParams.z,
+                                                                  uniforms.rtGIParams.w);
                             }
                             float rough = mat.materialParams.z;
                             float metal = mat.materialParams.w;
@@ -8658,7 +8784,8 @@ struct MetalView: UIViewRepresentable {
                                                              (Q3_RTPerfHUD() > 1 || entityDemandCounterEnabled) ? 1.0 : 0.0,
                                                              entityReflectionRequested ? 1.0 : 0.0,
                                                              0.0)
-            uniforms.rtGIParams = SIMD4<Float>(Q3_RTGI(), Q3_RTGICeiling(), 0.0, 0.0)
+            uniforms.rtGIParams = SIMD4<Float>(Q3_RTGI(), Q3_RTGICeiling(),
+                                               Q3_RTDarkDesatStrength(), Q3_RTDarkDesatLuma())
             annotateEntityASDemandPerf(perfFrame)
             if rtDebugView != 0 {
                 let debugMap = currentRTMapName()

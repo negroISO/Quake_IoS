@@ -12382,6 +12382,31 @@ float Q3_RTGICeiling(void) {
     return v;
 }
 
+float Q3_RTDarkDesatStrength(void) {
+    if (ri.Cvar_Get == NULL) return 1.0f;
+    /* Stage72: RT direct-light chroma damping for dark, direct-dominated
+     * pixels. 0 = exact no-op; 1 = full low-luma blend toward the existing
+     * ambient/GI chroma. This is not a post/tonemap/global-desaturation cvar:
+     * the kernel applies it only to the direct term before adding it. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_dark_desat_strength", "1.0", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 1.0f;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    return v;
+}
+
+float Q3_RTDarkDesatLuma(void) {
+    if (ri.Cvar_Get == NULL) return 1.20f;
+    /* Pre-tonemap RT luma knee. Pixels below this are treated as dark; the
+     * curve fades out by roughly 2.5x the knee so bright maps keep their
+     * authored color. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_dark_desat_luma", "1.20", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 1.20f;
+    if (v < 0.02f) v = 0.02f;
+    if (v > 2.0f) v = 2.0f;
+    return v;
+}
+
 float Q3_RTTAA(void) {
     if (ri.Cvar_Get == NULL) return 1.0f;
     Q3_RTStage69DefaultsMigration();
