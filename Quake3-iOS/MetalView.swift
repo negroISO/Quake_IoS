@@ -4320,6 +4320,7 @@ struct MetalView: UIViewRepresentable {
         private var exposureBuffer: MTLBuffer?
         private var postprocessEncodeCount: Int = 0
         private var postprocessLogPrintedOnce: Bool = false
+        private var postUpscaleSharpenLogPrintedOnce: Bool = false
         private var exposureLogPrintedOnce: Bool = false
         private var entityPostOrderLoggedOnce: Bool = false
         private var entityPostExposureLogCount: Int = 0
@@ -5260,6 +5261,30 @@ struct MetalView: UIViewRepresentable {
                 uint h = target.get_height();
                 if (tid.x >= w || tid.y >= h) return;
                 float4 c = source.read(tid);
+                /* Stage82: sharpen the already-upscaled image on the output
+                 * pixel grid. The previous implementation lived inside
+                 * q3_spatial_upscale and stepped by one SOURCE texel, so a
+                 * medium-quality tap spanned two drawable pixels and was
+                 * immediately mixed with the scaler's linear reconstruction.
+                 * Keeping this here makes the order explicit:
+                 * upscale -> output-resolution sharpen -> tone map. */
+                float sharpen = saturate(u.taaSharpen);
+                if (sharpen > 0.001) {
+                    uint2 maxTid = uint2(max(w, 1u) - 1u, max(h, 1u) - 1u);
+                    uint2 pL = uint2(tid.x > 0u ? tid.x - 1u : 0u, tid.y);
+                    uint2 pR = uint2(min(tid.x + 1u, maxTid.x), tid.y);
+                    uint2 pU = uint2(tid.x, tid.y > 0u ? tid.y - 1u : 0u);
+                    uint2 pD = uint2(tid.x, min(tid.y + 1u, maxTid.y));
+                    float3 c0 = c.rgb;
+                    float3 cL = source.read(pL).rgb;
+                    float3 cR = source.read(pR).rgb;
+                    float3 cU = source.read(pU).rgb;
+                    float3 cD = source.read(pD).rgb;
+                    float3 boxMin = min(c0, min(min(cL, cR), min(cU, cD)));
+                    float3 boxMax = max(c0, max(max(cL, cR), max(cU, cD)));
+                    float3 blur = (cL + cR + cU + cD) * 0.25;
+                    c.rgb = clamp(c0 + (c0 - blur) * sharpen, boxMin, boxMax);
+                }
                 // Pre-exposure first so the ACES curve has HDR-ish values to
                 // roll off. With the old hard `saturate(c.rgb * intensity)`,
                 // any intensity > 1 clipped lit walls to flat white; the ACES
@@ -5292,20 +5317,6 @@ struct MetalView: UIViewRepresentable {
                 constexpr sampler s(filter::linear, address::clamp_to_edge);
                 float2 uv = (float2(tid) + 0.5) / float2(max(w, 1u), max(h, 1u));
                 float4 c = source.sample(s, uv);
-                float sharpen = saturate(u.taaSharpen);
-                if (sharpen > 0.001) {
-                    float2 texel = 1.0 / float2(max(source.get_width(), 1u),
-                                                max(source.get_height(), 1u));
-                    float3 c0 = c.rgb;
-                    float3 cL = source.sample(s, uv + float2(-texel.x, 0.0)).rgb;
-                    float3 cR = source.sample(s, uv + float2( texel.x, 0.0)).rgb;
-                    float3 cU = source.sample(s, uv + float2(0.0, -texel.y)).rgb;
-                    float3 cD = source.sample(s, uv + float2(0.0,  texel.y)).rgb;
-                    float3 boxMin = min(c0, min(min(cL, cR), min(cU, cD)));
-                    float3 boxMax = max(c0, max(max(cL, cR), max(cU, cD)));
-                    float3 blur = (cL + cR + cU + cD) * 0.25;
-                    c.rgb = clamp(c0 + (c0 - blur) * sharpen, boxMin, boxMax);
-                }
                 float exposure = q3_active_exposure(u, exposureBuffer);
                 float3 rgb = max(c.rgb * exposure, float3(0.0));
                 if (u.tonemap > 0.5) {
@@ -5407,13 +5418,23 @@ struct MetalView: UIViewRepresentable {
         private func encodePostprocess(commandBuffer: MTLCommandBuffer,
                                        sourceTexture: MTLTexture,
                                        outputTexture: MTLTexture,
-                                       measureExposure: Bool = true) {
+                                       measureExposure: Bool = true,
+                                       applyPostUpscaleSharpen: Bool = false) {
             if sourceTexture === outputTexture && Q3_PostprocessEnabled() == 0 { return }
             guard let device = commandBuffer.device as MTLDevice?,
                   let pso = ensurePostprocessPipeline(device: device) else {
                 return
             }
             var u = makePostprocessUniforms()
+            if applyPostUpscaleSharpen,
+               Q3_RTMix() > 0.001,
+               Q3_RTTAA() > 0.5 {
+                u.taaSharpen = Q3_RTTAASharpen()
+                if !postUpscaleSharpenLogPrintedOnce {
+                    postUpscaleSharpenLogPrintedOnce = true
+                    print("[Q3-SHARPEN] placement=post-upscale output=\(outputTexture.width)x\(outputTexture.height) strength=\(u.taaSharpen)")
+                }
+            }
             let exposureBuffer = ensureExposureBuffer(device: device, initialExposure: u.intensity)
             if measureExposure, let exposureBuffer {
                 encodeExposureReduction(commandBuffer: commandBuffer,
@@ -5495,7 +5516,6 @@ struct MetalView: UIViewRepresentable {
                   let pso = ensureSpatialUpscalePipeline(device: device) else { return }
             var u = makePostprocessUniforms()
             u.tonemap = 1.0
-            u.taaSharpen = (Q3_RTMix() > 0.001 && Q3_RTTAA() > 0.5) ? Q3_RTTAASharpen() : 0.0
             let exposureBuffer = ensureExposureBuffer(device: device, initialExposure: u.intensity)
             if let exposureBuffer {
                 encodeExposureReduction(commandBuffer: commandBuffer,
@@ -15281,7 +15301,8 @@ struct MetalView: UIViewRepresentable {
                     encodePostprocess(commandBuffer: commandBuffer,
                                       sourceTexture: resolveRT,
                                       outputTexture: drawable.texture,
-                                      measureExposure: false)
+                                      measureExposure: false,
+                                      applyPostUpscaleSharpen: true)
                     entityColorTexture = drawable.texture
                     entityDepthTexture = view.device.flatMap {
                         ensureSceneDepthTexture(device: $0,
@@ -15572,7 +15593,8 @@ struct MetalView: UIViewRepresentable {
                     encodePostprocess(commandBuffer: commandBuffer,
                                       sourceTexture: resolveRT,
                                       outputTexture: drawable.texture,
-                                      measureExposure: false)
+                                      measureExposure: false,
+                                      applyPostUpscaleSharpen: true)
                 } else if upscaleActive {
                     encodePostprocess(commandBuffer: commandBuffer,
                                       sourceTexture: drawable.texture,

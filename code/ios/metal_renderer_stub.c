@@ -12562,13 +12562,41 @@ float Q3_RTTAAAlpha(void) {
     return v;
 }
 
+static void Q3_RTStage82SharpenMigration(void) {
+    static qboolean migrationChecked = qfalse;
+    if (migrationChecked || ri.Cvar_Get == NULL) {
+        return;
+    }
+    migrationChecked = qtrue;
+
+    cvar_t *marker = ri.Cvar_Get("r_rt_stage82_taa_sharpen_migrated", "0", CVAR_ARCHIVE);
+    cvar_t *sharpen = ri.Cvar_Get("r_rt_taa_sharpen", "0.60", CVAR_ARCHIVE);
+    if (marker && marker->integer != 0) {
+        return;
+    }
+
+    /* Stage82 moves the filter from internal-source spacing to the output
+     * pixel grid. A measured 0.60 output-grid strength beats the rejected
+     * 0.20 internal-grid default without overshoot because the filter is
+     * bounded to its local min/max. Migrate only the stale shipped value,
+     * then mark it so later user tuning persists. */
+    if (ri.Cvar_Set != NULL) {
+        if (sharpen && sharpen->value > 0.199f && sharpen->value < 0.201f &&
+            sharpen->resetString && !Q_stricmp(sharpen->resetString, "0.60")) {
+            ri.Cvar_Set("r_rt_taa_sharpen", "0.60");
+        }
+        ri.Cvar_Set("r_rt_stage82_taa_sharpen_migrated", "1");
+    }
+}
+
 float Q3_RTTAASharpen(void) {
-    if (ri.Cvar_Get == NULL) return 0.20f;
-    /* Stage71: light upscale-domain sharpening for the default RT+TAA path.
+    if (ri.Cvar_Get == NULL) return 0.60f;
+    Q3_RTStage82SharpenMigration();
+    /* Stage82: output-resolution sharpening after the compute upscale.
      * Swift applies this only when r_rt_mix > 0, r_rt_taa is on, and the
      * spatial upscale path is active; raster/native/TAA-off stay zero. */
-    cvar_t *cv = ri.Cvar_Get("r_rt_taa_sharpen", "0.20", CVAR_ARCHIVE);
-    float v = cv ? cv->value : 0.20f;
+    cvar_t *cv = ri.Cvar_Get("r_rt_taa_sharpen", "0.60", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.60f;
     if (v < 0.0f) v = 0.0f;
     if (v > 1.0f) v = 1.0f;
     return v;
