@@ -5381,15 +5381,13 @@ struct MetalView: UIViewRepresentable {
                 constexpr sampler s(filter::linear, address::clamp_to_edge);
                 float2 uv = (float2(tid) + 0.5) / float2(max(w, 1u), max(h, 1u));
                 float4 c = source.sample(s, uv);
-                float exposure = q3_active_exposure(u, exposureBuffer);
-                float3 rgb = max(c.rgb * exposure, float3(0.0));
-                if (u.tonemap > 0.5) {
-                    rgb = (rgb * (2.51 * rgb + 0.03)) /
-                          (rgb * (2.43 * rgb + 0.59) + 0.14);
-                } else {
-                    rgb *= exposure;
-                }
-                output.write(float4(saturate(rgb), c.a), tid);
+                /* Keep the upscale linear. encodeSpatialUpscale updates the
+                 * shared exposure meter, then q3_postprocess applies exposure,
+                 * ACES and gamma exactly once at drawable resolution. Merely
+                 * setting u.tonemap=0 here is not sufficient: the old else
+                 * branch multiplied exposure a second time and saturated the
+                 * intermediate before the final post pass. */
+                output.write(c, tid);
             }
             """
             do {
@@ -5579,7 +5577,6 @@ struct MetalView: UIViewRepresentable {
             guard let device = commandBuffer.device as MTLDevice?,
                   let pso = ensureSpatialUpscalePipeline(device: device) else { return }
             var u = makePostprocessUniforms()
-            u.tonemap = 1.0
             let exposureBuffer = ensureExposureBuffer(device: device, initialExposure: u.intensity)
             if let exposureBuffer {
                 encodeExposureReduction(commandBuffer: commandBuffer,
