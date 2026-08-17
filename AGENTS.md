@@ -253,3 +253,47 @@ All three game modules (cgame, qagame, ui) are statically linked into the iOS bi
 - **MAE comparator script**: `scripts/q3_mae_q3dm4.py` (untracked, v2). CLI: `python3 scripts/q3_mae_q3dm4.py --out <session>/frames`. Searches ±120 frame offset range (step=2, start=0) for best temporal alignment between Metal session frames and the Vulkan reference set. Prep: both frames downscaled to 320×240 via `cv2.INTER_AREA` before MAE. Aggregate: `np.array_split` into 5 chunks, mean per chunk, median across chunks (outlier-robust). Min-samples gate: any offset with < 20 valid samples returns `None` and is skipped — this eliminates the alignment-edge instability where v1 was returning 5–6 samples and picking pathologically large-magnitude offsets. Output: `best_mae=<float> best_offset=<int> samples=<int> metal_frames=<n> ref_frames=<n>`.
 - **iphoneos Debug build**: `xcodebuild -project Quake3-iOS.xcodeproj -scheme Quake3-iOS -configuration Debug -destination 'id=<DEVICE_UDID>' -allowProvisioningUpdates build` — produces the `.app` that `scripts/q3dev_run.sh` installs and launches. Must be run before the first `q3dev_run.sh` invocation on a new checkout or after clean.
 <!-- END AUTO-MANAGED -->
+
+<!-- ═══════════════════════════════════════════════════════════════════════════
+     MANUALLY MAINTAINED — appended below the auto-generated blocks.
+     If a doc-regen tool rewrites the AUTO-MANAGED sections above, preserve
+     everything from this line down. The "Rendering Engineering Doctrine" block
+     is DUPLICATED VERBATIM in AGENTS.md and CLAUDE.md — edit both together.
+     NOTE: this file (AGENTS.md) is the git-TRACKED copy; CLAUDE.md is gitignored.
+     ═══════════════════════════════════════════════════════════════════════════ -->
+
+# Rendering Engineering Doctrine (all stages)
+
+You are an autonomous senior rendering engineer (Metal, ray tracing, GPU pipelines, motion vectors, temporal reconstruction, denoising, Quake renderer parity). Implement the ACTIVE STAGE BRIEF (`briefs/<stage>.md`) exactly. The rendered image is the primary truth; logs, counters, builds, and Metal validation are supporting evidence only — necessary but never sufficient. For infrastructure stages, success = zero visual regression + correct debug views (a stage that produces no visible change can still be complete).
+
+## ddemby protocol
+- Session start: `brains_list` + one relevant semantic search to confirm it is live.
+- Before any code change touching a subsystem: query ddemby for prior verdicts on it.
+- Before diagnosing any build / runtime / visual / Metal-validation failure: query ddemby first, before writing the fix.
+- Judge retrieval quality; if irrelevant, reformulate once, then fall back to source, git history, and platform docs. Routes: `projects/quake3-metal-port/work/verdicts` for prior diagnostics; `sources/Quake_IoS` for code lookups. If ddemby is unreachable, note it and proceed on source.
+
+## Invariants (never violated by any stage)
+- Confirm git HEAD matches the brief's start commit and the tree is clean before editing; read the brief's required handoffs first.
+- Never modify untracked files unless the brief explicitly promotes them.
+- One bounded increment. No broad refactors. The brief's Not-Allowed list is absolute — grep your own diff to prove the excluded keywords are absent.
+- Uniform structs: append new fields at the TAIL of matching Swift/MSL structs only — never insert mid-struct (shifts every field offset, corrupts all bindings).
+- Motion-vector convention: UV-space, cur−prev, unjittered; first frame / map load / camera cut ⇒ MV = 0; miss / sky ⇒ MV = 0 + far depth. Document sign/space in the report.
+- Validation: Mac Catalyst direct binary launch (`-ApplePersistenceIgnoreState YES`), fresh binary timestamps, `STALE_LOG=0`, `bad_marker_count=0`, `Q3_UPSCALE_QUALITY=native` (medium hits an open BGRA8/RGBA16Float validation assertion), `devmap q3dm1` (NOT `demo` — it falls back to the q3dm0 menu map), window-ID capture of the Q3_RT window ONLY (verify each PNG contains Q3_RT; full-screen screenshots are not proof). Sky is a known Catalyst-only render bug — exclude it from Catalyst visual acceptance.
+- Truth set: `/Volumes/iOS/Projects/RTX_Truth/q3dm1_frames/` (verify reachable; do not substitute ModDB shots). Ground visual claims in a metric (`scripts/q3_mae_q3dm4.py` / SSIM per region), not gut-feel percentages.
+- Commit only on green acceptance. Completion report: start/final commit, ddemby queries + quality, files changed, commands run, log/capture paths, debug-view results, no-regression evidence, remaining ranked mismatches, "would another engineer notice before/after? Y/N — if N, why worth doing", blockers, next-stage rec.
+
+# RT Pipeline Invariants (current as of Stage 16 — ported from CLAUDE.md)
+
+The auto-generated blocks above predate the RT / PBR / denoiser work (last regen Apr 2026). These are the load-bearing RT rules the implementer MUST honor before touching the RT path:
+
+- **RT intersector:** `rtKernel`'s `intersector<triangle_data>` is DEFAULT-configured — NO `force_opaque` / `assume_geometry_type` hints. They do not exist on the iOS Metal toolchain and cause per-frame RT library compile failure. Do not re-add. (History recorded at `MetalView.swift` ~L3581.)
+- **Append-only struct tails:** `RayTracingUniforms` / `WorldDrawUniforms` / `EntityUniforms` — new fields at the TAIL only, Swift + MSL in sync. Mid-struct insertion corrupts all bindings.
+- **Motion vectors (Stage 17+):** UV-space, cur−prev, unjittered; first frame / map / cut ⇒ 0; miss / sky ⇒ 0 + far depth.
+- **RT emissive (Stage 16, `c36066dd`):** authored emissive masks bind `pbrEmissiveTexture` for slots tagged `rtAlbedoSlotKinds==1` (NOT albedo). `r_rt_emissive` default is 1.0. Do not revert to albedo-as-emissive (it caused the whole-primitive white-square bug).
+- **RT material signature (Stage 15, `4693da45`):** `rtWorldMaterialSignature` hashes the REPRESENTATIVE stage (not stage 0) + material routing inputs. Do not revert to stage-0-only.
+- **RT lighting cvars/defaults:** `r_rt_lightmap_scale` 1.0, `r_rt_direct_scale` 1.0, `r_rt_normal_scale` 0.0, `r_rt_hdr` 1. `rtPBRGlobal` = (.x normal, .y parallax-reserved, .z lightmap, .w direct).
+- **World/entity AS:** `geomDesc.opaque = true`; alpha/grate surfaces are opaque occluders (known gap, audit P4 — see `PATCH_PLAN_rt_alpha_grate_occlusion.md` on the Mac Desktop). Don't assume alpha discard in the AS.
+- **Buffer fence:** raster dynamic buffers retired by command-buffer completion (`6c564113`); RT/entity buffers still UNFENCED (audit P3/P7 — open). Don't assume RT buffers are safe to overwrite in-flight.
+- **Reverted landmines (never restore):** global alpha discard (`37bea83`); a fragment-side lightmap×2 energy scalar (lightmap is a real 2nd GL_DST_COLOR/GL_ZERO pass, not a shader multiply); ComputeRGBGen spec-literal renumbering (current Metal-parser numbering is intentional).
+- **Known-open (not your stage unless the brief says so):** emissive-as-area-light / colored GI is weak (separate lighting work — denoise/FI do NOT fix it); Catalyst blue-blocky sky bug; medium-upscale BGRA8/RGBA16Float validation assertion.
+- **Caps:** `Q3_METAL_MAX_DRAWS` 65536, `Q3_METAL_MAX_TEXTURES` 4096.
