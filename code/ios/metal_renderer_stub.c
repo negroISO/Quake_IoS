@@ -9454,6 +9454,121 @@ static void MetalAcceptSceneEntity(const refEntity_t *re, qboolean mirrored) {
     }
 }
 
+/* Optional historical first-person viewmodel fallback.  The modern native
+ * cgame path is authoritative and this cvar defaults off.  Keeping the old
+ * camera-relative model available lets us compare its placement/material
+ * behavior against the native tag-driven path without removing modern
+ * PBR/reflection routing. */
+static qhandle_t s_syntheticViewmodelHandles[16];
+static cvar_t *s_cvarSyntheticViewmodel;
+static cvar_t *s_cvarSyntheticVmForward;
+static cvar_t *s_cvarSyntheticVmRight;
+static cvar_t *s_cvarSyntheticVmUp;
+static cvar_t *s_cvarSyntheticVmScale;
+static cvar_t *s_cvarSyntheticVmSway;
+static cvar_t *s_cvarSyntheticDrawGun;
+
+static qboolean MetalSyntheticViewmodelEnabled(void) {
+    if (s_cvarSyntheticViewmodel == NULL) {
+        s_cvarSyntheticViewmodel = ri.Cvar_Get("metal_synth_viewmodel", "0", CVAR_ARCHIVE);
+    }
+    return s_cvarSyntheticViewmodel->integer ? qtrue : qfalse;
+}
+
+static qhandle_t MetalSyntheticViewmodelHandle(int weapon) {
+    static const char *names[] = {
+        NULL,
+        "models/weapons2/gauntlet/gauntlet.md3",
+        "models/weapons2/machinegun/machinegun.md3",
+        "models/weapons2/shotgun/shotgun.md3",
+        "models/weapons2/grenadel/grenadel.md3",
+        "models/weapons2/rocketl/rocketl.md3",
+        "models/weapons2/lightning/lightning.md3",
+        "models/weapons2/railgun/railgun.md3",
+        "models/weapons2/plasma/plasma.md3",
+        "models/weapons2/bfg/bfg.md3",
+        "models/weapons2/grapple/grapple.md3"
+    };
+    if (weapon <= 0 || weapon >= (int)(sizeof(names) / sizeof(names[0])) ||
+        names[weapon] == NULL) {
+        return 0;
+    }
+    if (s_syntheticViewmodelHandles[weapon] == 0) {
+        s_syntheticViewmodelHandles[weapon] = RE_RegisterModel(names[weapon]);
+    }
+    return s_syntheticViewmodelHandles[weapon];
+}
+
+static void MetalSynthesizeViewmodelEntity(const vec3_t vieworg,
+                                           const vec3_t axis0,
+                                           const vec3_t axis1,
+                                           const vec3_t axis2) {
+    refEntity_t entity;
+    qhandle_t model;
+    vec3_t origin;
+    float t, swayRight, swayUp, swayAmp;
+    float forward, right, up, scale;
+
+    if (!MetalSyntheticViewmodelEnabled() || !s_world.loaded ||
+        s_sceneEntityCount >= Q3_METAL_MAX_REFENTITIES) {
+        return;
+    }
+    if (s_cvarSyntheticVmForward == NULL) {
+        s_cvarSyntheticVmForward = ri.Cvar_Get("metal_vm_forward", "6", CVAR_ARCHIVE);
+        s_cvarSyntheticVmRight = ri.Cvar_Get("metal_vm_right", "5", CVAR_ARCHIVE);
+        /* Tuned for the current Hor+ vertical FOV.  The historical Vert-
+         * branch used -4/0.3, but its narrower vertical FOV made that model
+         * occupy a smaller/lower screen region. */
+        s_cvarSyntheticVmUp = ri.Cvar_Get("metal_vm_up", "-5", CVAR_ARCHIVE);
+        s_cvarSyntheticVmScale = ri.Cvar_Get("metal_vm_scale", "0.24", CVAR_ARCHIVE);
+        s_cvarSyntheticVmSway = ri.Cvar_Get("metal_vm_sway", "0.4", CVAR_ARCHIVE);
+        s_cvarSyntheticDrawGun = ri.Cvar_Get("cg_drawGun", "1", 0);
+    }
+    if (s_cvarSyntheticDrawGun != NULL && s_cvarSyntheticDrawGun->integer == 0) {
+        return;
+    }
+
+    model = MetalSyntheticViewmodelHandle(cl.snap.ps.weapon);
+    if (model == 0) {
+        return;
+    }
+
+    forward = s_cvarSyntheticVmForward->value;
+    right = s_cvarSyntheticVmRight->value;
+    up = s_cvarSyntheticVmUp->value;
+    scale = s_cvarSyntheticVmScale->value;
+    swayAmp = s_cvarSyntheticVmSway->value;
+    if (scale <= 0.0f) {
+        scale = 0.24f;
+    }
+
+    Com_Memset(&entity, 0, sizeof(entity));
+    entity.reType = RT_MODEL;
+    entity.hModel = model;
+    entity.renderfx = RF_DEPTHHACK | RF_FIRST_PERSON;
+    entity.shader.rgba[0] = 255;
+    entity.shader.rgba[1] = 255;
+    entity.shader.rgba[2] = 255;
+    entity.shader.rgba[3] = 255;
+
+    VectorCopy(vieworg, origin);
+    VectorMA(origin, forward, axis0, origin);
+    VectorMA(origin, -right, axis1, origin);
+    VectorMA(origin, up, axis2, origin);
+
+    t = (float)cls.realtime * 0.002f;
+    swayRight = sinf(t) * swayAmp;
+    swayUp = cosf(t) * (swayAmp * 0.6f);
+    VectorMA(origin, -swayRight, axis1, origin);
+    VectorMA(origin, swayUp, axis2, origin);
+    VectorCopy(origin, entity.origin);
+
+    VectorScale(axis0, scale, entity.axis[0]);
+    VectorScale(axis1, scale, entity.axis[1]);
+    VectorScale(axis2, scale, entity.axis[2]);
+    MetalAcceptSceneEntity(&entity, qfalse);
+}
+
 static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime) {
     vec3_t cross;
 
@@ -9526,6 +9641,14 @@ static void RE_AddRefEntityToScene(const refEntity_t *re, qboolean intShaderTime
     }
     if (re->hModel == 0 || FindModelByHandle(re->hModel) == NULL) {
         s_entityRejectedModelThisFrame += 1;
+        return;
+    }
+    /* The optional synthetic path replaces the native first-person weapon
+     * chain rather than drawing both.  Other RF_DEPTHHACK effects remain on
+     * their normal route. */
+    if (MetalSyntheticViewmodelEnabled() &&
+        (re->renderfx & RF_FIRST_PERSON) != 0 &&
+        (re->renderfx & RF_DEPTHHACK) != 0) {
         return;
     }
 
@@ -9744,6 +9867,8 @@ static void RE_RenderScene(const refdef_t *fd) {
         s_sceneView.viewAxis[6] = axis2[0];
         s_sceneView.viewAxis[7] = axis2[1];
         s_sceneView.viewAxis[8] = axis2[2];
+
+        MetalSynthesizeViewmodelEntity(vieworg, axis0, axis1, axis2);
     }
 
     s_sceneLogCounter += 1;
