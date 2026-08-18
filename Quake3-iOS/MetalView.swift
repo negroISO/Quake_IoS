@@ -1587,7 +1587,7 @@ struct MetalView: UIViewRepresentable {
              * .w = intensity. (1,1,1,0) means "no emissive contribution". */
             var emissiveParams: SIMD4<Float> = SIMD4(1, 1, 1, 0)
             /* 2026-06-10: viewmodel-only PBR base floor.
-             *   .x = floor strength (from r_pbr_viewmodel_floor, default 0.65)
+             *   .x = floor strength (from r_pbr_viewmodel_floor, default 0.35)
              *   .y = viewmodel gate (1.0 when RF_DEPTHHACK draw, 0.0 otherwise)
              *   .z, .w = pad
              * MSL applies `base.rgb = max(base.rgb, texel.rgb * .x)` only
@@ -2391,7 +2391,7 @@ struct MetalView: UIViewRepresentable {
             // Same semantics as WorldDrawUniforms.emissiveParams.
             float4 emissiveParams;
             // 2026-06-10: viewmodel-only PBR base-color floor.
-            // .x = floor strength (r_pbr_viewmodel_floor, default 0.65)
+            // .x = floor strength (r_pbr_viewmodel_floor, default 0.35)
             // .y = viewmodel gate (1.0 for RF_DEPTHHACK, 0.0 otherwise)
             // .z, .w = pad. Fragment applies `base.rgb = max(base.rgb,
             // texel.rgb * .x)` only when `.y > 0.5`. Layout MUST match
@@ -3760,7 +3760,7 @@ struct MetalView: UIViewRepresentable {
             // 2026-06-10: viewmodel base-color floor. Applied BEFORE emissive
             // so glow ride-alongs are unaffected. Gate: `.y > 0.5` means
             // "this draw is RF_DEPTHHACK (first-person weapon)". Floor:
-            // `.x = r_pbr_viewmodel_floor` (default 0.65). Reads
+            // `.x = r_pbr_viewmodel_floor` (default 0.35). Reads
             // `texel.rgb` as the unlit albedo sample so the viewmodel always
             // shows its real material color through low-energy IBL — a
             // gameplay readability exception, not a PBR correctness fix.
@@ -13138,7 +13138,7 @@ struct MetalView: UIViewRepresentable {
                         entityUniforms.emissiveParams = emissiveParamsForPBRMaterial(handle: draw.textureHandle)
                         // 2026-06-10: viewmodel-only base-color floor. .x is
                         // the floor strength from `r_pbr_viewmodel_floor`
-                        // (CVAR_ARCHIVE, default 0.65). .y is the gate flag
+                        // (CVAR_ARCHIVE, default 0.35). .y is the gate flag
                         // (1.0 for RF_DEPTHHACK, 0.0 for world entities) so
                         // the MSL `if (.y > 0.5)` runs only on first-person
                         // weapons. World pickups, scene polys, and HUD heads
