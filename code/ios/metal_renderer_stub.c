@@ -12108,7 +12108,7 @@ float Q3_PBRWorldSpecBoost(void) {
     if (v > 2.0f) v = 2.0f;
     return v;
 }
-/* r_pbr_viewmodel_floor (default 0.35) — viewmodel-only PBR base-color
+/* r_pbr_viewmodel_floor (default 0) — viewmodel-only PBR base-color
  * floor. Most weapon viewmodels are authored metallic=1.0; with our
  * neutral 0.08 procedural envCube an IBL-only metal surface comes out
  * near-black regardless of orientation. The floor clamps `base.rgb` to
@@ -12206,9 +12206,9 @@ float Q3_PBREmissiveIntensityMax(void) {
 }
 
 float Q3_PBRViewmodelFloor(void) {
-    if (ri.Cvar_Get == NULL) return 0.35f;
-    cvar_t *cv = ri.Cvar_Get("r_pbr_viewmodel_floor", "0.35", CVAR_ARCHIVE);
-    float v = cv ? cv->value : 0.35f;
+    if (ri.Cvar_Get == NULL) return 0.0f;
+    cvar_t *cv = ri.Cvar_Get("r_pbr_viewmodel_floor", "0", CVAR_ARCHIVE);
+    float v = cv ? cv->value : 0.0f;
     if (v < 0.0f) v = 0.0f;
     if (v > 1.0f) v = 1.0f;
     return v;
