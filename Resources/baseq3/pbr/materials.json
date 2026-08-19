@@ -19818,6 +19818,19 @@
    },
    "renderCategory": "OPAQUE",
    "roughness_constant": 0.17999999
+  },
+  "2AE856AACC1DA15F": {
+   "hash": "2AE856AACC1DA15F",
+   "albedo": "assets/ingested/2AE856AACC1DA15F_albedo.a.rtex.dds",
+   "normal": "assets/ingested/2AE856AACC1DA15F_normal_OTH_Normal.n.rtex.dds",
+   "roughness": "assets/ingested/2AE856AACC1DA15F_roughness.r.rtex.dds",
+   "metallic": "assets/ingested/2AE856AACC1DA15F_metallic.m.rtex.dds",
+   "height": "assets/ingested/2AE856AACC1DA15F_height.h.rtex.dds",
+   "displace_in": 0.01,
+   "displace_out": 0.01,
+   "renderCategory": "OPAQUE",
+   "alphaMode": "OPAQUE",
+   "notes": "RTX 0.7.5 material; strong visual match to textures/ctf/ctf_blueflag.tga (64 ORB good matches, 59 affine inliers, structural correlation 0.9797)."
   }
  },
  "materials_by_name": {
@@ -36336,6 +36349,27 @@
    "source": "stage78_truth_constants",
    "stage78_note": "stage78 q3dm0 corridor truth: shiny patch/metal panel; constants only, no DDS/map assignment",
    "notes": "q3dm0 shiny patch/metal panel; constants only, no DDS/map assignment"
+  },
+  "textures/ctf/ctf_blueflag": {
+   "hash": "2AE856AACC1DA15F",
+   "albedo": "assets/ingested/2AE856AACC1DA15F_albedo.a.rtex.dds",
+   "normal": "assets/ingested/2AE856AACC1DA15F_normal_OTH_Normal.n.rtex.dds",
+   "roughness": "assets/ingested/2AE856AACC1DA15F_roughness.r.rtex.dds",
+   "metallic": "assets/ingested/2AE856AACC1DA15F_metallic.m.rtex.dds",
+   "height": "assets/ingested/2AE856AACC1DA15F_height.h.rtex.dds",
+   "displace_in": 0.01,
+   "displace_out": 0.01,
+   "renderCategory": "OPAQUE",
+   "alphaMode": "OPAQUE",
+   "notes": "RTX 0.7.5 material; strong visual match to textures/ctf/ctf_blueflag.tga (64 ORB good matches, 59 affine inliers, structural correlation 0.9797).",
+   "gamePath": "textures/ctf/ctf_blueflag",
+   "sourceTexture": "textures/ctf/ctf_blueflag.tga",
+   "maps": [
+    "textures/ctf/ctf_blueflag.tga"
+   ],
+   "inMaterialTable": true,
+   "matchScore": 0.9797,
+   "matchEvidence": "ORB 64 good / 59 RANSAC inliers against the vanilla Aerowalk blue-flag texture; histogram differs because RTX remasters color."
   }
  },
  "metadata": {
