@@ -2656,6 +2656,7 @@ static qboolean IsPickupEntityShaderName(const char *name) {
     return name != NULL &&
         (!Q_stricmpn(name, "models/powerups/health/", 23) ||
          !Q_stricmpn(name, "models/powerups/armor/", 22) ||
+         !Q_stricmpn(name, "models/weapons2/", 16) ||
          !Q_stricmpn(name, "models/powerups/ammo/", 21));
 }
 
