@@ -36370,6 +36370,42 @@
    "inMaterialTable": true,
    "matchScore": 0.9797,
    "matchEvidence": "ORB 64 good / 59 RANSAC inliers against the vanilla Aerowalk blue-flag texture; histogram differs because RTX remasters color."
+  },
+  "textures/base_light/ceil1_30_8k": {
+   "hash": "8837100C6E428DDF",
+   "inMaterialTable": true,
+   "source": "shader-stage-alias",
+   "sourceTexture": "textures/base_light/ceil1_30.blend",
+   "aliasOf": "textures/base_light/ceil1_30.blend",
+   "maps": [
+    "textures/base_light/ceil1_30.tga",
+    "textures/base_light/ceil1_30.blend.tga"
+   ],
+   "matchEvidence": "RTX 0.7.5 parent material already mapped to the exact base stage named by this light-output shader variant."
+  },
+  "textures/gothic_light/gothic_light3_2K": {
+   "hash": "90632069D51CC347",
+   "inMaterialTable": true,
+   "source": "shader-stage-alias",
+   "sourceTexture": "textures/gothic_light/gothic_light3",
+   "aliasOf": "textures/gothic_light/gothic_light3",
+   "maps": [
+    "textures/gothic_light/gothic_light3.tga",
+    "textures/gothic_light/gothic_light2_blend.tga"
+   ],
+   "matchEvidence": "RTX 0.7.5 parent material already mapped to the exact base stage named by this light-output shader variant."
+  },
+  "textures/gothic_light/ironcrosslt2_2000": {
+   "hash": "6EBCC51BE170034F",
+   "inMaterialTable": true,
+   "source": "shader-stage-alias",
+   "sourceTexture": "textures/gothic_light/ironcrosslt2",
+   "aliasOf": "textures/gothic_light/ironcrosslt2",
+   "maps": [
+    "textures/gothic_light/ironcrosslt2.tga",
+    "textures/gothic_light/ironcrosslt2.blend.tga"
+   ],
+   "matchEvidence": "RTX 0.7.5 parent material already mapped to the exact base stage named by this light-output shader variant."
   }
  },
  "metadata": {
