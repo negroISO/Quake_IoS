@@ -36446,6 +36446,169 @@
    ],
    "matchScore": 0.927982,
    "matchEvidence": "256x256 vanilla stage versus 2048x2048 RTX albedo: grayscale NCC 0.927982; ORB 47 good / 36 affine RANSAC inliers; runner-up NCC only 0.459866."
+  },
+  "textures/base_floor/clang_floorshiny": {
+   "hash": "38D02A8A9ADD816A",
+   "inMaterialTable": true,
+   "source": "shader-stage-alias",
+   "sourceTexture": "textures/base_floor/clang_floorshiny_alpha",
+   "aliasOf": "textures/base_floor/clang_floorshiny_alpha",
+   "maps": [
+    "textures/base_floor/clang_floorshiny_alpha.tga"
+   ],
+   "matchEvidence": "NV15 shader definition uses the parent material's exact concrete stage(s); target differs only in light output or transparency classification."
+  },
+  "textures/nvidia/border11_150": {
+   "hash": "1473FC43CD96BF5C",
+   "inMaterialTable": true,
+   "source": "shader-stage-alias",
+   "sourceTexture": "textures/base_trim/border11light",
+   "aliasOf": "textures/base_trim/border11light",
+   "maps": [
+    "textures/base_trim/border11light.tga",
+    "textures/base_trim/border11light.glow.tga"
+   ],
+   "matchEvidence": "NV15 shader definition uses the parent material's exact concrete stage(s); target differs only in light output or transparency classification."
+  },
+  "textures/nvidia/baslt4_1_1k": {
+   "hash": "11A56BD000F0D254",
+   "inMaterialTable": true,
+   "source": "shader-stage-alias",
+   "sourceTexture": "textures/base_light/baslt4_1",
+   "aliasOf": "textures/base_light/baslt4_1",
+   "maps": [
+    "textures/base_light/baslt4_1.tga",
+    "textures/base_light/baslt4_1.blend.tga"
+   ],
+   "matchEvidence": "NV15 shader definition uses the parent material's exact concrete stage(s); target differs only in light output or transparency classification."
+  },
+  "textures/nvidia/baslt4_1_2k": {
+   "hash": "11A56BD000F0D254",
+   "inMaterialTable": true,
+   "source": "shader-stage-alias",
+   "sourceTexture": "textures/base_light/baslt4_1",
+   "aliasOf": "textures/base_light/baslt4_1",
+   "maps": [
+    "textures/base_light/baslt4_1.tga",
+    "textures/base_light/baslt4_1.blend.tga"
+   ],
+   "matchEvidence": "NV15 shader definition uses the parent material's exact concrete stage(s); target differs only in light output or transparency classification."
+  },
+  "textures/nvidia/baslt4_1_3k": {
+   "hash": "11A56BD000F0D254",
+   "inMaterialTable": true,
+   "source": "shader-stage-alias",
+   "sourceTexture": "textures/base_light/baslt4_1",
+   "aliasOf": "textures/base_light/baslt4_1",
+   "maps": [
+    "textures/base_light/baslt4_1.tga",
+    "textures/base_light/baslt4_1.blend.tga"
+   ],
+   "matchEvidence": "NV15 shader definition uses the parent material's exact concrete stage(s); target differs only in light output or transparency classification."
+  },
+  "textures/base_light/baslt4_1_4k": {
+   "hash": "11A56BD000F0D254",
+   "inMaterialTable": true,
+   "source": "shader-stage-alias",
+   "sourceTexture": "textures/base_light/baslt4_1",
+   "aliasOf": "textures/base_light/baslt4_1",
+   "maps": [
+    "textures/base_light/baslt4_1.tga",
+    "textures/base_light/baslt4_1.blend.tga"
+   ],
+   "matchEvidence": "NV15 shader definition uses the parent material's exact concrete stage(s); target differs only in light output or transparency classification."
+  },
+  "textures/nvidia/baslt4_1_500": {
+   "hash": "11A56BD000F0D254",
+   "inMaterialTable": true,
+   "source": "shader-stage-alias",
+   "sourceTexture": "textures/base_light/baslt4_1",
+   "aliasOf": "textures/base_light/baslt4_1",
+   "maps": [
+    "textures/base_light/baslt4_1.tga",
+    "textures/base_light/baslt4_1.blend.tga"
+   ],
+   "matchEvidence": "NV15 shader definition uses the parent material's exact concrete stage(s); target differs only in light output or transparency classification."
+  },
+  "textures/nvidia/wsupprt1_12_200": {
+   "hash": "159CF4046ECC816F",
+   "inMaterialTable": true,
+   "source": "shader-stage-alias",
+   "sourceTexture": "textures/base_light/wsupprt1_12.blend",
+   "aliasOf": "textures/base_light/wsupprt1_12.blend",
+   "maps": [
+    "textures/base_light/wsupprt1_12.tga",
+    "textures/base_light/wsupprt1_12.blend.tga"
+   ],
+   "matchEvidence": "NV15 shader definition uses the parent material's exact concrete stage(s); target differs only in light output or transparency classification."
+  },
+  "textures/nvidia/wsupprt1_12_500": {
+   "hash": "159CF4046ECC816F",
+   "inMaterialTable": true,
+   "source": "shader-stage-alias",
+   "sourceTexture": "textures/base_light/wsupprt1_12.blend",
+   "aliasOf": "textures/base_light/wsupprt1_12.blend",
+   "maps": [
+    "textures/base_light/wsupprt1_12.tga",
+    "textures/base_light/wsupprt1_12.blend.tga"
+   ],
+   "matchEvidence": "NV15 shader definition uses the parent material's exact concrete stage(s); target differs only in light output or transparency classification."
+  },
+  "textures/base_light/pj_wstlt1_3k": {
+   "hash": "937CEDA6AEE7631E",
+   "inMaterialTable": true,
+   "source": "shader-stage-alias",
+   "sourceTexture": "textures/base_light/wstlt1_5",
+   "aliasOf": "textures/base_light/wstlt1_5",
+   "maps": [
+    "textures/base_light/wstlt1_5.tga",
+    "textures/base_light/wstlt1_5.blend.tga"
+   ],
+   "matchEvidence": "NV15 shader definition uses the parent material's exact concrete stage(s); target differs only in light output or transparency classification."
+  },
+  "textures/nvidia/proto_lightblue_3": {
+   "hash": "747A2D593E19173E",
+   "inMaterialTable": true,
+   "source": "shader-stage-alias",
+   "sourceTexture": "textures/nvidia/proto_lightblue",
+   "aliasOf": "textures/nvidia/proto_lightblue",
+   "maps": [
+    "textures/nvidia/proto_lightblue.tga"
+   ],
+   "matchEvidence": "NV15 shader definition uses the parent material's exact concrete stage(s); target differs only in light output or transparency classification."
+  },
+  "textures/nvidia/proto_lightamber_3": {
+   "hash": "7C57E2111CFF8D46",
+   "inMaterialTable": true,
+   "source": "shader-stage-alias",
+   "sourceTexture": "textures/nvidia/proto_lightamber",
+   "aliasOf": "textures/nvidia/proto_lightamber",
+   "maps": [
+    "textures/nvidia/proto_lightamber.tga"
+   ],
+   "matchEvidence": "NV15 shader definition uses the parent material's exact concrete stage(s); target differs only in light output or transparency classification."
+  },
+  "textures/nvidia/proto_lightgreen_3": {
+   "hash": "E004EEC208E8349C",
+   "inMaterialTable": true,
+   "source": "shader-stage-alias",
+   "sourceTexture": "textures/nvidia/proto_lightgreen",
+   "aliasOf": "textures/nvidia/proto_lightgreen",
+   "maps": [
+    "textures/nvidia/proto_lightgreen.tga"
+   ],
+   "matchEvidence": "NV15 shader definition uses the parent material's exact concrete stage(s); target differs only in light output or transparency classification."
+  },
+  "textures/base_trim/deeprust_trans": {
+   "hash": "DBD7FAAD105B479C",
+   "inMaterialTable": true,
+   "source": "shader-stage-alias",
+   "sourceTexture": "textures/base_trim/deeprust",
+   "aliasOf": "textures/base_trim/deeprust",
+   "maps": [
+    "textures/base_trim/deeprust.tga"
+   ],
+   "matchEvidence": "NV15 shader definition uses the parent material's exact concrete stage(s); target differs only in light output or transparency classification."
   }
  },
  "metadata": {
