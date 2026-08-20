@@ -19831,6 +19831,22 @@
    "renderCategory": "OPAQUE",
    "alphaMode": "OPAQUE",
    "notes": "RTX 0.7.5 material; strong visual match to textures/ctf/ctf_blueflag.tga (64 ORB good matches, 59 affine inliers, structural correlation 0.9797)."
+  },
+  "E1F10C6FEEC7765F": {
+   "hash": "E1F10C6FEEC7765F",
+   "albedo": "assets/ingested/E1F10C6FEEC7765F_albedo.a.rtex.dds",
+   "normal": "assets/ingested/E1F10C6FEEC7765F_normal_OTH_Normal.n.rtex.dds",
+   "roughness": "assets/ingested/E1F10C6FEEC7765F_roughness.r.rtex.dds",
+   "metallic": "assets/ingested/E1F10C6FEEC7765F_metallic.m.rtex.dds",
+   "emissive": null,
+   "height": "assets/ingested/E1F10C6FEEC7765F_height.h.rtex.dds",
+   "emissive_intensity": null,
+   "emissive_color": null,
+   "displace_in": 0.02,
+   "displace_out": 0.02,
+   "renderCategory": "OPAQUE",
+   "alphaMode": "OPAQUE",
+   "notes": "RTX 0.7.5 material; strong match to Aerowalk textures/ctf/blocks18c_3_b.jpg."
   }
  },
  "materials_by_name": {
@@ -36406,6 +36422,30 @@
     "textures/gothic_light/ironcrosslt2.blend.tga"
    ],
    "matchEvidence": "RTX 0.7.5 parent material already mapped to the exact base stage named by this light-output shader variant."
+  },
+  "textures/ctf/blocks18c_3_b": {
+   "hash": "E1F10C6FEEC7765F",
+   "albedo": "assets/ingested/E1F10C6FEEC7765F_albedo.a.rtex.dds",
+   "normal": "assets/ingested/E1F10C6FEEC7765F_normal_OTH_Normal.n.rtex.dds",
+   "roughness": "assets/ingested/E1F10C6FEEC7765F_roughness.r.rtex.dds",
+   "metallic": "assets/ingested/E1F10C6FEEC7765F_metallic.m.rtex.dds",
+   "emissive": null,
+   "height": "assets/ingested/E1F10C6FEEC7765F_height.h.rtex.dds",
+   "emissive_intensity": null,
+   "emissive_color": null,
+   "displace_in": 0.02,
+   "displace_out": 0.02,
+   "renderCategory": "OPAQUE",
+   "alphaMode": "OPAQUE",
+   "notes": "RTX 0.7.5 material; strong match to Aerowalk textures/ctf/blocks18c_3_b.jpg.",
+   "inMaterialTable": true,
+   "gamePath": "textures/ctf/blocks18c_3_b",
+   "sourceTexture": "textures/ctf/blocks18c_3_b.jpg",
+   "maps": [
+    "textures/ctf/blocks18c_3_b.jpg"
+   ],
+   "matchScore": 0.927982,
+   "matchEvidence": "256x256 vanilla stage versus 2048x2048 RTX albedo: grayscale NCC 0.927982; ORB 47 good / 36 affine RANSAC inliers; runner-up NCC only 0.459866."
   }
  },
  "metadata": {
