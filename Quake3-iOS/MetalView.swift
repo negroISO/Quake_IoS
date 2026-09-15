@@ -15957,7 +15957,7 @@ struct MetalView: UIViewRepresentable {
             do {
                 uiPipelineState = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
             } catch {
-                print("[Metal] Failed to create UI pipeline: \\(error)")
+                print("[Metal] Failed to create UI pipeline: \(error)")
             }
 
             // Per-blend-mode variants of the UI pipeline. Each Q3MetalDrawCmd
@@ -15975,7 +15975,7 @@ struct MetalView: UIViewRepresentable {
             do {
                 uiOpaquePipelineState = try device.makeRenderPipelineState(descriptor: uiOpaqueDesc)
             } catch {
-                print("[Metal] Failed to create UI opaque pipeline: \\(error)")
+                print("[Metal] Failed to create UI opaque pipeline: \(error)")
             }
 
             let uiAdditiveDesc = MTLRenderPipelineDescriptor()
@@ -15994,7 +15994,7 @@ struct MetalView: UIViewRepresentable {
             do {
                 uiAdditivePipelineState = try device.makeRenderPipelineState(descriptor: uiAdditiveDesc)
             } catch {
-                print("[Metal] Failed to create UI additive pipeline: \\(error)")
+                print("[Metal] Failed to create UI additive pipeline: \(error)")
             }
 
             /* UI alpha-modulated additive (GL_SRC_ALPHA/GL_ONE) — blendMode=1.
@@ -16019,7 +16019,7 @@ struct MetalView: UIViewRepresentable {
             do {
                 uiAdditiveAlphaPipelineState = try device.makeRenderPipelineState(descriptor: uiAdditiveAlphaDesc)
             } catch {
-                print("[Metal] Failed to create UI additive-alpha pipeline: \\(error)")
+                print("[Metal] Failed to create UI additive-alpha pipeline: \(error)")
             }
 
             let uiFilterDesc = MTLRenderPipelineDescriptor()
@@ -16038,7 +16038,7 @@ struct MetalView: UIViewRepresentable {
             do {
                 uiFilterPipelineState = try device.makeRenderPipelineState(descriptor: uiFilterDesc)
             } catch {
-                print("[Metal] Failed to create UI filter pipeline: \\(error)")
+                print("[Metal] Failed to create UI filter pipeline: \(error)")
             }
 
             let worldPipelineDescriptor = MTLRenderPipelineDescriptor()
@@ -16051,7 +16051,7 @@ struct MetalView: UIViewRepresentable {
             do {
                 worldPipelineState = try device.makeRenderPipelineState(descriptor: worldPipelineDescriptor)
             } catch {
-                print("[Metal] Failed to create world pipeline: \\(error)")
+                print("[Metal] Failed to create world pipeline: \(error)")
             }
 
             let sunShadowPipelineDescriptor = MTLRenderPipelineDescriptor()
@@ -16074,7 +16074,7 @@ struct MetalView: UIViewRepresentable {
             do {
                 worldFilterPipelineState = try device.makeRenderPipelineState(descriptor: worldFilterPipelineDescriptor)
             } catch {
-                print("[Metal] Failed to create filter world pipeline: \\(error)")
+                print("[Metal] Failed to create filter world pipeline: \(error)")
             }
 
             let worldAlphaPipelineDescriptor = worldPipelineDescriptor.copy() as! MTLRenderPipelineDescriptor
@@ -16085,7 +16085,7 @@ struct MetalView: UIViewRepresentable {
             do {
                 worldAlphaPipelineState = try device.makeRenderPipelineState(descriptor: worldAlphaPipelineDescriptor)
             } catch {
-                print("[Metal] Failed to create alpha world pipeline: \\(error)")
+                print("[Metal] Failed to create alpha world pipeline: \(error)")
             }
 
             let fogVolumePipelineDescriptor = MTLRenderPipelineDescriptor()
@@ -16109,7 +16109,7 @@ struct MetalView: UIViewRepresentable {
             do {
                 fogVolumePipelineState = try device.makeRenderPipelineState(descriptor: fogVolumePipelineDescriptor)
             } catch {
-                print("[Metal] Failed to create fog-volume pipeline: \\(error)")
+                print("[Metal] Failed to create fog-volume pipeline: \(error)")
             }
 
             /* Alpha-modulated additive (blendMode=1): GL_SRC_ALPHA/GL_ONE. */
@@ -16121,7 +16121,7 @@ struct MetalView: UIViewRepresentable {
             do {
                 worldAdditivePipelineState = try device.makeRenderPipelineState(descriptor: worldAdditivePipelineDescriptor)
             } catch {
-                print("[Metal] Failed to create additive world pipeline: \\(error)")
+                print("[Metal] Failed to create additive world pipeline: \(error)")
             }
 
             /* Full-intensity additive (blendMode=5): GL_ONE/GL_ONE. Distinct
@@ -16134,7 +16134,7 @@ struct MetalView: UIViewRepresentable {
             do {
                 worldAdditiveFullPipelineState = try device.makeRenderPipelineState(descriptor: worldAdditiveFullDescriptor)
             } catch {
-                print("[Metal] Failed to create additive-full world pipeline: \\(error)")
+                print("[Metal] Failed to create additive-full world pipeline: \(error)")
             }
 
             // Sky pipeline: view-direction spherical projection. No blending,
@@ -16150,7 +16150,7 @@ struct MetalView: UIViewRepresentable {
             do {
                 skyPipelineState = try device.makeRenderPipelineState(descriptor: skyPipelineDescriptor)
             } catch {
-                print("[Metal] Failed to create sky pipeline: \\(error)")
+                print("[Metal] Failed to create sky pipeline: \(error)")
             }
 
             /* Full-intensity additive sky stage (blendMode=5, GL_ONE/GL_ONE).
@@ -16163,7 +16163,7 @@ struct MetalView: UIViewRepresentable {
             do {
                 skyAdditivePipelineState = try device.makeRenderPipelineState(descriptor: skyAdditiveDescriptor)
             } catch {
-                print("[Metal] Failed to create additive sky pipeline: \\(error)")
+                print("[Metal] Failed to create additive sky pipeline: \(error)")
             }
 
             /* Alpha-modulated additive sky stage (blendMode=1, GL_SRC_ALPHA/GL_ONE).
@@ -16176,7 +16176,7 @@ struct MetalView: UIViewRepresentable {
             do {
                 skyAdditiveAlphaPipelineState = try device.makeRenderPipelineState(descriptor: skyAdditiveAlphaDesc)
             } catch {
-                print("[Metal] Failed to create additive-alpha sky pipeline: \\(error)")
+                print("[Metal] Failed to create additive-alpha sky pipeline: \(error)")
             }
 
             let skyDepthDescriptor = MTLDepthStencilDescriptor()
@@ -16194,7 +16194,7 @@ struct MetalView: UIViewRepresentable {
             do {
                 entityPipelineState = try device.makeRenderPipelineState(descriptor: entityPipelineDescriptor)
             } catch {
-                print("[Metal] Failed to create entity pipeline: \\(error)")
+                print("[Metal] Failed to create entity pipeline: \(error)")
             }
 
             /* Alpha-modulated additive (blendMode=1): GL_SRC_ALPHA/GL_ONE.
@@ -16218,7 +16218,7 @@ struct MetalView: UIViewRepresentable {
             do {
                 entityAdditivePipelineState = try device.makeRenderPipelineState(descriptor: entityAdditiveDesc)
             } catch {
-                print("[Metal] Failed to create additive entity pipeline: \\(error)")
+                print("[Metal] Failed to create additive entity pipeline: \(error)")
             }
 
             /* Full-intensity additive (blendMode=5): GL_ONE/GL_ONE.
@@ -16244,7 +16244,7 @@ struct MetalView: UIViewRepresentable {
             do {
                 entityAdditiveFullPipelineState = try device.makeRenderPipelineState(descriptor: entityAdditiveFullDesc)
             } catch {
-                print("[Metal] Failed to create additive-full entity pipeline: \\(error)")
+                print("[Metal] Failed to create additive-full entity pipeline: \(error)")
             }
 
             let entityAlphaDesc = MTLRenderPipelineDescriptor()
@@ -16261,7 +16261,7 @@ struct MetalView: UIViewRepresentable {
             do {
                 entityAlphaPipelineState = try device.makeRenderPipelineState(descriptor: entityAlphaDesc)
             } catch {
-                print("[Metal] Failed to create alpha entity pipeline: \\(error)")
+                print("[Metal] Failed to create alpha entity pipeline: \(error)")
             }
 
             let entityFilterDesc = MTLRenderPipelineDescriptor()
@@ -16281,7 +16281,7 @@ struct MetalView: UIViewRepresentable {
             do {
                 entityFilterPipelineState = try device.makeRenderPipelineState(descriptor: entityFilterDesc)
             } catch {
-                print("[Metal] Failed to create filter entity pipeline: \\(error)")
+                print("[Metal] Failed to create filter entity pipeline: \(error)")
             }
 
             // Subtract (GL_ZERO / GL_ONE_MINUS_SRC_COLOR) — out = dst * (1 - src).
@@ -16310,7 +16310,7 @@ struct MetalView: UIViewRepresentable {
             do {
                 entitySubtractPipelineState = try device.makeRenderPipelineState(descriptor: entitySubtractDesc)
             } catch {
-                print("[Metal] Failed to create subtract entity pipeline: \\(error)")
+                print("[Metal] Failed to create subtract entity pipeline: \(error)")
             }
 
             // Depth state for additive entities — read but no write
