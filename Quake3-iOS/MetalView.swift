@@ -8381,6 +8381,12 @@ struct MetalView: UIViewRepresentable {
             enc.endEncoding()
             cb.commit(); cb.waitUntilCompleted()
             if let err = cb.error { print("[RT] AS build failed: \(err)"); return nil }
+            /* The compact position buffer is an acceleration-structure build
+             * input only: the trace passes bind the full world vertex/index
+             * buffers for attribute reads, never this one. Drop the long-lived
+             * reference now that the build completed so it stops staying
+             * resident for the whole map lifetime. */
+            rtASPositionBuffer = nil
             rtASVertexBuffer = worldVertexBuffer; rtASIndexBuffer = ib
             rtLastMaterialSignature = rtWorldMaterialSignature(worldGeneration: snapshot.worldGeneration)
             rtPrimitiveMaterialBufferCache.removeAll(keepingCapacity: true)
@@ -8403,11 +8409,22 @@ struct MetalView: UIViewRepresentable {
                                       traceHeight: Int,
                                       compositeWidth: Int,
                                       compositeHeight: Int,
-                                      pixelFormat: MTLPixelFormat) -> Bool {
+                                      pixelFormat: MTLPixelFormat,
+                                      denoiseEnabled: Bool) -> Bool {
             let tw = max(traceWidth, 1), th = max(traceHeight, 1)
             let cw = max(compositeWidth, 1), ch = max(compositeHeight, 1)
             let rtPixelFormat: MTLPixelFormat = (Q3_RTHDR() != 0) ? .rgba16Float : .rgba8Unorm
-            if rtTexture != nil && rtAccumTexture != nil && rtHistoryTexture != nil && rtDenoisedTexture != nil &&
+            /* Q3.RT.denoised exists purely as the MetalFX TemporalDenoisedScaler
+             * output. The legacy accumulate path never reads it, and Catalyst
+             * always takes that path (see the "[RT-DENOISE] Catalyst MetalFX
+             * backend disabled ... using legacy path" log), so skip the
+             * composite-resolution allocation when MetalFX denoise is not the
+             * active mode. */
+            if !denoiseEnabled {
+                rtDenoisedTexture = nil
+            }
+            let denoisedTextureReady = !denoiseEnabled || rtDenoisedTexture != nil
+            if rtTexture != nil && rtAccumTexture != nil && rtHistoryTexture != nil && denoisedTextureReady &&
                 rtCompositeTexture != nil &&
                 rtGNormalTexture != nil && rtGDepthTexture != nil && rtGAlbedoTexture != nil &&
                 rtGRoughnessTexture != nil && rtDenoiseMaskTexture != nil && rtMotionTexture != nil &&
@@ -8437,7 +8454,7 @@ struct MetalView: UIViewRepresentable {
             rtTexture = device.makeTexture(descriptor: rtDesc)
             rtAccumTexture = device.makeTexture(descriptor: rtDesc)
             rtHistoryTexture = device.makeTexture(descriptor: rtDesc)
-            rtDenoisedTexture = device.makeTexture(descriptor: denoisedDesc)
+            rtDenoisedTexture = denoiseEnabled ? device.makeTexture(descriptor: denoisedDesc) : nil
             rtCompositeTexture = device.makeTexture(descriptor: compDesc)
             rtGNormalTexture = device.makeTexture(descriptor: gNormalDesc)
             rtGDepthTexture = device.makeTexture(descriptor: gDepthDesc)
@@ -8474,7 +8491,7 @@ struct MetalView: UIViewRepresentable {
                 print("[Q3-GBUFFER] ready trace=\(tw)x\(th) mv=rg16Float depth=r32Float roughness=r16Float denoiseMask=r8Unorm")
                 rtGBufferReadyLogPrinted = true
             }
-            return rtTexture != nil && rtAccumTexture != nil && rtHistoryTexture != nil && rtDenoisedTexture != nil &&
+            return rtTexture != nil && rtAccumTexture != nil && rtHistoryTexture != nil && denoisedTextureReady &&
                 rtCompositeTexture != nil &&
                 rtGNormalTexture != nil && rtGDepthTexture != nil && rtGAlbedoTexture != nil &&
                 rtGRoughnessTexture != nil && rtDenoiseMaskTexture != nil && rtMotionTexture != nil
@@ -8972,11 +8989,11 @@ struct MetalView: UIViewRepresentable {
                                    traceHeight: traceH,
                                    compositeWidth: renderW,
                                    compositeHeight: renderH,
-                                   pixelFormat: rasterTexture.pixelFormat),
+                                   pixelFormat: rasterTexture.pixelFormat,
+                                   denoiseEnabled: rtDenoiseEnabled),
                   let rtTex = rtTexture,
                   let accumTex = rtAccumTexture,
                   let historyTex = rtHistoryTexture,
-                  let denoisedTex = rtDenoisedTexture,
                   let compositeTex = rtCompositeTexture,
                   let gNormalTex = rtGNormalTexture,
                   let gDepthTex = rtGDepthTexture,
@@ -9331,7 +9348,8 @@ struct MetalView: UIViewRepresentable {
             #if canImport(MetalFX) && !os(visionOS)
             if rtDenoiseEnabled,
                #available(iOS 26.0, macOS 26.0, *),
-               let scaler = rtDenoiseScaler {
+               let scaler = rtDenoiseScaler,
+               let denoisedTex = rtDenoisedTexture {
                 scaler.colorTexture = rtTex
                 scaler.depthTexture = gDepthTex
                 scaler.motionTexture = motionTex
@@ -16615,6 +16633,12 @@ struct MetalView: UIViewRepresentable {
                 mipmapped: false
             )
             descriptor.usage = .shaderRead
+            /* Populated with replace(region:...), so the texture has to be
+             * CPU-writable. Leaving storageMode unset inherits the platform
+             * default (.managed on Mac Catalyst), which carries a second
+             * GPU-side copy the renderer never reads and inflates the
+             * residency shown in GPU traces. */
+            descriptor.storageMode = .shared
 
             guard let texture = device.makeTexture(descriptor: descriptor) else {
                 return nil
