@@ -4351,8 +4351,23 @@ struct MetalView: UIViewRepresentable {
         private var worldFilterPipelineState: MTLRenderPipelineState?
         private var worldAlphaPipelineState: MTLRenderPipelineState?
         private var fogVolumePipelineState: MTLRenderPipelineState?
-        private var sceneDepthTexture: MTLTexture?
-        private var sceneDepthTextureSize = MTLSize(width: 0, height: 0, depth: 1)
+        /* Two-slot scene-depth cache. Under rtWorldPostBeforeEntitiesActive +
+         * upscaleActive on fogged maps, the fog pass ensures depth at render
+         * resolution while the entity-post block re-ensures it at output
+         * resolution in the same frame. A single size-keyed slot therefore
+         * reallocated ~7.7 MB <-> ~30.9 MB every frame. Two LRU slots keep
+         * both resolutions resident; texture contents are still re-populated
+         * per use exactly as before, so render behaviour is unchanged. */
+        private struct SceneDepthCacheEntry {
+            let width: Int
+            let height: Int
+            let texture: MTLTexture
+            var lastUsed: UInt64
+        }
+
+        private var sceneDepthCache: [SceneDepthCacheEntry] = []
+        private var sceneDepthCacheTick: UInt64 = 0
+        private static let sceneDepthCacheSlotCount = 2
         /* Alpha-modulated additive (GL_SRC_ALPHA/GL_ONE) — blendMode=1. */
         private var worldAdditivePipelineState: MTLRenderPipelineState?
         /* Full-intensity additive (GL_ONE/GL_ONE) — blendMode=5. NEVER
@@ -9513,10 +9528,11 @@ struct MetalView: UIViewRepresentable {
         private func ensureSceneDepthTexture(device: MTLDevice, width: Int, height: Int) -> MTLTexture? {
             let w = max(width, 1)
             let h = max(height, 1)
-            if let sceneDepthTexture,
-               sceneDepthTextureSize.width == w,
-               sceneDepthTextureSize.height == h {
-                return sceneDepthTexture
+            sceneDepthCacheTick &+= 1
+            let tick = sceneDepthCacheTick
+            if let slot = sceneDepthCache.firstIndex(where: { $0.width == w && $0.height == h }) {
+                sceneDepthCache[slot].lastUsed = tick
+                return sceneDepthCache[slot].texture
             }
             let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float,
                                                                 width: w,
@@ -9524,10 +9540,16 @@ struct MetalView: UIViewRepresentable {
                                                                 mipmapped: false)
             desc.usage = [.renderTarget, .shaderRead]
             desc.storageMode = .private
-            let tex = device.makeTexture(descriptor: desc)
-            tex?.label = "Q3.scene.depth.shaderRead"
-            sceneDepthTexture = tex
-            sceneDepthTextureSize = MTLSize(width: w, height: h, depth: 1)
+            guard let tex = device.makeTexture(descriptor: desc) else { return nil }
+            tex.label = "Q3.scene.depth.shaderRead"
+            while sceneDepthCache.count >= Self.sceneDepthCacheSlotCount,
+                  let lru = sceneDepthCache.indices.min(by: { sceneDepthCache[$0].lastUsed < sceneDepthCache[$1].lastUsed }) {
+                sceneDepthCache.remove(at: lru)
+            }
+            sceneDepthCache.append(SceneDepthCacheEntry(width: w,
+                                                        height: h,
+                                                        texture: tex,
+                                                        lastUsed: tick))
             return tex
         }
 
