@@ -2819,7 +2819,7 @@ static qhandle_t WorldShaderClassicDiffuseHandle(const char *shaderName,
      * real handle so its albedo/normal/metallic/emissive remain reachable.
      * Shared classic FX layers still require the isolated MISS alias below. */
     if (!WorldMapPathIsClassicEffectLayer(stage->mapPath) &&
-        q3_pbr_lookup_by_name(stage->mapPath) != NULL) {
+        TextureHandleHasWorldPBRSidecar(baseHandle)) {
         if (outSourcePath != NULL) *outSourcePath = stage->mapPath;
         return baseHandle;
     }
