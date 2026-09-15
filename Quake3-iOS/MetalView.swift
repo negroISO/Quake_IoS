@@ -16705,6 +16705,7 @@ struct MetalView: UIViewRepresentable {
             loggedParallaxHandles.removeAll(keepingCapacity: false)
             textureCache.removeAll(keepingCapacity: false)
             rtASVertexBuffer = nil
+            rtASPositionBuffer = nil
             rtASIndexBuffer = nil
             entityASDemandSuspended = false
             entityASDemandLowFrames = 0
