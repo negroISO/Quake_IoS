@@ -7144,7 +7144,7 @@ struct MetalView: UIViewRepresentable {
                                                 if (rmat.lightmapSlot < 64) {
                                                     rlight = texTable.lightmap[rmat.lightmapSlot].sample(clampSampler, rlm).rgb;
                                                 }
-                                                reflColor = ralb * max(rlight * 1.25, float3(uniforms.rtToneParams.z));
+                                                reflColor = ralb * max(rlight * 2.0, float3(uniforms.rtToneParams.z));
                                                 if (rmat.materialFlags.y != 0) {
                                                     float3 remitSample = rtEmissionSample(texTable, rmat, ralb, repeatSampler, ruv);
                                                     reflColor += remitSample * rmat.materialParams.x;
