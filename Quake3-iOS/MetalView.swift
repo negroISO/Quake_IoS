@@ -18,6 +18,25 @@ import simd
 /// actual UIKit screen and is normalized to landscape.
 @MainActor
 func Q3MetalOutputTargetSize(screen: UIScreen? = nil) -> CGSize {
+    #if targetEnvironment(macCatalyst)
+    // On Catalyst, UIScreen describes the whole macOS display while the app
+    // can live in an arbitrarily sized UIKit window. Deriving the drawable from
+    // UIScreen therefore renders a 3456x2234 image into the default 4:3 window,
+    // non-uniformly compressing every entity silhouette. Use the actual key
+    // window's pixel bounds when the scene is available; keep the display-sized
+    // fallback only for pre-window startup paths.
+    if let window = UIApplication.shared.connectedScenes
+        .compactMap({ $0 as? UIWindowScene })
+        .compactMap(\.keyWindow)
+        .first {
+        let scale = window.screen.nativeScale > 0 ? window.screen.nativeScale : window.screen.scale
+        let px = CGSize(width: window.bounds.width * scale,
+                        height: window.bounds.height * scale)
+        let w = max(1, floor(max(px.width, px.height)))
+        let h = max(1, floor(min(px.width, px.height)))
+        return CGSize(width: w, height: h)
+    }
+    #endif
     let screen = screen ?? UIScreen.main
     let scale = screen.nativeScale > 0 ? screen.nativeScale : screen.scale
     let px = CGSize(width: screen.bounds.width * scale,
