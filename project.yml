@@ -2,7 +2,7 @@ name: Quake3-iOS
 options:
   bundleIdPrefix: com.quake3ios
   deploymentTarget:
-    iOS: "18.0"
+    iOS: "26.0"
   createIntermediateGroups: true
 
 settings:
