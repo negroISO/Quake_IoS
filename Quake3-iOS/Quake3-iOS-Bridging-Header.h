@@ -284,6 +284,10 @@ float Q3_RTTAASharpen(void);
 /* Stage 18 RT denoiser. 1 = MetalFX temporal denoised scaler path when
  * available; 0 = exact pre-Stage18 RT accumulate/upscale behavior. */
 int   Q3_RTDenoise(void);
+/* Batch3 MTL4FX RT denoiser opt-in. 0 (default) leaves the Stage54 policy
+ * unchanged: non-Catalyst prefers MTL4FX and then MTLFX, Catalyst stays on the
+ * legacy denoise path. 1 = force-try the MTL4FX denoiser even on Catalyst. */
+int   Q3_RTDenoiseMetalFX4(void);
 /* Stage 19 RT perf: r_rt_perf_hud is session-only instrumentation; shadow
  * budget is archived and defaults to the shipped Stage19 sun-only budget. */
 int   Q3_RTPerfHUD(void);

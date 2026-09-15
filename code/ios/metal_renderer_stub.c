@@ -12750,6 +12750,21 @@ int Q3_RTDenoise(void) {
     return (cv && cv->integer == 0) ? 0 : 1;
 }
 
+int Q3_RTDenoiseMetalFX4(void) {
+    if (ri.Cvar_Get == NULL) return 0;
+    /* Batch3 MTL4FX denoiser opt-in.
+     *   0 (default) keeps the Stage54 policy exactly: non-Catalyst prefers the
+     *     MTL4FX temporal denoised scaler when the OS and device support it and
+     *     falls back to the iOS26 MTLFX scaler otherwise, while Catalyst stays
+     *     on the legacy denoise path because the iOS26 MetalFX/ANE backend
+     *     asserts.
+     *   1 force-tries the MTL4FX denoiser even on Catalyst so the MTL4 backend
+     *     can be A/B'd against that assertion. Any MTL4FX creation or encode
+     *     failure still falls back to the MTLFX/legacy path. */
+    cvar_t *cv = ri.Cvar_Get("r_rt_denoise_metalfx4", "0", CVAR_ARCHIVE);
+    return (cv && cv->integer != 0) ? 1 : 0;
+}
+
 int Q3_RTPerfHUD(void) {
     if (ri.Cvar_Get == NULL) return 0;
     /* Stage 19: session-only GPU timing diagnostics. Do not archive; leaving
