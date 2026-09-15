@@ -5430,18 +5430,19 @@ struct MetalView: UIViewRepresentable {
                     print("[MTL_POSTPROC] makeFunction failed")
                     return nil
                 }
-                let pso = try device.makeComputePipelineState(function: fn)
+                let pso = try makeComputePipelineState(device: device, function: fn)
                 postprocessPipelineState = pso
                 if let upFn = lib.makeFunction(name: "q3_spatial_upscale") {
-                    spatialUpscalePipelineState = try? device.makeComputePipelineState(function: upFn)
+                    spatialUpscalePipelineState = try? makeComputePipelineState(device: device, function: upFn)
                 }
                 if let exposureFn = lib.makeFunction(name: "q3_exposure_reduce") {
-                    exposureReducePipelineState = try? device.makeComputePipelineState(function: exposureFn)
+                    exposureReducePipelineState = try? makeComputePipelineState(device: device, function: exposureFn)
                 }
                 if !postprocessLogPrintedOnce {
                     print("[MTL_POSTPROC] q3_postprocess pipeline ready")
                     postprocessLogPrintedOnce = true
                 }
+                flushPSOBinaryArchive()
                 return pso
             } catch {
                 print("[MTL_POSTPROC] compile failed: \(error)")
@@ -7407,10 +7408,11 @@ struct MetalView: UIViewRepresentable {
                 print("[RT] failed to create rtKernel"); return nil
             }
             do {
-                let pso = try device.makeComputePipelineState(function: fn); rtPipelineState = pso
+                let pso = try makeComputePipelineState(device: device, function: fn); rtPipelineState = pso
                 // Step 2a: build the argument encoder for the RTTexTable at buffer(8).
                 rtTexArgEncoder = fn.makeArgumentEncoder(bufferIndex: 8)
                 print("[RT] rtKernel pipeline ready (texArgEncoder len=\(rtTexArgEncoder?.encodedLength ?? 0))")
+                flushPSOBinaryArchive()
                 return pso
             }
             catch { print("[RT] pipeline state error: \(error)"); return nil }
@@ -7422,7 +7424,7 @@ struct MetalView: UIViewRepresentable {
             guard let lib = makeRTLibrary(device: device), let fn = lib.makeFunction(name: "blendRT") else {
                 print("[RT] failed to create blendRT"); return nil
             }
-            do { let pso = try device.makeComputePipelineState(function: fn); rtBlendPipelineState = pso; print("[RT] blendRT pipeline ready"); return pso }
+            do { let pso = try makeComputePipelineState(device: device, function: fn); rtBlendPipelineState = pso; print("[RT] blendRT pipeline ready"); flushPSOBinaryArchive(); return pso }
             catch { print("[RT] blend pipeline state error: \(error)"); return nil }
         }
 
@@ -7433,7 +7435,7 @@ struct MetalView: UIViewRepresentable {
             guard let lib = makeRTLibrary(device: device), let fn = lib.makeFunction(name: "accumulateRT") else {
                 print("[RT] failed to create accumulateRT"); return nil
             }
-            do { let pso = try device.makeComputePipelineState(function: fn); rtAccumPipelineState = pso; print("[RT] accumulateRT pipeline ready clamp=3x3-strict"); return pso }
+            do { let pso = try makeComputePipelineState(device: device, function: fn); rtAccumPipelineState = pso; print("[RT] accumulateRT pipeline ready clamp=3x3-strict"); flushPSOBinaryArchive(); return pso }
             catch { print("[RT] accumulate pipeline state error: \(error)"); return nil }
         }
 
@@ -15931,6 +15933,159 @@ struct MetalView: UIViewRepresentable {
             }
         }
 
+        /* MTLBinaryArchive PSO cache. Strictly a compile-time accelerator:
+         * every render/compute pipeline is still described by exactly the same
+         * descriptor as before, the archive only lets Metal reuse already
+         * compiled GPU code across launches instead of recompiling on the first
+         * frame. Archives are attached via descriptor.binaryArchives; on any
+         * archive error we clear it and compile the identical descriptor
+         * normally, so a stale archive (OS / GPU / pixel-format change) can
+         * never break rendering. */
+        private static let psoBinaryArchiveName = "Q3_PSO.metallib-archive"
+        private var psoBinaryArchive: (any MTLBinaryArchive)?
+        private var psoBinaryArchiveURL: URL?
+        private var psoBinaryArchiveDirty = false
+        private var psoBinaryArchiveDisabled = false
+        private var psoBinaryArchiveLogged = false
+
+        @MainActor
+        private func disablePSOBinaryArchive(_ reason: String, _ error: Error?) {
+            psoBinaryArchive = nil
+            psoBinaryArchiveDirty = false
+            if psoBinaryArchiveDisabled { return }
+            psoBinaryArchiveDisabled = true
+            if let error {
+                print("[Metal] PSO binary archive disabled (\(reason): \(error)); using normal pipeline compilation")
+            } else {
+                print("[Metal] PSO binary archive disabled (\(reason)); using normal pipeline compilation")
+            }
+        }
+
+        /* The archive has to live somewhere writable - the app bundle is
+         * read-only on device. A bundled Products/Q3_PSO.metallib-archive, if
+         * one is shipped, seeds the writable copy on first run; otherwise the
+         * store file is generated at the end of the first pipeline build. */
+        private func psoBinaryArchiveStoreURL() -> URL? {
+            let fm = FileManager.default
+            let directory = (try? fm.url(for: .cachesDirectory,
+                                         in: .userDomainMask,
+                                         appropriateFor: nil,
+                                         create: true))
+                ?? URL(fileURLWithPath: NSTemporaryDirectory())
+            return directory.appendingPathComponent(Self.psoBinaryArchiveName)
+        }
+
+        private func psoBinaryArchiveSeedURL() -> URL? {
+            let name = (Self.psoBinaryArchiveName as NSString).deletingPathExtension
+            let ext = (Self.psoBinaryArchiveName as NSString).pathExtension
+            if let bundled = Bundle.main.url(forResource: name, withExtension: ext, subdirectory: "Products") {
+                return bundled
+            }
+            return Bundle.main.url(forResource: name, withExtension: ext)
+        }
+
+        @MainActor
+        private func ensurePSOBinaryArchive(device: MTLDevice) -> (any MTLBinaryArchive)? {
+            if psoBinaryArchiveDisabled { return nil }
+            if let psoBinaryArchive { return psoBinaryArchive }
+            let storeURL = psoBinaryArchiveStoreURL()
+            psoBinaryArchiveURL = storeURL
+            let fm = FileManager.default
+            if let storeURL, let seedURL = psoBinaryArchiveSeedURL(),
+               !fm.fileExists(atPath: storeURL.path) {
+                do {
+                    try fm.copyItem(at: seedURL, to: storeURL)
+                } catch {
+                    print("[Metal] PSO binary archive seed copy failed (\(error))")
+                }
+            }
+            let archiveDesc = MTLBinaryArchiveDescriptor()
+            /* url == nil asks for an empty archive, which is exactly the
+             * first-run case where no store file exists yet. */
+            if let storeURL, fm.fileExists(atPath: storeURL.path) {
+                archiveDesc.url = storeURL
+            }
+            do {
+                psoBinaryArchive = try device.makeBinaryArchive(descriptor: archiveDesc)
+                return psoBinaryArchive
+            } catch {
+                disablePSOBinaryArchive("open", error)
+                return nil
+            }
+        }
+
+        /* Persist everything added so far. Guarded by the dirty flag and only
+         * called once per pipeline-creation group. */
+        @MainActor
+        private func flushPSOBinaryArchive() {
+            guard psoBinaryArchiveDirty, !psoBinaryArchiveDisabled,
+                  let archive = psoBinaryArchive,
+                  let storeURL = psoBinaryArchiveURL else { return }
+            psoBinaryArchiveDirty = false
+            do {
+                try archive.serialize(to: storeURL)
+                if !psoBinaryArchiveLogged {
+                    psoBinaryArchiveLogged = true
+                    print("[Metal] PSO binary archive cached at \(storeURL.path)")
+                }
+            } catch {
+                disablePSOBinaryArchive("serialize", error)
+            }
+        }
+
+        @MainActor
+        private func makeRenderPipelineState(device: MTLDevice,
+                                             descriptor: MTLRenderPipelineDescriptor) throws -> MTLRenderPipelineState {
+            guard let archive = ensurePSOBinaryArchive(device: device) else {
+                return try device.makeRenderPipelineState(descriptor: descriptor)
+            }
+            do {
+                try archive.addRenderPipelineFunctions(descriptor: descriptor)
+                psoBinaryArchiveDirty = true
+            } catch {
+                disablePSOBinaryArchive("addRenderPipelineFunctions", error)
+                return try device.makeRenderPipelineState(descriptor: descriptor)
+            }
+            descriptor.binaryArchives = [archive]
+            do {
+                return try device.makeRenderPipelineState(descriptor: descriptor)
+            } catch {
+                /* Stale archive vs. the current device/pixel formats is the
+                 * usual cause. Same descriptor, compiled without the archive. */
+                descriptor.binaryArchives = nil
+                disablePSOBinaryArchive("render PSO cache miss", error)
+                return try device.makeRenderPipelineState(descriptor: descriptor)
+            }
+        }
+
+        @MainActor
+        private func makeComputePipelineState(device: MTLDevice,
+                                              function: MTLFunction) throws -> MTLComputePipelineState {
+            guard let archive = ensurePSOBinaryArchive(device: device) else {
+                return try device.makeComputePipelineState(function: function)
+            }
+            /* Only computeFunction is set, so this descriptor is equivalent to
+             * the plain makeComputePipelineState(function:) entry point. */
+            let descriptor = MTLComputePipelineDescriptor()
+            descriptor.computeFunction = function
+            do {
+                try archive.addComputePipelineFunctions(descriptor: descriptor)
+                psoBinaryArchiveDirty = true
+            } catch {
+                disablePSOBinaryArchive("addComputePipelineFunctions", error)
+                return try device.makeComputePipelineState(function: function)
+            }
+            descriptor.binaryArchives = [archive]
+            do {
+                let (pso, _) = try device.makeComputePipelineState(descriptor: descriptor, options: [])
+                return pso
+            } catch {
+                descriptor.binaryArchives = nil
+                disablePSOBinaryArchive("compute PSO cache miss", error)
+                return try device.makeComputePipelineState(function: function)
+            }
+        }
+
         @MainActor
         private func configureRenderer(for view: MTKView) {
             guard let device = view.device else { return }
@@ -15977,7 +16132,7 @@ struct MetalView: UIViewRepresentable {
 
             pipelineDescriptor.label = "Q3.ui"
             do {
-                uiPipelineState = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
+                uiPipelineState = try makeRenderPipelineState(device: device, descriptor: pipelineDescriptor)
             } catch {
                 print("[Metal] Failed to create UI pipeline: \(error)")
             }
@@ -15995,7 +16150,7 @@ struct MetalView: UIViewRepresentable {
             uiOpaqueDesc.colorAttachments[0].isBlendingEnabled = false
             uiOpaqueDesc.label = "Q3.ui.opaque"
             do {
-                uiOpaquePipelineState = try device.makeRenderPipelineState(descriptor: uiOpaqueDesc)
+                uiOpaquePipelineState = try makeRenderPipelineState(device: device, descriptor: uiOpaqueDesc)
             } catch {
                 print("[Metal] Failed to create UI opaque pipeline: \(error)")
             }
@@ -16014,7 +16169,7 @@ struct MetalView: UIViewRepresentable {
             uiAdditiveDesc.colorAttachments[0].destinationAlphaBlendFactor = .one
             uiAdditiveDesc.label = "Q3.ui.additive"
             do {
-                uiAdditivePipelineState = try device.makeRenderPipelineState(descriptor: uiAdditiveDesc)
+                uiAdditivePipelineState = try makeRenderPipelineState(device: device, descriptor: uiAdditiveDesc)
             } catch {
                 print("[Metal] Failed to create UI additive pipeline: \(error)")
             }
@@ -16039,7 +16194,7 @@ struct MetalView: UIViewRepresentable {
             uiAdditiveAlphaDesc.colorAttachments[0].destinationAlphaBlendFactor = .one
             uiAdditiveAlphaDesc.label = "Q3.ui.additiveAlpha"
             do {
-                uiAdditiveAlphaPipelineState = try device.makeRenderPipelineState(descriptor: uiAdditiveAlphaDesc)
+                uiAdditiveAlphaPipelineState = try makeRenderPipelineState(device: device, descriptor: uiAdditiveAlphaDesc)
             } catch {
                 print("[Metal] Failed to create UI additive-alpha pipeline: \(error)")
             }
@@ -16058,7 +16213,7 @@ struct MetalView: UIViewRepresentable {
             uiFilterDesc.colorAttachments[0].destinationAlphaBlendFactor = .zero
             uiFilterDesc.label = "Q3.ui.filter"
             do {
-                uiFilterPipelineState = try device.makeRenderPipelineState(descriptor: uiFilterDesc)
+                uiFilterPipelineState = try makeRenderPipelineState(device: device, descriptor: uiFilterDesc)
             } catch {
                 print("[Metal] Failed to create UI filter pipeline: \(error)")
             }
@@ -16071,7 +16226,7 @@ struct MetalView: UIViewRepresentable {
 
             worldPipelineDescriptor.label = "Q3.world.lit"
             do {
-                worldPipelineState = try device.makeRenderPipelineState(descriptor: worldPipelineDescriptor)
+                worldPipelineState = try makeRenderPipelineState(device: device, descriptor: worldPipelineDescriptor)
             } catch {
                 print("[Metal] Failed to create world pipeline: \(error)")
             }
@@ -16083,7 +16238,7 @@ struct MetalView: UIViewRepresentable {
             sunShadowPipelineDescriptor.colorAttachments[0].pixelFormat = .invalid
             sunShadowPipelineDescriptor.depthAttachmentPixelFormat = .depth32Float
             do {
-                sunShadowPipelineState = try device.makeRenderPipelineState(descriptor: sunShadowPipelineDescriptor)
+                sunShadowPipelineState = try makeRenderPipelineState(device: device, descriptor: sunShadowPipelineDescriptor)
             } catch {
                 print("[Metal] Failed to create sun shadow pipeline: \(error)")
             }
@@ -16094,7 +16249,7 @@ struct MetalView: UIViewRepresentable {
                                 dst: Q3GLBlendFactor.zero.rawValue)
             worldFilterPipelineDescriptor.label = "Q3.world.filter"
             do {
-                worldFilterPipelineState = try device.makeRenderPipelineState(descriptor: worldFilterPipelineDescriptor)
+                worldFilterPipelineState = try makeRenderPipelineState(device: device, descriptor: worldFilterPipelineDescriptor)
             } catch {
                 print("[Metal] Failed to create filter world pipeline: \(error)")
             }
@@ -16105,7 +16260,7 @@ struct MetalView: UIViewRepresentable {
                                 dst: Q3GLBlendFactor.oneMinusSrcAlpha.rawValue)
             worldAlphaPipelineDescriptor.label = "Q3.world.alpha"
             do {
-                worldAlphaPipelineState = try device.makeRenderPipelineState(descriptor: worldAlphaPipelineDescriptor)
+                worldAlphaPipelineState = try makeRenderPipelineState(device: device, descriptor: worldAlphaPipelineDescriptor)
             } catch {
                 print("[Metal] Failed to create alpha world pipeline: \(error)")
             }
@@ -16129,7 +16284,7 @@ struct MetalView: UIViewRepresentable {
             fogVolumePipelineDescriptor.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
             fogVolumePipelineDescriptor.label = "Q3.fog.depthLimitedRayBox"
             do {
-                fogVolumePipelineState = try device.makeRenderPipelineState(descriptor: fogVolumePipelineDescriptor)
+                fogVolumePipelineState = try makeRenderPipelineState(device: device, descriptor: fogVolumePipelineDescriptor)
             } catch {
                 print("[Metal] Failed to create fog-volume pipeline: \(error)")
             }
@@ -16141,7 +16296,7 @@ struct MetalView: UIViewRepresentable {
                                 dst: Q3GLBlendFactor.one.rawValue)
             worldAdditivePipelineDescriptor.label = "Q3.world.additive"
             do {
-                worldAdditivePipelineState = try device.makeRenderPipelineState(descriptor: worldAdditivePipelineDescriptor)
+                worldAdditivePipelineState = try makeRenderPipelineState(device: device, descriptor: worldAdditivePipelineDescriptor)
             } catch {
                 print("[Metal] Failed to create additive world pipeline: \(error)")
             }
@@ -16154,7 +16309,7 @@ struct MetalView: UIViewRepresentable {
                                 dst: Q3GLBlendFactor.one.rawValue)
             worldAdditiveFullDescriptor.label = "Q3.world.additiveFull"
             do {
-                worldAdditiveFullPipelineState = try device.makeRenderPipelineState(descriptor: worldAdditiveFullDescriptor)
+                worldAdditiveFullPipelineState = try makeRenderPipelineState(device: device, descriptor: worldAdditiveFullDescriptor)
             } catch {
                 print("[Metal] Failed to create additive-full world pipeline: \(error)")
             }
@@ -16170,7 +16325,7 @@ struct MetalView: UIViewRepresentable {
             skyPipelineDescriptor.fragmentFunction = library.makeFunction(name: "q3_sky_fragment")
             skyPipelineDescriptor.label = "Q3.sky"
             do {
-                skyPipelineState = try device.makeRenderPipelineState(descriptor: skyPipelineDescriptor)
+                skyPipelineState = try makeRenderPipelineState(device: device, descriptor: skyPipelineDescriptor)
             } catch {
                 print("[Metal] Failed to create sky pipeline: \(error)")
             }
@@ -16183,7 +16338,7 @@ struct MetalView: UIViewRepresentable {
                                 dst: Q3GLBlendFactor.one.rawValue)
             skyAdditiveDescriptor.label = "Q3.sky.additive"
             do {
-                skyAdditivePipelineState = try device.makeRenderPipelineState(descriptor: skyAdditiveDescriptor)
+                skyAdditivePipelineState = try makeRenderPipelineState(device: device, descriptor: skyAdditiveDescriptor)
             } catch {
                 print("[Metal] Failed to create additive sky pipeline: \(error)")
             }
@@ -16196,7 +16351,7 @@ struct MetalView: UIViewRepresentable {
                                 dst: Q3GLBlendFactor.one.rawValue)
             skyAdditiveAlphaDesc.label = "Q3.sky.additiveAlpha"
             do {
-                skyAdditiveAlphaPipelineState = try device.makeRenderPipelineState(descriptor: skyAdditiveAlphaDesc)
+                skyAdditiveAlphaPipelineState = try makeRenderPipelineState(device: device, descriptor: skyAdditiveAlphaDesc)
             } catch {
                 print("[Metal] Failed to create additive-alpha sky pipeline: \(error)")
             }
@@ -16214,7 +16369,7 @@ struct MetalView: UIViewRepresentable {
 
             entityPipelineDescriptor.label = "Q3.entity"
             do {
-                entityPipelineState = try device.makeRenderPipelineState(descriptor: entityPipelineDescriptor)
+                entityPipelineState = try makeRenderPipelineState(device: device, descriptor: entityPipelineDescriptor)
             } catch {
                 print("[Metal] Failed to create entity pipeline: \(error)")
             }
@@ -16238,7 +16393,7 @@ struct MetalView: UIViewRepresentable {
             entityAdditiveDesc.fragmentFunction = library.makeFunction(name: "q3_entity_fragment")
             entityAdditiveDesc.label = "Q3.entity.additive"
             do {
-                entityAdditivePipelineState = try device.makeRenderPipelineState(descriptor: entityAdditiveDesc)
+                entityAdditivePipelineState = try makeRenderPipelineState(device: device, descriptor: entityAdditiveDesc)
             } catch {
                 print("[Metal] Failed to create additive entity pipeline: \(error)")
             }
@@ -16264,7 +16419,7 @@ struct MetalView: UIViewRepresentable {
             entityAdditiveFullDesc.fragmentFunction = library.makeFunction(name: "q3_entity_fragment")
             entityAdditiveFullDesc.label = "Q3.entity.additiveFull"
             do {
-                entityAdditiveFullPipelineState = try device.makeRenderPipelineState(descriptor: entityAdditiveFullDesc)
+                entityAdditiveFullPipelineState = try makeRenderPipelineState(device: device, descriptor: entityAdditiveFullDesc)
             } catch {
                 print("[Metal] Failed to create additive-full entity pipeline: \(error)")
             }
@@ -16281,7 +16436,7 @@ struct MetalView: UIViewRepresentable {
             entityAlphaDesc.fragmentFunction = library.makeFunction(name: "q3_entity_fragment")
             entityAlphaDesc.label = "Q3.entity.alpha"
             do {
-                entityAlphaPipelineState = try device.makeRenderPipelineState(descriptor: entityAlphaDesc)
+                entityAlphaPipelineState = try makeRenderPipelineState(device: device, descriptor: entityAlphaDesc)
             } catch {
                 print("[Metal] Failed to create alpha entity pipeline: \(error)")
             }
@@ -16301,7 +16456,7 @@ struct MetalView: UIViewRepresentable {
             entityFilterDesc.fragmentFunction = library.makeFunction(name: "q3_entity_fragment")
             entityFilterDesc.label = "Q3.entity.filter"
             do {
-                entityFilterPipelineState = try device.makeRenderPipelineState(descriptor: entityFilterDesc)
+                entityFilterPipelineState = try makeRenderPipelineState(device: device, descriptor: entityFilterDesc)
             } catch {
                 print("[Metal] Failed to create filter entity pipeline: \(error)")
             }
@@ -16330,7 +16485,7 @@ struct MetalView: UIViewRepresentable {
             entitySubtractDesc.fragmentFunction = library.makeFunction(name: "q3_entity_fragment")
             entitySubtractDesc.label = "Q3.entity.subtract"
             do {
-                entitySubtractPipelineState = try device.makeRenderPipelineState(descriptor: entitySubtractDesc)
+                entitySubtractPipelineState = try makeRenderPipelineState(device: device, descriptor: entitySubtractDesc)
             } catch {
                 print("[Metal] Failed to create subtract entity pipeline: \(error)")
             }
@@ -16417,6 +16572,10 @@ struct MetalView: UIViewRepresentable {
             depthHackDescriptor.isDepthWriteEnabled = true
             depthHackDescriptor.depthCompareFunction = .lessEqual
             depthHackDepthStencilState = device.makeDepthStencilState(descriptor: depthHackDescriptor)
+
+            /* Every render pipeline has now been described; persist the
+             * archive so the next launch loads compiled GPU code. */
+            flushPSOBinaryArchive()
         }
 
         private func uploadVertices(_ vertices: UnsafeBufferPointer<Q3MetalVertex>, device: MTLDevice?, slot: Int) -> MTLBuffer? {
