@@ -4180,14 +4180,212 @@ struct MetalView: UIViewRepresentable {
             #endif
         }
 
+        /* ============ MTL4FX effect backend (iOS 27 / macOS 27) ============
+         *
+         * The MTL4FX* variants of the MetalFX effects are NOT drop-in
+         * replacements for the MTLFX* ones. They inherit every configuration
+         * property from the shared MTLFX*Base protocols, but the encode entry
+         * point differs:
+         *
+         *   MTLFX*   - encodeToCommandBuffer:(id<MTLCommandBuffer>)
+         *   MTL4FX*  - encodeToCommandBuffer:(id<MTL4CommandBuffer>)
+         *
+         * MTL4CommandBuffer is a separate protocol with no bridging to
+         * MTLCommandBuffer: it is created from MTLDevice, has an explicit
+         * beginCommandBuffer(allocator:)/endCommandBuffer() lifecycle, and is
+         * submitted through an MTL4CommandQueue instead of the classic
+         * MTLCommandQueue. This renderer is MTKView-driven and only ever holds
+         * a classic MTLCommandBuffer, so an MTL4FX effect has to run in its own
+         * MTL4 command buffer.
+         *
+         * Ordering against the frame happens entirely on the GPU through a pair
+         * of MTLSharedEvents, which both command-buffer families accept:
+         *
+         *   classic CB  encodeSignalEvent(produceEvent, value: n)  // inputs ready
+         *   MTL4 queue  waitForEvent(produceEvent, value: n)
+         *   MTL4 queue  commit([effectCommandBuffer])
+         *   MTL4 queue  signalEvent(consumeEvent, value: n)        // output ready
+         *   classic CB  encodeWaitForEvent(consumeEvent, value: n) // before read
+         *
+         * That keeps the frame in one classic command buffer — no frame split,
+         * no CPU stall — while giving the GPU strict
+         * inputs -> effect -> consumers ordering.
+         *
+         * Adoption is strictly opt-in per effect: any nil or thrown failure
+         * marks the MTL4 command path unusable for the rest of the session and
+         * the caller keeps its existing MTLFX backend. Because the classic
+         * frame command buffer never changes at r_rt_denoise_metalfx4 0 on
+         * pre-iOS-27 OSes, none of this code runs there. */
+        #if canImport(MetalFX) && !os(visionOS)
+        private var metal4Compiler: MTL4Compiler?
+        private var metal4CompilerDevice: MTLDevice?
+        private var metal4CommandQueue: MTL4CommandQueue?
+        private var metal4ProduceEvent: MTLSharedEvent?
+        private var metal4ConsumeEvent: MTLSharedEvent?
+        private var metal4EventValue: UInt64 = 0
+        /// One allocator per in-flight frame. An allocator may be reused for
+        /// encoding as soon as endCommandBuffer() returns, so a ring this size
+        /// never hands the same allocator to two live command buffers.
+        private var metal4CommandAllocators: [MTL4CommandAllocator?] = Array(repeating: nil, count: Coordinator.maxInflightFrames + 1)
+        private var metal4AllocatorSlot = 0
+        private var metal4CommandPathFailed = false
+        private var metal4LoggedFallbacks = Set<String>()
+        private var metal4LoggedBackends = Set<String>()
+
+        @MainActor
+        private func metal4LogFallback(_ effect: String, _ reason: String) {
+            if metal4LoggedFallbacks.insert("\(effect)|\(reason)").inserted {
+                print("[Q3-METALFX4] \(effect) fallback: \(reason)")
+            }
+        }
+
+        @MainActor
+        private func metal4LogBackend(_ effect: String, _ backend: String, _ reason: String) {
+            if metal4LoggedBackends.insert("\(effect)|\(backend)|\(reason)").inserted {
+                print("[Q3-METALFX4] \(effect) backend=\(backend) reason=\(reason)")
+            }
+        }
+
+        /// True when the running OS can host MTL4FX effects at all.
+        @MainActor
+        private func metal4Available() -> Bool {
+            if #available(iOS 27.0, macOS 27.0, *) { return true }
+            return false
+        }
+
+        /// The single cached MTL4Compiler every MTL4FX effect is built with.
+        /// nil means MTL4FX is unusable and the caller must keep its MTLFX
+        /// backend. Recreated if the MTLDevice instance ever changes.
+        @MainActor
+        private func ensureMetal4Compiler(device: MTLDevice, effect: String) -> MTL4Compiler? {
+            if let compiler = metal4Compiler, metal4CompilerDevice === device { return compiler }
+            metal4Compiler = nil
+            metal4CompilerDevice = nil
+            guard metal4Available() else {
+                metal4LogFallback(effect, "os-unavailable")
+                return nil
+            }
+            let desc = MTL4CompilerDescriptor()
+            desc.label = "Q3.metalfx4"
+            do {
+                let compiler = try device.makeCompiler(descriptor: desc)
+                metal4Compiler = compiler
+                metal4CompilerDevice = device
+                return compiler
+            } catch {
+                metal4LogFallback(effect, "mtl4-compiler-nil(\(error.localizedDescription))")
+                return nil
+            }
+        }
+
+        /// Build the MTL4 queue plus the produce/consume shared events. Sticky
+        /// failure: once this cannot be built we stop retrying and every effect
+        /// stays on MTLFX for the rest of the session.
+        @MainActor
+        private func ensureMetal4CommandPath(device: MTLDevice, effect: String) -> Bool {
+            if metal4CommandPathFailed { return false }
+            if metal4CommandQueue != nil, metal4ProduceEvent != nil, metal4ConsumeEvent != nil { return true }
+            guard metal4Available() else {
+                metal4CommandPathFailed = true
+                metal4LogFallback(effect, "os-unavailable")
+                return false
+            }
+            let queueDesc = MTL4CommandQueueDescriptor()
+            queueDesc.label = "Q3.MTL4FX"
+            let queue: MTL4CommandQueue?
+            do {
+                queue = try device.makeMTL4CommandQueue(descriptor: queueDesc)
+            } catch {
+                queue = nil
+                metal4LogFallback(effect, "mtl4-command-queue-threw(\(error.localizedDescription))")
+            }
+            guard let queue else {
+                metal4CommandPathFailed = true
+                metal4LogFallback(effect, "mtl4-command-queue-nil")
+                return false
+            }
+            guard let produceEvent = device.makeSharedEvent(), let consumeEvent = device.makeSharedEvent() else {
+                metal4CommandPathFailed = true
+                metal4LogFallback(effect, "shared-event-nil")
+                return false
+            }
+            produceEvent.label = "Q3.MTL4FX.produce"
+            consumeEvent.label = "Q3.MTL4FX.consume"
+            metal4CommandQueue = queue
+            metal4ProduceEvent = produceEvent
+            metal4ConsumeEvent = consumeEvent
+            return true
+        }
+
+        @MainActor
+        private func nextMetal4CommandAllocator(device: MTLDevice, effect: String) -> MTL4CommandAllocator? {
+            let count = metal4CommandAllocators.count
+            guard count > 0 else { return nil }
+            let slot = metal4AllocatorSlot % count
+            metal4AllocatorSlot = (slot + 1) % count
+            if let allocator = metal4CommandAllocators[slot] { return allocator }
+            let desc = MTL4CommandAllocatorDescriptor()
+            desc.label = "Q3.MTL4FX.allocator.\(slot)"
+            do {
+                let allocator = try device.makeCommandAllocator(descriptor: desc)
+                metal4CommandAllocators[slot] = allocator
+                return allocator
+            } catch {
+                metal4CommandPathFailed = true
+                metal4LogFallback(effect, "mtl4-command-allocator-threw(\(error.localizedDescription))")
+                return nil
+            }
+        }
+
+        /// Run one MTL4FX effect in its own MTL4 command buffer, ordered
+        /// against `commandBuffer` by the produce/consume shared events.
+        /// Returns false when the MTL4 command path is unavailable; the caller
+        /// must then use its MTLFX backend.
+        @MainActor
+        private func encodeMetal4Effect(effect: String,
+                                        device: MTLDevice,
+                                        commandBuffer: MTLCommandBuffer,
+                                        encode: (MTL4CommandBuffer) -> Void) -> Bool {
+            guard !metal4CommandPathFailed else { return false }
+            guard ensureMetal4CommandPath(device: device, effect: effect),
+                  let queue = metal4CommandQueue,
+                  let produceEvent = metal4ProduceEvent,
+                  let consumeEvent = metal4ConsumeEvent,
+                  let allocator = nextMetal4CommandAllocator(device: device, effect: effect) else { return false }
+            /* MTLDevice/makeCommandBuffer() is the Metal 4 entry point; the
+             * classic MTLCommandQueue/makeCommandBuffer() is a different
+             * method on a different type. */
+            guard let effectCommandBuffer = device.makeCommandBuffer() else {
+                metal4CommandPathFailed = true
+                metal4LogFallback(effect, "mtl4-command-buffer-nil")
+                return false
+            }
+            metal4EventValue &+= 1
+            let value = metal4EventValue
+            effectCommandBuffer.label = "Q3.MTL4FX.\(effect)"
+            commandBuffer.encodeSignalEvent(produceEvent, value: value)
+            queue.waitForEvent(produceEvent, value: value)
+            effectCommandBuffer.beginCommandBuffer(allocator: allocator)
+            encode(effectCommandBuffer)
+            effectCommandBuffer.endCommandBuffer()
+            queue.commit([effectCommandBuffer])
+            queue.signalEvent(consumeEvent, value: value)
+            commandBuffer.encodeWaitForEvent(consumeEvent, value: value)
+            return true
+        }
+        #endif
+
         #if canImport(MetalFX) && !os(visionOS)
         @MainActor
-        private func ensureFrameInterpolator(device: MTLDevice, inputW: Int, inputH: Int, outputW: Int, outputH: Int, colorFormat: MTLPixelFormat) -> MTLFXFrameInterpolator? {
-            guard #available(iOS 26.0, macOS 26.0, *) else { fiLogUnavailable("os-unavailable"); return nil }
-            guard MTLFXFrameInterpolatorDescriptor.supportsDevice(device) else { fiLogUnavailable("device-unsupported"); return nil }
-            let key = (inputW, inputH, outputW, outputH, colorFormat)
-            if let frameInterpolator, frameInterpolatorKey == key { return frameInterpolator }
-            let desc = MTLFXFrameInterpolatorDescriptor()
+        /// Descriptor configuration shared by both frame-interpolator backends.
+        /// MTLFX and MTL4FX interpolators are built from the same
+        /// MTLFXFrameInterpolatorDescriptor; only the factory method differs.
+        private func configureFrameInterpolatorDescriptor(_ desc: MTLFXFrameInterpolatorDescriptor,
+                                                          inputW: Int,
+                                                          inputH: Int,
+                                                          outputW: Int,
+                                                          outputH: Int,
+                                                          colorFormat: MTLPixelFormat) {
             desc.colorTextureFormat = colorFormat
             desc.outputTextureFormat = colorFormat
             desc.depthTextureFormat = .r32Float
@@ -4197,13 +4395,61 @@ struct MetalView: UIViewRepresentable {
             desc.inputHeight = max(1, inputH)
             desc.outputWidth = max(1, outputW)
             desc.outputHeight = max(1, outputH)
+        }
+
+        @MainActor
+        private func ensureFrameInterpolator(device: MTLDevice, inputW: Int, inputH: Int, outputW: Int, outputH: Int, colorFormat: MTLPixelFormat) -> MTLFXFrameInterpolator? {
+            guard #available(iOS 26.0, macOS 26.0, *) else { fiLogUnavailable("os-unavailable"); return nil }
+            guard MTLFXFrameInterpolatorDescriptor.supportsDevice(device) else { fiLogUnavailable("device-unsupported"); return nil }
+            let key = (inputW, inputH, outputW, outputH, colorFormat)
+            if let frameInterpolator, frameInterpolatorKey == key { return frameInterpolator }
+            let desc = MTLFXFrameInterpolatorDescriptor()
+            configureFrameInterpolatorDescriptor(desc, inputW: inputW, inputH: inputH, outputW: outputW, outputH: outputH, colorFormat: colorFormat)
             guard let interpolator = desc.makeFrameInterpolator(device: device) else { fiLogUnavailable("makeFrameInterpolator-nil"); return nil }
             frameInterpolator = interpolator
             frameInterpolatorKey = key
+            metal4LogBackend("frame-interpolator", "metalfx", "mtl4fx-not-selected input=\(inputW)x\(inputH) output=\(outputW)x\(outputH)")
             if !fiLoggedReady {
                 print("[Q3-FI] frame interpolator ready input=\(inputW)x\(inputH) output=\(outputW)x\(outputH) color=\(colorFormat) motion=rg16Float depth=r32Float")
                 fiLoggedReady = true
             }
+            return interpolator
+        }
+
+        /// MTL4FX frame interpolator, preferred on iOS 27 / macOS 27. Returns
+        /// nil — after logging one `[Q3-METALFX4] frame-interpolator fallback:`
+        /// line — whenever the MTL4 backend cannot host the effect, so the
+        /// caller drops to the MTLFX interpolator above. The MTL4 command path
+        /// is verified here rather than at encode time so a failure can still
+        /// fall back cleanly.
+        @MainActor
+        private func ensureFrameInterpolator4(device: MTLDevice, inputW: Int, inputH: Int, outputW: Int, outputH: Int, colorFormat: MTLPixelFormat) -> MTL4FXFrameInterpolator? {
+            guard metal4Available() else { return nil }
+            if metal4CommandPathFailed {
+                /* The MTL4 command path is unusable for the rest of this
+                 * session. Release any cached MTL4FX object so the MTLFX
+                 * interpolator takes over instead of being skipped forever. */
+                frameInterpolator4 = nil
+                frameInterpolator4Key = (0, 0, 0, 0, .invalid)
+                return nil
+            }
+            let key = (inputW, inputH, outputW, outputH, colorFormat)
+            if let frameInterpolator4, frameInterpolator4Key == key { return frameInterpolator4 }
+            guard MTLFXFrameInterpolatorDescriptor.supportsDevice(device) else {
+                metal4LogFallback("frame-interpolator", "device-unsupported")
+                return nil
+            }
+            guard ensureMetal4CommandPath(device: device, effect: "frame-interpolator"),
+                  let compiler = ensureMetal4Compiler(device: device, effect: "frame-interpolator") else { return nil }
+            let desc = MTLFXFrameInterpolatorDescriptor()
+            configureFrameInterpolatorDescriptor(desc, inputW: inputW, inputH: inputH, outputW: outputW, outputH: outputH, colorFormat: colorFormat)
+            guard let interpolator = desc.makeFrameInterpolator(device: device, compiler: compiler) else {
+                metal4LogFallback("frame-interpolator", "makeFrameInterpolator-nil")
+                return nil
+            }
+            frameInterpolator4 = interpolator
+            frameInterpolator4Key = key
+            metal4LogBackend("frame-interpolator", "mtl4fx", "device-supported input=\(inputW)x\(inputH) output=\(outputW)x\(outputH)")
             return interpolator
         }
         #endif
@@ -4214,7 +4460,23 @@ struct MetalView: UIViewRepresentable {
             guard !fiLastRTMotionWasReset else { return nil }
             guard let depthTexture = rtGDepthTexture, let motionTexture = rtMotionTexture, fiLastRTTraceWidth > 0, fiLastRTTraceHeight > 0 else { fiLogUnavailable("gbuffer-missing"); return nil }
             #if canImport(MetalFX) && !os(visionOS)
-            guard let interpolator = ensureFrameInterpolator(device: device, inputW: fiLastRTTraceWidth, inputH: fiLastRTTraceHeight, outputW: renderW, outputH: renderH, colorFormat: currentSceneTexture.pixelFormat),
+            /* Prefer MTL4FX on iOS 27 / macOS 27. ensureFrameInterpolator4
+             * returns nil (after one [Q3-METALFX4] fallback line) whenever the
+             * MTL4 backend cannot host the effect, and the MTLFX interpolator
+             * takes over unchanged. Both variants expose every configuration
+             * property through MTLFXFrameInterpolatorBase, so the input setup
+             * below is shared; only the encode call differs. */
+            let interpolator4 = ensureFrameInterpolator4(device: device, inputW: fiLastRTTraceWidth, inputH: fiLastRTTraceHeight, outputW: renderW, outputH: renderH, colorFormat: currentSceneTexture.pixelFormat)
+            let interpolatorFX: MTLFXFrameInterpolator? = interpolator4 == nil
+                ? ensureFrameInterpolator(device: device, inputW: fiLastRTTraceWidth, inputH: fiLastRTTraceHeight, outputW: renderW, outputH: renderH, colorFormat: currentSceneTexture.pixelFormat)
+                : nil
+            let interpolatorBase: MTLFXFrameInterpolatorBase?
+            if let interpolator4 {
+                interpolatorBase = interpolator4
+            } else {
+                interpolatorBase = interpolatorFX
+            }
+            guard let interpolator = interpolatorBase,
                   let outputTexture = nextFrameInterpolationOutputTarget() else { return nil }
             interpolator.colorTexture = currentSceneTexture
             interpolator.prevColorTexture = previousSceneTexture
@@ -4248,7 +4510,20 @@ struct MetalView: UIViewRepresentable {
                 interpolator.outputOffsetX = 0
                 interpolator.outputOffsetY = 0
             }
-            interpolator.encode(commandBuffer: commandBuffer)
+            if let interpolator4 {
+                /* MTL4FX encodes into an MTL4CommandBuffer, so the effect runs
+                 * on the MTL4 queue ordered against this frame's classic
+                 * command buffer by the produce/consume shared events. */
+                guard encodeMetal4Effect(effect: "frame-interpolator",
+                                         device: device,
+                                         commandBuffer: commandBuffer,
+                                         encode: { interpolator4.encode(commandBuffer: $0) }) else {
+                    fiLogUnavailable("mtl4-encode-failed")
+                    return nil
+                }
+            } else {
+                interpolatorFX?.encode(commandBuffer: commandBuffer)
+            }
             return outputTexture
             #else
             fiLogUnavailable("symbol-unavailable")
@@ -4447,9 +4722,19 @@ struct MetalView: UIViewRepresentable {
         #if canImport(MetalFX) && !os(visionOS)
         private var rtTemporalDenoisedScaler: MTLFXTemporalDenoisedScaler?
         private var frameInterpolator: MTLFXFrameInterpolator?
+        /* MTL4FX counterparts of the two effects above. They share every
+         * configuration property with the MTLFX variants through the
+         * MTLFX*Base protocols, but they encode into an MTL4CommandBuffer
+         * rather than an MTLCommandBuffer (see the MTL4FX effect backend
+         * block below), so each backend keeps its own cache slot and its own
+         * encode path. */
+        private var rtTemporalDenoisedScaler4: MTL4FXTemporalDenoisedScaler?
+        private var frameInterpolator4: MTL4FXFrameInterpolator?
         #endif
         private var rtTemporalDenoisedScalerKey: (Int, Int, Int, Int, MTLPixelFormat) = (0, 0, 0, 0, .invalid)
+        private var rtTemporalDenoisedScaler4Key: (Int, Int, Int, Int, MTLPixelFormat) = (0, 0, 0, 0, .invalid)
         private var frameInterpolatorKey: (Int, Int, Int, Int, MTLPixelFormat) = (0, 0, 0, 0, .invalid)
+        private var frameInterpolator4Key: (Int, Int, Int, Int, MTLPixelFormat) = (0, 0, 0, 0, .invalid)
         private var rtWhiteTexture: MTLTexture?
         private var pbrMissingTexture: MTLTexture?
         private var sunShadowPipelineState: MTLRenderPipelineState?
@@ -8496,10 +8781,14 @@ struct MetalView: UIViewRepresentable {
             rtHistoryValid = false
             rtPrevViewProjection = nil
             rtTemporalDenoisedScalerKey = (0, 0, 0, 0, .invalid)
+            rtTemporalDenoisedScaler4Key = (0, 0, 0, 0, .invalid)
             frameInterpolatorKey = (0, 0, 0, 0, .invalid)
+            frameInterpolator4Key = (0, 0, 0, 0, .invalid)
             #if canImport(MetalFX) && !os(visionOS)
             rtTemporalDenoisedScaler = nil
+            rtTemporalDenoisedScaler4 = nil
             frameInterpolator = nil
+            frameInterpolator4 = nil
             #endif
             resetFrameInterpolationHistory(reason: "rt-texture-resize")
             rtGBufferPrevCurrentLogPrinted = false
@@ -8516,31 +8805,17 @@ struct MetalView: UIViewRepresentable {
 
         #if canImport(MetalFX) && !os(visionOS)
         @MainActor
-        private func ensureRTTemporalDenoisedScaler(device: MTLDevice,
-                                                    inputW: Int,
-                                                    inputH: Int,
-                                                    outputW: Int,
-                                                    outputH: Int,
-                                                    colorFormat: MTLPixelFormat) -> MTLFXTemporalDenoisedScaler? {
-            guard colorFormat == .rgba16Float else {
-                if !rtDenoiseFallbackLogPrinted {
-                    print("[RT-DENOISE] MetalFX disabled: requires HDR rgba16Float RT input, got \(colorFormat)")
-                    rtDenoiseFallbackLogPrinted = true
-                }
-                return nil
-            }
-            let key = (inputW, inputH, outputW, outputH, colorFormat)
-            if let rtTemporalDenoisedScaler, rtTemporalDenoisedScalerKey == key {
-                return rtTemporalDenoisedScaler
-            }
-            guard #available(iOS 26.0, macOS 26.0, *) else {
-                if !rtDenoiseFallbackLogPrinted {
-                    print("[RT-DENOISE] MetalFX TemporalDenoisedScaler unavailable on this OS")
-                    rtDenoiseFallbackLogPrinted = true
-                }
-                return nil
-            }
-            let desc = MTLFXTemporalDenoisedScalerDescriptor()
+        /// Descriptor configuration shared by both RT denoiser backends. MTLFX
+        /// and MTL4FX temporal denoised scalers are built from the same
+        /// MTLFXTemporalDenoisedScalerDescriptor; only the factory method
+        /// differs (`makeTemporalDenoisedScaler(device:)` vs
+        /// `makeTemporalDenoisedScaler(device:compiler:)`).
+        private func configureRTDenoiseDescriptor(_ desc: MTLFXTemporalDenoisedScalerDescriptor,
+                                                  inputW: Int,
+                                                  inputH: Int,
+                                                  outputW: Int,
+                                                  outputH: Int,
+                                                  colorFormat: MTLPixelFormat) {
             desc.colorTextureFormat = colorFormat
             desc.depthTextureFormat = .r32Float
             desc.motionTextureFormat = .rg16Float
@@ -8580,6 +8855,35 @@ struct MetalView: UIViewRepresentable {
              * and synchronize the live resources with scaler.fence instead. */
             desc.requiresSynchronousInitialization = false
             desc.isAutoExposureEnabled = false
+        }
+
+        @MainActor
+        private func ensureRTTemporalDenoisedScaler(device: MTLDevice,
+                                                    inputW: Int,
+                                                    inputH: Int,
+                                                    outputW: Int,
+                                                    outputH: Int,
+                                                    colorFormat: MTLPixelFormat) -> MTLFXTemporalDenoisedScaler? {
+            guard colorFormat == .rgba16Float else {
+                if !rtDenoiseFallbackLogPrinted {
+                    print("[RT-DENOISE] MetalFX disabled: requires HDR rgba16Float RT input, got \(colorFormat)")
+                    rtDenoiseFallbackLogPrinted = true
+                }
+                return nil
+            }
+            let key = (inputW, inputH, outputW, outputH, colorFormat)
+            if let rtTemporalDenoisedScaler, rtTemporalDenoisedScalerKey == key {
+                return rtTemporalDenoisedScaler
+            }
+            guard #available(iOS 26.0, macOS 26.0, *) else {
+                if !rtDenoiseFallbackLogPrinted {
+                    print("[RT-DENOISE] MetalFX TemporalDenoisedScaler unavailable on this OS")
+                    rtDenoiseFallbackLogPrinted = true
+                }
+                return nil
+            }
+            let desc = MTLFXTemporalDenoisedScalerDescriptor()
+            configureRTDenoiseDescriptor(desc, inputW: inputW, inputH: inputH, outputW: outputW, outputH: outputH, colorFormat: colorFormat)
             guard let scaler = desc.makeTemporalDenoisedScaler(device: device) else {
                 if !rtDenoiseFallbackLogPrinted {
                     print("[RT-DENOISE] MetalFX makeTemporalDenoisedScaler returned nil input=\(inputW)x\(inputH) output=\(outputW)x\(outputH)")
@@ -8590,6 +8894,7 @@ struct MetalView: UIViewRepresentable {
             rtTemporalDenoisedScaler = scaler
             rtTemporalDenoisedScalerKey = key
             rtDenoiseFallbackLogPrinted = false
+            metal4LogBackend("denoiser", "metalfx", "mtl4fx-not-selected input=\(inputW)x\(inputH) output=\(outputW)x\(outputH)")
             if !rtDenoiseBackendLogPrinted {
                 #if targetEnvironment(macCatalyst)
                 let maskMode = "disabled-catalyst"
@@ -8600,6 +8905,112 @@ struct MetalView: UIViewRepresentable {
                 rtDenoiseBackendLogPrinted = true
             }
             return scaler
+        }
+
+        /// MTL4FX RT denoiser, preferred on iOS 27 / macOS 27. Returns nil —
+        /// after logging one `[Q3-METALFX4] denoiser fallback:` line — whenever
+        /// the MTL4 backend cannot host the effect, so the caller drops to the
+        /// iOS 26 MTLFX scaler (or, on Catalyst, to the Stage54 legacy path).
+        /// The MTL4 command path is verified here rather than at encode time so
+        /// a failure can still fall back cleanly.
+        @MainActor
+        private func ensureRTTemporalDenoisedScaler4(device: MTLDevice,
+                                                     inputW: Int,
+                                                     inputH: Int,
+                                                     outputW: Int,
+                                                     outputH: Int,
+                                                     colorFormat: MTLPixelFormat) -> MTL4FXTemporalDenoisedScaler? {
+            guard metal4Available() else { return nil }
+            guard colorFormat == .rgba16Float else {
+                metal4LogFallback("denoiser", "requires-rgba16Float-got-\(colorFormat)")
+                return nil
+            }
+            if metal4CommandPathFailed {
+                /* The MTL4 command path is unusable for the rest of this
+                 * session. Release any cached MTL4FX scaler so the caller drops
+                 * to the iOS26 MTLFX scaler (legacy on Catalyst) instead of
+                 * degrading permanently. */
+                rtTemporalDenoisedScaler4 = nil
+                rtTemporalDenoisedScaler4Key = (0, 0, 0, 0, .invalid)
+                return nil
+            }
+            let key = (inputW, inputH, outputW, outputH, colorFormat)
+            if let rtTemporalDenoisedScaler4, rtTemporalDenoisedScaler4Key == key {
+                return rtTemporalDenoisedScaler4
+            }
+            guard MTLFXTemporalDenoisedScalerDescriptor.supportsDevice(device) else {
+                metal4LogFallback("denoiser", "device-unsupported")
+                return nil
+            }
+            guard ensureMetal4CommandPath(device: device, effect: "denoiser"),
+                  let compiler = ensureMetal4Compiler(device: device, effect: "denoiser") else { return nil }
+            let desc = MTLFXTemporalDenoisedScalerDescriptor()
+            configureRTDenoiseDescriptor(desc, inputW: inputW, inputH: inputH, outputW: outputW, outputH: outputH, colorFormat: colorFormat)
+            guard let scaler = desc.makeTemporalDenoisedScaler(device: device, compiler: compiler) else {
+                metal4LogFallback("denoiser", "makeTemporalDenoisedScaler-nil")
+                return nil
+            }
+            rtTemporalDenoisedScaler4 = scaler
+            rtTemporalDenoisedScaler4Key = key
+            #if targetEnvironment(macCatalyst)
+            let maskMode = "disabled-catalyst"
+            #else
+            let maskMode = "r8Unorm"
+            #endif
+            metal4LogBackend("denoiser", "mtl4fx", "device-supported input=\(inputW)x\(inputH) output=\(outputW)x\(outputH) mask=\(maskMode)")
+            return scaler
+        }
+
+        /// Per-frame denoiser input binding, shared by both backends through
+        /// MTLFXTemporalDenoisedScalerBase. Callers set `fence` separately: it
+        /// only applies to the MTLFX backend (see encodeRTDenoise).
+        @MainActor
+        private func applyRTDenoiseInputs(_ scaler: MTLFXTemporalDenoisedScalerBase,
+                                          rtTex: MTLTexture,
+                                          gDepthTex: MTLTexture,
+                                          gNormalTex: MTLTexture,
+                                          gAlbedoTex: MTLTexture,
+                                          gRoughnessTex: MTLTexture,
+                                          denoiseMaskTex: MTLTexture,
+                                          motionTex: MTLTexture,
+                                          denoisedTex: MTLTexture,
+                                          jitter: SIMD2<Float>,
+                                          traceW: Int,
+                                          traceH: Int,
+                                          resetHistory: Bool,
+                                          viewProj: simd_float4x4) {
+            scaler.colorTexture = rtTex
+            scaler.depthTexture = gDepthTex
+            scaler.motionTexture = motionTex
+            scaler.diffuseAlbedoTexture = gAlbedoTex
+            // Specular albedo is not exported as a separate Stage 17 target.
+            // Reuse the clean albedo guide rather than allocating a noisy
+            // placeholder; roughness still provides the specular edge hint.
+            scaler.specularAlbedoTexture = gAlbedoTex
+            scaler.normalTexture = gNormalTex
+            scaler.roughnessTexture = gRoughnessTex
+            scaler.specularHitDistanceTexture = nil
+            #if targetEnvironment(macCatalyst)
+            scaler.denoiseStrengthMaskTexture = nil
+            #else
+            scaler.denoiseStrengthMaskTexture = denoiseMaskTex
+            #endif
+            scaler.transparencyOverlayTexture = nil
+            scaler.outputTexture = denoisedTex
+            scaler.exposureTexture = nil
+            scaler.preExposure = 1.0
+            scaler.reactiveMaskTexture = nil
+            scaler.jitterOffsetX = jitter.x * Float(max(traceW, 1))
+            scaler.jitterOffsetY = jitter.y * Float(max(traceH, 1))
+            // Stage 17 MV is UV-space cur-prev. MetalFX wants a vector
+            // from current pixel to the previous-frame pixel in pixel
+            // units, so multiply by -resolution.
+            scaler.motionVectorScaleX = -Float(max(traceW, 1))
+            scaler.motionVectorScaleY = -Float(max(traceH, 1))
+            scaler.shouldResetHistory = resetHistory
+            scaler.isDepthReversed = false
+            scaler.worldToViewMatrix = matrix_identity_float4x4
+            scaler.viewToClipMatrix = viewProj
         }
         #endif
 
@@ -8983,8 +9394,13 @@ struct MetalView: UIViewRepresentable {
             let rtResolutionScale = Q3_RTTraceScale()
             let rtDenoiseRequested = Q3_RTDenoise() != 0
             var rtDenoiseEnabled = rtDenoiseRequested
+            /* Batch3: r_rt_denoise_metalfx4 1 force-tries the MTL4FX denoiser
+             * even on Catalyst so the MTL4 backend can be A/B'd against the
+             * iOS26 MetalFX/ANE assertion the Stage54 policy exists to avoid.
+             * At the default 0 the Stage54 policy below is unchanged. */
+            let rtDenoiseMetalFX4Forced = Q3_RTDenoiseMetalFX4() != 0
             #if targetEnvironment(macCatalyst)
-            if rtDenoiseEnabled {
+            if rtDenoiseEnabled, !rtDenoiseMetalFX4Forced {
                 rtDenoiseEnabled = false
                 if !rtDenoiseCatalystDisabledLogPrinted {
                     print("[RT-DENOISE] Catalyst MetalFX backend disabled reason=metalfx-ane-assertion using legacy path")
@@ -9031,18 +9447,42 @@ struct MetalView: UIViewRepresentable {
                 return r
             }
             #if canImport(MetalFX) && !os(visionOS)
+            let rtDenoiseScaler4: MTL4FXTemporalDenoisedScaler?
             let rtDenoiseScaler: MTLFXTemporalDenoisedScaler?
             if rtDenoiseEnabled, #available(iOS 26.0, macOS 26.0, *) {
-                rtDenoiseScaler = ensureRTTemporalDenoisedScaler(device: device,
-                                                                 inputW: traceW,
-                                                                 inputH: traceH,
-                                                                 outputW: renderW,
-                                                                 outputH: renderH,
-                                                                 colorFormat: rtTex.pixelFormat)
+                /* MTL4FX first. The MTLFX scaler is only built when the MTL4
+                 * backend declines, so a successful MTL4FX adoption creates
+                 * exactly one scaler object. */
+                rtDenoiseScaler4 = ensureRTTemporalDenoisedScaler4(device: device,
+                                                                   inputW: traceW,
+                                                                   inputH: traceH,
+                                                                   outputW: renderW,
+                                                                   outputH: renderH,
+                                                                   colorFormat: rtTex.pixelFormat)
+                #if targetEnvironment(macCatalyst)
+                /* Stage54 stays the final fallback on Catalyst: the iOS26
+                 * MetalFX/ANE backend asserts there, so a declined MTL4FX
+                 * denoiser drops straight to the legacy accumulate path rather
+                 * than re-arming the backend Stage54 disabled. */
+                rtDenoiseScaler = nil
+                #else
+                rtDenoiseScaler = rtDenoiseScaler4 == nil
+                    ? ensureRTTemporalDenoisedScaler(device: device,
+                                                     inputW: traceW,
+                                                     inputH: traceH,
+                                                     outputW: renderW,
+                                                     outputH: renderH,
+                                                     colorFormat: rtTex.pixelFormat)
+                    : nil
+                #endif
             } else {
+                rtDenoiseScaler4 = nil
                 rtDenoiseScaler = nil
             }
-            let rtDenoiseActive = rtDenoiseScaler != nil
+            let rtDenoiseActive = rtDenoiseScaler4 != nil || rtDenoiseScaler != nil
+            if rtDenoiseEnabled, !rtDenoiseActive {
+                metal4LogBackend("denoiser", "legacy", rtDenoiseMetalFX4Forced ? "no-mtl4fx-scaler" : "no-metalfx-scaler")
+            }
             #else
             let rtDenoiseActive = false
             #endif
@@ -9363,42 +9803,66 @@ struct MetalView: UIViewRepresentable {
             let denoiseShouldResetHistory = forcePrevCurrentForMV || !rtHistoryValid
             encodeRTPerfPoint(commandBuffer: commandBuffer, frame: perfFrame, sample: .denoiseStart)
             #if canImport(MetalFX) && !os(visionOS)
+            /* MTL4FX first. Its encode runs in a separate MTL4 command buffer,
+             * so a failure there must fall through to the legacy accumulate
+             * path instead of leaving rtDenoisedTexture unwritten. */
+            var rtDenoiseMTL4Encoded = false
             if rtDenoiseEnabled,
+               let scaler4 = rtDenoiseScaler4,
+               let denoisedTex = rtDenoisedTexture {
+                applyRTDenoiseInputs(scaler4,
+                                     rtTex: rtTex,
+                                     gDepthTex: gDepthTex,
+                                     gNormalTex: gNormalTex,
+                                     gAlbedoTex: gAlbedoTex,
+                                     gRoughnessTex: gRoughnessTex,
+                                     denoiseMaskTex: denoiseMaskTex,
+                                     motionTex: motionTex,
+                                     denoisedTex: denoisedTex,
+                                     jitter: jitter,
+                                     traceW: traceW,
+                                     traceH: traceH,
+                                     resetHistory: denoiseShouldResetHistory,
+                                     viewProj: viewProj)
+                /* MTLFence only orders resources inside a single command
+                 * buffer. The MTL4FX backend encodes into an MTL4 command
+                 * buffer submitted on a different queue, where a fence created
+                 * for the classic frame command buffer does not apply, so
+                 * encodeMetal4Effect orders the trace -> denoise -> blend
+                 * dependency with the produce/consume shared events instead. */
+                scaler4.fence = nil
+                rtDenoiseMTL4Encoded = encodeMetal4Effect(effect: "denoiser",
+                                                          device: device,
+                                                          commandBuffer: commandBuffer,
+                                                          encode: { scaler4.encode(commandBuffer: $0) })
+                if rtDenoiseMTL4Encoded {
+                    rtColorForBlend = denoisedTex
+                    rtAlphaForBlend = rtTex
+                    rtDenoiseMode = "mtl4fx"
+                    rtHistoryValid = true
+                } else {
+                    metal4LogFallback("denoiser", "mtl4-encode-failed")
+                }
+            }
+            if !rtDenoiseMTL4Encoded,
+               rtDenoiseEnabled,
                #available(iOS 26.0, macOS 26.0, *),
                let scaler = rtDenoiseScaler,
                let denoisedTex = rtDenoisedTexture {
-                scaler.colorTexture = rtTex
-                scaler.depthTexture = gDepthTex
-                scaler.motionTexture = motionTex
-                scaler.diffuseAlbedoTexture = gAlbedoTex
-                // Specular albedo is not exported as a separate Stage 17 target.
-                // Reuse the clean albedo guide rather than allocating a noisy
-                // placeholder; roughness still provides the specular edge hint.
-                scaler.specularAlbedoTexture = gAlbedoTex
-                scaler.normalTexture = gNormalTex
-                scaler.roughnessTexture = gRoughnessTex
-                scaler.specularHitDistanceTexture = nil
-                #if targetEnvironment(macCatalyst)
-                scaler.denoiseStrengthMaskTexture = nil
-                #else
-                scaler.denoiseStrengthMaskTexture = denoiseMaskTex
-                #endif
-                scaler.transparencyOverlayTexture = nil
-                scaler.outputTexture = denoisedTex
-                scaler.exposureTexture = nil
-                scaler.preExposure = 1.0
-                scaler.reactiveMaskTexture = nil
-                scaler.jitterOffsetX = jitter.x * Float(max(traceW, 1))
-                scaler.jitterOffsetY = jitter.y * Float(max(traceH, 1))
-                // Stage 17 MV is UV-space cur-prev. MetalFX wants a vector
-                // from current pixel to the previous-frame pixel in pixel
-                // units, so multiply by -resolution.
-                scaler.motionVectorScaleX = -Float(max(traceW, 1))
-                scaler.motionVectorScaleY = -Float(max(traceH, 1))
-                scaler.shouldResetHistory = denoiseShouldResetHistory
-                scaler.isDepthReversed = false
-                scaler.worldToViewMatrix = matrix_identity_float4x4
-                scaler.viewToClipMatrix = viewProj
+                applyRTDenoiseInputs(scaler,
+                                     rtTex: rtTex,
+                                     gDepthTex: gDepthTex,
+                                     gNormalTex: gNormalTex,
+                                     gAlbedoTex: gAlbedoTex,
+                                     gRoughnessTex: gRoughnessTex,
+                                     denoiseMaskTex: denoiseMaskTex,
+                                     motionTex: motionTex,
+                                     denoisedTex: denoisedTex,
+                                     jitter: jitter,
+                                     traceW: traceW,
+                                     traceH: traceH,
+                                     resetHistory: denoiseShouldResetHistory,
+                                     viewProj: viewProj)
                 // MetalFX documents this fence as the synchronization point
                 // for untracked resources. The Catalyst denoiser/ANE path was
                 // asserting when it consumed the just-written RT G-buffer in
@@ -9410,7 +9874,7 @@ struct MetalView: UIViewRepresentable {
                 rtAlphaForBlend = rtTex
                 rtDenoiseMode = "metalfx"
                 rtHistoryValid = true
-            } else {
+            } else if !rtDenoiseMTL4Encoded {
                 var accumAlpha: Float = (!rtTAAEnabled || !rtHistoryValid) ? 1.0 : rtTAAAlpha
                 if let enc = commandBuffer.makeComputeCommandEncoder() {
                     enc.label = "Q3.RT.accumulate"
