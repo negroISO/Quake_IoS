@@ -13352,11 +13352,14 @@ struct MetalView: UIViewRepresentable {
                 let nativeSize = mainScreen.nativeBounds.size
                 target = CGSize(width: max(nativeSize.width, nativeSize.height),
                                 height: min(nativeSize.width, nativeSize.height))
+            } else if profile == "metal_1280_25" {
+                // Mac Catalyst reports .phone idiom, so the old isPad
+                // ternary collapsed both profiles to 960x444.  Honor the
+                // actual profile name to match the C-side table in ios_main.m.
+                target = CGSize(width: 1280, height: 960)
             } else if profile != nil {
-                // matchProfile960 / matchProfile1280 — keep deterministic
-                // sizes so AVI captures still bit-diff against prior runs.
-                target = CGSize(width: isPad ? 1280 : 960,
-                                height: isPad ? 960 : 444)
+                // metal_960_25 and any legacy match-profile fallback.
+                target = CGSize(width: 960, height: 444)
             } else {
                 // Normal play. Use the same active-screen target as app boot
                 // (`Q3_SetRenderResolution`). Mixing nativeBounds with the
