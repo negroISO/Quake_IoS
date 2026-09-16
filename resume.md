@@ -1,105 +1,136 @@
-# Resume — Quake3-iOS Metal port (as of 2026-01-28)
+# RESUME — raster-parity campaign state (paused 2026-09-16 for machine transfer)
 
-## Goal
-- Native Metal renderer for Quake3-iOS (for VisionOS). iOS first.
-- Current state: **2D UI/menus + 3D BSP world geometry render via Metal**. Gun model and text still missing.
+Read `docs/goal.md` first (objective + definition of done + open items).
+This file is the operational resume card: what's done, exact recipes,
+what's next, and the environment facts a new machine needs.
 
-## What already works
-- App boots, audio/game loop runs.
-- baseq3 can be bundled or in Documents. App no longer requires Documents only.
-- Metal 2D pipeline draws menus/UI (uses DrawStretchPic).
-- Metal 3D pipeline draws BSP world geometry (4849 surfaces on q3dm0).
-- Full game lifecycle: server starts → client connects → cgame loads → LoadWorldMap → RenderScene.
-- Partial shutdown preserves Metal device/window/pipelines during map transitions.
-- Idle timer disabled to prevent screen auto-lock during gameplay.
+## 1. Landed this campaign (all pushed, branch metal-renderer-fresh)
 
-## Key file changes already done
-- `Quake3/renderermtl/tr_mtl_backend.mm`:
-  - Creates Metal device/layer/command queue, clears each frame.
-  - Added 2D Metal pipeline (shaders in `mtl_shaders.metal`).
-  - Texture loading via `R_LoadTGA`/`R_LoadJPG`, stored in `mtlImages`.
-  - `MTLimp_RegisterTexture`, `MTLimp_SetColor`, `MTLimp_DrawStretchPic` implemented.
-  - 2D draws textured quads with alpha blending.
-- `Quake3/renderermtl/tr_mtl_init.c`:
-  - `RegisterShader` and `RegisterShaderNoMip` now call `MTLimp_RegisterTexture`.
-  - `SetColor` and `DrawStretchPic` now call Metal backend.
-- `Quake3/renderermtl/mtl_shaders.metal`: 2D vertex/fragment implemented.
-- `Quake3-iOS/GameViewController.swift`: baseq3 lookup uses Documents or bundle; `fs_basepath` set accordingly; `r_useMetal 1`.
-- `Quake3-iOS/MainMenuViewController.swift`: baseq3 detection uses Documents or bundle; extraction uses whichever is available.
-- `Quake3-iOS.xcodeproj/project.pbxproj`:
-  - Added Metal.framework, renderermtl files, `mtl_shaders.metal`.
-  - Added build phase to copy baseq3 into app bundle at build time.
-  - Disabled user script sandboxing for that copy phase.
+| Commit | What |
+|---|---|
+| 2a3b2c62 | docs: Stage-83 viewmodel lighting fix recorded as landed (fde9d961) |
+| dddf7bcf | fix(metal): honor match-profile name in drawable target (FOV/aspect) — THE viewmodel-placement + world-perspective fix. Gate: fov 90/73.74 exact; v1 parity 0.95x |
 
-## Last test result
-- Built & installed to device; menus + 3D world render via Metal.
-- Full game flow: CS_FREE → CS_CONNECTED → CS_PRIMED → CS_ACTIVE.
-- BSP q3dm0 loaded: 113 shaders, 24587 verts, 47757 idx, 5023 surfs, 4849 rendered.
-- RenderScene executing with correct fov/vieworg data.
-- 2D HUD (health, ammo) renders correctly.
-- Gun model NOT visible (entity rendering not implemented).
-- Bot chat text NOT visible (font registration returns empty data).
+## 2. Verified findings (evidence in /Volumes/iOS/Quake_iOS27_Review_20260914/)
 
-## Completed 3D pipeline implementation
+1. **FOV/aspect bug (FIXED)**: `mtkView(drawableSizeWillChange)` collapsed
+   both match profiles to 960x444 on Catalyst (.phone idiom). Measured:
+   logged fov aspect 2.16 == 960/444; gun silhouette 3x too small/low.
+2. **Hall darkness = PBR sidecar divergence (config-solved)**: q3dm4 v2-hall
+   surfaces are bare textures (no shader defs) routed through RTX-Remix PBR
+   sidecars. Ladder: PBR-on 21.6 -> boot-time `r_pbrMaterials 0` -> 53.2
+   (ioq3 71.0). Parity baseline MUST run PBR-off.
+3. **v1 (small room) at 0.95x parity** on the fully clean config.
+4. **Tone parity is config, not code**: match-profile pins r_gamma 1.15 +
+   post chain (autoexposure/ACES/intensity 2.2). Neutralize per §3 recipe.
+5. Rejected: Codex "double overbright" theory (direction contradiction —
+   Metal measures DARKER in bright regions, a x4 theory predicts brighter;
+   claimed diff absent from tree).
+6. Demo-time AVI alignment is unreliable across engines — use FIXED
+   `setviewpos` vantages (the harness does).
 
-### What's implemented
-- `mtl_shaders.metal`: 3D vertex/fragment shaders (`mtl3d_vertex`, `mtl3d_fragment`).
-- `tr_mtl_backend.mm`:
-  - `MTLimp_LoadWorldMap`: Parses BSP via `ri.FS_ReadFile`, extracts lumps, converts drawVert_t to GPU format, builds vertex/index buffers, registers surface textures. Offsets relative indices by firstVert.
-  - `MTLimp_RenderScene`: Binds 3D pipeline, depth state, MVP matrix. Iterates all surfaces, binds textures, draws indexed primitives.
-  - `MTLimp_BuildMVP`: Row-major view + projection matrix, transposed to column-major for Metal float4x4.
-  - `MTLimp_BeginFrame`: Creates render pass with depth attachment (Depth32Float, cleared to 1.0).
-  - `MTLimp_ShutdownPartial` / `MTLimp_ShutdownFull`: Split shutdown preserves Metal device during map transitions.
-  - BeginFrame recovers from longjmp-orphaned Metal encoder/command buffer state.
-- `tr_mtl_init.c`: `RE_MTL_Shutdown` calls partial/full based on `destroyWindow`. `IN_Shutdown` only called during full shutdown.
-- `tr_mtl_backend.h`: Declares `MTLimp_ShutdownPartial`, `MTLimp_ShutdownFull`.
-- `GameViewController.swift`: Idle timer disabled.
+## 3. The deterministic parity harness (exact recipe)
 
-### Key bugs fixed
-1. **mtlDevice nil during LoadWorldMap**: `re.Shutdown(qfalse)` destroyed everything. Fixed with partial/full shutdown split.
-2. **Client stuck at CS_CONNECTED**: `IN_Shutdown` killed SDL input during partial shutdown. Fixed by only calling it during full shutdown.
-3. **MVP projection matrix transposed**: `proj[11]` and `proj[14]` were swapped (column-major vs row-major mixing). Fixed.
-4. **BSP indices relative to firstVert**: drawIndexes are offsets from surface's firstVert, not absolute. Fixed by adding firstVert during loading.
+Both legs render 1280x960, cg_draw2D 0, cg_drawGun 1, r_picmip 0,
+r_gamma 1.0, r_overBrightBits 1, r_mapOverBrightBits 2.
 
-## NOT DONE YET (what to finish next)
-1. **Entity rendering** (gun model, player models, items):
-   - Implement `RE_MTL_AddRefEntityToScene` to collect entities.
-   - Render entities with per-entity model-view-projection transforms.
-   - Requires loading MD3 model geometry.
-2. **Text rendering** (bot chat, console):
-   - Implement `RE_MTL_RegisterFont` to load Q3 `.dat` font files.
-   - Or verify bitmap charset (`gfx/2d/bigchars`) loads via `MTLimp_RegisterTexture`.
-3. **Lightmaps**: BSP lightmap data is available but not yet used. Vertex colors are forced white.
-4. **Shader stages**: Q3 .shader script parsing for multi-pass effects.
-5. **PSO cache**: Metal Binary Archive to precompile pipelines on Mac and bundle.
-6. **Patch surfaces**: BSP patch meshes (MST_PATCH) not yet rendered — only planar + triangle soup.
-7. **Culling**: No frustum culling; all 4849 surfaces drawn every frame.
+**ioq3 leg** (binary /Volumes/iOS/q3_builds/ioq3-mac/build/Release/ioquake3.app,
+run dir = mktemp with paks symlinked from Quake3-iOS/baseq3, demos copied —
+four.dm_66 lives in pak6.pk3):
 
-## Notes / constraints
-- Use C functions from qcommon: need C linkage. `tr_mtl_backend.h` & `tr_mtl_local.h` now wrap C includes in `extern "C"` to fix linkage.
-- `mtlWorld` should be cleared on shutdown; call `MTLimp_ClearWorld()` in `MTLimp_Shutdown()`.
-- No PSO cache yet. Once 3D pipeline is stable, use Metal Binary Archive to precompile on Mac and bundle.
+    cat > $RD/baseq3/autoexec.cfg <<'EOF'
+    seta logfile 2
+    wait 30
+    devmap q3dm4
+    wait 250
+    seta r_gamma 1.0
+    setviewpos 680 240 -120 180
+    wait 40
+    screenshot
+    wait 10
+    quit
+    EOF
+    ioquake3 +set fs_basepath $RD +set fs_homepath $RD +set r_mode -1 \
+      +set r_customwidth 1280 +set r_customheight 960 +set r_fullscreen 0 \
+      +set r_picmip 0 +set r_gamma 1.0 +set r_overBrightBits 1 \
+      +set r_mapOverBrightBits 2 +set cg_draw2D 0 +set cg_drawGun 1
+    # shots land in $RD/baseq3/screenshots/shotNNNN.tga (pixel-exact)
 
-## Device build/install commands used
-- Device UDID: `00008150-001E714A02C0401C` (iPhone "Yd-Mubarak MajMaj")
-- Build (device):
-  `xcodebuild -project Quake3-iOS.xcodeproj -scheme Quake3-iOS -destination 'id=00008150-001E714A02C0401C' -allowProvisioningUpdates -allowProvisioningDeviceRegistration DEVELOPMENT_TEAM=72MB2RMPTC CODE_SIGN_STYLE=Automatic PRODUCT_BUNDLE_IDENTIFIER=com.garrettcullum.quake3metal build`
-- Install:
-  `xcrun devicectl device install app --device 00008150-001E714A02C0401C /Users/targus/Library/Developer/Xcode/DerivedData/Quake3-iOS-giqfdkmnjcuenyaxpxgjwvjbggpl/Build/Products/Debug-iphoneos/Quake3-iOS.app`
-- Launch:
-  `xcrun devicectl device process launch --device 00008150-001E714A02C0401C --terminate-existing com.garrettcullum.quake3metal`
+**Catalyst leg** (app: newest Debug-maccatalyst Q3_RT.app in DerivedData):
 
-## Repo state (dirty files)
-- `Quake3-iOS.xcodeproj/project.pbxproj`
-- `Quake3-iOS/GameViewController.swift`
-- `Quake3-iOS/MainMenuViewController.swift`
-- `Quake3/client/cl_main.c`
-- `Quake3/sdl/sdl_glimp.c`
-- `Quake3/renderermtl/*` (new + modified)
+    env Q3_LAUNCH_COMMAND="developer 1; devmap q3dm4; wait 400; cg_fov 90; \
+      r_gamma 1; r_postprocess_autoexposure 0; r_postprocess_tonemap 0; \
+      r_postprocess_intensity 1.0; setviewpos 680 240 -120 180; wait 1500" \
+      Q3_MATCH_PROFILE=metal_1280_25 Q3_RT_MIX=off Q3_UPSCALE_QUALITY=native \
+      <app>/Contents/MacOS/Q3_RT -ApplePersistenceIgnoreState YES
+    # container autoexec (~/Library/Containers/21579E2F-.../Data/Documents/baseq3/
+    #   autoexec.cfg) must contain: seta r_pbrMaterials 0
+    # cg_fov MUST come via Q3_LAUNCH_COMMAND (autoexec seta does NOT stick —
+    #   archived cg_fov 95 in the container q3config wins otherwise)
+    # capture: pin window via AppleScript to {20,40} size {1280,992}, then
+    #   screencapture -x -R 20,72,1280,960  -> 2560x1920 -> LANCZOS to 1280x960
 
-## Next immediate action for Claude
-1. Get user visual confirmation of 3D world rendering on device.
-2. Implement entity rendering (gun model, player models) — `AddRefEntityToScene` + MD3 loading.
-3. Fix text rendering (RegisterFont or bitmap charset).
-4. Add lightmap support to BSP surfaces.
-5. Add patch surface rendering (MST_PATCH — Bezier curves to triangle meshes).
+**Verify FOV in the log**: `grep "world frame" <log> | tail -1` must show
+`fov=(90.00, 73.74)`. Anything else = config drift.
+
+## 4. Canonical vantages (q3dm4)
+
+- v1 small room: `setviewpos -192 -768 -320 90` (settles z=-333.9; 0.95x parity)
+- v2 long hall: `setviewpos 680 240 -120 180` (the residual test case)
+- ioq3 reference grids: v1 overall 59.9, v2 71.0; v2 grid
+  [[43,63,95,95],[50,63,81,50],[64,74,81,50],[56,79,52,82]] (4x4 luma means)
+
+## 5. Open defect — v2 bright-region residual
+
+Clean-config Metal 48.8 vs ioq3 71.0 (0.69x): dark regions at parity
+(43~43, 50~49), bright regions compressed to ~51-55 luma (ioq3 63-95),
+ratios 0.54-0.87 surface-dependent. Lightmap-only views: Metal 129.9 vs
+ioq3 156.7 (0.83x). Load-time shift verified equivalent to ioq3
+(R_ColorShiftLightingBytes mirror, normalize-by-max). NOT: fog (yaw-invariant),
+NOT missing lightmap data (debug2 bright everywhere), NOT PBR/parallax/IBL
+(all off), NOT skip-on-handle-0 (refuted by grids).
+
+**Next instrument (agreed)**: lightmap texel forensics — extract the actual
+lightmap page bytes for an affected bright surface (e.g. the wall right of
+v2 view) from the BSP, run BOTH engines' load-path math on the same bytes,
+and diff. Suspects remaining: upload color-space, sampling filtering, or a
+presentation-only debug-view difference (i.e., possibly TWO smaller issues).
+
+## 6. Environment facts (new machine needs these)
+
+- Repo: /Volumes/iOS/Projects/Quake_IoS_Phase9_Fork (branch metal-renderer-fresh,
+  HEAD dddf7bcf, remote github.com/negroISO/Quake_IoS). CLAUDE.md is
+  intentionally untracked (policy commit 57bb26a0).
+- Results/evidence: /Volumes/iOS/Quake_iOS27_Review_20260914/ (raster_parity/
+  is this campaign; dm4_demo_compare/ the previous one; GOAL_COMPLETION.md
+  indexes the 2026-09-14/15 review).
+- ioq3 reference build: /Volumes/iOS/q3_builds/ioq3-mac (branch `audit`, has
+  r_stageaudit/r_renderaudit instrumentation).
+- Catalyst container: ~/Library/Containers/21579E2F-6467-4375-8C90-BE862362FB0F
+  (boot source=documents materials.json; autoexec currently has
+  r_pbrMaterials 0 appended — see §3).
+- iPhone 17 Pro Max: UUID 1EED792C-F233-511F-8DBD-15A47EC570A3, iOS 27.0
+  (24A435), bundle com.quake3ios.rt; appDataContainer pull works
+  (Documents/baseq3/videos, capture_ras2/3 lossless TGA sets).
+- Codex invocation that works:
+  `codex exec --yolo -c model_provider=Model_Studio_Token_Plan_Personal -m qwen3.8-max "$(cat brief.md)" < /dev/null`
+  (CCR profile dead; DeepSeek disabled). Briefs live in the results folder.
+- ddemby RAG: intermittent DNS (ddemby.home.arpa); shell route
+  /Volumes/iOS/Development/q3rt-ask.sh when up.
+- Auto-memory hook incident (solved): hooks resolve CLAUDE_PROJECT_DIR — if
+  session cwd is /Volumes/iOS, the ACTIVE queue is
+  /Volumes/iOS/.claude/auto-memory/dirty-files (NOT the repo path). Always
+  check that path first when the Stop hook loops.
+- DeviceSupport cleanup 2026-09-15: 15->53 GiB free; log
+  reports/devicesupport_deletion_20260915.log.
+
+## 7. On resume (ordered)
+
+1. Rebuild both legs, re-verify fov=(90.00,73.74) + v1 0.95x (regression gate
+   for the transfer).
+2. Lightmap texel forensics on v2 bright surfaces (§5) — identify, then ONE
+   minimal upstream-backed fix, gated on re-capture.
+3. Weapon silhouette A/B post-FOV-fix (expect ~parity; verify area/centroid).
+4. Broaden: q3dm1 (medallion/red wall), nv15 fixed vantages.
+5. Only then: commit sequence review, Metal validation run, and (if all
+   bars met) `RASTER_PARITY_VERIFIED`.
