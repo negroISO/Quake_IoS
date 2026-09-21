@@ -1926,6 +1926,7 @@ struct MetalView: UIViewRepresentable {
             // from the BSP lightgrid sampled at the vertex's world pos.
             // Smooth-interpolated; consumed by ComputeRGBGen mode 2.
             float3 lightingDiffuse;
+            float2 fogTexCoord; // Native Q3 computes S/T at vertices.
         };
 
         /* Dynamic point light, matches C Q3MetalLight. */
@@ -2320,12 +2321,11 @@ struct MetalView: UIViewRepresentable {
                 drawUniforms.fogParams.x <= 0.0) {
                 return out;
             }
-            /* WorldUniforms stores screen-right and up.  Q3 fog S is
-             * forward distance from the eye.  right×up = forward; the
-             * old up×right returned -forward, driving S negative for
-             * visible geometry and making stock per-surface fog vanish. */
-            float3 forward = normalize(cross(float3(uniforms.cameraRight),
-                                             float3(uniforms.cameraUp)));
+            // Q3 axis[1] is left; Swift stores cameraRight = -axis[1].
+            // up x right therefore recovers axis[0] (forward). Reversing
+            // this cross product made S negative for visible surfaces.
+            float3 forward = normalize(cross(float3(uniforms.cameraUp),
+                                             float3(uniforms.cameraRight)));
             float s = dot(worldPos - float3(uniforms.cameraPos), forward) *
                       drawUniforms.fogParams.x + (1.0 / 512.0);
             float t = 31.0 / 32.0;
@@ -2353,14 +2353,9 @@ struct MetalView: UIViewRepresentable {
             out.t = t;
             return out;
         }
-        float q3FogFactor(float3 worldPos,
-                          constant WorldUniforms &uniforms,
-                          constant WorldDrawUniforms &drawUniforms) {
-            Q3FogTexCoord st = q3FogTexCoords(worldPos, uniforms, drawUniforms);
-            if (st.s < 0.0 || st.t < (1.0 / 32.0)) {
-                return 0.0;
-            }
-            return saturate(q3FogImageFactor(st.s, st.t));
+        float q3InterpolatedFogFactor(float2 st) {
+            if (st.x < 0.0 || st.y < (1.0 / 32.0)) { return 0.0; }
+            return saturate(q3FogImageFactor(st.x, st.y));
         }
 
         struct EntityVertexIn {
@@ -2437,11 +2432,11 @@ struct MetalView: UIViewRepresentable {
             float4 additiveClampParams;
         };
 
-        float q3EntityFogFactor(float3 worldPos,
+        float2 q3EntityFogTexCoords(float3 worldPos,
                                 constant EntityUniforms &uniforms) {
             if (uniforms.fogColorDistance.w <= 0.0 ||
                 uniforms.fogParams.x <= 0.0) {
-                return 0.0;
+                return float2(-1.0, 0.0);
             }
 
             float s = dot(worldPos - uniforms.cameraPos,
@@ -2464,10 +2459,7 @@ struct MetalView: UIViewRepresentable {
                 }
             }
 
-            if (s < 0.0 || t < (1.0 / 32.0)) {
-                return 0.0;
-            }
-            return saturate(q3FogImageFactor(s, t));
+            return float2(s, t);
         }
 
         struct EntityVertexOut {
@@ -2481,6 +2473,7 @@ struct MetalView: UIViewRepresentable {
             // (sprite / beam / synthetic overlay); the fragment falls
             // back to a flat face normal via dfdx/dfdy of worldPos.
             float3 normal;
+            float2 fogTexCoord;
         };
 
         vertex WorldVertexOut q3_world_vertex(const device WorldVertexIn *vertices [[buffer(0)]],
@@ -2624,9 +2617,8 @@ struct MetalView: UIViewRepresentable {
             out.texCoord = inVertex.texCoord;
             out.lightmapTexCoord = inVertex.lightmapTexCoord;
             out.color = inVertex.color;
-            // Pass through world-space position for the fog distance
-            // calculation in the fragment. Cheap; perspective-correct
-            // interpolation is what we want for linear fog.
+            // World position remains available for lighting and tcGen.
+            // Fog S/T uses native vertex evaluation before interpolation.
             out.worldPos = worldPos;
             // Smooth per-vertex normal. Pre-normalized at parse time
             // (drawVert_t.normal); after rasterizer interpolation the
@@ -2637,6 +2629,8 @@ struct MetalView: UIViewRepresentable {
             // normal. Smooth-interpolated by the rasterizer; consumed by
             // ComputeRGBGen mode 2 in the fragment.
             out.lightingDiffuse = inVertex.lightingDiffuse;
+            Q3FogTexCoord fogST = q3FogTexCoords(worldPos, uniforms, drawUniforms);
+            out.fogTexCoord = float2(fogST.s, fogST.t);
             return out;
         }
 
@@ -2841,45 +2835,9 @@ struct MetalView: UIViewRepresentable {
                 if (drawUniforms.fogColorDistance.w <= 0.0) {
                     return float4(0.0);
                 }
-                float f = q3FogFactor(in.worldPos, uniforms, drawUniforms);
-                if (drawUniforms._pad0 > 0.5) {
-                    /* Explicit fog-volume boundary sheets (xdensegreyfog in
-                     * q3dm4) are authored as the visible fog cap, not as an
-                     * opaque box. Only keep a low floor on faces whose normal
-                     * is parallel to the fog surface plane. Side faces keep
-                     * the stock fog-image value so the volume does not read as
-                     * a hard rectangular wall when the camera moves inside or
-                     * below the pit. */
-                    float capFloor = 0.0;
-                    if (drawUniforms.fogParams.y > 0.5) {
-                        float3 fogN = drawUniforms.fogSurface.xyz;
-                        float fogNLen = length(fogN);
-                        if (fogNLen > 1e-4) {
-                            fogN /= fogNLen;
-                            float3 n = in.worldNormal;
-                            float nLen = length(n);
-                            if (nLen > 1e-4) {
-                                n /= nLen;
-                            } else {
-                                float3 dx = dfdx(in.worldPos);
-                                float3 dy = dfdy(in.worldPos);
-                                n = normalize(cross(dx, dy));
-                            }
-                            float capAlign = abs(dot(n, fogN));
-                            if (capAlign <= 0.70) {
-                                /* Side walls of fog brushes are not visible
-                                 * fog surfaces in stock Q3. Letting the fog
-                                 * image alpha through here produces the hard
-                                 * rectangular grey slab seen in q3dm4. */
-                                f = 0.0;
-                            }
-                            capFloor = (capAlign > 0.70) ? 0.24 : 0.0;
-                        }
-                    } else {
-                        capFloor = 0.18;
-                    }
-                    f = max(f, capFloor);
-                }
+                float f = q3InterpolatedFogFactor(in.fogTexCoord);
+                // Authored fog coordinates determine opacity; a fixed
+                // boundary floor creates a visible slab outside the volume.
                 return float4(q3ResolvedFogColor(drawUniforms.fogColorDistance.xyz), saturate(f));
             }
 
@@ -3215,6 +3173,7 @@ struct MetalView: UIViewRepresentable {
              * silhouette the player sees. */
             out.worldPos = worldPos;
             out.normal = inVertex.normal;
+            out.fogTexCoord = q3EntityFogTexCoords(worldPos, uniforms);
             return out;
         }
 
@@ -3310,12 +3269,9 @@ struct MetalView: UIViewRepresentable {
              * everywhere) while the Q3 shader expects a luminance mask. Recover
              * a soft mask in-shader for additive draws and alpha-tested entity
              * stages so smoke/flares/explosions do not become solid quads. */
-            bool entityAlphaSensitive = (uniforms.forceLuminanceAlpha != 0u ||
-                                         uniforms.suppressDlights != 0u ||
-                                         uniforms.alphaTestThreshold != 0.0 ||
-                                         uniforms.alphaGenMode == 5u ||
-                                         uniforms.alphaGenMode == 6u);
-            if (entityAlphaSensitive && (uniforms.forceLuminanceAlpha != 0u || texel.a >= 0.995)) {
+            // Only explicitly selected replacement textures may reconstruct alpha.
+            // Stock Q3 FX retain their authored masks and additive RGB.
+            if (uniforms.forceLuminanceAlpha != 0u) {
                 float lumAlpha = max(max(texel.r, texel.g), texel.b);
                 float2 centered = alphaMaskUV - 0.5;
                 float radial = saturate(1.0 - dot(centered, centered) * 2.0);
@@ -3373,7 +3329,7 @@ struct MetalView: UIViewRepresentable {
                 if (texel.a < uniforms.alphaTestThreshold) discard_fragment();
             } else if (uniforms.alphaTestThreshold < 0.0) {
                 if (texel.a >= -uniforms.alphaTestThreshold) discard_fragment();
-            } else if (texel.a <= 0.025) {
+            } else if (uniforms.forceLuminanceAlpha != 0u && texel.a <= 0.025) {
                 /* Several RTX/classic alias textures carry transparent UV
                  * padding but their Q3 shader stage has no explicit
                  * alphaFunc. Dropping fully transparent texels here removes
@@ -3489,7 +3445,7 @@ struct MetalView: UIViewRepresentable {
                 base.rgb = applyDlights(base.rgb, in.worldPos, dlightN, dlights);
             }
             if (uniforms.fogColorDistance.w > 0.0) {
-                float f = q3EntityFogFactor(in.worldPos, uniforms);
+                float f = q3InterpolatedFogFactor(in.fogTexCoord);
                 base.rgb = mix(base.rgb, q3ResolvedFogColor(uniforms.fogColorDistance.xyz), f);
             }
             /* PBR Phase 2 — normal-mapped lighting modulation.
@@ -4334,7 +4290,10 @@ struct MetalView: UIViewRepresentable {
             guard count > 0 else { return nil }
             let slot = metal4AllocatorSlot % count
             metal4AllocatorSlot = (slot + 1) % count
-            if let allocator = metal4CommandAllocators[slot] { return allocator }
+            // Reusing an allocator without reset grows its command heaps.
+            // A fresh allocator per effect avoids resetting storage still
+            // consumed by another in-flight Metal4 command buffer. The
+            // bounded recent slots plus the frame completion retain it.
             let desc = MTL4CommandAllocatorDescriptor()
             desc.label = "Q3.MTL4FX.allocator.\(slot)"
             do {
@@ -4356,6 +4315,7 @@ struct MetalView: UIViewRepresentable {
         private func encodeMetal4Effect(effect: String,
                                         device: MTLDevice,
                                         commandBuffer: MTLCommandBuffer,
+                                        resources: [MTLResource],
                                         encode: (MTL4CommandBuffer) -> Void) -> Bool {
             guard !metal4CommandPathFailed else { return false }
             guard ensureMetal4CommandPath(device: device, effect: effect),
@@ -4371,14 +4331,34 @@ struct MetalView: UIViewRepresentable {
                 metal4LogFallback(effect, "mtl4-command-buffer-nil")
                 return false
             }
+            // Metal 4 requires explicit residency for the caller-owned
+            // textures that MetalFX accesses on its separate command queue.
+            let residencyDescriptor = MTLResidencySetDescriptor()
+            residencyDescriptor.label = "Q3.MTL4FX.\(effect).resources"
+            residencyDescriptor.initialCapacity = resources.count
+            guard let residencySet = try? device.makeResidencySet(descriptor: residencyDescriptor) else {
+                metal4LogFallback(effect, "residency-set-nil")
+                return false
+            }
+            for resource in resources { residencySet.addAllocation(resource) }
+            residencySet.commit()
+            // The classic frame waits for this effect before completing.
+            // Retain its allocations and set until both queues have finished.
+            commandBuffer.addCompletedHandler { [resources, residencySet, allocator] _ in
+                withExtendedLifetime((resources, residencySet, allocator)) {}
+            }
             metal4EventValue &+= 1
             let value = metal4EventValue
             effectCommandBuffer.label = "Q3.MTL4FX.\(effect)"
             commandBuffer.encodeSignalEvent(produceEvent, value: value)
             queue.waitForEvent(produceEvent, value: value)
             effectCommandBuffer.beginCommandBuffer(allocator: allocator)
+            effectCommandBuffer.useResidencySet(residencySet)
             encode(effectCommandBuffer)
             effectCommandBuffer.endCommandBuffer()
+            if value % 120 == 0 && ProcessInfo.processInfo.environment["Q3_LOGIC_TRACE"] == "1" {
+                print("[MTL4FX-MEMORY] effect=\(effect) event=\(value) allocatorBytes=\(allocator.allocatedSize()) deviceBytes=\(device.currentAllocatedSize)")
+            }
             queue.commit([effectCommandBuffer])
             queue.signalEvent(consumeEvent, value: value)
             commandBuffer.encodeWaitForEvent(consumeEvent, value: value)
@@ -4528,6 +4508,8 @@ struct MetalView: UIViewRepresentable {
                 guard encodeMetal4Effect(effect: "frame-interpolator",
                                          device: device,
                                          commandBuffer: commandBuffer,
+                                         resources: [currentSceneTexture, previousSceneTexture,
+                                                     depthTexture, motionTexture, outputTexture],
                                          encode: { interpolator4.encode(commandBuffer: $0) }) else {
                     fiLogUnavailable("mtl4-encode-failed")
                     return nil
@@ -4757,6 +4739,9 @@ struct MetalView: UIViewRepresentable {
         private var rtTexturePixelFormat: MTLPixelFormat = .invalid
         private var worldASBuilt = false
         private var worldASGeneration: UInt32 = 0
+        private var rtWorldBulges: [Int: SIMD3<Float>] = [:]
+        private var rtWorldGeometryTime: Float?
+        private var rtPreviousWorldVertexBuffer: MTLBuffer?
         private var rtASVertexBuffer: MTLBuffer?
         private var rtASPositionBuffer: MTLBuffer?
         private var rtASIndexBuffer: MTLBuffer?
@@ -5170,7 +5155,8 @@ struct MetalView: UIViewRepresentable {
                 print("[RT] light set map='\(map)' lights=\(authored.count) sun=\(sun)")
             }
 
-            let authoredSource = rtLightsPrioritizedCPU.isEmpty ? rtLightsCPU : rtLightsPrioritizedCPU
+            let authoredSource: [RTLightGPU] = Q3_RTLights() != 0
+                ? (rtLightsPrioritizedCPU.isEmpty ? rtLightsCPU : rtLightsPrioritizedCPU) : []
             let authoredCount = rtLightsCPU.count
             let maxTransient = 32
             let maxTotal = 128
@@ -5195,21 +5181,21 @@ struct MetalView: UIViewRepresentable {
                     // scale. Preserve radius and map brightness into RT's
                     // local-light intensity domain.
                     let radius = max(Float(l.radius), 1.0)
-                    let intensity = min(max(radius * 0.75, 10.0), 800.0)
+                    let intensity: Float = 1.0
                     lights.append(RTLightGPU(
                         posRadius: SIMD4(Float(l.origin.0), Float(l.origin.1), Float(l.origin.2), radius),
                         colorIntensity: SIMD4(Float(l.color.0), Float(l.color.1), Float(l.color.2), intensity),
-                        dirType: SIMD4(0, 0, -1, 1)))
+                        dirType: SIMD4(0, 0, -1, 2)))
                 }
             }
             rtLightCount = lights.count
             let count = max(lights.count, 1)
             let length = count * MemoryLayout<RTLightGPU>.stride
-            if rtLightBuffer == nil || rtLightBufferCapacity < count {
-                rtLightBuffer = device.makeBuffer(length: length, options: .storageModeShared)
-                rtLightBufferCapacity = count
-                rtLightBuffer?.label = "Q3.RT.lights.\(map)"
-            }
+            // Per-frame light positions/colors must not overwrite a buffer
+            // still sampled by an older in-flight frame.
+            rtLightBuffer = device.makeBuffer(length: length, options: .storageModeShared)
+            rtLightBufferCapacity = count
+            rtLightBuffer?.label = "Q3.RT.lights.\(map)"
             if let buf = rtLightBuffer {
                 let ptr = buf.contents().bindMemory(to: RTLightGPU.self, capacity: count)
                 ptr[0] = RTLightGPU(posRadius: .zero, colorIntensity: .zero,
@@ -6439,6 +6425,25 @@ struct MetalView: UIViewRepresentable {
                 return result;
             }
 
+            float rtGameplayLightWeight(float3 position, float3 normal, float3 lightPosition, float radius) {
+                float r = max(radius, 1.0);
+                float3 toL = lightPosition - position;
+                float dist = length(toL);
+
+                float attenuation = saturate(1.0 - dist / r);
+                attenuation *= attenuation;
+
+                bool normalValid = (length(normal) > 1e-4f);
+                if (normalValid && dist > 1e-4f) {
+                    float3 n = normalize(normal);
+                    float3 lDir = toL / dist;
+                    float facing = clamp(dot(n, lDir), 0.0, 1.0);
+                    attenuation *= (0.15 + 0.85 * facing);
+                }
+
+                return attenuation * 0.65;
+            }
+
             kernel void rtKernel(texture2d<float, access::write> output [[texture(0)]],
                                  texturecube<float> envCube [[texture(1)]],
                                  texture2d<float, access::write> gNormal [[texture(2)]],
@@ -6460,6 +6465,7 @@ struct MetalView: UIViewRepresentable {
                                  const device uint *entityIndices [[buffer(10)]],
                                  const device RTEntityVertex *entityVertices [[buffer(11)]],
                                  const device RTEntityPrimitiveMaterial *entityPrimitiveMaterials [[buffer(12)]],
+                                 const device RTWorldVertex *previousWorldVertices [[buffer(13)]],
                                  uint2 tid [[thread_position_in_grid]]) {
                 if (tid.x >= output.get_width() || tid.y >= output.get_height()) return;
                 float2 curUv = (float2(tid) + 0.5) / float2(output.get_width(), output.get_height());
@@ -6590,7 +6596,10 @@ struct MetalView: UIViewRepresentable {
                         float2 lm1 = vertices[i1].lightmapTexCoord;
                         float2 lm2 = vertices[i2].lightmapTexCoord;
                         float3 hitPos = uniforms.cameraPos.xyz + rayDir * hit.distance;
-                        float4 pc = uniforms.prevViewProjection * float4(hitPos, 1.0);
+                        float3 previousHit = float3(previousWorldVertices[i0].position) * w +
+                                             float3(previousWorldVertices[i1].position) * bary.x +
+                                             float3(previousWorldVertices[i2].position) * bary.y;
+                        float4 pc = uniforms.prevViewProjection * float4(previousHit, 1.0);
                         float2 pndc = pc.xy / max(pc.w, 1.0e-6);
                         float2 pUv = float2(pndc.x, -pndc.y) * 0.5 + 0.5;
                         // Stage 17 MV convention: UV-space, cur-prev,
@@ -6851,6 +6860,7 @@ struct MetalView: UIViewRepresentable {
                                                     uint bestLocal = 0xFFFFFFFFu;
                                                     float bestLocalScore = 0.0;
                                                     for (uint li = firstLocalGI; li < lightCountGI; ++li) {
+                                        if (rtLights[li].dirType.w > 1.5) { continue; }
                                                         float3 toL = rtLights[li].posRadius.xyz - bHitPos;
                                                         float d2 = max(dot(toL, toL), 1.0);
                                                         float ndl = max(dot(bN, toL * rsqrt(d2)), 0.0);
@@ -6998,6 +7008,7 @@ struct MetalView: UIViewRepresentable {
                                                                         uint bestSecond = 0xFFFFFFFFu;
                                                                         float bestSecondScore = 0.0;
                                                                         for (uint sli = firstLocalSecond; sli < lightCountSecond; ++sli) {
+                                        if (rtLights[sli].dirType.w > 1.5) { continue; }
                                                                             float3 stoL = rtLights[sli].posRadius.xyz - sHitPos;
                                                                             float sd2 = max(dot(stoL, stoL), 1.0);
                                                                             float sndl = max(dot(sN, stoL * rsqrt(sd2)), 0.0);
@@ -7166,6 +7177,7 @@ struct MetalView: UIViewRepresentable {
                                     uint bestIdx2 = 0xFFFFFFFFu, bestIdx3 = 0xFFFFFFFFu;
                                     float bestS0 = 0.0, bestS1 = 0.0, bestS2 = 0.0, bestS3 = 0.0;
                                     for (uint li = firstLocal; li < lightCount; ++li) {
+                                        if (rtLights[li].dirType.w > 1.5) { continue; }
                                         float3 toL = rtLights[li].posRadius.xyz - hitPos;
                                         float d2 = max(dot(toL, toL), 1.0);
                                         float ndl = max(dot(N, toL * rsqrt(d2)), 0.0);
@@ -7219,6 +7231,27 @@ struct MetalView: UIViewRepresentable {
                                                                      uniforms.rtGIParams.z,
                                                                      uniforms.rtGIParams.w);
                                 color += directTerm;
+                                // Native gameplay dlights use a finite influence volume,
+                                // not a large physical emitter radius. Keep their color
+                                // separate from authored-light top-K and dark chroma blending.
+                                float3 gameplay = float3(0.0);
+                                for (uint li = 0; li < lightCount; ++li) {
+                                    RTLight light = rtLights[li];
+                                    if (light.dirType.w < 1.5) { continue; }
+                                    float weight = rtGameplayLightWeight(hitPos, N, light.posRadius.xyz, light.posRadius.w);
+                                    if (weight <= 0.0001) { continue; }
+                                    float3 delta = light.posRadius.xyz - hitPos;
+                                    float distance = length(delta);
+                                    bool blocked = false;
+                                    if (distance > 1.0) {
+                                        ray shadowRay(hitPos + N * 0.75, delta / distance, 0.1, max(distance - 1.0, 0.2));
+                                        auto shadowHit = i.intersect(shadowRay, worldAS);
+                                        blocked = shadowHit.type == intersection_type::triangle &&
+                                                  primitiveMaterials[shadowHit.primitive_id].materialFlags.x == 0;
+                                    }
+                                    if (!blocked) { gameplay += light.colorIntensity.rgb * weight; }
+                                }
+                                color += min(gameplay, float3(0.85)) * lightScale * uniforms.rtPBRGlobal.w;
                             }
                             if (emissiveNEEEnabled) {
                                 uint emissiveCount = min((uint)max(uniforms.rtBudgetParams.y, 0.0), 64u);
@@ -8731,6 +8764,74 @@ struct MetalView: UIViewRepresentable {
             return assignedTriangles > 0 ? buffer : nil
         }
 
+        // Refit inputs are immutable per frame: command buffers retain both the
+        // current and previous attribute buffers until GPU consumers finish.
+        private func deformedRTWorldVertices(device: MTLDevice, time: Float) -> MTLBuffer? {
+            guard let source = worldVertexBuffer else { return nil }
+            guard !rtWorldBulges.isEmpty else { return source }
+            guard let buffer = device.makeBuffer(bytes: source.contents(), length: source.length,
+                                                  options: .storageModeShared) else { return nil }
+            buffer.label = "Q3.RT.worldVertices.deformed"
+            let vertices = buffer.contents().bindMemory(to: GPUWorldVertex.self,
+                                                         capacity: source.length / MemoryLayout<GPUWorldVertex>.stride)
+            for (index, bulge) in rtWorldBulges {
+                let normal = vertices[index].normal
+                let normalLength = simd_length(normal)
+                if normalLength > 1e-4 {
+                    let phase = vertices[index].texCoord.x * bulge.x + time * bulge.z
+                    vertices[index].position += (normal / normalLength) * (sin(phase) * bulge.y)
+                }
+            }
+            return buffer
+        }
+
+        private func rtWorldGeometryDescriptor(vertices: MTLBuffer, indices: MTLBuffer,
+                                                indexCount: Int) -> MTLPrimitiveAccelerationStructureDescriptor {
+            let geometry = MTLAccelerationStructureTriangleGeometryDescriptor()
+            geometry.vertexBuffer = vertices
+            geometry.vertexStride = MemoryLayout<GPUWorldVertex>.stride
+            geometry.vertexFormat = .float3
+            geometry.indexBuffer = indices
+            geometry.indexType = .uint32
+            geometry.triangleCount = indexCount / 3
+            geometry.opaque = true
+            let descriptor = MTLPrimitiveAccelerationStructureDescriptor()
+            descriptor.geometryDescriptors = [geometry]
+            if !rtWorldBulges.isEmpty { descriptor.usage = .refit }
+            return descriptor
+        }
+
+        private func refitRTWorldGeometry(device: MTLDevice, commandBuffer: MTLCommandBuffer,
+                                            accelerationStructure: MTLAccelerationStructure) -> Bool {
+            guard !rtWorldBulges.isEmpty else { return true }
+            let time = Q3MetalRenderer_GetFrameSnapshot()?.pointee.shaderTime ?? 0
+            guard rtWorldGeometryTime != time else {
+                // A repeated snapshot (including a frozen demo) has no new
+                // deformation motion relative to the last rendered frame.
+                rtPreviousWorldVertexBuffer = rtASVertexBuffer
+                return true
+            }
+            guard let indices = rtASIndexBuffer,
+                  let vertices = deformedRTWorldVertices(device: device, time: time) else { return false }
+            let descriptor = rtWorldGeometryDescriptor(vertices: vertices, indices: indices,
+                                                        indexCount: Int(Q3MetalRenderer_GetWorldIndexCount()))
+            let sizes = device.accelerationStructureSizes(descriptor: descriptor)
+            guard let scratch = device.makeBuffer(length: max(sizes.refitScratchBufferSize, 1),
+                                                   options: .storageModePrivate),
+                  let encoder = commandBuffer.makeAccelerationStructureCommandEncoder() else { return false }
+            scratch.label = "Q3.RT.worldAS.refitScratch"
+            encoder.label = "Q3.RT.refitWorldBulge"
+            encoder.refit(sourceAccelerationStructure: accelerationStructure,
+                          descriptor: descriptor,
+                          destinationAccelerationStructure: accelerationStructure,
+                          scratchBuffer: scratch, scratchBufferOffset: 0, options: .vertexData)
+            encoder.endEncoding()
+            rtPreviousWorldVertexBuffer = rtASVertexBuffer
+            rtASVertexBuffer = vertices
+            rtWorldGeometryTime = time
+            return true
+        }
+
         @MainActor
         private func buildWorldAccelerationStructure(device: MTLDevice) -> MTLAccelerationStructure? {
             guard device.supportsRaytracing, Q3MetalRenderer_IsWorldLoaded() != 0 else { return nil }
@@ -8748,37 +8849,53 @@ struct MetalView: UIViewRepresentable {
             }
             guard vertexCount > 0, indexCount >= 3, let src = Q3MetalRenderer_GetWorldVertices() else { return nil }
 
-            let verts = UnsafeBufferPointer(start: src, count: vertexCount)
-            var compactPositions = [Float]()
-            compactPositions.reserveCapacity(vertexCount * 3)
-            for v in verts {
-                compactPositions.append(v.position.0)
-                compactPositions.append(v.position.1)
-                compactPositions.append(v.position.2)
+            // Fog-only carriers shade raster depth; they are not opaque surfaces.
+            // Keep triangle numbering stable for material lookups by degenerating
+            // only carriers with no non-fog surface sharing their index range.
+            guard let sourceIndices = Q3MetalRenderer_GetWorldIndices(),
+                  let allDraws = Q3MetalRenderer_GetWorldAllDrawCommands() else { return nil }
+            _ = src
+            var rayIndices = Array(UnsafeBufferPointer(start: sourceIndices, count: indexCount))
+            var surfaceOwned = [Bool](repeating: false, count: indexCount / 3)
+            var fogOwned = surfaceOwned
+            rtWorldBulges.removeAll(keepingCapacity: true)
+            let fogOnly = UInt32(Q3_METAL_WORLD_DRAWFLAG_FOG_ONLY)
+            for draw in UnsafeBufferPointer(start: allDraws, count: Int(Q3MetalRenderer_GetWorldAllDrawCommandCount())) {
+                let first = Int(draw.firstIndex)
+                let end = min(first + Int(draw.indexCount), indexCount)
+                guard first >= 0, first < end else { continue }
+                let isFog = (draw.flags & fogOnly) != 0
+                for tri in (first / 3)..<(end / 3) {
+                    if isFog { fogOwned[tri] = true } else { surfaceOwned[tri] = true }
+                }
+                guard !isFog else { continue }
+                for stageIndex in 0..<min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES)) {
+                    let stage = Self.worldStage(draw, stageIndex)
+                    guard stage.deformBulgeWidth != 0 || stage.deformBulgeHeight != 0 else { continue }
+                    let bulge = SIMD3<Float>(stage.deformBulgeWidth, stage.deformBulgeHeight, stage.deformBulgeSpeed)
+                    for offset in first..<end {
+                        let vertex = Int(sourceIndices[offset])
+                        if vertex < vertexCount { rtWorldBulges[vertex] = bulge }
+                    }
+                    break
+                }
             }
-            guard let positionBuffer = device.makeBuffer(bytes: compactPositions,
-                                                         length: compactPositions.count * MemoryLayout<Float>.stride,
-                                                         options: .storageModeShared) else {
-                print("[RT] AS compact position buffer allocation failed")
-                return nil
+            var removed = 0
+            for tri in 0..<(indexCount / 3) where fogOwned[tri] && !surfaceOwned[tri] {
+                rayIndices[tri * 3 + 1] = rayIndices[tri * 3]
+                rayIndices[tri * 3 + 2] = rayIndices[tri * 3]
+                removed += 1
             }
-            positionBuffer.label = "Q3.RT.positions.compact"
-            rtASPositionBuffer = positionBuffer
-
+            guard let rayIndexBuffer = device.makeBuffer(bytes: rayIndices,
+                                                          length: indexCount * MemoryLayout<UInt32>.stride,
+                                                          options: .storageModeShared),
+                  let vertices = deformedRTWorldVertices(device: device, time: snapshot.shaderTime) else { return nil }
+            rayIndexBuffer.label = "Q3.RT.worldIndices.withoutFogCarriers"
+            rtWorldGeometryTime = snapshot.shaderTime
+            rtPreviousWorldVertexBuffer = vertices
+            print("[RT-GEOMETRY] fogCarrierTriangles=\(removed) bulgeVertices=\(rtWorldBulges.count) time=\(snapshot.shaderTime)")
             buildRTPrimitiveMaterials(device: device, primitiveCount: indexCount / 3)
-
-            let geomDesc = MTLAccelerationStructureTriangleGeometryDescriptor()
-            geomDesc.vertexBuffer = positionBuffer
-            geomDesc.vertexBufferOffset = 0
-            geomDesc.vertexStride = 3 * MemoryLayout<Float>.stride
-            geomDesc.vertexFormat = .float3
-            geomDesc.indexBuffer = ib
-            geomDesc.indexBufferOffset = 0
-            geomDesc.indexType = .uint32
-            geomDesc.triangleCount = indexCount / 3
-            geomDesc.opaque = true
-            let asDesc = MTLPrimitiveAccelerationStructureDescriptor()
-            asDesc.geometryDescriptors = [geomDesc]
+            let asDesc = rtWorldGeometryDescriptor(vertices: vertices, indices: rayIndexBuffer, indexCount: indexCount)
             let sizes = device.accelerationStructureSizes(descriptor: asDesc)
             guard let scratch = device.makeBuffer(length: sizes.buildScratchBufferSize, options: .storageModePrivate),
                   let accel = device.makeAccelerationStructure(size: sizes.accelerationStructureSize),
@@ -8794,13 +8911,9 @@ struct MetalView: UIViewRepresentable {
             enc.endEncoding()
             cb.commit(); cb.waitUntilCompleted()
             if let err = cb.error { print("[RT] AS build failed: \(err)"); return nil }
-            /* The compact position buffer is an acceleration-structure build
-             * input only: the trace passes bind the full world vertex/index
-             * buffers for attribute reads, never this one. Drop the long-lived
-             * reference now that the build completed so it stops staying
-             * resident for the whole map lifetime. */
             rtASPositionBuffer = nil
-            rtASVertexBuffer = worldVertexBuffer; rtASIndexBuffer = ib
+            rtASVertexBuffer = vertices
+            rtASIndexBuffer = rayIndexBuffer
             rtLastMaterialSignature = rtWorldMaterialSignature(worldGeneration: snapshot.worldGeneration)
             rtPrimitiveMaterialBufferCache.removeAll(keepingCapacity: true)
             rtEmissiveLightCache.removeAll(keepingCapacity: true)
@@ -9457,6 +9570,7 @@ struct MetalView: UIViewRepresentable {
                 return nil
             }
             guard worldASBuilt, let worldAS = worldAccelerationStructure else { return nil }
+            guard refitRTWorldGeometry(device: device, commandBuffer: commandBuffer, accelerationStructure: worldAS) else { return nil }
             let rtNow = Float(CACurrentMediaTime() - frameTimeOrigin)
             if rtNow - rtLastMaterialRefreshTime >= (1.0 / 30.0) {
                 let sig = rtWorldMaterialSignature(worldGeneration: worldGeneration)
@@ -9699,7 +9813,7 @@ struct MetalView: UIViewRepresentable {
             // the kernel never reads an unbound/empty buffer(6).
             let lightInfo = ensureRTLightBuffer(device: device)
             uniforms.rtLightParams = SIMD4<Float>(
-                (Q3_RTLights() != 0 && lightInfo.buffer != nil) ? Float(lightInfo.count) : 0,
+                lightInfo.buffer != nil ? Float(lightInfo.count) : 0,
                 Q3_RTLightScale(),
                 Q3_RTReflections() != 0 ? 1.0 : 0.0,
                 Q3_RTReflRoughnessMax())
@@ -9824,13 +9938,21 @@ struct MetalView: UIViewRepresentable {
                     // PBR sidecars parallel to albedo. sidecar[i] resolves from
                     // the SAME handle as albedo[i].
                     let flatNormal = pbrFlatNormalDefault() ?? fallbackTex
+                    // Match the kernel's normal-map sampling gate. Disabled
+                    // normals need no sidecar allocation; enabling the cvar
+                    // later still resolves the texture through the same cache.
+                    let rtNormalMapsActive = uniforms.rtPBRGlobal.x > 0
                     for i in 0..<rtMaxAlbedoSlots {
                         let h = rtAlbedoHandles[i]
-                        rtTexResident.append((rtClassicLayerHandles.contains(h) ? nil : pbrNormalTexture(for: h, allowGenericFallback: false)) ?? flatNormal)
+                        let normal = rtNormalMapsActive && !rtClassicLayerHandles.contains(h)
+                            ? pbrNormalTexture(for: h, allowGenericFallback: false) : nil
+                        rtTexResident.append(normal ?? flatNormal)
                     }
-                    for i in 0..<rtMaxAlbedoSlots {
-                        let h = rtAlbedoHandles[i]
-                        rtTexResident.append(pbrHeightTexture(for: h) ?? fallbackTex)
+                    // Height slots are reserved in RTTexTable but the RT
+                    // kernel never samples them. Keep its argument layout
+                    // populated without loading unused height-map sidecars.
+                    for _ in 0..<rtMaxAlbedoSlots {
+                        rtTexResident.append(fallbackTex)
                     }
                     let emissiveDefault = pbrEmissiveDefault() ?? fallbackTex
                     let rtEmissiveMapActive = Q3_RTEmissive() > 0
@@ -9908,6 +10030,7 @@ struct MetalView: UIViewRepresentable {
                 enc.setBuffer(entityIndexBufferForRT ?? rtASIndexBuffer, offset: 0, index: 10)
                 enc.setBuffer(entityVertexBufferForRT ?? rtASVertexBuffer, offset: 0, index: 11)
                 enc.setBuffer(entityPrimitiveMaterialBufferForRT ?? primitiveMaterialBuffer, offset: 0, index: 12)
+                enc.setBuffer(forcePrevCurrentForMV ? rtASVertexBuffer : (rtPreviousWorldVertexBuffer ?? rtASVertexBuffer), offset: 0, index: 13)
                 enc.dispatchThreadgroups(traceGroups, threadsPerThreadgroup: tg)
                 if let rtDenoiseFence {
                     enc.updateFence(rtDenoiseFence)
@@ -9916,8 +10039,9 @@ struct MetalView: UIViewRepresentable {
             }
             if auditCaptureActive, let path = ProcessInfo.processInfo.environment["Q3_GPU_TRACE_PATH"] {
                 // Read actual GPU outputs, before denoising, alongside exact material inputs.
-                for (name, source) in [("rawRT", rtTex), ("albedo", gAlbedoTex)] {
-                    let rowBytes = ((source.width * 8 + 255) / 256) * 256
+                for (name, source) in [("rawRT", rtTex), ("albedo", gAlbedoTex), ("motion", motionTex)] {
+                    let bytesPerPixel = source.pixelFormat == .rg16Float ? 4 : 8
+                    let rowBytes = ((source.width * bytesPerPixel + 255) / 256) * 256
                     let byteCount = rowBytes * source.height
                     if let readback = device.makeBuffer(length: byteCount, options: .storageModeShared),
                        let blit = commandBuffer.makeBlitCommandEncoder() {
@@ -9929,7 +10053,7 @@ struct MetalView: UIViewRepresentable {
                                   destinationBytesPerImage: byteCount)
                         blit.endEncoding()
                         let meta: [String: Any] = ["width": source.width, "height": source.height,
-                                                  "rowBytes": rowBytes, "format": "rgba16Float",
+                                                  "rowBytes": rowBytes, "format": source.pixelFormat == .rg16Float ? "rg16Float" : "rgba16Float",
                                                   "sceneTime": uniforms.sceneAnimationTime.x]
                         let metadata = try? JSONSerialization.data(withJSONObject: meta, options: .sortedKeys)
                         commandBuffer.addCompletedHandler { cb in
@@ -9988,6 +10112,9 @@ struct MetalView: UIViewRepresentable {
                 rtDenoiseMTL4Encoded = encodeMetal4Effect(effect: "denoiser",
                                                           device: device,
                                                           commandBuffer: commandBuffer,
+                                                          resources: [rtTex, gDepthTex, gNormalTex,
+                                                                      gAlbedoTex, gRoughnessTex,
+                                                                      denoiseMaskTex, motionTex, denoisedTex],
                                                           encode: { scaler4.encode(commandBuffer: $0) })
                 if rtDenoiseMTL4Encoded {
                     rtColorForBlend = denoisedTex
@@ -13430,6 +13557,132 @@ struct MetalView: UIViewRepresentable {
         private var entityVertexBufferCapacities: [Int] = Array(repeating: 0, count: Coordinator.maxInflightFrames)
         private var entityIndexBuffers: [MTLBuffer?] = Array(repeating: nil, count: Coordinator.maxInflightFrames)
         private var entityIndexBufferCapacities: [Int] = Array(repeating: 0, count: Coordinator.maxInflightFrames)
+        private var auditEntityDrawRecords: [[String: Any]] = []
+        private func auditSceneInputs(snapshot: Q3MetalFrameSnapshot, path: String) {
+            let outPath = path + ".scene.json"
+
+            var root: [String: Any] = [:]
+            root["frameNumber"] = Int(snapshot.frameNumber)
+            root["shaderTime"] = snapshot.shaderTime
+            root["description"] = "Scene submissions plus actual encoded entity draws; worldCommands are not draw-call proof"
+            root["encodedEntityDraws"] = auditEntityDrawRecords
+            root["bulgeVertices"] = rtWorldBulges.count
+            root["worldVertexStride"] = MemoryLayout<GPUWorldVertex>.stride
+            for (name, buffer) in [("worldVertices", rtASVertexBuffer), ("previousWorldVertices", rtPreviousWorldVertexBuffer), ("worldIndices", rtASIndexBuffer)] {
+                if let buffer { try? Data(bytes: buffer.contents(), count: buffer.length).write(to: URL(fileURLWithPath: path + "." + name + ".bin")) }
+            }
+            var textures: [[String: Any]] = []
+            let handles = Set(auditEntityDrawRecords.compactMap { $0["textureHandle"] as? Int })
+            for handle in handles.sorted() {
+                var info = Q3MetalTextureInfo()
+                if Q3MetalRenderer_GetTextureInfo(UInt32(handle), &info) != 0, let bytes = info.rgbaBytes {
+                    let count = Int(info.width) * Int(info.height) * 4
+                    guard count > 0, count <= 4194304 else { continue }
+                    let name = Q3MetalRenderer_GetTextureName(UInt32(handle)).map { String(cString: $0) } ?? "unknown"
+                    try? Data(bytes: bytes, count: count).write(to: URL(fileURLWithPath: path + ".texture-\(handle).rgba"))
+                    textures.append(["handle": handle, "name": name, "width": Int(info.width), "height": Int(info.height)])
+                }
+            }
+            root["sourceTextures"] = textures
+
+
+            // World draw commands
+            var worldCmds: [[String: Any]] = []
+            if let rawWorld = Q3MetalRenderer_GetWorldDrawCommands() {
+                for i in 0..<Int(snapshot.worldCommandCount) {
+                    let draw = rawWorld[i]
+                    var cmd: [String: Any] = [:]
+                    cmd["firstIndex"] = Int(draw.firstIndex)
+                    cmd["indexCount"] = Int(draw.indexCount)
+                    cmd["flags"] = Int(draw.flags)
+                    cmd["stageCount"] = Int(draw.stageCount)
+                    cmd["fogIndex"] = Int(draw.fogIndex)
+
+                    var stages: [[String: Any]] = []
+                    let stageCount = min(Int(draw.stageCount), Int(Q3_METAL_MAX_STAGES))
+                    for s in 0..<stageCount {
+                        let stg = Self.worldStage(draw, s)
+                        var stageDict: [String: Any] = [:]
+                        stageDict["textureHandle"] = Int(stg.textureHandle)
+                        stageDict["textureName"] = textureNameForLog(stg.textureHandle)
+                        stageDict["blendMode"] = Int(stg.blendMode)
+                        stageDict["rgbGen"] = Int(stg.rgbGen)
+                        stageDict["alphaGen"] = Int(stg.alphaGen)
+                        stageDict["tcGen"] = Int(stg.tcGen)
+                        stageDict["useLightmap"] = stg.useLightmap != 0
+                        stageDict["deformWaveFunc"] = Int(stg.deformWaveFunc)
+                        stageDict["deformMoveFunc"] = Int(stg.deformMoveFunc)
+                        stageDict["deformWaveAmp"] = stg.deformWaveAmp
+                        stageDict["deformBulgeWidth"] = stg.deformBulgeWidth
+                        stageDict["deformBulgeHeight"] = stg.deformBulgeHeight
+                        stageDict["deformBulgeSpeed"] = stg.deformBulgeSpeed
+                        stages.append(stageDict)
+                    }
+                    cmd["stages"] = stages
+                    worldCmds.append(cmd)
+                }
+            }
+            root["worldCommands"] = worldCmds
+
+            // Entity draw commands
+            var entityCmds: [[String: Any]] = []
+            if let rawEntity = Q3MetalRenderer_GetEntityDrawCommands() {
+                for i in 0..<Int(snapshot.entityCommandCount) {
+                    let ent = rawEntity[i]
+                    var cmd: [String: Any] = [:]
+                    cmd["firstIndex"] = Int(ent.firstIndex)
+                    cmd["indexCount"] = Int(ent.indexCount)
+                    cmd["textureHandle"] = Int(ent.textureHandle)
+                    cmd["textureName"] = textureNameForLog(ent.textureHandle)
+                    cmd["flags"] = Int(ent.flags)
+                    cmd["fogIndex"] = Int(ent.fogIndex)
+                    cmd["shaderTime"] = ent.shaderTime
+
+                    var colorArr: [Float] = []
+                    colorArr.append(ent.entityColor.0)
+                    colorArr.append(ent.entityColor.1)
+                    colorArr.append(ent.entityColor.2)
+                    colorArr.append(ent.entityColor.3)
+                    cmd["entityColor"] = colorArr
+
+                    entityCmds.append(cmd)
+                }
+            }
+            root["entityCommands"] = entityCmds
+
+            // Lights
+            var lights: [[String: Any]] = []
+            if let rawLights = Q3MetalRenderer_GetLights() {
+                for i in 0..<Int(snapshot.lightCount) {
+                    let lt = rawLights[i]
+                    var lightDict: [String: Any] = [:]
+
+                    var originArr: [Float] = []
+                    originArr.append(lt.origin.0)
+                    originArr.append(lt.origin.1)
+                    originArr.append(lt.origin.2)
+                    lightDict["origin"] = originArr
+
+                    lightDict["radius"] = lt.radius
+
+                    var colorArr: [Float] = []
+                    colorArr.append(lt.color.0)
+                    colorArr.append(lt.color.1)
+                    colorArr.append(lt.color.2)
+                    lightDict["color"] = colorArr
+
+                    lights.append(lightDict)
+                }
+            }
+            root["lights"] = lights
+
+            do {
+                let data = try JSONSerialization.data(withJSONObject: root, options: [])
+                try data.write(to: URL(fileURLWithPath: outPath), options: .atomic)
+            } catch {
+                print("[Q3-AUDIT-ERROR] \(error)")
+            }
+        }
         private var auditCaptureActive = false
         private var auditCaptureAttempted = false
         private func beginAuditCapture(queue: MTLCommandQueue, path: String) -> Bool {
@@ -13693,7 +13946,9 @@ struct MetalView: UIViewRepresentable {
                         let ec = draw.entityColor
                         entityUniforms.entityColor = SIMD4<Float>(ec.0, ec.1, ec.2, ec.3)
                         entityUniforms.timeSeconds = draw.shaderTime
-                        entityUniforms.suppressDlights = (drawPass == 3 || drawPass == 5) ? 1 : 0
+                        // Decals/filter stages consume their authored RGB. Adding a
+                        // light to a black subtractive texel darkens the entire carrier.
+                        entityUniforms.suppressDlights = (drawPass != 0 || (draw.flags & scenePolyBit) != 0) ? 1 : 0
                         /* Per TASK PART 3: no rgbGen/alphaGen override for
                          * scene polys — the shader's resolved genMode
                          * flows through verbatim from packEntityRgbGen. */
@@ -13788,9 +14043,10 @@ struct MetalView: UIViewRepresentable {
                         // the original pak0 JPG-decoded texture. Falls
                         // back to the original on miss / DDS-load fail.
                         let q3Name = Q3MetalRenderer_GetTextureName(draw.textureHandle).map { String(cString: $0) } ?? "unknown"
-                        entityUniforms.forceLuminanceAlpha = Self.textureAlphaSynthesisMode(q3Name)
+                        let replacementAlphaMode = Self.textureAlphaSynthesisMode(q3Name)
+                        entityUniforms.forceLuminanceAlpha = 0
                         let preferClassicFX = isEntityAdditive || isEntityAdditiveFull || isEntityAlpha || isScenePoly ||
-                                              entityUniforms.forceLuminanceAlpha != 0 ||
+                                              replacementAlphaMode != 0 ||
                                               shouldPreferClassicTextureForAlphaFX(q3Name, isEntity: true)
                         // Entity-side FX-stage sidecar promotion experiment
                         // reverted 2026-06-12: enabling the world-path
@@ -13809,6 +14065,7 @@ struct MetalView: UIViewRepresentable {
                         // dict probe, or (b) the per-frame texture cache promoted
                         // to a flat array keyed by handle. Deferred.
                         let pbrTex = preferClassicFX ? nil : pbrAlbedoTexture(for: draw.textureHandle)
+                        entityUniforms.forceLuminanceAlpha = pbrTex != nil ? replacementAlphaMode : 0
                         // 2026-06-10: emissiveParams must be written BEFORE the
                         // setVertexBytes/setFragmentBytes upload, not after.
                         // Previously assigned ~98 lines below, which meant the
@@ -13818,7 +14075,7 @@ struct MetalView: UIViewRepresentable {
                         // material. Visible as flat/dark viewmodels with no
                         // emissive glow even when the material had an
                         // emissive map bound at fragment slot 6.
-                        entityUniforms.emissiveParams = emissiveParamsForPBRMaterial(handle: draw.textureHandle)
+                        entityUniforms.emissiveParams = preferClassicFX ? SIMD4<Float>(1, 1, 1, 0) : emissiveParamsForPBRMaterial(handle: draw.textureHandle)
                         // 2026-06-10: viewmodel-only base-color floor. .x is
                         // the floor strength from `r_pbr_viewmodel_floor`
                         // (CVAR_ARCHIVE, default 0). .y is the gate flag
@@ -13826,7 +14083,9 @@ struct MetalView: UIViewRepresentable {
                         // the MSL `if (.y > 0.5)` runs only on first-person
                         // weapons. World pickups, scene polys, and HUD heads
                         // get (0,0,0,0) and skip the floor entirely.
-                        let vmFloor: Float = pbrMaterialsEnabled ? Q3_PBRViewmodelFloor() : 0
+                        // Authored FX use black as the additive identity; a readability floor
+                        // would reveal their polygon carriers even with the stock texture.
+                        let vmFloor: Float = (pbrMaterialsEnabled && !preferClassicFX) ? Q3_PBRViewmodelFloor() : 0
                         // P0.2: .z doubles as the r_rt_debug_entity_mask
                         // flag — q3_entity_fragment returns solid white
                         // when it is > 0.5 (after alpha-test discards), to
@@ -13842,7 +14101,7 @@ struct MetalView: UIViewRepresentable {
                             // pickups) so full-metal items (RL/plasma/ammo/health,
                             // metallic=1.0) don't go near-invisible under the dark
                             // IBL cube. Viewmodels use .x instead.
-                            (wantsDepthHack || !pbrMaterialsEnabled) ? 0.0 : Q3_PBREntityFloor())
+                            (wantsDepthHack || !pbrMaterialsEnabled || preferClassicFX) ? 0.0 : Q3_PBREntityFloor())
                         if wantsDepthHack && !loggedViewmodelFloorOnce && vmFloor > 0.0 {
                             loggedViewmodelFloorOnce = true
                             pbrLog("[Q3-PBR-ENTITY] viewmodel floor enabled strength=\(String(format: "%.3f", vmFloor))")
@@ -14023,6 +14282,33 @@ struct MetalView: UIViewRepresentable {
                             encoder.setFragmentSamplerState(wantClamp ? uiSamplerState : worldSamplerState, index: 0)
                             entityLastSamplerWasClamp = wantClamp
                         }
+                        if auditCaptureActive {
+                            var record: [String: Any] = [:]
+                            record["pass"] = entityPass
+                            record["textureHandle"] = Int(draw.textureHandle)
+                            record["textureName"] = q3Name
+                            record["boundTexture"] = entityColorTexture.label ?? "unlabeled"
+                            record["textureSize"] = [entityColorTexture.width, entityColorTexture.height]
+                            record["firstIndex"] = Int(draw.firstIndex)
+                            record["indexCount"] = Int(draw.indexCount)
+                            record["flags"] = Int(draw.flags)
+                            record["fogIndex"] = Int(draw.fogIndex)
+                            record["time"] = entityUniforms.timeSeconds
+                            record["rgbGen"] = Int(entityUniforms.rgbGenMode)
+                            record["alphaGen"] = Int(entityUniforms.alphaGenMode)
+                            record["forceLuminanceAlpha"] = Int(entityUniforms.forceLuminanceAlpha)
+                            record["suppressDlights"] = Int(entityUniforms.suppressDlights)
+                            record["rgbWaveFunc"] = Int(entityUniforms.rgbWaveFunc)
+                            let w = entityUniforms.rgbGenWaveParams
+                            record["rgbWaveParams"] = [w.x, w.y, w.z, w.w]
+                            record["classicFX"] = preferClassicFX
+                            let floorParams = entityUniforms.viewmodelParams
+                            record["viewmodelParams"] = [floorParams.x, floorParams.y, floorParams.z, floorParams.w]
+                            record["clampSampler"] = wantClamp
+                            record["additiveMax"] = entityUniforms.additiveClampParams.x
+                            auditEntityDrawRecords.append(record)
+                            encoder.pushDebugGroup("Q3.audit.entity pass=\(entityPass) tex=\(q3Name)")
+                        }
                         encoder.drawIndexedPrimitives(
                             type: .triangle,
                             indexCount: Int(draw.indexCount),
@@ -14030,6 +14316,7 @@ struct MetalView: UIViewRepresentable {
                             indexBuffer: entityIndexBuffer,
                             indexBufferOffset: Int(draw.firstIndex) * MemoryLayout<UInt32>.stride
                         )
+                        if auditCaptureActive { encoder.popDebugGroup() }
                     }
                     } // end entityPass loop
                     setEntityDepthRangeHack(false)
@@ -14287,6 +14574,7 @@ struct MetalView: UIViewRepresentable {
                Q3MetalRenderer_IsWorldLoaded() != 0,
                let queue = commandQueue, let path = auditEnv["Q3_GPU_TRACE_PATH"] {
                 auditCaptureAttempted = true
+                auditEntityDrawRecords.removeAll(keepingCapacity: true)
                 auditCaptureActive = beginAuditCapture(queue: queue, path: path)
             }
             let ownsAuditCapture = auditCaptureActive
@@ -16492,6 +16780,7 @@ struct MetalView: UIViewRepresentable {
             commandBuffer.commit()
             if auditCaptureActive {
                 commandBuffer.waitUntilCompleted()
+                if let path = auditEnv["Q3_GPU_TRACE_PATH"] { auditSceneInputs(snapshot: snapshot, path: path) }
                 print("[Q3-GPU-CAPTURE-STATUS] frame=\(debugFrameCounter) status=\(commandBuffer.status.rawValue) error=\(String(describing: commandBuffer.error))")
             }
 
@@ -16959,6 +17248,10 @@ struct MetalView: UIViewRepresentable {
             Self.configureBlend(worldAlphaPipelineDescriptor.colorAttachments[0],
                                 src: Q3GLBlendFactor.srcAlpha.rawValue,
                                 dst: Q3GLBlendFactor.oneMinusSrcAlpha.rawValue)
+            // Fog and translucent world layers use source-over coverage,
+            // independent of their RGB source-alpha weighting. Squaring the
+            // source alpha punched the opaque scene down to 0.75 coverage.
+            worldAlphaPipelineDescriptor.colorAttachments[0].sourceAlphaBlendFactor = .one
             worldAlphaPipelineDescriptor.label = "Q3.world.alpha"
             do {
                 worldAlphaPipelineState = try makeRenderPipelineState(device: device, descriptor: worldAlphaPipelineDescriptor)
@@ -17130,7 +17423,7 @@ struct MetalView: UIViewRepresentable {
             entityAlphaDesc.colorAttachments[0].isBlendingEnabled = true
             entityAlphaDesc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
             entityAlphaDesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
-            entityAlphaDesc.colorAttachments[0].sourceAlphaBlendFactor = .sourceAlpha
+            entityAlphaDesc.colorAttachments[0].sourceAlphaBlendFactor = .one
             entityAlphaDesc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
             entityAlphaDesc.depthAttachmentPixelFormat = view.depthStencilPixelFormat
             entityAlphaDesc.vertexFunction = library.makeFunction(name: "q3_entity_vertex")
@@ -17150,8 +17443,8 @@ struct MetalView: UIViewRepresentable {
             entityFilterDesc.colorAttachments[0].alphaBlendOperation = .add
             entityFilterDesc.colorAttachments[0].sourceRGBBlendFactor = .destinationColor
             entityFilterDesc.colorAttachments[0].destinationRGBBlendFactor = .zero
-            entityFilterDesc.colorAttachments[0].sourceAlphaBlendFactor = .one
-            entityFilterDesc.colorAttachments[0].destinationAlphaBlendFactor = .zero
+            entityFilterDesc.colorAttachments[0].sourceAlphaBlendFactor = .zero
+            entityFilterDesc.colorAttachments[0].destinationAlphaBlendFactor = .one
             entityFilterDesc.depthAttachmentPixelFormat = view.depthStencilPixelFormat
             entityFilterDesc.vertexFunction = library.makeFunction(name: "q3_entity_vertex")
             entityFilterDesc.fragmentFunction = library.makeFunction(name: "q3_entity_fragment")
@@ -17176,11 +17469,11 @@ struct MetalView: UIViewRepresentable {
             entitySubtractDesc.colorAttachments[0].alphaBlendOperation = .add
             entitySubtractDesc.colorAttachments[0].sourceRGBBlendFactor = .zero
             entitySubtractDesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceColor
-            /* Alpha: write source alpha straight through (one/zero).
-             * Previously used oneMinusSourceAlpha which is a
-             * premultiplied-alpha idiom — inappropriate here. */
-            entitySubtractDesc.colorAttachments[0].sourceAlphaBlendFactor = .one
-            entitySubtractDesc.colorAttachments[0].destinationAlphaBlendFactor = .zero
+            // These decals modify scene RGB, not its coverage. Preserve
+            // destination alpha so transparent padding cannot punch holes
+            // in postprocessing, MetalFX inputs, or exported frames.
+            entitySubtractDesc.colorAttachments[0].sourceAlphaBlendFactor = .zero
+            entitySubtractDesc.colorAttachments[0].destinationAlphaBlendFactor = .one
             entitySubtractDesc.depthAttachmentPixelFormat = view.depthStencilPixelFormat
             entitySubtractDesc.vertexFunction = library.makeFunction(name: "q3_entity_vertex")
             entitySubtractDesc.fragmentFunction = library.makeFunction(name: "q3_entity_fragment")
@@ -17406,6 +17699,9 @@ struct MetalView: UIViewRepresentable {
             loggedParallaxHandles.removeAll(keepingCapacity: false)
             textureCache.removeAll(keepingCapacity: false)
             rtASVertexBuffer = nil
+            rtPreviousWorldVertexBuffer = nil
+            rtWorldGeometryTime = nil
+            rtWorldBulges.removeAll(keepingCapacity: true)
             rtASPositionBuffer = nil
             rtASIndexBuffer = nil
             entityASDemandSuspended = false

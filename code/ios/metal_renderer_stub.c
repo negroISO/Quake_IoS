@@ -2297,37 +2297,9 @@ static qhandle_t RegisterTexture(const char *name) {
         return existing->handle;
     }
 
-    {
-        qhandle_t animHandle = ShaderMap_ResolveCurrentFrame(name);
-        if (animHandle != 0) {
-            /* Propagate the parent shader's blendMode to the frame
-             * texture. Frame textures are registered under their own
-             * filenames (flame4.tga, etc.) which have no shader-map
-             * entry → blendMode stays 0. But the PARENT shader
-             * (flame1_hell) has blendMode=1 (additive). Without this
-             * propagation, additive flames render opaque. */
-            metalTexture_t *animTex = FindTextureByHandle(animHandle);
-            if (animTex != NULL) {
-                animTex->blendMode = ShaderMap_GetBlendMode(name);
-                animTex->alphaFunc = ShaderMap_GetAlphaFunc(name);
-                animTex->tcGenEnv = ShaderMap_GetTcGenEnv(name);
-                animTex->rgbGen = ShaderMap_GetRgbGen(name);
-                animTex->rgbGenExplicit = ShaderMap_GetRgbGenExplicit(name);
-                animTex->alphaGen = ShaderMap_GetAlphaGen(name);
-                ShaderMap_GetRgbWave(name, &animTex->rgbWaveFunc,
-                                     &animTex->rgbWaveBase, &animTex->rgbWaveAmp,
-                                     &animTex->rgbWavePhase, &animTex->rgbWaveFreq);
-                ShaderMap_GetAlphaWave(name, &animTex->alphaWaveFunc,
-                                       &animTex->alphaWaveBase, &animTex->alphaWaveAmp,
-                                       &animTex->alphaWavePhase, &animTex->alphaWaveFreq);
-                ShaderMap_GetRgbConst(name, animTex->rgbConstColor);
-                animTex->alphaConst = ShaderMap_GetAlphaConst(name);
-                ShaderMap_GetTcMods(name, &animTex->tcModCount, animTex->tcMods);
-            }
-            return animHandle;
-        }
-    }
-
+    /* Keep a logical animated shader's own handle and metadata. Returning
+     * a frame texture here lost the parent name and mutated shared frame
+     * metadata; per-entity age could never select the correct stage/frame. */
     if (!TryLoadImageRGBA(name, &rgba, &width, &height, resolvedName, sizeof(resolvedName))) {
         /* Shader-name → texture-path resolver. The .shader scripts map
          * logical names (models/powerups/health/yellow) to actual files
@@ -2945,6 +2917,72 @@ static qhandle_t RegisterEntityStageTexture(const char *shaderName, int stageInd
     texture->rgbaBytes = base->rgbaBytes;
     texture->generation = base->generation;
     CopyStageMetadataToTexture(texture, stage);
+    return texture->handle;
+}
+
+static qboolean EntityShaderHasAnimatedStages(const char *name) {
+    const metalShaderMap_t *entry = EntityShaderLookupEntryCached(name);
+    if (entry == NULL) return qfalse;
+    for (int i = 0; i < entry->stageCount; ++i) {
+        if (entry->stages[i].animFrameCount > 0) return qtrue;
+    }
+    return qfalse;
+}
+
+static int EntitySpriteStageDrawCount(qhandle_t shaderHandle) {
+    metalTexture_t *tex = FindTextureByHandle(shaderHandle);
+    if (tex == NULL || tex->name[0] == '\0') return 1;
+    const metalShaderMap_t *entry = EntityShaderLookupEntryCached(tex->name);
+    int count = 0;
+    if (entry != NULL) {
+        for (int i = 0; i < entry->stageCount; i++) {
+            const Q3MetalStage *s = &entry->stages[i];
+            if (!s->useLightmap && (s->mapPath[0] != '\0' || s->animFrameCount > 0)) count++;
+        }
+    }
+    return count > 0 ? count : 1;
+}
+
+static qhandle_t RegisterSpriteStageTexture(qhandle_t shaderHandle, int stageIndex, float shaderTime) {
+    metalTexture_t *tex = FindTextureByHandle(shaderHandle);
+    if (tex == NULL || tex->name[0] == '\0') return 0;
+    const metalShaderMap_t *entry = EntityShaderLookupEntryCached(tex->name);
+    if (entry == NULL || stageIndex < 0 || stageIndex >= entry->stageCount) return 0;
+    const Q3MetalStage *stage = &entry->stages[stageIndex];
+    if (stage->useLightmap) return 0;
+
+    const char *path = stage->mapPath;
+    if (stage->animFrameCount > 0) {
+        float fps = stage->animFps > 0.0f ? stage->animFps : 8.0f;
+        int frame = (int)(fmaxf(shaderTime, 0.0f) * fps) % stage->animFrameCount;
+        path = stage->animFrames[frame];
+    }
+    if (path[0] == '\0') return 0;
+
+    qhandle_t baseHandle = RegisterTexture(path);
+    metalTexture_t *base = FindTextureByHandle(baseHandle);
+    if (base == NULL || base->rgbaBytes == NULL) return 0;
+
+    char alias[MAX_QPATH];
+    Com_sprintf(alias, sizeof(alias), "*sprite-stage:%d:%d:%u",
+                (int)shaderHandle, stageIndex, (unsigned)baseHandle);
+    metalTexture_t *texture = FindTextureByName(alias);
+    if (texture != NULL) return texture->handle;
+
+    texture = AllocTextureSlot();
+    if (texture == NULL) return 0;
+    Q_strncpyz(texture->name, alias, sizeof(texture->name));
+    texture->width = base->width;
+    texture->height = base->height;
+    texture->rgbaBytes = base->rgbaBytes;
+    texture->generation = base->generation;
+    CopyStageMetadataToTexture(texture, stage);
+    /* Explicit identity has no dependency on cgame shaderRGBA. */
+    if (texture->rgbGen == 0) {
+        texture->rgbGen = 4;
+        texture->rgbConstColor[0] = texture->rgbConstColor[1] = texture->rgbConstColor[2] = 1.0f;
+    }
+    texture->pbrMaterial = Q3_PBR_MATERIAL_MISS_SENTINEL;
     return texture->handle;
 }
 
@@ -10007,11 +10045,11 @@ static void RE_RenderScene(const refdef_t *fd) {
             const md3Surface_t *surface;
             int surfaceIndex;
 
-            /* Sprites reserve a single quad: 4 verts, 6 indices, 1 draw. */
+            /* Sprite stages share one quad but require distinct material draws. */
             if (sceneEntity->entity.reType == RT_SPRITE) {
                 totalEntityVerts += 4;
                 totalEntityIndices += 6;
-                totalEntityDraws += 1;
+                totalEntityDraws += EntitySpriteStageDrawCount((qhandle_t)sceneEntity->entity.customShader);
                 continue;
             }
             if (sceneEntity->entity.reType == RT_LIGHTNING) {
@@ -10074,6 +10112,14 @@ static void RE_RenderScene(const refdef_t *fd) {
                     if (shaderSlot < 0) shaderSlot = 0;
                     shaderName = shader[shaderSlot].name;
                     stageDraws = EntityPickupStageDrawCount(shaderName);
+                    if (EntityShaderHasAnimatedStages(shaderName)) {
+                        stageDraws = EntitySpriteStageDrawCount(RegisterTexture(shaderName));
+                    }
+                }
+                qhandle_t custom = (qhandle_t)sceneEntity->entity.customShader;
+                const metalTexture_t *customTexture = FindTextureByHandle(custom);
+                if (customTexture != NULL && EntityShaderHasAnimatedStages(customTexture->name)) {
+                    stageDraws = EntitySpriteStageDrawCount(custom);
                 }
                 totalEntityVerts += (uint32_t)surface->numVerts;
                 totalEntityIndices += (uint32_t)(surface->numTriangles * 3);
@@ -10187,6 +10233,8 @@ static void RE_RenderScene(const refdef_t *fd) {
                         s_entityVertices[baseVertex + i].color[1] = g;
                         s_entityVertices[baseVertex + i].color[2] = b;
                         s_entityVertices[baseVertex + i].color[3] = a;
+                        /* Billboard normals must not inherit reused model-vertex memory. */
+                        VectorScale(axis0, -1.0f, s_entityVertices[baseVertex + i].normal);
                     }
                     /* Two triangles: 0-1-2, 0-2-3. */
                     s_entityIndices[entityIndexCursor + 0] = baseVertex + 0;
@@ -10198,81 +10246,38 @@ static void RE_RenderScene(const refdef_t *fd) {
                     entityVertexCursor += 4;
                     entityIndexCursor += 6;
 
-                    /* Derive sprite blend from the resolved shader's
-                     * blendMode instead of hard-coding additive. The old
-                     * path rendered every sprite through the additive
-                     * entity pipeline, which lights up the transparent
-                     * corners of alpha-blended textures like smokePuff
-                     * and shotgunSmokePuff as solid orange rectangles.
-                     * Model entities already do this at ~line 3827.
-                     * Legacy fallback: unknown / opaque → additive, to
-                     * preserve the prior behavior for plasma bolts,
-                     * rail cores, and muzzle flashes whose shaders we
-                     * haven't parsed. */
+                    /* Preserve every authored sprite stage and select animMap
+                     * by this entity's own shader clock. Stage aliases are immutable:
+                     * simultaneous explosions of different ages cannot retarget each other. */
                     {
-                        uint32_t spriteFlags = Q3_METAL_ENTITY_DRAWFLAG_NOCULL;
-                        const metalTexture_t *tex = FindTextureByHandle(
-                            (qhandle_t)sceneEntity->entity.customShader);
-                        qboolean isAdditiveLike = qfalse;
-                        qboolean hasExplicitATest = qfalse;
-                        EmitMetalEntityStageAuditForHandle(
-                            (qhandle_t)sceneEntity->entity.customShader,
-                            "sprite");
-                        if (tex != NULL) {
-                            if (tex->blendMode == 1) {
-                                spriteFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
-                                isAdditiveLike = qtrue;
-                            } else if (tex->blendMode == 2) {
-                                spriteFlags |= Q3_METAL_ENTITY_DRAWFLAG_ALPHA;
-                            } else if (tex->blendMode == 3) {
-                                spriteFlags |= Q3_METAL_ENTITY_DRAWFLAG_FILTER;
-                            } else if (tex->blendMode == 4) {
-                                spriteFlags |= Q3_METAL_ENTITY_DRAWFLAG_SUBTRACT;
-                            } else if (tex->blendMode == 5) {
-                                spriteFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE_FULL;
-                                isAdditiveLike = qtrue;
-                            } else {
-                                spriteFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
-                                isAdditiveLike = qtrue;
-                            }
-                            hasExplicitATest = (tex->alphaFunc != 0);
-                        } else {
-                            spriteFlags |= Q3_METAL_ENTITY_DRAWFLAG_ADDITIVE;
-                            isAdditiveLike = qtrue;
+                        qhandle_t shaderHandle = (qhandle_t)sceneEntity->entity.customShader;
+                        const metalTexture_t *shaderTexture = FindTextureByHandle(shaderHandle);
+                        const metalShaderMap_t *entry = shaderTexture != NULL
+                            ? EntityShaderLookupEntryCached(shaderTexture->name) : NULL;
+                        float shaderTime = fmaxf((float)(s_entitySceneTimeSeconds - sceneEntity->entity.shaderTime.f), 0.0f);
+                        int emitted = 0;
+                        for (int si = 0; entry != NULL && si < entry->stageCount; ++si) {
+                            qhandle_t stageHandle = RegisterSpriteStageTexture(shaderHandle, si, shaderTime);
+                            if (stageHandle == 0) continue;
+                            s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
+                            s_entityDraws[entityDrawCursor].indexCount = 6;
+                            s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)stageHandle;
+                            s_entityDraws[entityDrawCursor].flags = EntityFlagsForTexture(
+                                stageHandle, Q3_METAL_ENTITY_DRAWFLAG_NOCULL, qfalse);
+                            SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity, stageHandle);
+                            entityDrawCursor++;
+                            emitted++;
                         }
-                        /* TASK #1: force implicit alphaFunc GT0 for sprites
-                         * whose shader uses additive blending and doesn't
-                         * set alphaFunc explicitly. Prevents JPEG-compressed
-                         * dark-but-not-black rlboom/plasma/flash borders
-                         * from contributing to GL_ONE/GL_ONE blend
-                         * (classic hard-rectangular explosion quad). */
-                        if (isAdditiveLike && !hasExplicitATest) {
-                            spriteFlags |= Q3_METAL_ENTITY_DRAWFLAG_ATEST_GT0;
+                        if (emitted == 0) {
+                            s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
+                            s_entityDraws[entityDrawCursor].indexCount = 6;
+                            s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)shaderHandle;
+                            s_entityDraws[entityDrawCursor].flags = EntityFlagsForTexture(
+                                shaderHandle, Q3_METAL_ENTITY_DRAWFLAG_NOCULL, qtrue);
+                            SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity, shaderHandle);
+                            entityDrawCursor++;
                         }
-                        if (MetalVerboseAuditEnabled() && MetalRenderAuditEnabled()) {
-                            static int s_spriteAuditCount = 0;
-                            if (s_spriteAuditCount < 64) {
-                                ri.Printf(PRINT_DEVELOPER,
-                                    "[sprite-audit] shader=%d tex='%s' radius=%.1f rgba=%.2f,%.2f,%.2f,%.2f blend=%d alphaFunc=%d rgbGen=%d alphaGen=%d flags=0x%x\n",
-                                    (int)sceneEntity->entity.customShader,
-                                    tex ? tex->name : "(no-tex)",
-                                    radius, r, g, b, a,
-                                    tex ? tex->blendMode : -1,
-                                    tex ? tex->alphaFunc : -1,
-                                    tex ? tex->rgbGen : -1,
-                                    tex ? tex->alphaGen : -1,
-                                    (unsigned)spriteFlags);
-                                s_spriteAuditCount++;
-                            }
-                        }
-                        s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
-                        s_entityDraws[entityDrawCursor].indexCount = 6;
-                        s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)sceneEntity->entity.customShader;
-                        s_entityDraws[entityDrawCursor].flags = spriteFlags;
-                        SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity,
-                                           (qhandle_t)sceneEntity->entity.customShader);
                     }
-                    entityDrawCursor += 1;
                     continue;
                 }
 
@@ -10836,7 +10841,26 @@ static void RE_RenderScene(const refdef_t *fd) {
                         }
                     }
 
-                    if (shaderNameForStages != NULL &&
+                    const metalTexture_t *resolvedTexture = FindTextureByHandle(textureHandle);
+                    /* Match the measurement pass: custom-skin surfaces retain
+                     * their existing single-stage path unless customShader
+                     * overrides the skin. Never emit unbudgeted stage draws. */
+                    if ((sceneEntity->entity.customShader != 0 || sceneEntity->entity.customSkin == 0) &&
+                        resolvedTexture != NULL && EntityShaderHasAnimatedStages(resolvedTexture->name)) {
+                        const metalShaderMap_t *entry = EntityShaderLookupEntryCached(resolvedTexture->name);
+                        float shaderTime = fmaxf((float)(s_entitySceneTimeSeconds - sceneEntity->entity.shaderTime.f), 0.0f);
+                        for (int si = 0; entry != NULL && si < entry->stageCount; ++si) {
+                            qhandle_t stageHandle = RegisterSpriteStageTexture(textureHandle, si, shaderTime);
+                            if (stageHandle == 0) continue;
+                            s_entityDraws[entityDrawCursor].firstIndex = firstIndex;
+                            s_entityDraws[entityDrawCursor].indexCount = entityIndexCursor - firstIndex;
+                            s_entityDraws[entityDrawCursor].textureHandle = (uint32_t)stageHandle;
+                            s_entityDraws[entityDrawCursor].flags = MetalEntityDrawFlagsForSceneEntity(
+                                sceneEntity, EntityFlagsForTexture(stageHandle, baseDrawFlags, qfalse));
+                            SetEntityDrawColor(entityDrawCursor, &sceneEntity->entity, stageHandle);
+                            entityDrawCursor++;
+                        }
+                    } else if (shaderNameForStages != NULL &&
                         EntityPickupStageDrawCount(shaderNameForStages) > 0) {
                         const metalShaderMap_t *entry = EntityShaderLookupEntryCached(shaderNameForStages);
                         int si;
