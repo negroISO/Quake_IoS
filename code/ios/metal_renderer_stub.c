@@ -1832,6 +1832,8 @@ static void CopyTextureTcModsToDrawCmd(uint32_t cursor, qhandle_t textureHandle)
  * all rendered static instead of scrolling. Pass 0 if the caller
  * cannot supply a texture handle — the tcMod chain falls back to
  * count=0 (identity transform). */
+static double s_entitySceneTimeSeconds = 0;
+
 static void SetEntityDrawColor(uint32_t cursor, const refEntity_t *e, qhandle_t textureHandle) {
     if (e != NULL && e->shader.rgba[3] != 0) {
         s_entityDraws[cursor].entityColor[0] = (float)e->shader.rgba[0] / 255.0f;
@@ -1844,8 +1846,11 @@ static void SetEntityDrawColor(uint32_t cursor, const refEntity_t *e, qhandle_t 
         s_entityDraws[cursor].entityColor[2] = 1.0f;
         s_entityDraws[cursor].entityColor[3] = 1.0f;
     }
+    /* shaderTime must be scene seconds minus entity's own offset, not
+     * cls.realtime (which is wall-clock). Use the per-scene time set in
+     * RE_RenderScene so all entities share a consistent clock. */
     s_entityDraws[cursor].shaderTime =
-        (float)cls.realtime * 0.001f - (e != NULL ? e->shaderTime.f : 0.0f);
+        (float)(s_entitySceneTimeSeconds - (e != NULL ? e->shaderTime.f : 0.0f));
     /* tcMod chain copy via the helper below. Order doesn't matter since
      * tcMod fields are independent of entityColor / shaderTime. */
     CopyTextureTcModsToDrawCmd(cursor, textureHandle);
@@ -6204,46 +6209,8 @@ static void MetalWorldEmitSurfaceStages(const char *shaderName,
                 RawBlendFromMode(_drawStage.blendMode, &_drawStage.rawSrcBlend, &_drawStage.rawDstBlend);
                 _drawStage.depthWrite = 1;
             }
-            /* Remix/PBR owner routing: some stock Q3 shaders use an
-             * animated sfx/liquid layer as an opaque GL_ONE/GL_ZERO
-             * underlay, then put the concrete wall/floor material in a
-             * later alpha stage. Remix keyed authored PBR sidecars to that
-             * concrete stage, not to the fire/swirly underlay. If the
-             * owner material is staged and usable, skip only the opaque
-             * classic FX underlay so it does not become a black/dark
-             * depth-writing rectangle (q3dm1 largerblock3b_ow,
-             * killblockgeomtrn). Do not skip additive/alpha FX stages:
-             * those are real Q3 visual layers. */
-            if (_pbrOwnerTex != 0 &&
-                _st->useLightmap == 0 &&
-                _drawStage.blendMode == 0 &&
-                _drawStage.rawSrcBlend == Q3_GL_ONE &&
-                _drawStage.rawDstBlend == Q3_GL_ZERO &&
-                WorldMapPathIsClassicEffectLayer(_st->mapPath)) {
-                if (s_worldMapAuditActive) {
-                    static char s_skipFXSeen[32][MAX_QPATH];
-                    static int s_skipFXSeenCount = 0;
-                    qboolean seen = qfalse;
-                    int si;
-                    for (si = 0; si < s_skipFXSeenCount; ++si) {
-                        if (!Q_stricmp(s_skipFXSeen[si], shaderName)) { seen = qtrue; break; }
-                    }
-                    if (!seen) {
-                        const metalTexture_t *ownerTex = FindTextureByHandle(_pbrOwnerTex);
-                        if (s_skipFXSeenCount < (int)(sizeof(s_skipFXSeen) / sizeof(s_skipFXSeen[0]))) {
-                            Q_strncpyz(s_skipFXSeen[s_skipFXSeenCount++], shaderName, MAX_QPATH);
-                        }
-                        MetalTelemetryPrintf("metal_draw_plan", PRINT_ALL,
-                            "[metal-draw-plan] skip classic FX underlay shader=%s stage=%d texture=%s ownerHandle=%u owner=%s reason=staged-structural-owner\n",
-                            shaderName,
-                            _s,
-                            _st->mapPath,
-                            (unsigned)_pbrOwnerTex,
-                            ownerTex ? ownerTex->name : "(unknown)");
-                    }
-                }
-                continue;
-            }
+            /* Authored opaque underlay establishes whole-shader coverage/depth.
+             * PBR owner selection cannot discard it. */
             /* Suppress rgbGen=wave on light-fixture stages with additivefull (GL_ONE/GL_ONE) blending.
              * Light overlays like textures/base_light/s_proto_light should be static, not pulsing.
              * The wave animation creates visible "rotating ovals" artifacts around the lights. */
@@ -9786,6 +9753,7 @@ static void RE_RenderScene(const refdef_t *fd) {
     if (fd == NULL) {
         return;
     }
+    s_entitySceneTimeSeconds = (double)fd->time * 0.001;
     s_renderSceneCalls += 1;
 
     /* Per-frame world-surface animMap retarget. Walk only the draws we
@@ -11911,6 +11879,7 @@ int Q3_PostprocessEnabled(void) {
  * duration of the call site. */
 const Q3PBRMaterialPaths *Q3MetalRenderer_GetPBRMaterial(unsigned int textureHandle) {
     static Q3PBRMaterialPaths s_paths;  /* not thread-safe; Swift renderer is single-threaded */
+    if (!q3_pbr_enabled()) return NULL;
     if (textureHandle == 0) return NULL;
     metalTexture_t *tex = FindTextureByHandle((qhandle_t)textureHandle);
     if (tex == NULL) return NULL;
@@ -11974,6 +11943,7 @@ const Q3PBRMaterialPaths *Q3MetalRenderer_GetPBRMaterial(unsigned int textureHan
  * no sprite_sheet data. */
 const Q3PBRMaterialPaths *Q3MetalRenderer_GetPBRMaterialByName(const char *name) {
     static Q3PBRMaterialPaths s_paths;
+    if (!q3_pbr_enabled()) return NULL;
     if (name == NULL || name[0] == '\0') return NULL;
     const q3_pbr_material_t *m = q3_pbr_lookup_by_name(name);
     if (m == NULL) return NULL;

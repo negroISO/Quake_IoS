@@ -18,6 +18,16 @@ import simd
 /// actual UIKit screen and is normalized to landscape.
 @MainActor
 func Q3MetalOutputTargetSize(screen: UIScreen? = nil) -> CGSize {
+    // The boot path, initial drawable and resize callback must honor the same
+    // explicit capture geometry, regardless of UIKit window/screen dimensions.
+    switch ProcessInfo.processInfo.environment["Q3_MATCH_PROFILE"] {
+    case "metal_1280_25": return CGSize(width: 1280, height: 960)
+    case "metal_960_25": return CGSize(width: 960, height: 444)
+    case "native_ipad_25":
+        let size = (screen ?? UIScreen.main).nativeBounds.size
+        return CGSize(width: max(size.width, size.height), height: min(size.width, size.height))
+    default: break
+    }
     #if targetEnvironment(macCatalyst)
     // On Catalyst, UIScreen describes the whole macOS display while the app
     // can live in an arbitrarily sized UIKit window. Deriving the drawable from
@@ -1307,6 +1317,7 @@ struct MetalView: UIViewRepresentable {
 
         private func cachedEntityAtlasResolution(handle: UInt32,
                                                  allowsIndirectRedirect: Bool) -> EntityAtlasResolution? {
+            guard pbrMaterialsEnabled else { return nil }
             let key = EntityAtlasCacheKey(handle: handle,
                                           allowsIndirectRedirect: allowsIndirectRedirect)
             if let cached = entityAtlasResolutionCache[key] {
@@ -1783,15 +1794,16 @@ struct MetalView: UIViewRepresentable {
 
         struct WorldUniforms {
             float4x4 viewProjection;
-            packed_float3 cameraPos;
+            // Match Swift SIMD3 storage (16 bytes), including the explicit scalar pads.
+            float3 cameraPos;
             float _pad;
-            packed_float3 cameraRight;
+            float3 cameraRight;
             float _padR;
-            packed_float3 cameraUp;
+            float3 cameraUp;
             float _padU;
             // USD sun (slot 0 of per-map light buffer when DistantLight).
             // sunColor.w 0=fall back to hardcoded sunDir; 1=use sunDir.
-            packed_float3 sunDir;
+            float3 sunDir;
             float sunIntensity;
             float4 sunColor;
             float4x4 sunShadowMatrix;
@@ -1802,7 +1814,9 @@ struct MetalView: UIViewRepresentable {
         struct FogVolumeUniforms {
             float4x4 viewProjection;
             float4x4 inverseViewProjection;
-            packed_float3 cameraPos;
+            // Swift SIMD3 occupies 16 bytes before the explicit _pad.
+            // Keep this aligned: packed_float3 shifts every fog field by 16 bytes.
+            float3 cameraPos;
             float _pad;
             float4 fogColorDistance;
             float4 boundsMin;
@@ -2351,19 +2365,10 @@ struct MetalView: UIViewRepresentable {
             float4 color;
             float3 normal;
         };
-        // NOTE 2026-06-01: tried packed_float3 swap here to match the
-        // tightly-packed C Q3MetalEntityVertex (48 bytes vs MSL float3-
-        // padded 56). The Geometry tab on a flare draw clearly showed
-        // negative-w vertices producing radial bursts, so the misalignment
-        // hypothesis seemed right. But the packed_float3 build turned fog
-        // green and killed rocket-explosion brightness — so something
-        // upstream is already compensating for the stride mismatch (the
-        // CPU upload path probably re-lays the vertices to MSL-aligned
-        // 56 bytes before binding, or there's a hidden vertex descriptor).
-        // The diagonal "light ray" turned out to be a real BSP lens flare
-        // (light_flare entity), not a geometry bug. If we ever DO need
-        // to revisit struct alignment, audit how Q3MetalRenderer_Get*
-        // buffers are uploaded first.
+        // Both uploadEntityBuffers and drawFlarePass convert packed C bridge
+        // vertices to GPUEntityVertex. Keep this aligned layout in sync with
+        // that Swift type; consuming Q3MetalEntityVertex directly reads beyond
+        // the flare buffer (48-byte C stride versus 64-byte GPU stride).
 
         struct EntityUniforms {
             float4x4 viewProjection;
@@ -2420,7 +2425,7 @@ struct MetalView: UIViewRepresentable {
             float4 viewmodelParams;
             // USD-authored sun for entity/viewmodel normal/specular path.
             // sunColor.w = 0: use legacy hardcoded entity sun.
-            packed_float3 sunDir;
+            float3 sunDir;
             float sunIntensity;
             float4 sunColor;
             // 2026-06-19: additive-stage brightness cap. .x = max per-channel
@@ -3508,7 +3513,9 @@ struct MetalView: UIViewRepresentable {
              * when active, branchless skip when not. Apple Silicon
              * absorbs both in the fragment budget for the few hundred
              * pixels a weapon viewmodel occupies. */
-            if (!is_null_texture(normalTexture)) {
+            // Negative scale explicitly disables PBR; required flat/default
+            // texture bindings alone cannot advertise an authored material.
+            if (pbrNormalScale >= 0.0 && !is_null_texture(normalTexture)) {
                 float3 nMap = normalTexture.sample(textureSampler, in.texCoord).xyz * 2.0 - 1.0;
 
                 float3 N = in.normal;
@@ -5473,6 +5480,7 @@ struct MetalView: UIViewRepresentable {
             var rtEmitMaxEVBits: UInt64
             var pbrBakedLightmaps: UInt32
             var mirrorExclusion: Bool
+            var pbrMaterialsEnabled: Bool
         }
         private var rtMaterialSignatureCacheKey: RTMaterialSignatureCacheKey?
         private var rtMaterialSignatureCacheValue: UInt64 = 0
@@ -7917,7 +7925,7 @@ struct MetalView: UIViewRepresentable {
                 if skipPortalDraws && (draw.flags & portalBit) != 0 { continue }
                 guard let stage = Self.rtRepresentativeStage(for: draw) else { continue }
                 let triCount = max(1, Int(draw.indexCount / 3))
-                let materialHandle = Self.worldPBRMaterialHandle(for: stage)
+                let materialHandle = pbrMaterialsEnabled ? Self.worldPBRMaterialHandle(for: stage) : stage.textureHandle
                 if stage.useLightmap == 0 && stage.textureHandle != 0 {
                     albedoWeights[materialHandle, default: 0] += triCount
                 }
@@ -7965,7 +7973,7 @@ struct MetalView: UIViewRepresentable {
                 guard let stage = Self.rtRepresentativeStage(for: draw) else { continue }
                 let skyFlagBit = UInt32(Q3_METAL_WORLD_DRAWFLAG_SKY)
                 let isSkyDraw = (draw.flags & skyFlagBit) != 0
-                let materialHandle = Self.worldPBRMaterialHandle(for: stage)
+                let materialHandle = pbrMaterialsEnabled ? Self.worldPBRMaterialHandle(for: stage) : stage.textureHandle
                 let aSlotOptional = albedoSlots[materialHandle]
                 let lSlotOptional = lightmapSlots[draw.lightmapTextureHandle]
                 guard stage.useLightmap == 0 else { continue }
@@ -8214,7 +8222,8 @@ struct MetalView: UIViewRepresentable {
                 rtEmitBits: Self.floatBits(Q3_RTEmissive()),
                 rtEmitMaxEVBits: Self.floatBits(Q3_RTEmissiveMaxEV()),
                 pbrBakedLightmaps: UInt32(Q3_PBRBakedLightmaps() != 0 ? 1 : 0),
-                mirrorExclusion: rtPortalMaterialExclusionActive)
+                mirrorExclusion: rtPortalMaterialExclusionActive,
+                pbrMaterialsEnabled: pbrMaterialsEnabled)
             if rtMaterialSignatureCacheKey == key {
                 return rtMaterialSignatureCacheValue
             }
@@ -8253,6 +8262,7 @@ struct MetalView: UIViewRepresentable {
             func mixScaled(_ v: Float, scale: Float = 1000.0, clamp: Int = 1_000_000) {
                 mix(UInt64(max(0, min(clamp, Int((v * scale).rounded())))))
             }
+            mix(pbrMaterialsEnabled ? 1 : 0)
             mixScaled(Q3_PBREmissiveIntensityMax(), clamp: 16_000)
             mixScaled(Q3_RTEmissive(), clamp: 16_000)
             mixScaled(Q3_RTEmissiveMaxEV(), clamp: 8_000)
@@ -8266,7 +8276,7 @@ struct MetalView: UIViewRepresentable {
                 if (draw.flags & fogOnlyBit) != 0 { continue }
                 if skipPortalDraws && (draw.flags & portalBit) != 0 { continue }
                 guard let stage = Self.rtRepresentativeStage(for: draw) else { continue }
-                let materialHandle = Self.worldPBRMaterialHandle(for: stage)
+                let materialHandle = pbrMaterialsEnabled ? Self.worldPBRMaterialHandle(for: stage) : stage.textureHandle
                 let blendMode = Self.worldBlendClass(for: stage)
                 let alphaThreshold = Self.alphaTestThreshold(for: stage.alphaFunc)
                 let tcMods = [stage.tcMods.0, stage.tcMods.1, stage.tcMods.2, stage.tcMods.3]
@@ -9219,6 +9229,10 @@ struct MetalView: UIViewRepresentable {
                                                       fallback: MTLTexture,
                                                       stage: Q3MetalWorldStage,
                                                       materialHandle: UInt32? = nil) -> WorldTextureSelection {
+            guard pbrMaterialsEnabled else {
+                return WorldTextureSelection(texture: fallback, useWorldPBR: false,
+                                             classicFX: false, atlasParams: nil, materialHandle: handle)
+            }
             let name = textureNameForLog(handle)
             let pbrHandle = materialHandle ?? handle
             let isFXStage = stage.blendMode != 0 ||
@@ -10531,12 +10545,12 @@ struct MetalView: UIViewRepresentable {
         }
 
         private func hasRenderableFogVolume() -> Bool {
-            /* Stock Q3 fog is the BSP fog overlay plus per-surface fog pass.
-             * The ray-box pass is only safe when the eye is actually inside a
-             * fog brush (see encodeFogVolumeRayBox); otherwise the brush AABB
-             * reads as a rectangular fog slab over adjacent rooms. Keep a kill
-             * switch for A/B, but default on with the inside-volume gate. */
-            guard ProcessInfo.processInfo.environment["Q3_METAL_DISABLE_RAYBOX_FOG"] != "1" else { return false }
+            /* Authored surface/boundary fog is replayed after RT compositing.
+             * Adding ray-box integration applies the same fog a second time.
+             * Keep that alternate model explicit for GPU diagnostics only. */
+            guard Q3_RTMix() > 0,
+                  ProcessInfo.processInfo.environment["Q3_METAL_ENABLE_RAYBOX_FOG"] == "1",
+                  ProcessInfo.processInfo.environment["Q3_METAL_DISABLE_RAYBOX_FOG"] != "1" else { return false }
             guard fogVolumePipelineState != nil,
                   let fogs = Q3MetalRenderer_GetWorldFogs() else { return false }
             let fogCount = Int(Q3MetalRenderer_GetWorldFogCount())
@@ -11318,6 +11332,9 @@ struct MetalView: UIViewRepresentable {
 
         private var pbrMaterialInfoCache: [UInt32: PBRMaterialInfo] = [:]
         private var pbrMaterialInfoMisses: Set<UInt32> = []
+        // Snapshot the master switch once after engine commands execute. Cache
+        // contents remain reusable, but disabled lookups never return or cache PBR.
+        private var pbrMaterialsEnabled = false
         private var pbrMaterialExistsCache: [UInt32: Bool] = [:]
         private var loggedBakedTcModHandles: Set<UInt32> = []
 
@@ -11327,6 +11344,7 @@ struct MetalView: UIViewRepresentable {
         }
 
         private func pbrMaterialInfo(for handle: UInt32) -> PBRMaterialInfo? {
+            guard pbrMaterialsEnabled else { return nil }
             if let cached = pbrMaterialInfoCache[handle] { return cached }
             if pbrMaterialInfoMisses.contains(handle) { return nil }
             guard let matPtr = Q3MetalRenderer_GetPBRMaterial(handle) else {
@@ -11355,6 +11373,7 @@ struct MetalView: UIViewRepresentable {
         }
 
         private func pbrMaterialExists(_ handle: UInt32) -> Bool {
+            guard pbrMaterialsEnabled else { return false }
             if let cached = pbrMaterialExistsCache[handle] { return cached }
             let exists = pbrMaterialInfo(for: handle) != nil
             pbrMaterialExistsCache[handle] = exists
@@ -11511,6 +11530,7 @@ struct MetalView: UIViewRepresentable {
 
         private func pbrSpriteAtlasParams(for handle: UInt32, atlasTime: Float,
                                           logEnabled: Bool = true) -> SIMD4<Float> {
+            guard pbrMaterialsEnabled else { return SIMD4<Float>(repeating: 0) }
             if let mat = pbrMaterialInfo(for: handle) {
                 if mat.spriteCols > 0 {
                     let rows = mat.spriteRows > 0 ? mat.spriteRows : 1
@@ -11622,6 +11642,7 @@ struct MetalView: UIViewRepresentable {
         }
 
         private func pbrAlbedoTexture(for handle: UInt32) -> MTLTexture? {
+            guard pbrMaterialsEnabled else { return nil }
             if let cached = pbrAlbedoCache[handle] { return cached }
             if pbrTriedAndMissed.contains(handle) { return nil }
             guard let matPtr = Q3MetalRenderer_GetPBRMaterial(handle) else {
@@ -11710,6 +11731,7 @@ struct MetalView: UIViewRepresentable {
         /// would gamma-correct the .xyz fields and the per-pixel normals
         /// would point in the wrong direction.
         private func pbrNormalTexture(for handle: UInt32, allowGenericFallback: Bool = true) -> MTLTexture? {
+            guard pbrMaterialsEnabled else { return nil }
             if let cached = pbrNormalCache[handle] { return cached }
             if pbrNormalTried.contains(handle) { return nil }
             pbrNormalTried.insert(handle)
@@ -11774,6 +11796,7 @@ struct MetalView: UIViewRepresentable {
         private var pbrGenericNormalTex: MTLTexture?
         private var pbrGenericNormalAttempted = false
         private func pbrGenericFallbackNormal() -> MTLTexture? {
+            guard pbrMaterialsEnabled else { return nil }
             if pbrGenericNormalTex != nil { return pbrGenericNormalTex }
             if pbrGenericNormalAttempted { return nil }
             pbrGenericNormalAttempted = true
@@ -12758,6 +12781,7 @@ struct MetalView: UIViewRepresentable {
         /// IBL block. Brings shotgun/lightning/railgun/grenade/BFG up to
         /// the same shading path as the rocket.
         private func pbrRoughnessTexture(for handle: UInt32) -> MTLTexture? {
+            guard pbrMaterialsEnabled else { return nil }
             if let cached = pbrRoughnessCache[handle] { return cached }
             if pbrRoughnessTried.contains(handle) { return nil }
             pbrRoughnessTried.insert(handle)
@@ -12823,6 +12847,7 @@ struct MetalView: UIViewRepresentable {
         /// Phase 6+ extension: see pbrRoughnessTexture(for:) comment — same
         /// fallback policy with `pbrMetallicDefault` (value 0.50).
         private func pbrMetallicTexture(for handle: UInt32) -> MTLTexture? {
+            guard pbrMaterialsEnabled else { return nil }
             if let cached = pbrMetallicCache[handle] { return cached }
             if pbrMetallicTried.contains(handle) { return nil }
             pbrMetallicTried.insert(handle)
@@ -12882,6 +12907,7 @@ struct MetalView: UIViewRepresentable {
         /// needs a sentinel: sample a map only when Remix authored one and it
         /// actually loaded; otherwise keep `materialParams.z/.w` scalars.
         private func pbrAuthoredRoughnessTexture(for handle: UInt32) -> MTLTexture? {
+            guard pbrMaterialsEnabled else { return nil }
             guard let matPtr = Q3MetalRenderer_GetPBRMaterial(handle),
                   Self.hasNonEmptyPBRPath(matPtr.pointee.roughness) else {
                 return nil
@@ -12892,6 +12918,7 @@ struct MetalView: UIViewRepresentable {
         }
 
         private func pbrAuthoredMetallicTexture(for handle: UInt32) -> MTLTexture? {
+            guard pbrMaterialsEnabled else { return nil }
             guard let matPtr = Q3MetalRenderer_GetPBRMaterial(handle),
                   Self.hasNonEmptyPBRPath(matPtr.pointee.metallic) else {
                 return nil
@@ -12957,6 +12984,7 @@ struct MetalView: UIViewRepresentable {
         /// map-backed lights still sample the real emissive texture in-kernel at
         /// the chosen triangle UV, so sparse masks remain sparse.
         private func pbrEmissiveAverage(for handle: UInt32) -> SIMD3<Float>? {
+            guard pbrMaterialsEnabled else { return nil }
             if let cached = pbrEmissiveAverageCache[handle] { return cached }
             if pbrEmissiveAverageTried.contains(handle) { return nil }
             pbrEmissiveAverageTried.insert(handle)
@@ -13026,6 +13054,7 @@ struct MetalView: UIViewRepresentable {
         }
 
         private func pbrEmissiveTexture(for handle: UInt32) -> MTLTexture? {
+            guard pbrMaterialsEnabled else { return nil }
             if let cached = pbrEmissiveCache[handle] { return cached }
             if pbrEmissiveTried.contains(handle) { return nil }
             pbrEmissiveTried.insert(handle)
@@ -13082,6 +13111,7 @@ struct MetalView: UIViewRepresentable {
         private var pbrHeightCache: [UInt32: MTLTexture] = [:]
         private var pbrHeightTried: Set<UInt32> = []
         private func pbrHeightTexture(for handle: UInt32) -> MTLTexture? {
+            guard pbrMaterialsEnabled else { return nil }
             if let cached = pbrHeightCache[handle] { return cached }
             if pbrHeightTried.contains(handle) { return nil }
             pbrHeightTried.insert(handle)
@@ -13336,47 +13366,10 @@ struct MetalView: UIViewRepresentable {
         }
 
         func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
-            // Persistent drawable lock to engine's logical render
-            // resolution so the AVI muxer captures pixels at the
-            // declared r_customwidth/r_customheight. SwiftUI's natural layout produces
-            // ~592×720 on iPad which is wrong aspect (5:6 vs 4:3) and
-            // invalidates every Vulkan parity diff. Re-apply on every
-            // resize event — when we set view.drawableSize=target, the
-            // delegate fires again with size==target and the early
-            // return below handles it (no recursion).
-            let isPad = (UIDevice.current.userInterfaceIdiom == .pad)
-            let profile = ProcessInfo.processInfo.environment["Q3_MATCH_PROFILE"]
-            let target: CGSize
-            if profile == "native_ipad_25" {
-                let mainScreen = view.window?.windowScene?.screen ?? UIScreen.main
-                let nativeSize = mainScreen.nativeBounds.size
-                target = CGSize(width: max(nativeSize.width, nativeSize.height),
-                                height: min(nativeSize.width, nativeSize.height))
-            } else if profile == "metal_1280_25" {
-                // Mac Catalyst reports .phone idiom, so the old isPad
-                // ternary collapsed both profiles to 960x444.  Honor the
-                // actual profile name to match the C-side table in ios_main.m.
-                target = CGSize(width: 1280, height: 960)
-            } else if profile != nil {
-                // metal_960_25 and any legacy match-profile fallback.
-                target = CGSize(width: 960, height: 444)
-            } else {
-                // Normal play. Use the same active-screen target as app boot
-                // (`Q3_SetRenderResolution`). Mixing nativeBounds with the
-                // MTKView callback aspect makes Q3's 2D UI projection and the
-                // drawable disagree, which crops the iPad/OLED menu.
-                target = Q3MetalOutputTargetSize(screen: view.window?.screen ?? UIScreen.main)
-            }
-            print("[Metal] Drawable size: \(size) (target \(target))")
-            if size.width.isFinite && size.height.isFinite
-                && size.width > 0 && size.height > 0
-                && (Int(size.width) != Int(target.width) ||
-                    Int(size.height) != Int(target.height)) {
-                view.drawableSize = target
-                print("[Metal] Drawable forced to \(target) (was \(size))")
-                Q3MetalRenderer_UpdateDrawableSize(Int32(target.width), Int32(target.height))
-                return
-            }
+            // Do not assign drawableSize from its own callback. UIKit may
+            // notify between width and height updates; a nested assignment
+            // corrupts the final aspect on physical devices. draw(in:) applies
+            // the target outside this callback, then uses the real attachment.
             Q3MetalRenderer_UpdateDrawableSize(Int32(size.width), Int32(size.height))
         }
 
@@ -13468,7 +13461,6 @@ struct MetalView: UIViewRepresentable {
                     let tcGenEnvBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_TCGEN_ENV)
                     let scenePolyBit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_SCENE_POLY)
                     let aTestGT0Bit = UInt32(Q3_METAL_ENTITY_DRAWFLAG_ATEST_GT0)
-                    let rtPreserveDepthHackAlways = Q3_RTMix() > 0 && Q3_RTPreserveEntities() != 0
                     let entityFrameContext = buildEntityFrameContext(draws: allEntityDraws,
                                                                      first: first,
                                                                      end: end)
@@ -13623,9 +13615,8 @@ struct MetalView: UIViewRepresentable {
                                       : (wantsDepthHack ? depthHackDepthStencilState : depthStencilState)
                             encoder.setDepthStencilState(ensuredDepthStencilState(state, device: device))
                         }
-                        if rtPreserveDepthHackAlways, wantsDepthHack, let alwaysDepth = alwaysPassDepthStencilState {
-                            encoder.setDepthStencilState(alwaysDepth)
-                        }
+                        // The compressed viewmodel depth range still needs ordinary
+                        // self-occlusion, including when preserved over the RT composite.
                         // PBR Phase 1: when q3_pbr_lookup_by_name matched
                         // a Q3 shader (rocket / shotgun / bfg / etc.), the
                         // C-side stamped pbrMaterial on the metalTexture
@@ -13671,7 +13662,7 @@ struct MetalView: UIViewRepresentable {
                         // the MSL `if (.y > 0.5)` runs only on first-person
                         // weapons. World pickups, scene polys, and HUD heads
                         // get (0,0,0,0) and skip the floor entirely.
-                        let vmFloor = Q3_PBRViewmodelFloor()
+                        let vmFloor: Float = pbrMaterialsEnabled ? Q3_PBRViewmodelFloor() : 0
                         // P0.2: .z doubles as the r_rt_debug_entity_mask
                         // flag — q3_entity_fragment returns solid white
                         // when it is > 0.5 (after alpha-test discards), to
@@ -13687,7 +13678,7 @@ struct MetalView: UIViewRepresentable {
                             // pickups) so full-metal items (RL/plasma/ammo/health,
                             // metallic=1.0) don't go near-invisible under the dark
                             // IBL cube. Viewmodels use .x instead.
-                            wantsDepthHack ? 0.0 : Q3_PBREntityFloor())
+                            (wantsDepthHack || !pbrMaterialsEnabled) ? 0.0 : Q3_PBREntityFloor())
                         if wantsDepthHack && !loggedViewmodelFloorOnce && vmFloor > 0.0 {
                             loggedViewmodelFloorOnce = true
                             pbrLog("[Q3-PBR-ENTITY] viewmodel floor enabled strength=\(String(format: "%.3f", vmFloor))")
@@ -13734,9 +13725,8 @@ struct MetalView: UIViewRepresentable {
                         // entity draws (yellow/red health, quad shell). Fall
                         // back to a 1×1 flat normal so the binding stays valid
                         // while behaving as identity for PBR-off draws.
-                        let entityNormalTex = preferClassicFX
-                            ? pbrFlatNormalDefault()
-                            : (pbrNormalTexture(for: draw.textureHandle) ?? pbrFlatNormalDefault())
+                        let authoredEntityNormal = preferClassicFX ? nil : pbrNormalTexture(for: draw.textureHandle)
+                        let entityNormalTex = authoredEntityNormal ?? pbrFlatNormalDefault()
                         encoder.setFragmentTexture(entityNormalTex, index: 1)
                         // PBR Phase 4 — viewmodel-vs-world entity gating.
                         // Viewmodels (RF_DEPTHHACK) get the wide
@@ -13745,7 +13735,10 @@ struct MetalView: UIViewRepresentable {
                         // weapons) get the tight (0.78..1.18) range to
                         // avoid Mikkelsen TBN derivative instability on
                         // rotating geometry.
-                        var pbrNormalScaleEntity: Float = wantsDepthHack ? 1.0 : 0.0
+                        // Material presence gates shading even when a missing normal
+                        // map uses the required flat fallback texture.
+                        var pbrNormalScaleEntity: Float = !preferClassicFX && pbrMaterialExists(draw.textureHandle)
+                            ? (wantsDepthHack ? 1.0 : 0.0) : -1.0
                         encoder.setFragmentBytes(&pbrNormalScaleEntity, length: 4, index: 3)
                         // PBR Phase F — rim params at buffer(4). Disable the
                         // Fresnel rim for now: it reads as a white outline on
@@ -13987,9 +13980,8 @@ struct MetalView: UIViewRepresentable {
                         // Normal at index 1 — same fallback chain as the
                         // primary entity bind site. Never nil to satisfy
                         // Q3.entity pipeline's required `normalTexture` slot.
-                        let entityNormalTexSub = preferClassicFX
-                            ? pbrFlatNormalDefault()
-                            : (pbrNormalTexture(for: draw.textureHandle) ?? pbrFlatNormalDefault())
+                        let authoredSubNormal = preferClassicFX ? nil : pbrNormalTexture(for: draw.textureHandle)
+                        let entityNormalTexSub = authoredSubNormal ?? pbrFlatNormalDefault()
                         encoder.setFragmentTexture(entityNormalTexSub, index: 1)
                         // Roughness@3 + metallic@4 — same correctness rule as
                         // the primary bind site. Q3.entity pipeline declares
@@ -14011,7 +14003,7 @@ struct MetalView: UIViewRepresentable {
                         // sub-pass entityUniforms.emissiveParams left at the
                         // struct default (1,1,1,0) so the MSL gate skips.
                         encoder.setFragmentTexture(pbrEmissiveDefault(), index: 6)
-                        var pbrNormalScaleSub: Float = 0.0
+                        var pbrNormalScaleSub: Float = !preferClassicFX && pbrMaterialExists(draw.textureHandle) ? 0.0 : -1.0
                         encoder.setFragmentBytes(&pbrNormalScaleSub, length: 4, index: 3)
                         // PBR Phase F — rim params at buffer(4).
                         var pbrRimParamsSub = SIMD2<Float>(0.0, Q3_PBRRimFalloff())
@@ -14114,8 +14106,27 @@ struct MetalView: UIViewRepresentable {
              * "effective drawable" is the RT size so projection / viewport
              * / scissor math is consistent with what we'll actually feed
              * to MetalFX. Native quality keeps the existing direct path. */
-            let outputW = Int(view.drawableSize.width)
-            let outputH = Int(view.drawableSize.height)
+            // Acquiring the drawable can trigger a resize callback. Derive all
+            // per-frame dimensions from the acquired attachment, not a size
+            // cached before that callback (which can exceed the render target).
+            let targetSize = Q3MetalOutputTargetSize(screen: view.window?.screen ?? UIScreen.main)
+            if view.drawableSize != targetSize {
+                view.drawableSize = targetSize
+            }
+            if let layer = view.layer as? CAMetalLayer, layer.drawableSize != targetSize {
+                layer.drawableSize = targetSize
+            }
+            let drawableAcquireStart = CACurrentMediaTime()
+            guard let drawable = view.currentDrawable,
+                  let descriptor = view.currentRenderPassDescriptor,
+                  let commandQueue,
+                  let uiSamplerState,
+                  let worldSamplerState,
+                  let commandBuffer = commandQueue.makeCommandBuffer()
+            else { return }
+            let drawableAcquireMs = (CACurrentMediaTime() - drawableAcquireStart) * 1000.0
+            let outputW = drawable.texture.width
+            let outputH = drawable.texture.height
             if frameInterpolation != .on {
                 resetFrameInterpolationHistory(reason: "toggle-off")
             }
@@ -14133,7 +14144,7 @@ struct MetalView: UIViewRepresentable {
             let renderW: Int
             let renderH: Int
             if effectiveUpscaleQuality != .native, let device = view.device, outputW > 0, outputH > 0 {
-                let rs = effectiveUpscaleQuality.renderSize(forOutput: view.drawableSize)
+                let rs = effectiveUpscaleQuality.renderSize(forOutput: CGSize(width: outputW, height: outputH))
                 let rW = max(1, Int(rs.width))
                 let rH = max(1, Int(rs.height))
                 if ensureSpatialUpscaleTargets(device: device,
@@ -14159,22 +14170,6 @@ struct MetalView: UIViewRepresentable {
             Q3MetalRenderer_UpdateDrawableSize(Int32(renderW), Int32(renderH))
             Q3MetalRenderer_UpdateCaptureSize(Int32(outputW), Int32(outputH))
 
-            /* Acquire the CAMetalLayer drawable before running the Q3
-             * simulation/render build. On ProMotion hardware, waiting until
-             * after a 3-5ms Quake3_Frame() can miss the layer's current
-             * acquisition window, turning otherwise-fast maps (nv15) into
-             * every-other-vblank 60Hz despite low GPU time. Holding the
-             * drawable while Q3 builds command lists is short in steady
-             * state and lets us commit before the next 120Hz deadline. */
-            let drawableAcquireStart = CACurrentMediaTime()
-            guard let drawable = view.currentDrawable,
-                  let descriptor = view.currentRenderPassDescriptor,
-                  let commandQueue,
-                  let uiSamplerState,
-                  let worldSamplerState,
-                  let commandBuffer = commandQueue.makeCommandBuffer()
-            else { return }
-            let drawableAcquireMs = (CACurrentMediaTime() - drawableAcquireStart) * 1000.0
             commandBuffer.label = "Q3.frame"
             var rtPerfFrame: RTPerfFrame? = nil
             var frameDiagLiveEnvFace: Int? = nil
@@ -14207,6 +14202,18 @@ struct MetalView: UIViewRepresentable {
             let q3FrameStart = CACurrentMediaTime()
             Quake3_Frame()
             let q3FrameMs = (CACurrentMediaTime() - q3FrameStart) * 1000.0
+            let materialsEnabled = q3_pbr_enabled() != 0
+            if materialsEnabled != pbrMaterialsEnabled {
+                pbrMaterialsEnabled = materialsEnabled
+                rtMaterialSignatureCacheKey = nil
+                // Cached primitive buffers share the current handle-to-slot tables.
+                // Rebuild them together when material routing changes.
+                rtPrimitiveMaterialBufferCache.removeAll(keepingCapacity: true)
+                rtEmissiveLightCache.removeAll(keepingCapacity: true)
+                rtLastMaterialSignature = 0
+                rtLastMaterialRefreshTime = -.infinity
+                rtHistoryValid = false
+            }
 
             guard let snapshot = Q3MetalRenderer_GetFrameSnapshot()?.pointee else { return }
             if Q3MetalRenderer_IsWorldLoaded() != 0 {
@@ -14276,7 +14283,11 @@ struct MetalView: UIViewRepresentable {
             }
 
             let wantsFogRayBox = hasRenderableFogVolume()
-            let sceneDepth = wantsFogRayBox ? view.device.flatMap { device in
+            // RT splits the world and preserved entities into separate render
+            // passes. Preserve world depth on every RT map, including maps
+            // without fog, so loaded depth remains defined for entity tests.
+            let needsPersistentSceneDepth = wantsFogRayBox || Q3_RTMix() > 0
+            let sceneDepth = needsPersistentSceneDepth ? view.device.flatMap { device in
                 ensureSceneDepthTexture(device: device,
                                         width: renderW,
                                         height: renderH)
@@ -14363,7 +14374,8 @@ struct MetalView: UIViewRepresentable {
                     guard stageCount > 0 else { continue }
 
                     let fogOverlayDraw = (draw.flags & fogOverlayBit) != 0
-                    if fogOverlayDraw && fog.hasBounds != 0 {
+                    // Only hide the boundary if a requested volume pass replaces it.
+                    if fogOverlayDraw && wantsFogRayBox && sceneDepth != nil && fog.hasBounds != 0 {
                         let rawMin = SIMD3<Float>(fog.boundsMin.0, fog.boundsMin.1, fog.boundsMin.2)
                         let rawMax = SIMD3<Float>(fog.boundsMax.0, fog.boundsMax.1, fog.boundsMax.2)
                         let bmin = simd_min(rawMin, rawMax)
@@ -15292,7 +15304,9 @@ struct MetalView: UIViewRepresentable {
                                 continue
                             }
                             let fogOverlayDraw = (draw.flags & fogOverlayBit) != 0
-                            if fogOverlayDraw && fogHasBounds != 0 {
+                            // Suppress a boundary only when the volume pass will replace it.
+                            // Classic raster must retain the authored boundary from inside too.
+                            if fogOverlayDraw && wantsFogRayBox && sceneDepth != nil && fogHasBounds != 0 {
                                 let bmin = simd_min(fogBoundsMin, fogBoundsMax)
                                 let bmax = simd_max(fogBoundsMin, fogBoundsMax)
                                 let margin: Float = 0.5
@@ -16333,6 +16347,7 @@ struct MetalView: UIViewRepresentable {
         private var videoReadbackBuffer: [UInt8]?
         private var debugCaptureConfigured = false
         private var debugCaptureDir: URL?
+        private var debugCaptureToStdout = false
         private var debugCaptureRemaining = 0
         private var debugCaptureStartFrame: UInt32 = 120
         private var debugCaptureStride: UInt32 = 60
@@ -16342,13 +16357,19 @@ struct MetalView: UIViewRepresentable {
             guard !debugCaptureConfigured else { return }
             debugCaptureConfigured = true
             let env = ProcessInfo.processInfo.environment
-            guard let dir = env["Q3_CAPTURE_FRAME_DIR"], !dir.isEmpty else { return }
+            let dir = env["Q3_CAPTURE_FRAME_DIR"] ?? ""
+            debugCaptureToStdout = env["Q3_CAPTURE_STDOUT"] == "1"
+            guard debugCaptureToStdout || !dir.isEmpty else { return }
             let requested = Int(env["Q3_CAPTURE_FRAMES"] ?? "0") ?? 0
             guard requested > 0 else { return }
-            debugCaptureDir = URL(fileURLWithPath: dir, isDirectory: true)
             debugCaptureRemaining = requested
             debugCaptureStartFrame = UInt32(max(0, Int(env["Q3_CAPTURE_START_FRAME"] ?? "120") ?? 120))
             debugCaptureStride = UInt32(max(1, Int(env["Q3_CAPTURE_STRIDE"] ?? "60") ?? 60))
+            if debugCaptureToStdout {
+                print("[Q3-CAPTURE] enabled stdout frames=\(requested) start=\(debugCaptureStartFrame) stride=\(debugCaptureStride)")
+                return
+            }
+            debugCaptureDir = URL(fileURLWithPath: dir, isDirectory: true)
             do {
                 try FileManager.default.createDirectory(at: debugCaptureDir!,
                                                         withIntermediateDirectories: true)
@@ -16363,7 +16384,7 @@ struct MetalView: UIViewRepresentable {
         private func nextDebugFrameCaptureNumber() -> UInt32? {
             configureDebugFrameCaptureIfNeeded()
             guard debugCaptureRemaining > 0,
-                  debugCaptureDir != nil,
+                  (debugCaptureDir != nil || debugCaptureToStdout),
                   debugFrameCounter >= debugCaptureStartFrame else { return nil }
             if let last = debugCaptureLastFrame,
                debugFrameCounter &- last < debugCaptureStride {
@@ -16379,7 +16400,7 @@ struct MetalView: UIViewRepresentable {
                                             height: Int,
                                             byteCount: Int,
                                             frame: UInt32) {
-            guard let bgra, let dir = debugCaptureDir else { return }
+            guard let bgra else { return }
             guard width > 0, height > 0, width <= 65535, height <= 65535 else { return }
             var header = [UInt8](repeating: 0, count: 18)
             header[2] = 2               // uncompressed true-colour TGA
@@ -16391,6 +16412,22 @@ struct MetalView: UIViewRepresentable {
             header[17] = 0x28           // 8 alpha bits, top-left origin
             var data = Data(header)
             data.append(bgra.assumingMemoryBound(to: UInt8.self), count: byteCount)
+            if debugCaptureToStdout {
+                // Opt-in debug transport: the host writes the console stream
+                // to its chosen volume, with no device/container file mutation.
+                // Indexed chunks and exact byte count let the receiver reject
+                // interrupted or interleaved captures rather than reuse a frame.
+                let chunkBytes = 3072
+                let chunks = (data.count + chunkBytes - 1) / chunkBytes
+                for index in 0..<chunks {
+                    let start = index * chunkBytes
+                    let payload = data.subdata(in: start..<min(start + chunkBytes, data.count)).base64EncodedString()
+                    print("[Q3-CAPTURE-DATA] frame=\(frame) chunk=\(index)/\(chunks) \(payload)")
+                }
+                print("[Q3-CAPTURE-END] frame=\(frame) bytes=\(data.count) width=\(width) height=\(height)")
+                return
+            }
+            guard let dir = debugCaptureDir else { return }
             let url = dir.appendingPathComponent(String(format: "frame_%06u.tga", frame))
             do {
                 try data.write(to: url, options: .atomic)
@@ -16454,6 +16491,14 @@ struct MetalView: UIViewRepresentable {
         @MainActor
         private func ensurePSOBinaryArchive(device: MTLDevice) -> (any MTLBinaryArchive)? {
             if psoBinaryArchiveDisabled { return nil }
+            let env = ProcessInfo.processInfo.environment
+            // On the current SDK, adding instrumented render pipelines to a
+            // binary archive crashes in MTLMetalScriptBuilder. Compile normally
+            // for shader validation; leave the user's existing cache intact.
+            if env["MTL_SHADER_VALIDATION"] == "1" || env["Q3_DISABLE_PSO_ARCHIVE"] == "1" {
+                disablePSOBinaryArchive("diagnostic compilation", nil)
+                return nil
+            }
             if let psoBinaryArchive { return psoBinaryArchive }
             let storeURL = psoBinaryArchiveStoreURL()
             psoBinaryArchiveURL = storeURL
@@ -17546,7 +17591,7 @@ struct MetalView: UIViewRepresentable {
             encoder.setFragmentTexture(ensurePBREnvCube(), index: 5)
             encoder.setFragmentTexture(pbrEmissiveDefault(), index: 6)
             encoder.setFragmentSamplerState(ensurePBREnvSampler(), index: 1)
-            var pbrNormalScaleFlare: Float = 0.0
+            var pbrNormalScaleFlare: Float = -1.0
             encoder.setFragmentBytes(&pbrNormalScaleFlare, length: 4, index: 3)
             var pbrRimParamsFlare = SIMD2<Float>(0.0, Q3_PBRRimFalloff())
             encoder.setFragmentBytes(&pbrRimParamsFlare, length: 8, index: 4)
@@ -17594,7 +17639,10 @@ struct MetalView: UIViewRepresentable {
                 (SIMD2(-1,  1), SIMD2(0, 0)),
             ]
 
-            var vertices = [Q3MetalEntityVertex]()
+            // q3_entity_vertex reads EntityVertexIn, the aligned GPU layout.
+            // Uploading the packed C bridge type here makes vertex indexing
+            // step past this buffer and interpret adjacent allocations as color.
+            var vertices = [GPUEntityVertex]()
             vertices.reserveCapacity(flareCount * 4)
             var indices = [UInt32]()
             indices.reserveCapacity(flareCount * 6)
@@ -17606,18 +17654,18 @@ struct MetalView: UIViewRepresentable {
                 let base = UInt32(i * 4)
                 for (corner, uv) in corners {
                     let p = origin + right * (corner.x * halfSize) + up * (corner.y * halfSize)
-                    var vert = Q3MetalEntityVertex(
-                        position: (p.x, p.y, p.z),
-                        texCoord: (uv.x, uv.y),
-                        color: (color.x, color.y, color.z, 1.0),
-                        normal: (0, 0, 0)
+                    let vert = GPUEntityVertex(
+                        position: p,
+                        texCoord: uv,
+                        color: SIMD4(color.x, color.y, color.z, 1.0),
+                        normal: SIMD3(0, 0, 0)
                     )
                     vertices.append(vert)
                 }
                 indices.append(contentsOf: [base, base + 1, base + 2, base, base + 2, base + 3])
             }
 
-            let vertStride = MemoryLayout<Q3MetalEntityVertex>.stride
+            let vertStride = MemoryLayout<GPUEntityVertex>.stride
             guard let vertexBuffer = device.makeBuffer(
                 bytes: vertices,
                 length: vertices.count * vertStride,
@@ -17629,6 +17677,8 @@ struct MetalView: UIViewRepresentable {
                 options: .storageModeShared
             ) else { return }
 
+            vertexBuffer.label = "Q3.vb.flares"
+            indexBuffer.label = "Q3.ib.flares"
             encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
             encoder.setVertexBytes(&uniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
             encoder.setFragmentBytes(&uniforms, length: MemoryLayout<EntityUniforms>.stride, index: 1)
