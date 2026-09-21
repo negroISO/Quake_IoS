@@ -303,7 +303,9 @@ enum {
      * lightmapTexture at uv1, replacing the historical second
      * GL_DST_COLOR/GL_ZERO lightmap draw. Only set for simple opaque
      * base/lightmap pairs so multi-stage shader semantics stay intact. */
-    Q3_METAL_WORLD_DRAWFLAG_COMBINED_LIGHTMAP = 1u << 12
+    Q3_METAL_WORLD_DRAWFLAG_COMBINED_LIGHTMAP = 1u << 12,
+    /* Validated opaque base + alpha overlays; retain per-layer UVs in RT. */
+    Q3_METAL_WORLD_DRAWFLAG_RT_CLASSIC_LAYERS = 1u << 13
 };
 
 enum {

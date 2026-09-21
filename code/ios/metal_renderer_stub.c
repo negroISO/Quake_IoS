@@ -1982,8 +1982,8 @@ static qboolean TextureNeedsLuminanceAlpha(const char *path) {
     if (!Q_stricmpn(path, "models/powerups/", 16)) return PathHasFXNameMarker(path);
     if (!Q_stricmpn(path, "models/ammo/", 12))     return PathHasFXNameMarker(path);
     if (!Q_stricmpn(path, "models/weapons2/", 16)) return WeaponModelPathHasExplicitFXMarker(path);
-    if (!Q_stricmpn(path, "textures/sfx/", 13)) return qtrue;
-    if (!Q_stricmpn(path, "textures/effects/", 17)) return qtrue;
+    // textures/sfx/ and textures/effects/ removed: stock world JPGs have no alpha
+    // and radial masking would zero their RGB. Sprite/model heuristics below remain.
     if (!Q_stricmpn(path, "gfx/damage/", 11)) return qtrue;
     if (!Q_stricmpn(path, "gfx/misc/", 9)) return qtrue;
     if (!Q_stricmpn(path, "gfx/2d/", 7)) return qtrue;
@@ -6145,6 +6145,27 @@ static void MetalWorldEmitSurfaceStages(const char *shaderName,
     }
 
     _e = ShaderMap_LookupEntry(shaderName);
+    /* This stock column is one opaque animated core under three masked
+     * layers, including a stationary outer panel. A single PBR owner cannot
+     * replace each layer using the core's UV transforms. Keep its authored
+     * layers until a verified equivalent replacement material is available.
+     * Validate the shader shape so a mod cannot silently use this path with
+     * unsupported blend/texgen semantics. */
+    if (!Q_stricmp(shaderName, "textures/gothic_block/blocks18cgeomtrnx") &&
+        _e != NULL && _e->stageCount == 5) {
+        qboolean layered = qtrue;
+        for (int si = 0; si < 5; ++si) {
+            const Q3MetalStage *st = &_e->stages[si];
+            if (st->rgbGen != 0 || st->alphaGen != 0 || st->alphaFunc != 0 ||
+                st->tcGen != 0 || st->animFrameCount != 0 ||
+                (si == 0 && (st->blendMode != 0 || st->useLightmap)) ||
+                (si > 0 && si < 4 && (st->blendMode != 2 || st->useLightmap)) ||
+                (si == 4 && (!st->useLightmap || st->tcModCount != 0))) {
+                layered = qfalse;
+            }
+        }
+        if (layered) worldFlags |= Q3_METAL_WORLD_DRAWFLAG_RT_CLASSIC_LAYERS;
+    }
     _emitted = 0;
     _combinedLightmapBaseStage = MetalShaderCombinedLightmapBaseStage(_e, hasLightmap, lightmapHandle);
     _combinedLightmap = (_combinedLightmapBaseStage >= 0) ? qtrue : qfalse;

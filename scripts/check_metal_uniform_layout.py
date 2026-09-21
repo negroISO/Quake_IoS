@@ -10,9 +10,10 @@ s=source_path.read_text()
 def block(name,n):
  a=-1
  for _ in range(n+1):a=s.index('struct '+name+' {',a+1)
- b=s.index('\n        }',a)+10
- return s[a:b]+(';' if n else '')
-structs=['WorldUniforms','EntityUniforms'];sw='';ms='#include <metal_stdlib>\nusing namespace metal;\n';tests=''
+ end=re.search(r'\n[ \t]*};?',s[a:])
+ assert end, name
+ return s[a:a+end.end()].rstrip(';')+(';' if n else '')
+structs=['WorldUniforms','EntityUniforms','RayTracingUniforms'];sw='';ms='#include <metal_stdlib>\nusing namespace metal;\n';tests=''
 for name in structs:
  swift=block(name,0);metal=block(name,1);sw+=swift+'\n';ms+=metal+'\n'
  fields=re.findall(r'^\s*var (\w+):\s*(simd_float4x4|SIMD[234]<Float>|Float|UInt32|Int32)',swift,re.M)
@@ -29,7 +30,8 @@ for name in structs:
   else:assigns.append(f'u.{field} = {val}');reads.append(f'float(u.{field})')
   expect+=list(range(val,val+n));off.append(f'"{field}": MemoryLayout<{name}>.offset(of: \\.{field})!')
  ms+=f'kernel void probe{name}(constant {name}& u [[buffer(0)]], device float* o [[buffer(1)]]) {{ o[0]=sizeof({name}); '+''.join(f'o[{i+1}]={v};' for i,v in enumerate(reads))+'}\n'
- init='viewProjection:matrix_identity_float4x4'+(', cameraPos: SIMD3<Float>(0,0,0)' if name=='WorldUniforms' else '')
+ required=[(f,t) for f,t in fields if re.search(r'^\s*var '+re.escape(f)+r':[^=\n]*(?://[^\n]*)?$',swift,re.M)]
+ init=','.join(f+':'+('matrix_identity_float4x4' if t=='simd_float4x4' else '.zero' if t.startswith('SIMD') else '0') for f,t in required)
  tests+='''do {
 '''+f'var u = {name}({init})\n'+'\n'.join(assigns)+f'''
 let pipeline = try device.makeComputePipelineState(function:library.makeFunction(name:"probe{name}")!)
@@ -51,5 +53,6 @@ p=root/('layout-'+variant+'.swift');p.write_text(code)
 subprocess.run(['xcrun','swiftc',str(p),'-o',str(p.with_suffix(''))],check=True)
 res=subprocess.run([str(p.with_suffix(''))],capture_output=True,text=True);(root/('layout-'+variant+'.log')).write_text(res.stdout+res.stderr)
 print(res.stdout)
+if res.returncode: print(res.stderr)
 print('Probe source and log:',root)
 sys.exit(res.returncode)

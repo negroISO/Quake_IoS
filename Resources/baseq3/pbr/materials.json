@@ -29759,38 +29759,6 @@
    "source": "albedo",
    "sourceTexture": "textures/gothic_block/blocks18cgeom.jpg"
   },
-  "textures/gothic_block/blocks18cgeomtrnx": {
-   "albedo": "assets/ingested/BB9CB6998E4845D0_albedo.a.rtex.dds",
-   "alphaMode": "BLEND",
-   "animMaps": [],
-   "dstBlend": "GL_ONE_MINUS_SRC_ALPHA",
-   "emissive": null,
-   "emissive_color": null,
-   "emissive_intensity": null,
-   "gamePath": "textures/gothic_block/blocks18cgeomtrnx",
-   "hash": "BB9CB6998E4845D0",
-   "height": "assets/ingested/BB9CB6998E4845D0_height.h.rtex.dds",
-   "inMaterialTable": true,
-   "maps": [
-    "textures/sfx/fireswirl2blue.tga",
-    "textures/gothic_block/blocks18cgeomtrn2.tga",
-    "textures/gothic_block/blocks18cgeomtrn2.tga",
-    "textures/gothic_block/blocks18cgeomtrnx.tga"
-   ],
-   "matchScore": 0.72,
-   "metallic": null,
-   "normal": "assets/ingested/BB9CB6998E4845D0_normal_OTH_Normal.n.rtex.dds",
-   "notes": "The original texture features a gothic-style metal block with intricate carvings and a central circular motif, matching the description of blocks18cgeomtrnx.",
-   "renderCategory": "ALPHA_BLEND",
-   "roughness": null,
-   "source": "lmstudio",
-   "sourcePk3": "pak0.pk3",
-   "sourceShaderFile": "scripts/gothic_block.shader",
-   "sourceTexture": "textures/gothic_block/blocks18cgeomtrnx",
-   "srcBlend": "GL_SRC_ALPHA",
-   "surfaceparm_sky": false,
-   "surfaceparm_trans": false
-  },
   "textures/gothic_block/blocks18d": {
    "albedo": "assets/ingested/5010B8B5D3FEC886_albedo.a.rtex.dds",
    "emissive": null,
